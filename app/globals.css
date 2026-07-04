@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+@keyframes flash {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.1; }
+}
+
+@keyframes alarm-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+@keyframes motor-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.animate-flash {
+  animation: flash 0.3s linear infinite;
+}
+
+.animate-alarm {
+  animation: alarm-blink 0.2s linear infinite;
+}
+
+.animate-motor {
+  animation: motor-spin 0.4s linear infinite;
+}
+
+body {
+  background-color: #0a0a0a;
+}
