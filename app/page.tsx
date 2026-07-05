@@ -7,6 +7,8 @@ import { useLockState } from "@/hooks/useLockState";
 import { useVirtualClock } from "@/hooks/useVirtualClock";
 import { useSerialLink } from "@/hooks/useSerialLink";
 import { useProvisioning } from "@/hooks/useProvisioning";
+import { useElementWidth } from "@/hooks/useElementWidth";
+import { buildSampleOnboarding } from "@/lib/provisioning";
 import PhoneShell from "@/components/PhoneShell";
 import StatusLeds from "@/components/StatusLeds";
 import LockDisplay from "@/components/LockDisplay";
@@ -17,10 +19,16 @@ import BleProvisioning from "@/components/BleProvisioning";
 import SerialConsole from "@/components/SerialConsole";
 import DeviceRegistry from "@/components/DeviceRegistry";
 import HardwarePipelineToggle from "@/components/HardwarePipelineToggle";
+import OnboardingPanel from "@/components/OnboardingPanel";
+
+// Below this measured width the onboarding panel folds back under the console
+// instead of occupying its own third column.
+const THREE_COLUMN_MIN_WIDTH = 1280;
 
 export default function Page() {
   const clock = useVirtualClock();
   const [mode, setMode] = useState<HardwareMode>("SOFTWARE");
+  const { ref: mainRef, width: mainWidth } = useElementWidth<HTMLElement>();
 
   // Ref bridges break three dependency cycles without re-instantiating hooks:
   //  - protocol.onFrame -> lock.handleFrame (lock needs protocol.transmit)
@@ -80,8 +88,27 @@ export default function Page() {
     [serial]
   );
 
+  // Onboarding editor state is lifted here so it persists when the panel moves
+  // between the console column and its own third column as the width changes.
+  const [onboardingJson, setOnboardingJson] = useState(() =>
+    buildSampleOnboarding(provisioning.deviceMac)
+  );
+  const threeColumn = mainWidth >= THREE_COLUMN_MIN_WIDTH;
+
+  const onboardingPanel = (
+    <OnboardingPanel
+      value={onboardingJson}
+      onChange={setOnboardingJson}
+      onPublish={provisioning.handleMqttPayload}
+      deviceMac={provisioning.deviceMac}
+    />
+  );
+
   return (
-    <main className="mx-auto flex min-h-screen max-w-[1500px] flex-col gap-5 p-6 lg:p-10">
+    <main
+      ref={mainRef}
+      className="mx-auto flex min-h-screen max-w-[1900px] flex-col gap-5 p-6 lg:p-10"
+    >
       <HardwarePipelineToggle mode={mode} onModeChange={handleModeChange} serial={serial} />
 
       <div className="flex flex-col items-start justify-center gap-8 lg:flex-row">
@@ -132,7 +159,7 @@ export default function Page() {
         </div>
       </div>
 
-      <div className="flex w-full flex-col gap-3 lg:mt-2">
+      <div className="flex w-full min-w-0 flex-1 flex-col gap-3 lg:mt-2">
         <header>
           <h1 className="text-lg font-bold tracking-tight text-neutral-100">
             LockSim <span className="text-sky-500">·</span> Hardware Testbed
@@ -146,18 +173,33 @@ export default function Page() {
           txLog={protocol.txLog}
           onInject={protocol.injectHex}
           onServerPush={protocol.serverPush}
-          onPublishMqtt={provisioning.handleMqttPayload}
           onClear={protocol.clearLogs}
           clock={clock}
           mode={mode}
-          deviceMac={provisioning.deviceMac}
         />
         <DeviceRegistry
           credentials={lock.credentials}
           virtualNowMs={clock.virtualNowMs}
           onRevoke={lock.revokeCredential}
         />
+        {/* Narrow layout: onboarding folds under the console. */}
+        {!threeColumn && onboardingPanel}
       </div>
+
+      {/* Wide layout: onboarding gets its own third column. */}
+      {threeColumn && (
+        <div className="flex w-[420px] shrink-0 flex-col gap-3 lg:mt-2">
+          <header>
+            <h2 className="text-lg font-bold tracking-tight text-neutral-100">
+              Provisioning <span className="text-blue-500">·</span> OZKEYSERV/
+            </h2>
+            <p className="text-[11px] text-neutral-500">
+              Matter-style BLE onboarding over the MQTT command pipeline
+            </p>
+          </header>
+          {onboardingPanel}
+        </div>
+      )}
       </div>
     </main>
   );

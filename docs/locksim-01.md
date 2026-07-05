@@ -42,12 +42,16 @@ hooks/
   useProvisioning.ts  BLE onboarding state machine: bleMode, MAC broadcast,
                       OZKEYSERV/ handshake capture, green-x3 confirm pulse,
                       persisted NetworkProvisioning.
+  useElementWidth.ts  ResizeObserver width measurement driving the responsive
+                      layout (promotes onboarding to a 3rd column ≥1280px).
 components/
   PhoneShell, StatusLeds (power + BLE + Wi-Fi LEDs), LockDisplay, Keypad,
   PeripheralControls, KeySlider, BleProvisioning (BLE switch + MAC broadcast),
-  SerialConsole (virtual clock + dual terminals + injector + server-push +
-  OZKEYSERV MQTT onboarding), DeviceRegistry (Sovereign Device Registry DB grid),
-  HardwarePipelineToggle (Mode A / Mode B master switch + serial link controls).
+  SerialConsole (virtual clock + dual terminals + injector + server-push),
+  OnboardingPanel (OZKEYSERV/ MQTT handshake editor — its own 3rd column when
+  the measured page width ≥1280px, else folds under the console),
+  DeviceRegistry (Sovereign Device Registry DB grid),
+  HardwarePipelineToggle (compact single-row Mode A / Mode B segmented control).
 app/
   page.tsx        Wires hooks. Ref-bridge breaks the transmit<->handleFrame cycle.
   layout.tsx, globals.css (keyframes: flash, alarm-blink, motor-spin).
