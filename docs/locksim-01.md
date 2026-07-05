@@ -22,8 +22,11 @@ npm run build    # type-checks + prod build (passing)
 ```
 lib/
   tuya.ts         Pure protocol engine: frame build/parse, checksum8, DP codec,
-                  temp-credential codec (DPID 21-24), annotateFrame(). No React.
+                  temp-credential codec (DPID 21-24), annotateFrame(),
+                  extractFrames() for Web Serial reassembly. No React.
   credentials.ts  localStorage slot table + checkWindow() temporal check.
+  provisioning.ts BLE onboarding: topicMatches(), parseOnboardingPayload(),
+                  broadcast/sample builders, NetworkProvisioning storage. No React.
   audio.ts        WebAudio synth: keyClick / accessGranted / accessDenied / motorWhirr.
 hooks/
   useTuyaProtocol.ts  Simulated UART bus + mode router: rxLog/txLog, transmit(),
@@ -36,10 +39,14 @@ hooks/
   useSerialLink.ts    Mode B transport: Web Serial API. connect()/disconnect()/
                       write(Uint8Array); read loop reassembles frames via
                       extractFrames(). status/portLabel/ready/supported.
+  useProvisioning.ts  BLE onboarding state machine: bleMode, MAC broadcast,
+                      OZKEYSERV/ handshake capture, green-x3 confirm pulse,
+                      persisted NetworkProvisioning.
 components/
-  PhoneShell, StatusLeds, LockDisplay, Keypad, PeripheralControls, KeySlider,
-  SerialConsole (virtual clock + dual terminals + injector + server-push),
-  DeviceRegistry (Sovereign Device Registry DB compliance grid + per-row revoke),
+  PhoneShell, StatusLeds (power + BLE + Wi-Fi LEDs), LockDisplay, Keypad,
+  PeripheralControls, KeySlider, BleProvisioning (BLE switch + MAC broadcast),
+  SerialConsole (virtual clock + dual terminals + injector + server-push +
+  OZKEYSERV MQTT onboarding), DeviceRegistry (Sovereign Device Registry DB grid),
   HardwarePipelineToggle (Mode A / Mode B master switch + serial link controls).
 app/
   page.tsx        Wires hooks. Ref-bridge breaks the transmit<->handleFrame cycle.
@@ -110,6 +117,24 @@ Checksum = sum of all preceding bytes % 256.
     software bus", "SERVER CMD FORWARDED TO ESP32", or wire-offline warnings).
   - Web Serial needs Chrome/Edge over localhost or HTTPS; the toggle shows an
     "unsupported" state otherwise. Switching back to Mode A closes the port.
+
+- **Matter-style BLE provisioning** (`useProvisioning`, `BleProvisioning.tsx`):
+  - "BLE Provisioning Mode" switch inside the lock face. On → device goes
+    UNPROVISIONED (any prior pairing wiped), BLE LED flashes blue, main display
+    reads "UNPROVISIONED".
+  - "Broadcast Hardware MAC ID" button advertises MAC `AA:BB:CC:11:22:33` up to
+    the OZKEYSERV/ broker (`buildBroadcastPayload`) — logged on TX, and in Mode B
+    written out the USB-UART bridge as newline-terminated bytes via Web Serial.
+  - Handshake capture: the inbound stream parser accepts JSON on the MQTT topic
+    filter `hotel/rooms/+/lock/command`. A payload whose `mac` matches this device
+    and that carries a `room_no` (+ `server_ip`) is validated by
+    `parseOnboardingPayload`. On success it halts the blue flashing, shows
+    "PAIRED - ROOM [X]", persists `{assigned_room_no, server_ip, mac_token, mac}`
+    to LocalStorage (`locksim.provisioning.v1`), and flashes the LED green ×3.
+  - Two entry points: the console's "OZKEYSERV/ Onboarding Handshake" JSON panel
+    (Publish to Lock, plus valid/mismatch presets), and the main hex injector —
+    any input starting with `{` is auto-routed to the provisioning parser instead
+    of the Tuya hex decoder.
 
 ## Credentials for testing
 - Master PIN: `123456#`  ·  Master card UID: `7B 3F 91 D2`

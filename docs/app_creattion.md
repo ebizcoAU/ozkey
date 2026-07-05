@@ -76,3 +76,16 @@ Beneath or alongside the iPhone simulator housing, implement a dual-terminal spl
   - Active credentials must render with low-saturation green borders.
   - Credentials whose parameters haven't started or have explicitly expired must highlight with faded amber backdrops.
 - Include a manual "Revoke / Wipe Slot" click mechanism on each row that compiles and triggers an output Tuya deletion sequence (DPID 22 or 24) down the internal serial bus registers instantly.
+
+### 9. ADVANCED HARDWARE PROVISIONING (MATTER-STYLE ONBOARDING HOOKS)
+- Implement a physical toggle switch labeled "BLE Provisioning Mode".
+- When toggled on, the lock enters an unprovisioned state: the BLE indicator flashes blue, and the main display shows "UNPROVISIONED".
+- The simulator must provide an interactive "Broadcast Hardware MAC ID" button via Chrome's Web Serial bridge (`navigator.serial`). Clicking this will broadcast its mock physical address (e.g., `AA:BB:CC:11:22:33`) directly up to the `OZKEYSERV/` broker layer.
+- Handle Provisioning Handshake Capture: The simulator's incoming network stream parser must listen for a structural JSON onboarding validation payload from `OZKEYSERV/` over the local MQTT topic pipeline (`hotel/rooms/+/lock/command`). 
+- When an inbound packet containing its matching MAC address and an assigned `room_no` string is received:
+  - Halt the BLE blue flashing loop instantly.
+  - Transition the lock display state to "PAIRED - ROOM [X]".
+  - Permanently save the network variables (`assigned_room_no`, `server_ip`, `mac_token`) into the internal `LocalStorage` state.
+  - Flash the LED indicator green three times to confirm successful network registration.
+
+Do not truncate code blocks, avoid using structural layout placeholders, and do not leave generic comments. Provide a production-ready, highly engineered script suite built for real-time serial and database simulation parsing.

@@ -15,6 +15,25 @@
   to { transform: rotate(360deg); }
 }
 
+@keyframes ble-flash {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.12; }
+}
+
+@keyframes confirm-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.05; }
+}
+
+.animate-ble {
+  animation: ble-flash 0.6s ease-in-out infinite;
+}
+
+/* Three discrete green blinks, then holds — network registration confirmation. */
+.animate-confirm {
+  animation: confirm-blink 0.34s linear 3;
+}
+
 .animate-flash {
   animation: flash 0.3s linear infinite;
 }

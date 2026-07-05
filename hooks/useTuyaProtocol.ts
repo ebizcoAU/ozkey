@@ -32,6 +32,8 @@ interface UseTuyaProtocolOptions {
   sendToWire: (bytes: ByteArray) => Promise<boolean> | boolean;
   /** True when the Web Serial link is open and writable. */
   wireReady: boolean;
+  /** Route a non-hex JSON payload (MQTT onboarding) to the provisioning parser. */
+  onMqttPayload: (raw: string) => void;
 }
 
 /**
@@ -67,7 +69,13 @@ function push(log: SerialLogEntry[], entry: SerialLogEntry): SerialLogEntry[] {
  * Simulated 4-wire UART bus (3.3V TTL) speaking the Tuya 0x55 0xAA MCU protocol.
  * Owns the RX/TX hex stream logs and isolates all byte-level work from the UI.
  */
-export function useTuyaProtocol({ onFrame, mode, sendToWire, wireReady }: UseTuyaProtocolOptions) {
+export function useTuyaProtocol({
+  onFrame,
+  mode,
+  sendToWire,
+  wireReady,
+  onMqttPayload,
+}: UseTuyaProtocolOptions) {
   const [rxLog, setRxLog] = useState<SerialLogEntry[]>([]);
   const [txLog, setTxLog] = useState<SerialLogEntry[]>([]);
 
@@ -80,6 +88,18 @@ export function useTuyaProtocol({ onFrame, mode, sendToWire, wireReady }: UseTuy
   sendToWireRef.current = sendToWire;
   const wireReadyRef = useRef(wireReady);
   wireReadyRef.current = wireReady;
+  const onMqttPayloadRef = useRef(onMqttPayload);
+  onMqttPayloadRef.current = onMqttPayload;
+
+  /** Append a line to the outgoing (TX) terminal — used by non-frame uplinks. */
+  const pushTxLog = useCallback((text: string, notes: string[]) => {
+    setTxLog((log) => push(log, makeEntry(text, notes)));
+  }, []);
+
+  /** Append a line to the incoming (RX) terminal — used by MQTT/broker traffic. */
+  const pushRxLog = useCallback((text: string, notes: string[], error = false) => {
+    setRxLog((log) => push(log, makeEntry(text, notes, error)));
+  }, []);
 
   /**
    * Compile a frame from the lock and route it. Mode A keeps it internal (TX log
@@ -139,9 +159,17 @@ export function useTuyaProtocol({ onFrame, mode, sendToWire, wireReady }: UseTuy
     [receiveBytes]
   );
 
-  /** Manual developer injection from the console input bar. */
+  /**
+   * Manual developer injection from the console input bar. A payload beginning
+   * with `{` is treated as an MQTT/OZKEYSERV JSON handshake and handed to the
+   * provisioning parser; everything else is decoded as a raw Tuya hex frame.
+   */
   const injectHex = useCallback(
     (input: string) => {
+      if (input.trim().startsWith("{")) {
+        onMqttPayloadRef.current(input);
+        return;
+      }
       const bytes = fromHexString(input);
       if (!bytes) {
         setRxLog((log) =>
@@ -172,7 +200,17 @@ export function useTuyaProtocol({ onFrame, mode, sendToWire, wireReady }: UseTuy
     setTxLog([]);
   }, []);
 
-  return { rxLog, txLog, transmit, receiveBytes, injectHex, serverPush, clearLogs };
+  return {
+    rxLog,
+    txLog,
+    transmit,
+    receiveBytes,
+    injectHex,
+    serverPush,
+    pushTxLog,
+    pushRxLog,
+    clearLogs,
+  };
 }
 
 export type TuyaProtocolApi = ReturnType<typeof useTuyaProtocol>;

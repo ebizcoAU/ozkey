@@ -86,7 +86,7 @@ export default function HardwarePipelineToggle({
           () => onModeChange("SOFTWARE"),
           "Mode A",
           "Pure Software Emulation (No ESP32)",
-          "App simulates the Zhongshan lock motherboard and the missing Wi-Fi chip. Admin/server commands are encoded and looped into the internal parser to update LocalStorage instantly.",
+          "App simulates the Zhongshan lock motherboard and the missing Wi-Fi chip.",
           "border-emerald-700 bg-emerald-950/40 text-emerald-300"
         )}
         {card(
@@ -94,7 +94,7 @@ export default function HardwarePipelineToggle({
           () => onModeChange("HARDWARE"),
           "Mode B",
           "Physical Wire Integration (ESP32-C6)",
-          "Web Serial API binds a 3.3V USB-UART COM port. Keypad/peripheral frames stream out as Uint8Array; incoming server commands are forwarded over the wire for native translation.",
+          "Web Serial API binds a 3.3V USB-UART COM port. Keypad/peripheral frames stream out as Uint8Array; ",
           "border-sky-700 bg-sky-950/40 text-sky-300"
         )}
       </div>

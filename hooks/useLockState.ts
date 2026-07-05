@@ -305,6 +305,9 @@ export function useLockState({ transmit, virtualNow }: UseLockStateOptions) {
     [wake, fireMotor]
   );
 
+  /** Surface an external one-line status message on the event ticker. */
+  const pushEvent = useCallback((message: string) => setLastEvent(message), []);
+
   /** Manually revoke a slot: compile + fire a DPID 22/24 delete frame, then wipe. */
   const revokeCredential = useCallback(
     (kind: CredentialKind, slot: number) => {
@@ -397,6 +400,7 @@ export function useLockState({ transmit, virtualNow }: UseLockStateOptions) {
     triggerLowBattery,
     setMechanicalKey,
     revokeCredential,
+    pushEvent,
     handleFrame,
   };
 }

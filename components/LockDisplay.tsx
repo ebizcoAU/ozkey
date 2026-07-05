@@ -11,6 +11,9 @@ interface LockDisplayProps {
   alarm: boolean;
   lastEvent: string;
   virtualNowMs: number;
+  bleMode: boolean;
+  pairedBanner: string | null;
+  roomNo?: string;
 }
 
 function fmtCountdown(sec: number): string {
@@ -27,16 +30,39 @@ export default function LockDisplay({
   alarm,
   lastEvent,
   virtualNowMs,
+  bleMode,
+  pairedBanner,
+  roomNo,
 }: LockDisplayProps) {
   const sleeping = powerState === "SLEEPING";
-  const primary = sleeping ? "SLEEPING (7µA)" : lockState;
-  const primaryColor = alarm
-    ? "text-red-400 animate-alarm"
-    : sleeping
-      ? "text-neutral-500"
-      : lockState === "UNLOCKED"
-        ? "text-emerald-400"
-        : "text-amber-300";
+
+  // Provisioning display overrides the normal lock/power readout while active.
+  let primary: string;
+  let primaryColor: string;
+  if (pairedBanner) {
+    primary = pairedBanner;
+    primaryColor = "text-emerald-400";
+  } else if (bleMode) {
+    primary = "UNPROVISIONED";
+    primaryColor = "text-blue-400 animate-ble";
+  } else {
+    primary = sleeping ? "SLEEPING (7µA)" : lockState;
+    primaryColor = alarm
+      ? "text-red-400 animate-alarm"
+      : sleeping
+        ? "text-neutral-500"
+        : lockState === "UNLOCKED"
+          ? "text-emerald-400"
+          : "text-amber-300";
+  }
+
+  const subline = pairedBanner
+    ? "NETWORK REGISTERED • OZKEYSERV/ SESSION ACTIVE"
+    : bleMode
+      ? "BLE ADVERTISING • AWAITING OZKEYSERV/ HANDSHAKE"
+      : sleeping
+        ? "DEEP SLEEP • RADIO OFF • GPIO WAKE_INT: LOW"
+        : "WAKING (45mA) • GPIO WAKE_INT: HIGH";
 
   return (
     <div className="mx-5 rounded-2xl border border-neutral-800 bg-black/80 px-4 py-3 font-mono">
@@ -45,18 +71,23 @@ export default function LockDisplay({
         <span suppressHydrationWarning>
           SYS {new Date(virtualNowMs).toLocaleTimeString("en-GB")}
         </span>
-        <span className={countdown <= 5 ? "text-sky-400" : ""}>
-          HEARTBEAT T-{fmtCountdown(countdown)}
-        </span>
+        <div className="flex items-center gap-2">
+          {roomNo && !bleMode && (
+            <span className="rounded bg-emerald-950/70 px-1.5 py-0.5 text-emerald-300">
+              RM {roomNo}
+            </span>
+          )}
+          <span className={countdown <= 5 ? "text-sky-400" : ""}>
+            HEARTBEAT T-{fmtCountdown(countdown)}
+          </span>
+        </div>
       </div>
 
       {/* Primary status readout */}
       <div className="flex items-center justify-between py-2">
         <div>
           <div className={`text-2xl font-bold tracking-widest ${primaryColor}`}>{primary}</div>
-          <div className="mt-1 text-[10px] tracking-wider text-neutral-500">
-            {sleeping ? "DEEP SLEEP • RADIO OFF • GPIO WAKE_INT: LOW" : "WAKING (45mA) • GPIO WAKE_INT: HIGH"}
-          </div>
+          <div className="mt-1 text-[10px] tracking-wider text-neutral-500">{subline}</div>
         </div>
         {/* Clutch motor */}
         <svg

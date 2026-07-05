@@ -8,15 +8,18 @@ import {
   SAMPLE_ADD_TEMP_RFID_FRAME,
   SAMPLE_REMOTE_UNLOCK_FRAME,
 } from "@/lib/tuya";
+import { ONBOARDING_TOPIC, buildSampleOnboarding } from "@/lib/provisioning";
 
 interface SerialConsoleProps {
   rxLog: SerialLogEntry[];
   txLog: SerialLogEntry[];
   onInject: (hex: string) => void;
   onServerPush: (hex: string, label: string) => void;
+  onPublishMqtt: (raw: string) => void;
   onClear: () => void;
   clock: VirtualClockApi;
   mode: HardwareMode;
+  deviceMac: string;
 }
 
 const HOUR_MS = 3_600_000;
@@ -69,16 +72,24 @@ export default function SerialConsole({
   txLog,
   onInject,
   onServerPush,
+  onPublishMqtt,
   onClear,
   clock,
   mode,
+  deviceMac,
 }: SerialConsoleProps) {
   const [injectValue, setInjectValue] = useState("");
+  const [mqttValue, setMqttValue] = useState(() => buildSampleOnboarding(deviceMac));
 
   const execute = () => {
     if (!injectValue.trim()) return;
     onInject(injectValue);
     setInjectValue("");
+  };
+
+  const publishMqtt = () => {
+    if (!mqttValue.trim()) return;
+    onPublishMqtt(mqttValue);
   };
 
   const warpButton = (label: string, delta: number) => (
@@ -195,6 +206,49 @@ export default function SerialConsole({
           {pushButton("Remote Unlock", SAMPLE_REMOTE_UNLOCK_FRAME)}
           {pushButton("Add Temp PIN 482915 (Slot 14)", SAMPLE_ADD_TEMP_PIN_FRAME)}
           {pushButton("Add Temp RFID (Slot 3)", SAMPLE_ADD_TEMP_RFID_FRAME)}
+        </div>
+      </div>
+
+      {/* OZKEYSERV / MQTT onboarding handshake */}
+      <div className="rounded-lg border border-blue-900/50 bg-neutral-900/70 p-3">
+        <div className="mb-1.5 flex items-center justify-between">
+          <span className="text-[10px] font-bold uppercase tracking-widest text-blue-400">
+            ⛁ OZKEYSERV/ Onboarding Handshake
+          </span>
+          <span className="font-mono text-[9px] text-neutral-500">{ONBOARDING_TOPIC}</span>
+        </div>
+        <textarea
+          value={mqttValue}
+          onChange={(e) => setMqttValue(e.target.value)}
+          spellCheck={false}
+          rows={7}
+          className="w-full resize-y rounded border border-neutral-700 bg-black px-3 py-2 font-mono text-[11px] leading-relaxed text-blue-300 outline-none focus:border-blue-700"
+        />
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={publishMqtt}
+            className="rounded border border-blue-700 bg-blue-900/40 px-4 py-1.5 text-[11px] font-bold uppercase tracking-wider text-blue-200 hover:bg-blue-800/40"
+          >
+            Publish to Lock
+          </button>
+          <button
+            type="button"
+            onClick={() => setMqttValue(buildSampleOnboarding(deviceMac, "412"))}
+            className="rounded border border-neutral-700 bg-neutral-800 px-3 py-1.5 text-[10px] text-neutral-300 hover:bg-neutral-700"
+          >
+            Load valid handshake (Room 412)
+          </button>
+          <button
+            type="button"
+            onClick={() => setMqttValue(buildSampleOnboarding("00:11:22:33:44:55", "999"))}
+            className="rounded border border-neutral-700 bg-neutral-800 px-3 py-1.5 text-[10px] text-neutral-300 hover:bg-neutral-700"
+          >
+            Load MAC mismatch (rejected)
+          </button>
+          <span className="text-[9px] text-neutral-600">
+            Requires BLE mode + a matching MAC to pair
+          </span>
         </div>
       </div>
     </div>

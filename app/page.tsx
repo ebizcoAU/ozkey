@@ -6,12 +6,14 @@ import { useTuyaProtocol, type HardwareMode } from "@/hooks/useTuyaProtocol";
 import { useLockState } from "@/hooks/useLockState";
 import { useVirtualClock } from "@/hooks/useVirtualClock";
 import { useSerialLink } from "@/hooks/useSerialLink";
+import { useProvisioning } from "@/hooks/useProvisioning";
 import PhoneShell from "@/components/PhoneShell";
 import StatusLeds from "@/components/StatusLeds";
 import LockDisplay from "@/components/LockDisplay";
 import Keypad from "@/components/Keypad";
 import PeripheralControls from "@/components/PeripheralControls";
 import KeySlider from "@/components/KeySlider";
+import BleProvisioning from "@/components/BleProvisioning";
 import SerialConsole from "@/components/SerialConsole";
 import DeviceRegistry from "@/components/DeviceRegistry";
 import HardwarePipelineToggle from "@/components/HardwarePipelineToggle";
@@ -20,13 +22,17 @@ export default function Page() {
   const clock = useVirtualClock();
   const [mode, setMode] = useState<HardwareMode>("SOFTWARE");
 
-  // Ref bridges break two dependency cycles without re-instantiating hooks:
+  // Ref bridges break three dependency cycles without re-instantiating hooks:
   //  - protocol.onFrame -> lock.handleFrame (lock needs protocol.transmit)
   //  - serial read loop -> protocol.receiveBytes (protocol needs serial.write)
+  //  - protocol.onMqttPayload -> provisioning.handleMqttPayload (provisioning
+  //    needs protocol's log writers to emit MQTT lines)
   const frameHandlerRef = useRef<(f: TuyaFrame) => void>(() => {});
   const onFrame = useCallback((f: TuyaFrame) => frameHandlerRef.current(f), []);
   const receiveBytesRef = useRef<(b: ByteArray) => void>(() => {});
   const onFrameBytes = useCallback((b: ByteArray) => receiveBytesRef.current(b), []);
+  const mqttHandlerRef = useRef<(raw: string) => void>(() => {});
+  const onMqttPayload = useCallback((raw: string) => mqttHandlerRef.current(raw), []);
 
   const serial = useSerialLink({ onFrameBytes });
   const protocol = useTuyaProtocol({
@@ -34,10 +40,36 @@ export default function Page() {
     mode,
     sendToWire: serial.write,
     wireReady: serial.ready,
+    onMqttPayload,
   });
   const lock = useLockState({ transmit: protocol.transmit, virtualNow: clock.now });
+
+  // OZKEYSERV/ broker uplink: log to the TX terminal and, on a live wire, push
+  // the announcement out to the ESP32 bridge as newline-terminated bytes.
+  const uplink = useCallback(
+    (payload: string, label: string) => {
+      const overWire = mode === "HARDWARE" && serial.ready;
+      protocol.pushTxLog(payload, [
+        "UPLINK → OZKEYSERV/ broker",
+        label,
+        overWire ? "↳ over USB-UART bridge to ESP32" : "↳ simulated MQTT (software broker)",
+      ]);
+      if (overWire) {
+        void serial.write(Array.from(new TextEncoder().encode(payload + "\n")));
+      }
+    },
+    [mode, serial, protocol]
+  );
+
+  const provisioning = useProvisioning({
+    uplink,
+    logInbound: protocol.pushRxLog,
+    onEvent: lock.pushEvent,
+  });
+
   frameHandlerRef.current = lock.handleFrame;
   receiveBytesRef.current = protocol.receiveBytes;
+  mqttHandlerRef.current = provisioning.handleMqttPayload;
 
   // Leaving Mode B releases the physical port so the ESP32 link isn't left open.
   const handleModeChange = useCallback(
@@ -55,7 +87,14 @@ export default function Page() {
       <div className="flex flex-col items-start justify-center gap-8 lg:flex-row">
       <div className="flex flex-col items-center gap-3">
         <PhoneShell>
-          <StatusLeds powerState={lock.powerState} lowBattery={lock.lowBattery} alarm={lock.alarm} />
+          <StatusLeds
+            powerState={lock.powerState}
+            lowBattery={lock.lowBattery}
+            alarm={lock.alarm}
+            bleFlashing={provisioning.bleFlashing}
+            provisioned={provisioning.provisioning !== null}
+            confirmPulse={provisioning.confirmPulse}
+          />
           <LockDisplay
             powerState={lock.powerState}
             lockState={lock.lockState}
@@ -65,9 +104,19 @@ export default function Page() {
             alarm={lock.alarm}
             lastEvent={lock.lastEvent}
             virtualNowMs={clock.virtualNowMs}
+            bleMode={provisioning.bleMode}
+            pairedBanner={provisioning.pairedBanner}
+            roomNo={provisioning.provisioning?.assigned_room_no}
           />
           <Keypad onKey={lock.pressKey} />
           <KeySlider engaged={lock.mechanicalKey} onChange={lock.setMechanicalKey} />
+          <BleProvisioning
+            bleMode={provisioning.bleMode}
+            onToggle={provisioning.setBleMode}
+            onBroadcast={provisioning.broadcastMac}
+            deviceMac={provisioning.deviceMac}
+            provisioning={provisioning.provisioning}
+          />
           <PeripheralControls
             onTapRfid={lock.tapRfid}
             onScanFingerprint={lock.scanFingerprint}
@@ -97,9 +146,11 @@ export default function Page() {
           txLog={protocol.txLog}
           onInject={protocol.injectHex}
           onServerPush={protocol.serverPush}
+          onPublishMqtt={provisioning.handleMqttPayload}
           onClear={protocol.clearLogs}
           clock={clock}
           mode={mode}
+          deviceMac={provisioning.deviceMac}
         />
         <DeviceRegistry
           credentials={lock.credentials}
