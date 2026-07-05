@@ -26,7 +26,21 @@ export interface SerialLogEntry {
 interface UseTuyaProtocolOptions {
   /** Invoked for every checksum-valid frame received on the simulated RX line. */
   onFrame: (frame: TuyaFrame) => void;
+  /** Active hardware pipeline (see HardwarePipelineToggle). */
+  mode: HardwareMode;
+  /** Fire raw bytes out the physical USB-UART wire (Mode B). */
+  sendToWire: (bytes: ByteArray) => Promise<boolean> | boolean;
+  /** True when the Web Serial link is open and writable. */
+  wireReady: boolean;
 }
+
+/**
+ * A = Pure Software Emulation: the app simulates both the lock motherboard and
+ *     the missing Wi-Fi chip; outbound frames loop back to the internal parser.
+ * B = Physical Wire Integration: outbound frames stream out a USB-UART port to a
+ *     desk-side ESP32-C6, which owns the translation logic natively.
+ */
+export type HardwareMode = "SOFTWARE" | "HARDWARE";
 
 const MAX_LOG_ENTRIES = 300;
 let entrySeq = 0;
@@ -53,22 +67,38 @@ function push(log: SerialLogEntry[], entry: SerialLogEntry): SerialLogEntry[] {
  * Simulated 4-wire UART bus (3.3V TTL) speaking the Tuya 0x55 0xAA MCU protocol.
  * Owns the RX/TX hex stream logs and isolates all byte-level work from the UI.
  */
-export function useTuyaProtocol({ onFrame }: UseTuyaProtocolOptions) {
+export function useTuyaProtocol({ onFrame, mode, sendToWire, wireReady }: UseTuyaProtocolOptions) {
   const [rxLog, setRxLog] = useState<SerialLogEntry[]>([]);
   const [txLog, setTxLog] = useState<SerialLogEntry[]>([]);
 
-  // Ref keeps the latest handler visible to callbacks captured in timers.
+  // Refs keep the latest values visible to callbacks captured in timers.
   const onFrameRef = useRef(onFrame);
   onFrameRef.current = onFrame;
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+  const sendToWireRef = useRef(sendToWire);
+  sendToWireRef.current = sendToWire;
+  const wireReadyRef = useRef(wireReady);
+  wireReadyRef.current = wireReady;
 
-  /** Compile and fire an outbound frame onto the TX line. */
+  /**
+   * Compile a frame from the lock and route it. Mode A keeps it internal (TX log
+   * only); Mode B additionally flushes the binary Uint8Array out the USB port.
+   */
   const transmit = useCallback((command: Byte, payload: ByteArray, ...notes: string[]) => {
     const bytes = buildFrame(command, payload);
-    setTxLog((log) => push(log, makeEntry(toHexString(bytes), notes)));
+    const hardware = modeRef.current === "HARDWARE";
+    const routeNote = hardware
+      ? wireReadyRef.current
+        ? "↳ FLUSHED TO USB-UART → ESP32-C6"
+        : "↳ WIRE OFFLINE — frame not delivered"
+      : "↳ internal software bus (no ESP32)";
+    setTxLog((log) => push(log, makeEntry(toHexString(bytes), [...notes, routeNote])));
+    if (hardware && wireReadyRef.current) void sendToWireRef.current(bytes);
     return bytes;
   }, []);
 
-  /** Clock raw bytes into the RX line: log, validate, parse, dispatch. */
+  /** Clock raw bytes into the internal virtual parser: log, validate, dispatch. */
   const receiveBytes = useCallback((bytes: ByteArray) => {
     const result = parseFrame(bytes);
     if (result.ok) {
@@ -80,6 +110,34 @@ export function useTuyaProtocol({ onFrame }: UseTuyaProtocolOptions) {
       );
     }
   }, []);
+
+  /**
+   * Route an inbound server/admin command by mode. Mode A packs it and hands it
+   * to the internal virtual parser (updates LocalStorage immediately). Mode B
+   * forwards it out the physical wire so the ESP32 handles translation natively.
+   */
+  const dispatchInbound = useCallback(
+    (bytes: ByteArray, label: string) => {
+      if (modeRef.current === "HARDWARE") {
+        if (wireReadyRef.current) {
+          setTxLog((log) =>
+            push(log, makeEntry(toHexString(bytes), [`SERVER CMD FORWARDED TO ESP32 OVER UART — ${label}`]))
+          );
+          void sendToWireRef.current(bytes);
+        } else {
+          setRxLog((log) =>
+            push(
+              log,
+              makeEntry(toHexString(bytes), [`SERVER CMD DROPPED — Mode B active, no serial link — ${label}`], true)
+            )
+          );
+        }
+      } else {
+        receiveBytes(bytes);
+      }
+    },
+    [receiveBytes]
+  );
 
   /** Manual developer injection from the console input bar. */
   const injectHex = useCallback(
@@ -94,9 +152,19 @@ export function useTuyaProtocol({ onFrame }: UseTuyaProtocolOptions) {
         );
         return;
       }
-      receiveBytes(bytes);
+      dispatchInbound(bytes, "MANUAL INJECTION");
     },
-    [receiveBytes]
+    [dispatchInbound]
+  );
+
+  /** Fire a named server/cloud admin command (e.g. Remote Unlock, Add Token). */
+  const serverPush = useCallback(
+    (input: string, label: string) => {
+      const bytes = fromHexString(input);
+      if (!bytes) return;
+      dispatchInbound(bytes, label);
+    },
+    [dispatchInbound]
   );
 
   const clearLogs = useCallback(() => {
@@ -104,7 +172,7 @@ export function useTuyaProtocol({ onFrame }: UseTuyaProtocolOptions) {
     setTxLog([]);
   }, []);
 
-  return { rxLog, txLog, transmit, receiveBytes, injectHex, clearLogs };
+  return { rxLog, txLog, transmit, receiveBytes, injectHex, serverPush, clearLogs };
 }
 
 export type TuyaProtocolApi = ReturnType<typeof useTuyaProtocol>;

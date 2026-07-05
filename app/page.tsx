@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useRef } from "react";
-import type { TuyaFrame } from "@/lib/tuya";
-import { useTuyaProtocol } from "@/hooks/useTuyaProtocol";
+import { useCallback, useRef, useState } from "react";
+import type { ByteArray, TuyaFrame } from "@/lib/tuya";
+import { useTuyaProtocol, type HardwareMode } from "@/hooks/useTuyaProtocol";
 import { useLockState } from "@/hooks/useLockState";
 import { useVirtualClock } from "@/hooks/useVirtualClock";
+import { useSerialLink } from "@/hooks/useSerialLink";
 import PhoneShell from "@/components/PhoneShell";
 import StatusLeds from "@/components/StatusLeds";
 import LockDisplay from "@/components/LockDisplay";
@@ -13,22 +14,45 @@ import PeripheralControls from "@/components/PeripheralControls";
 import KeySlider from "@/components/KeySlider";
 import SerialConsole from "@/components/SerialConsole";
 import DeviceRegistry from "@/components/DeviceRegistry";
+import HardwarePipelineToggle from "@/components/HardwarePipelineToggle";
 
 export default function Page() {
   const clock = useVirtualClock();
+  const [mode, setMode] = useState<HardwareMode>("SOFTWARE");
 
-  // Ref bridge: the protocol engine needs a frame handler, but the handler
-  // lives on the lock hook which itself needs the engine's transmit(). The ref
-  // breaks the cycle without re-instantiating either hook.
+  // Ref bridges break two dependency cycles without re-instantiating hooks:
+  //  - protocol.onFrame -> lock.handleFrame (lock needs protocol.transmit)
+  //  - serial read loop -> protocol.receiveBytes (protocol needs serial.write)
   const frameHandlerRef = useRef<(f: TuyaFrame) => void>(() => {});
   const onFrame = useCallback((f: TuyaFrame) => frameHandlerRef.current(f), []);
+  const receiveBytesRef = useRef<(b: ByteArray) => void>(() => {});
+  const onFrameBytes = useCallback((b: ByteArray) => receiveBytesRef.current(b), []);
 
-  const protocol = useTuyaProtocol({ onFrame });
+  const serial = useSerialLink({ onFrameBytes });
+  const protocol = useTuyaProtocol({
+    onFrame,
+    mode,
+    sendToWire: serial.write,
+    wireReady: serial.ready,
+  });
   const lock = useLockState({ transmit: protocol.transmit, virtualNow: clock.now });
   frameHandlerRef.current = lock.handleFrame;
+  receiveBytesRef.current = protocol.receiveBytes;
+
+  // Leaving Mode B releases the physical port so the ESP32 link isn't left open.
+  const handleModeChange = useCallback(
+    (next: HardwareMode) => {
+      setMode(next);
+      if (next === "SOFTWARE" && serial.ready) void serial.disconnect();
+    },
+    [serial]
+  );
 
   return (
-    <main className="flex min-h-screen flex-col items-start justify-center gap-8 p-6 lg:flex-row lg:p-10">
+    <main className="mx-auto flex min-h-screen max-w-[1500px] flex-col gap-5 p-6 lg:p-10">
+      <HardwarePipelineToggle mode={mode} onModeChange={handleModeChange} serial={serial} />
+
+      <div className="flex flex-col items-start justify-center gap-8 lg:flex-row">
       <div className="flex flex-col items-center gap-3">
         <PhoneShell>
           <StatusLeds powerState={lock.powerState} lowBattery={lock.lowBattery} alarm={lock.alarm} />
@@ -72,14 +96,17 @@ export default function Page() {
           rxLog={protocol.rxLog}
           txLog={protocol.txLog}
           onInject={protocol.injectHex}
+          onServerPush={protocol.serverPush}
           onClear={protocol.clearLogs}
           clock={clock}
+          mode={mode}
         />
         <DeviceRegistry
           credentials={lock.credentials}
           virtualNowMs={clock.virtualNowMs}
           onRevoke={lock.revokeCredential}
         />
+      </div>
       </div>
     </main>
   );

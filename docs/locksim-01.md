@@ -26,16 +26,21 @@ lib/
   credentials.ts  localStorage slot table + checkWindow() temporal check.
   audio.ts        WebAudio synth: keyClick / accessGranted / accessDenied / motorWhirr.
 hooks/
-  useTuyaProtocol.ts  Simulated UART bus: rxLog/txLog, transmit(), receiveBytes(),
-                      injectHex(), clearLogs(). Owns hex stream logs.
+  useTuyaProtocol.ts  Simulated UART bus + mode router: rxLog/txLog, transmit(),
+                      receiveBytes(), injectHex(), serverPush(), clearLogs().
+                      Routes frames per HardwareMode (software loopback vs wire).
   useLockState.ts     MCU state machine: power (sleep/wake), lock state, PIN buffer,
                       heartbeat countdown, GPIO wake, credential validation,
-                      clutch motor, incoming-frame dispatch.
+                      clutch motor, incoming-frame dispatch, revokeCredential().
   useVirtualClock.ts  Virtual Master Clock (real time + warp offset). now() getter.
+  useSerialLink.ts    Mode B transport: Web Serial API. connect()/disconnect()/
+                      write(Uint8Array); read loop reassembles frames via
+                      extractFrames(). status/portLabel/ready/supported.
 components/
   PhoneShell, StatusLeds, LockDisplay, Keypad, PeripheralControls, KeySlider,
-  SerialConsole (virtual clock + dual terminals + injector),
-  DeviceRegistry (Sovereign Device Registry DB compliance grid + per-row revoke).
+  SerialConsole (virtual clock + dual terminals + injector + server-push),
+  DeviceRegistry (Sovereign Device Registry DB compliance grid + per-row revoke),
+  HardwarePipelineToggle (Mode A / Mode B master switch + serial link controls).
 app/
   page.tsx        Wires hooks. Ref-bridge breaks the transmit<->handleFrame cycle.
   layout.tsx, globals.css (keyframes: flash, alarm-blink, motor-spin).
@@ -89,6 +94,22 @@ Checksum = sum of all preceding bytes % 256.
   compiles + fires a DPID 22 (PIN) / 24 (RFID) delete frame on the TX bus and
   wipes the slot instantly. Registration token = `SRT-XXXX-XXXX` issued on
   provisioning (backfilled on load for pre-existing records).
+
+- **Dual-mode Hardware Pipeline** (`HardwarePipelineToggle.tsx`, top of page):
+  - **Mode A — Pure Software Emulation (no ESP32):** app simulates both the lock
+    motherboard and the Wi-Fi chip. `transmit()` and inbound server/admin commands
+    stay internal — `serverPush`/`injectHex` encode the frame and loop it into the
+    virtual parser (`receiveBytes`), updating LocalStorage immediately.
+  - **Mode B — Physical Wire Integration (ESP32-C6):** `useSerialLink` opens a
+    Web Serial port (9600 8N1). Keypad/peripheral frames from `transmit()` are
+    flushed out as a binary `Uint8Array` over USB-UART; inbound server commands
+    are forwarded over the wire (not parsed locally) so the ESP32 does translation.
+    Frames physically arriving from the ESP32 are reassembled (`extractFrames`)
+    and fed to the virtual parser to drive the on-screen sim.
+  - TX log annotates the route taken ("↳ FLUSHED TO USB-UART", "↳ internal
+    software bus", "SERVER CMD FORWARDED TO ESP32", or wire-offline warnings).
+  - Web Serial needs Chrome/Edge over localhost or HTTPS; the toggle shows an
+    "unsupported" state otherwise. Switching back to Mode A closes the port.
 
 ## Credentials for testing
 - Master PIN: `123456#`  ·  Master card UID: `7B 3F 91 D2`

@@ -180,6 +180,34 @@ export function parseFrame(bytes: ByteArray): ParseResult {
   };
 }
 
+/**
+ * Reassemble complete Tuya frames from a rolling byte buffer (Web Serial reads
+ * arrive in arbitrary chunks). Resyncs past leading junk, and returns any
+ * trailing partial frame in `rest` so the caller can prepend the next chunk.
+ */
+export function extractFrames(buffer: ByteArray): { frames: ByteArray[]; rest: ByteArray } {
+  const frames: ByteArray[] = [];
+  let i = 0;
+  while (i < buffer.length) {
+    if (buffer[i] !== FRAME_HEADER[0]) {
+      i++; // hunt for a 0x55 header start
+      continue;
+    }
+    if (i + 1 >= buffer.length) break; // need the second header byte
+    if (buffer[i + 1] !== FRAME_HEADER[1]) {
+      i++;
+      continue;
+    }
+    if (i + MIN_FRAME_LENGTH > buffer.length) break; // not enough to read length yet
+    const len = (buffer[i + 4] << 8) | buffer[i + 5];
+    const total = MIN_FRAME_LENGTH + len;
+    if (i + total > buffer.length) break; // frame still arriving
+    frames.push(buffer.slice(i, i + total));
+    i += total;
+  }
+  return { frames, rest: buffer.slice(i) };
+}
+
 export function toHexByte(b: Byte): string {
   return b.toString(16).toUpperCase().padStart(2, "0");
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { SerialLogEntry } from "@/hooks/useTuyaProtocol";
+import type { HardwareMode, SerialLogEntry } from "@/hooks/useTuyaProtocol";
 import type { VirtualClockApi } from "@/hooks/useVirtualClock";
 import {
   SAMPLE_ADD_TEMP_PIN_FRAME,
@@ -13,8 +13,10 @@ interface SerialConsoleProps {
   rxLog: SerialLogEntry[];
   txLog: SerialLogEntry[];
   onInject: (hex: string) => void;
+  onServerPush: (hex: string, label: string) => void;
   onClear: () => void;
   clock: VirtualClockApi;
+  mode: HardwareMode;
 }
 
 const HOUR_MS = 3_600_000;
@@ -62,7 +64,15 @@ function toDatetimeLocal(ms: number): string {
 }
 
 /** Bench diagnostic console: virtual clock, dual hex terminals, hex injector. */
-export default function SerialConsole({ rxLog, txLog, onInject, onClear, clock }: SerialConsoleProps) {
+export default function SerialConsole({
+  rxLog,
+  txLog,
+  onInject,
+  onServerPush,
+  onClear,
+  clock,
+  mode,
+}: SerialConsoleProps) {
   const [injectValue, setInjectValue] = useState("");
 
   const execute = () => {
@@ -82,15 +92,15 @@ export default function SerialConsole({ rxLog, txLog, onInject, onClear, clock }
     </button>
   );
 
-  const sampleButton = (label: string, frame: string) => (
+  const pushButton = (label: string, frame: string) => (
     <button
       key={label}
       type="button"
-      onClick={() => setInjectValue(frame)}
-      className="rounded border border-green-900/60 bg-green-950/30 px-2 py-1 text-[10px] text-green-500 hover:bg-green-900/30"
-      title={frame}
+      onClick={() => onServerPush(frame, label)}
+      className="rounded border border-green-900/60 bg-green-950/30 px-2 py-1 text-[10px] text-green-400 hover:bg-green-900/30"
+      title={`Fire "${label}" — routes ${mode === "HARDWARE" ? "out the USB-UART wire" : "into the internal parser"}`}
     >
-      {label}
+      ⇪ {label}
     </button>
   );
 
@@ -149,6 +159,9 @@ export default function SerialConsole({ rxLog, txLog, onInject, onClear, clock }
       <div className="rounded-lg border border-neutral-800 bg-neutral-900/70 p-3">
         <label className="mb-1.5 block text-[10px] font-bold uppercase tracking-widest text-neutral-400">
           Inject Incoming Hex Command
+          <span className="ml-2 font-normal normal-case tracking-normal text-neutral-600">
+            routes {mode === "HARDWARE" ? "→ USB-UART wire (Mode B)" : "→ internal parser (Mode A)"}
+          </span>
         </label>
         <div className="flex gap-2">
           <input
@@ -176,10 +189,12 @@ export default function SerialConsole({ rxLog, txLog, onInject, onClear, clock }
           </button>
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
-          <span className="text-[9px] uppercase tracking-wider text-neutral-600">Presets:</span>
-          {sampleButton("Remote Unlock", SAMPLE_REMOTE_UNLOCK_FRAME)}
-          {sampleButton("Add Temp PIN 482915 (Slot 14)", SAMPLE_ADD_TEMP_PIN_FRAME)}
-          {sampleButton("Add Temp RFID (Slot 3)", SAMPLE_ADD_TEMP_RFID_FRAME)}
+          <span className="text-[9px] uppercase tracking-wider text-neutral-600">
+            Server / Cloud Admin Push:
+          </span>
+          {pushButton("Remote Unlock", SAMPLE_REMOTE_UNLOCK_FRAME)}
+          {pushButton("Add Temp PIN 482915 (Slot 14)", SAMPLE_ADD_TEMP_PIN_FRAME)}
+          {pushButton("Add Temp RFID (Slot 3)", SAMPLE_ADD_TEMP_RFID_FRAME)}
         </div>
       </div>
     </div>
