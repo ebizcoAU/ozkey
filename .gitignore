@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# next.js build output
+.next/
+out/
+
+# logs
+*.log
+nohup.out
+
+# env / secrets
+.env
+.env.*
+
+# os
+.DS_Store
+
+# local session config
+.claude/settings.local.json

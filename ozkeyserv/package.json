@@ -1,0 +1,15 @@
+{
+  "name": "ozkeyserv",
+  "version": "1.0.0",
+  "description": "OZKEY Sovereign Smart Lock - API Gateway, Rule Engine & MySQL Manager",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "mqtt": "^5.10.1",
+    "mysql2": "^3.11.3"
+  }
+}
