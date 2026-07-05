@@ -1,8 +1,8 @@
 /*
  * ============================================================================
- *  OZKEY CORE COCKPIT — Sovereign Smart Lock Laboratory Dashboard (Port 3100)
+ *  OZKEY CORE COCKPIT — Sovereign Smart Lock Laboratory Dashboard (Port 3300)
  *  ---------------------------------------------------------------------------
- *  - 100-room pairing matrix (Block A) driven live from OZKEYSERV (Port 4000)
+ *  - 30-room pairing matrix (Block A) driven live from OZKEYSERV (Port 3200)
  *  - Discovered Unpaired Hardware panel (MQTT discovery + Web Serial capture)
  *  - Credential injector (PIN / RFID / Fingerprint) via the API gateway
  *  - Web Serial desk-module reader + scrolling green lab terminal
@@ -528,9 +528,9 @@ export default function Cockpit() {
 
       {/* == Main split: matrix | injector + serial ========================= */}
       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'stretch' }}>
-        {/* -- 100-room matrix ------------------------------------------- */}
+        {/* -- 30-room matrix --------------------------------------------- */}
         <div style={{ ...panelStyle, flex: '3 1 520px' }}>
-          <PanelTitle dot={C.blue}>100-Room Matrix — Block A</PanelTitle>
+          <PanelTitle dot={C.blue}>30-Room Matrix — Block A</PanelTitle>
           <div style={{ display: 'flex', gap: 14, fontSize: 10, color: C.dim, marginBottom: 10, flexWrap: 'wrap' }}>
             {[
               [C.gray, `UNPAIRED ${counts.unpaired}`],

@@ -8,7 +8,7 @@
  *  Database : MySQL (localhost / ozkey)
  *
  *  Responsibilities
- *    1. Bootstrap relational schema + auto-seed 100-room matrix (Block A)
+ *    1. Bootstrap relational schema + auto-seed 30-room matrix (Block A)
  *    2. Cache unprovisioned lock heartbeats  (hotel/locks/unpaired/heartbeat)
  *    3. Bind MAC -> room  (physical onboarding / pairing)
  *    4. Issue credentials as Tuya 55 AA serial frames, queue them, and burst
@@ -206,12 +206,12 @@ async function initDatabase() {
       status VARCHAR(50) DEFAULT 'queued'
     ) ENGINE=InnoDB`);
 
-  // 4. Auto-seed: Block A, floors 1-5, 20 rooms/floor => 101..120 ... 501..520.
+  // 4. Auto-seed: Block A, floors 1-3, 10 rooms/floor => 101..110 ... 301..310.
   const [[{ cnt }]] = await pool.query('SELECT COUNT(*) AS cnt FROM rooms');
   if (cnt === 0) {
     const rows = [];
-    for (let floor = 1; floor <= 5; floor++) {
-      for (let door = 1; door <= 20; door++) {
+    for (let floor = 1; floor <= 3; floor++) {
+      for (let door = 1; door <= 10; door++) {
         const roomNo = String(floor * 100 + door);
         rows.push(['Block A', floor, roomNo, null, 'Available']);
       }
@@ -220,7 +220,7 @@ async function initDatabase() {
       'INSERT INTO rooms (building, floor, room_no, mac_address, status) VALUES ?',
       [rows]
     );
-    logEvent('info', `Schema empty — auto-provisioned ${rows.length} rooms (Block A, floors 1-5)`);
+    logEvent('info', `Schema empty — auto-provisioned ${rows.length} rooms (Block A, floors 1-3)`);
   } else {
     logEvent('info', `Room matrix already provisioned (${cnt} rooms)`);
   }

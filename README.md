@@ -16,8 +16,8 @@ ozkey/
 
 - Node.js 18+ (tested on 22.x)
 - MySQL on `localhost` — user `root` / password `Cableman` (database `ozkey` is
-  auto-created, and 100 rooms are auto-seeded: Block A, floors 1–5, rooms
-  101–120 per floor)
+  auto-created, and 30 rooms are auto-seeded: Block A, floors 1–3, rooms
+  101–110 per floor)
 - TalkPOS Mosquitto broker reachable at `mqtt://10.1.1.21:1883` (the gateway
   keeps retrying every 5 s if the broker is down)
 - Chrome or Edge for the Web Serial desk-module link
@@ -46,7 +46,7 @@ cd ozkey     && npm install && npm run dev      # http://localhost:3300
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/health` | GET | Gateway / DB / MQTT status |
-| `/rooms` | GET | Full 100-room matrix |
+| `/rooms` | GET | Full 30-room matrix |
 | `/locks/unpaired` | GET | MACs broadcasting on the broker not yet bound to a room |
 | `/locks/pair` | POST | `{ room_no, mac_address }` — bind lock, confirm over MQTT |
 | `/locks/unpair` | POST | `{ room_no }` — release a lock back to discovery |
