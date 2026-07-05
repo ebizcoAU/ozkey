@@ -50,8 +50,8 @@ function roomColor(room) {
 const panelStyle = {
   background: C.panel,
   border: `1px solid ${C.panelEdge}`,
-  borderRadius: 10,
-  padding: 16,
+  borderRadius: 8,
+  padding: 12,
 };
 
 const inputStyle = {
@@ -69,7 +69,7 @@ const inputStyle = {
 
 function Label({ children }) {
   return (
-    <div style={{ fontSize: 10, letterSpacing: 1.2, color: C.dim, textTransform: 'uppercase', margin: '10px 0 4px' }}>
+    <div style={{ fontSize: 9, letterSpacing: 1, color: C.dim, textTransform: 'uppercase', margin: '8px 0 3px' }}>
       {children}
     </div>
   );
@@ -77,9 +77,9 @@ function Label({ children }) {
 
 function PanelTitle({ dot, children }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-      <span style={{ width: 8, height: 8, borderRadius: '50%', background: dot, boxShadow: `0 0 6px ${dot}` }} />
-      <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: 1.5, textTransform: 'uppercase', color: C.text }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+      <span style={{ width: 7, height: 7, borderRadius: '50%', background: dot, boxShadow: `0 0 6px ${dot}` }} />
+      <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1.2, textTransform: 'uppercase', color: C.text }}>
         {children}
       </span>
     </div>
@@ -401,40 +401,36 @@ export default function Cockpit() {
         color: C.text,
         fontFamily:
           "'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace",
-        padding: 20,
+        padding: 12,
       }}
     >
-      {/* == Header ========================================================= */}
+      {/* == Header (single slim row) ======================================= */}
       <div
         style={{
           ...panelStyle,
+          padding: '8px 14px',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          marginBottom: 16,
+          marginBottom: 10,
           flexWrap: 'wrap',
-          gap: 12,
+          gap: 10,
         }}
       >
-        <div>
-          <div style={{ fontSize: 20, fontWeight: 800, letterSpacing: 2 }}>
-            OZKEY <span style={{ color: C.green }}>//</span> SOVEREIGN LOCK COCKPIT
-          </div>
-          <div style={{ fontSize: 11, color: C.dim, marginTop: 4 }}>
-            Block A Laboratory Bench — Physical Onboarding &amp; Credential Sync (PMS bypass)
-          </div>
+        <div style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1.5 }}>
+          OZKEY <span style={{ color: C.green }}>//</span> LOCK COCKPIT
         </div>
-        <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
+        <div style={{ display: 'flex', gap: 14, fontSize: 10 }}>
           {[
-            ['GATEWAY :3200', gatewayUp],
-            ['MQTT 10.1.1.21', mqttUp],
-            ['SERIAL LINK', serialConnected],
+            ['GATEWAY', gatewayUp],
+            ['MQTT', mqttUp],
+            ['SERIAL', serialConnected],
           ].map(([label, up]) => (
-            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
               <span
                 style={{
-                  width: 8,
-                  height: 8,
+                  width: 7,
+                  height: 7,
                   borderRadius: '50%',
                   background: up ? C.green : C.red,
                   boxShadow: `0 0 6px ${up ? C.green : C.red}`,
@@ -446,91 +442,102 @@ export default function Cockpit() {
         </div>
       </div>
 
-      {/* == Discovered Unpaired Hardware banner ============================ */}
-      <div style={{ ...panelStyle, marginBottom: 16 }}>
-        <PanelTitle dot={C.amber}>Discovered Unpaired Hardware</PanelTitle>
-        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-end' }}>
-          <div style={{ flex: '2 1 340px' }}>
-            <Label>Broadcasting MACs (MQTT discovery + serial capture)</Label>
-            <div
+      {/* == Unpaired hardware + pairing (single inline row) ================ */}
+      <div
+        style={{
+          ...panelStyle,
+          padding: '8px 14px',
+          marginBottom: 10,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          flexWrap: 'wrap',
+        }}
+      >
+        <span
+          style={{
+            fontSize: 10,
+            fontWeight: 700,
+            letterSpacing: 1.2,
+            textTransform: 'uppercase',
+            color: C.amber,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          Unpaired HW
+        </span>
+        <div
+          style={{
+            display: 'flex',
+            gap: 6,
+            flexWrap: 'wrap',
+            alignItems: 'center',
+            flex: '2 1 260px',
+          }}
+        >
+          {allDiscovered.length === 0 && (
+            <span style={{ color: C.dim, fontSize: 11 }}>— none broadcasting —</span>
+          )}
+          {allDiscovered.map((d) => (
+            <button
+              key={d.mac}
+              onClick={() => setSelectedMac(d.mac)}
               style={{
-                display: 'flex',
-                gap: 8,
-                flexWrap: 'wrap',
-                minHeight: 40,
-                alignItems: 'center',
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+                fontSize: 11,
+                padding: '4px 8px',
+                borderRadius: 5,
+                border: `1px solid ${selectedMac === d.mac ? C.amber : C.panelEdge}`,
+                background: selectedMac === d.mac ? '#3a2f10' : C.bg,
+                color: selectedMac === d.mac ? C.amber : C.text,
               }}
             >
-              {allDiscovered.length === 0 && (
-                <span style={{ color: C.dim, fontSize: 12 }}>
-                  — no unprovisioned locks broadcasting —
-                </span>
-              )}
-              {allDiscovered.map((d) => (
-                <button
-                  key={d.mac}
-                  onClick={() => setSelectedMac(d.mac)}
-                  style={{
-                    cursor: 'pointer',
-                    fontFamily: 'inherit',
-                    fontSize: 12,
-                    padding: '6px 10px',
-                    borderRadius: 6,
-                    border: `1px solid ${selectedMac === d.mac ? C.amber : C.panelEdge}`,
-                    background: selectedMac === d.mac ? '#3a2f10' : C.bg,
-                    color: selectedMac === d.mac ? C.amber : C.text,
-                  }}
-                >
-                  {d.mac}
-                  <span style={{ color: C.dim, marginLeft: 6, fontSize: 10 }}>{d.src}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div style={{ flex: '1 1 180px' }}>
-            <Label>Target Room</Label>
-            <select
-              value={selectedRoom}
-              onChange={(e) => setSelectedRoom(e.target.value)}
-              style={inputStyle}
-            >
-              <option value="">— select unpaired room —</option>
-              {unpairedRooms.map((r) => (
-                <option key={r.id} value={r.room_no}>
-                  {r.building} / F{r.floor} / Room {r.room_no}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <button
-            onClick={doPair}
-            disabled={pairBusy || !selectedMac || !selectedRoom}
-            style={{
-              cursor: pairBusy || !selectedMac || !selectedRoom ? 'not-allowed' : 'pointer',
-              fontFamily: 'inherit',
-              fontWeight: 800,
-              letterSpacing: 1,
-              fontSize: 12,
-              padding: '10px 18px',
-              borderRadius: 6,
-              border: 'none',
-              background:
-                pairBusy || !selectedMac || !selectedRoom ? C.gray : C.green,
-              color: '#04170A',
-            }}
-          >
-            {pairBusy ? 'BINDING…' : 'PAIR LOCK TO ROOM'}
-          </button>
+              {d.mac}
+              <span style={{ color: C.dim, marginLeft: 5, fontSize: 9 }}>{d.src}</span>
+            </button>
+          ))}
         </div>
+
+        <select
+          value={selectedRoom}
+          onChange={(e) => setSelectedRoom(e.target.value)}
+          style={{ ...inputStyle, width: 'auto', flex: '0 1 170px', padding: '6px 8px', fontSize: 12 }}
+        >
+          <option value="">— target room —</option>
+          {unpairedRooms.map((r) => (
+            <option key={r.id} value={r.room_no}>
+              F{r.floor} / {r.room_no}
+            </option>
+          ))}
+        </select>
+
+        <button
+          onClick={doPair}
+          disabled={pairBusy || !selectedMac || !selectedRoom}
+          style={{
+            cursor: pairBusy || !selectedMac || !selectedRoom ? 'not-allowed' : 'pointer',
+            fontFamily: 'inherit',
+            fontWeight: 800,
+            letterSpacing: 1,
+            fontSize: 11,
+            padding: '7px 14px',
+            borderRadius: 5,
+            border: 'none',
+            background: pairBusy || !selectedMac || !selectedRoom ? C.gray : C.green,
+            color: '#04170A',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {pairBusy ? 'BINDING…' : 'PAIR LOCK TO ROOM'}
+        </button>
       </div>
 
       {/* == Main split: matrix | injector + serial ========================= */}
-      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'stretch' }}>
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'stretch' }}>
         {/* -- 30-room matrix --------------------------------------------- */}
         <div style={{ ...panelStyle, flex: '3 1 520px' }}>
-          <PanelTitle dot={C.blue}>30-Room Matrix — Block A</PanelTitle>
+          <PanelTitle dot={C.blue}>Room Matrix — Block A</PanelTitle>
           <div style={{ display: 'flex', gap: 14, fontSize: 10, color: C.dim, marginBottom: 10, flexWrap: 'wrap' }}>
             {[
               [C.gray, `UNPAIRED ${counts.unpaired}`],
@@ -595,10 +602,10 @@ export default function Cockpit() {
         </div>
 
         {/* -- Right column: injector + serial ----------------------------- */}
-        <div style={{ flex: '2 1 360px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div style={{ flex: '2 1 360px', display: 'flex', flexDirection: 'column', gap: 10 }}>
           {/* Credential injector */}
           <div style={panelStyle}>
-            <PanelTitle dot="#C084FC">Credential Injector — PMS Bypass</PanelTitle>
+            <PanelTitle dot="#C084FC">Credential Injector</PanelTitle>
 
             <Label>Paired Room</Label>
             <select
@@ -701,11 +708,7 @@ export default function Cockpit() {
 
           {/* Serial link */}
           <div style={panelStyle}>
-            <PanelTitle dot={C.amber}>Desk Test Module — Web Serial</PanelTitle>
-            <div style={{ fontSize: 11, color: C.dim, marginBottom: 10, lineHeight: 1.5 }}>
-              Reads raw UART strings from the bench module @ 115200 baud. Any MAC address seen on
-              the wire is pushed into the discovery pool above.
-            </div>
+            <PanelTitle dot={C.amber}>Web Serial — 115200 baud</PanelTitle>
             <button
               onClick={serialConnected ? disconnectSerial : connectSerial}
               style={{
@@ -735,8 +738,8 @@ export default function Cockpit() {
       </div>
 
       {/* == Lab logging terminal =========================================== */}
-      <div style={{ ...panelStyle, marginTop: 16 }}>
-        <PanelTitle dot={C.termGreen}>Lab Logging Terminal — pairing &amp; sync transitions</PanelTitle>
+      <div style={{ ...panelStyle, marginTop: 10 }}>
+        <PanelTitle dot={C.termGreen}>Lab Terminal</PanelTitle>
         <div
           ref={termRef}
           style={{
@@ -765,10 +768,6 @@ export default function Cockpit() {
             </div>
           ))}
         </div>
-      </div>
-
-      <div style={{ textAlign: 'center', color: '#334155', fontSize: 10, marginTop: 14 }}>
-        OZKEY SOVEREIGN LOCK LABORATORY — gateway :3200 · cockpit :3300 · broker 10.1.1.21:1883
       </div>
 
       <style jsx global>{`
