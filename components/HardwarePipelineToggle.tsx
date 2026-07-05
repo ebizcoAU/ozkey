@@ -28,6 +28,7 @@ const STATUS_DOT: Record<SerialStatus, string> = {
 /**
  * Master Hardware Pipeline Selection toggle — switches the whole simulator
  * backend between Mode A (pure software emulation) and Mode B (physical wire).
+ * Rendered as a compact single-row segmented control to conserve screen estate.
  */
 export default function HardwarePipelineToggle({
   mode,
@@ -36,94 +37,69 @@ export default function HardwarePipelineToggle({
 }: HardwarePipelineToggleProps) {
   const hardware = mode === "HARDWARE";
 
-  const card = (
-    active: boolean,
-    onClick: () => void,
-    tag: string,
-    title: string,
-    body: string,
-    accent: string
-  ) => (
+  const segment = (active: boolean, onClick: () => void, tag: string, title: string, activeCls: string) => (
     <button
       type="button"
       onClick={onClick}
-      className={`flex-1 rounded-lg border p-3 text-left transition-all ${
-        active
-          ? `${accent} shadow-[0_0_0_1px_rgba(255,255,255,0.05)]`
-          : "border-neutral-800 bg-neutral-900/40 opacity-60 hover:opacity-90"
+      title={title}
+      aria-pressed={active}
+      className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[11px] font-semibold transition-all ${
+        active ? activeCls : "text-neutral-500 hover:text-neutral-300"
       }`}
     >
-      <div className="flex items-center gap-2">
-        <span
-          className={`h-2.5 w-2.5 rounded-full ${
-            active ? "bg-current" : "border border-neutral-600"
-          }`}
-        />
-        <span className="text-[10px] font-bold uppercase tracking-widest">{tag}</span>
-      </div>
-      <div className="mt-1 text-sm font-semibold text-neutral-100">{title}</div>
-      <div className="mt-0.5 text-[10px] leading-snug text-neutral-400">{body}</div>
+      <span
+        className={`h-2 w-2 rounded-full ${active ? "bg-current" : "border border-neutral-600"}`}
+      />
+      {tag}
     </button>
   );
 
   return (
-    <div className="w-full rounded-xl border border-neutral-700 bg-neutral-900/80 p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <h2 className="text-xs font-bold uppercase tracking-[0.2em] text-neutral-200">
-          ⚙ Hardware Pipeline Selection
-        </h2>
-        <span className="text-[10px] text-neutral-500">
-          Active backend:{" "}
-          <span className={hardware ? "text-sky-400" : "text-emerald-400"}>
-            {hardware ? "MODE B · PHYSICAL WIRE" : "MODE A · SOFTWARE EMULATION"}
-          </span>
-        </span>
-      </div>
+    <div className="flex w-full flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-neutral-700 bg-neutral-900/80 px-3 py-2">
+      <h2 className="text-[10px] font-bold uppercase tracking-[0.2em] text-neutral-300">
+        ⚙ Hardware Pipeline
+      </h2>
 
-      <div className="flex flex-col gap-3 md:flex-row">
-        {card(
+      <div className="flex items-center gap-1 rounded-lg border border-neutral-800 bg-black/40 p-0.5">
+        {segment(
           !hardware,
           () => onModeChange("SOFTWARE"),
-          "Mode A",
-          "Pure Software Emulation (No ESP32)",
-          "App simulates the Zhongshan lock motherboard and the missing Wi-Fi chip.",
-          "border-emerald-700 bg-emerald-950/40 text-emerald-300"
+          "Mode A · Software",
+          "Pure Software Emulation (No ESP32): the app simulates the Zhongshan lock motherboard and the missing Wi-Fi chip; frames loop into the internal parser.",
+          "bg-emerald-950/60 text-emerald-300"
         )}
-        {card(
+        {segment(
           hardware,
           () => onModeChange("HARDWARE"),
-          "Mode B",
-          "Physical Wire Integration (ESP32-C6)",
-          "Web Serial API binds a 3.3V USB-UART COM port. Keypad/peripheral frames stream out as Uint8Array; ",
-          "border-sky-700 bg-sky-950/40 text-sky-300"
+          "Mode B · ESP32 Wire",
+          "Physical Wire Integration (ESP32-C6): Web Serial binds a 3.3V USB-UART COM port; keypad/peripheral frames stream out as a Uint8Array to the desk-side core.",
+          "bg-sky-950/60 text-sky-300"
         )}
       </div>
 
       {hardware && (
-        <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-sky-900/50 bg-black/50 p-2.5">
-          <span className={`h-2.5 w-2.5 rounded-full ${STATUS_DOT[serial.status]}`} />
-          <span className="font-mono text-[11px] text-neutral-300">
+        <div className="flex flex-1 flex-wrap items-center gap-2">
+          <span className={`h-2 w-2 rounded-full ${STATUS_DOT[serial.status]}`} />
+          <span className="font-mono text-[10px] text-neutral-400">
             {STATUS_TEXT[serial.status]}
-            {serial.portLabel && <span className="ml-2 text-green-400">{serial.portLabel}</span>}
+            {serial.portLabel && <span className="ml-1.5 text-green-400">{serial.portLabel}</span>}
           </span>
-          {serial.error && (
-            <span className="font-mono text-[10px] text-red-400">— {serial.error}</span>
-          )}
-          <div className="ml-auto flex gap-2">
+          {serial.error && <span className="font-mono text-[10px] text-red-400">— {serial.error}</span>}
+          <div className="ml-auto">
             {serial.ready ? (
               <button
                 type="button"
                 onClick={() => void serial.disconnect()}
-                className="rounded border border-red-800 bg-red-950/50 px-3 py-1 text-[11px] font-semibold text-red-300 hover:bg-red-900/50"
+                className="rounded border border-red-800 bg-red-950/50 px-2.5 py-1 text-[10px] font-semibold text-red-300 hover:bg-red-900/50"
               >
-                Disconnect Port
+                Disconnect
               </button>
             ) : (
               <button
                 type="button"
                 onClick={() => void serial.connect()}
                 disabled={!serial.supported || serial.status === "connecting"}
-                className="rounded border border-sky-700 bg-sky-900/50 px-3 py-1 text-[11px] font-semibold text-sky-200 hover:bg-sky-800/50 disabled:cursor-not-allowed disabled:opacity-40"
+                className="rounded border border-sky-700 bg-sky-900/50 px-2.5 py-1 text-[10px] font-semibold text-sky-200 hover:bg-sky-800/50 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {serial.status === "connecting" ? "Requesting…" : "Connect USB-UART Port"}
               </button>
