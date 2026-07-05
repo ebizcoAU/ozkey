@@ -34,7 +34,8 @@ hooks/
   useVirtualClock.ts  Virtual Master Clock (real time + warp offset). now() getter.
 components/
   PhoneShell, StatusLeds, LockDisplay, Keypad, PeripheralControls, KeySlider,
-  SerialConsole (virtual clock + dual terminals + injector + slot table).
+  SerialConsole (virtual clock + dual terminals + injector),
+  DeviceRegistry (Sovereign Device Registry DB compliance grid + per-row revoke).
 app/
   page.tsx        Wires hooks. Ref-bridge breaks the transmit<->handleFrame cycle.
   layout.tsx, globals.css (keyframes: flash, alarm-blink, motor-spin).
@@ -79,7 +80,15 @@ Checksum = sum of all preceding bytes % 256.
   Inside -> unlock + TX ACCESS_RESULT=SUCCESS.
 - **Console**: Terminal A (RX) / Terminal B (TX) matrix-green hex, auto-scroll,
   annotations; hex injector with Execute + presets; Clear Logs; virtual clock
-  warp (±1h/±1d, datetime picker, sync-real); credential slot table with live status.
+  warp (±1h/±1d, datetime picker, sync-real).
+- **Sovereign Device Registry DB** (`DeviceRegistry.tsx`): compliance grid over
+  the LocalStorage array. Columns: Slot ID | Credential Type | Raw String Value/
+  Hash | Valid From | Valid To | System Registration Token | Action. Rows colour
+  -code by live status vs Master Clock — ACTIVE = low-saturation green border,
+  PENDING/EXPIRED = faded amber backdrop. Each row has "Revoke / Wipe Slot" which
+  compiles + fires a DPID 22 (PIN) / 24 (RFID) delete frame on the TX bus and
+  wipes the slot instantly. Registration token = `SRT-XXXX-XXXX` issued on
+  provisioning (backfilled on load for pre-existing records).
 
 ## Credentials for testing
 - Master PIN: `123456#`  ·  Master card UID: `7B 3F 91 D2`

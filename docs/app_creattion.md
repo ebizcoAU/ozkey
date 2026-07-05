@@ -67,3 +67,12 @@ Beneath or alongside the iPhone simulator housing, implement a dual-terminal spl
   - If the Virtual Master Clock falls outside the credential's Start/End parameters, reject the entry, trigger an 'Expired Credential' error state, flash the LED Red, and fire an Outbound Tuya Status Hex Packet indicating an expired access failure.
   - If inside the window, proceed with standard unlock logic and fire a success packet.
 - Ensure all incoming commands automatically print beautifully broken-down annotations inside the scrolling logs (e.g., displaying 'Parsed Incoming Hex -> Action: Add Temporary PIN, Slot: 14, Value: 123456, Expires: 2026-12-31').
+
+### 8. INTERACTIVE MANAGEMENT LEDGER & COMPLIANCE VIEWPORT
+- Expand the layout console to include an open visual grid panel titled "Sovereign Device Registry DB".
+- Display columns exactly matching: [Slot ID] | [Credential Type] | [Raw String Value / Hash] | [Valid From (Date/Time)] | [Valid To (Date/Time)] | [System Registration Token].
+- Ensure this interface dynamically populates in real-time by hooking into the LocalStorage JSON array engine.
+- Color code the row entries based on real-time temporal status relative to the Master System Clock:
+  - Active credentials must render with low-saturation green borders.
+  - Credentials whose parameters haven't started or have explicitly expired must highlight with faded amber backdrops.
+- Include a manual "Revoke / Wipe Slot" click mechanism on each row that compiles and triggers an output Tuya deletion sequence (DPID 22 or 24) down the internal serial bus registers instantly.

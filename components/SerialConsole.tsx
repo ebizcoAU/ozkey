@@ -3,8 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { SerialLogEntry } from "@/hooks/useTuyaProtocol";
 import type { VirtualClockApi } from "@/hooks/useVirtualClock";
-import type { StoredCredential } from "@/lib/credentials";
-import { checkWindow } from "@/lib/credentials";
 import {
   SAMPLE_ADD_TEMP_PIN_FRAME,
   SAMPLE_ADD_TEMP_RFID_FRAME,
@@ -17,7 +15,6 @@ interface SerialConsoleProps {
   onInject: (hex: string) => void;
   onClear: () => void;
   clock: VirtualClockApi;
-  credentials: StoredCredential[];
 }
 
 const HOUR_MS = 3_600_000;
@@ -64,25 +61,8 @@ function toDatetimeLocal(ms: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function fmtWindow(sec: number): string {
-  return new Date(sec * 1000).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "short" });
-}
-
-const STATUS_STYLE: Record<string, string> = {
-  VALID: "text-green-400",
-  EXPIRED: "text-red-400",
-  NOT_YET_ACTIVE: "text-amber-400",
-};
-
-/** Bench diagnostic console: virtual clock, dual hex terminals, injector, slot table. */
-export default function SerialConsole({
-  rxLog,
-  txLog,
-  onInject,
-  onClear,
-  clock,
-  credentials,
-}: SerialConsoleProps) {
+/** Bench diagnostic console: virtual clock, dual hex terminals, hex injector. */
+export default function SerialConsole({ rxLog, txLog, onInject, onClear, clock }: SerialConsoleProps) {
   const [injectValue, setInjectValue] = useState("");
 
   const execute = () => {
@@ -201,46 +181,6 @@ export default function SerialConsole({
           {sampleButton("Add Temp PIN 482915 (Slot 14)", SAMPLE_ADD_TEMP_PIN_FRAME)}
           {sampleButton("Add Temp RFID (Slot 3)", SAMPLE_ADD_TEMP_RFID_FRAME)}
         </div>
-      </div>
-
-      {/* Credential slot table */}
-      <div className="rounded-lg border border-neutral-800 bg-neutral-900/70 p-3">
-        <div className="mb-1.5 text-[10px] font-bold uppercase tracking-widest text-neutral-400">
-          Credential Slot Table (LocalStorage EEPROM)
-        </div>
-        {credentials.length === 0 ? (
-          <div className="font-mono text-[11px] text-neutral-600">
-            -- no temporary credentials stored — inject a DPID 21/23 frame --
-          </div>
-        ) : (
-          <table className="w-full font-mono text-[11px]">
-            <thead>
-              <tr className="text-left text-neutral-600">
-                <th className="pr-3 font-normal">SLOT</th>
-                <th className="pr-3 font-normal">KIND</th>
-                <th className="pr-3 font-normal">VALUE</th>
-                <th className="pr-3 font-normal">WINDOW</th>
-                <th className="font-normal">STATUS</th>
-              </tr>
-            </thead>
-            <tbody>
-              {credentials.map((c) => {
-                const status = checkWindow(c, clock.virtualNowMs);
-                return (
-                  <tr key={`${c.kind}-${c.slot}`} className="text-neutral-300">
-                    <td className="pr-3">{c.slot}</td>
-                    <td className="pr-3">{c.kind}</td>
-                    <td className="pr-3 text-green-500">{c.value}</td>
-                    <td className="pr-3 text-neutral-500">
-                      {fmtWindow(c.start)} → {fmtWindow(c.end)}
-                    </td>
-                    <td className={STATUS_STYLE[status]}>{status}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
       </div>
     </div>
   );

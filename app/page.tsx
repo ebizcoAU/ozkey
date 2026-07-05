@@ -12,6 +12,7 @@ import Keypad from "@/components/Keypad";
 import PeripheralControls from "@/components/PeripheralControls";
 import KeySlider from "@/components/KeySlider";
 import SerialConsole from "@/components/SerialConsole";
+import DeviceRegistry from "@/components/DeviceRegistry";
 
 export default function Page() {
   const clock = useVirtualClock();
@@ -73,7 +74,11 @@ export default function Page() {
           onInject={protocol.injectHex}
           onClear={protocol.clearLogs}
           clock={clock}
+        />
+        <DeviceRegistry
           credentials={lock.credentials}
+          virtualNowMs={clock.virtualNowMs}
+          onRevoke={lock.revokeCredential}
         />
       </div>
     </main>

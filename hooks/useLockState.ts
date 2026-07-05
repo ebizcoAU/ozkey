@@ -19,8 +19,10 @@ import {
   checkWindow,
   deleteCredential,
   loadCredentials,
+  makeToken,
   saveCredentials,
   upsertCredential,
+  type CredentialKind,
   type StoredCredential,
 } from "@/lib/credentials";
 import { accessDenied, accessGranted, keyClick, motorWhirr } from "@/lib/audio";
@@ -303,6 +305,22 @@ export function useLockState({ transmit, virtualNow }: UseLockStateOptions) {
     [wake, fireMotor]
   );
 
+  /** Manually revoke a slot: compile + fire a DPID 22/24 delete frame, then wipe. */
+  const revokeCredential = useCallback(
+    (kind: CredentialKind, slot: number) => {
+      const dpId = kind === "PIN" ? DpId.DELETE_PIN : DpId.DELETE_RFID;
+      wake(`REGISTRY REVOKE — ${kind} SLOT ${slot}`);
+      transmitRef.current(
+        TuyaCommand.DP_REPORT,
+        buildDpPayload(dpId, DpType.RAW, [(slot >> 8) & 0xff, slot & 0xff]),
+        `Revoke ${kind} slot ${slot} -> DPID ${dpId} (${kind === "PIN" ? "Delete PIN" : "Delete RFID"}) wipe`
+      );
+      persistCredentials(deleteCredential(credentialsRef.current, kind, slot));
+      setLastEvent(`${kind} SLOT ${slot} REVOKED (DPID ${dpId})`);
+    },
+    [wake, persistCredentials]
+  );
+
   // ---------------------------------------------------------------------
   // Incoming frame dispatch (valid frames only, from useTuyaProtocol)
   // ---------------------------------------------------------------------
@@ -332,6 +350,7 @@ export function useLockState({ transmit, virtualNow }: UseLockStateOptions) {
                 value: parsed.credential,
                 start: parsed.start,
                 end: parsed.end,
+                token: makeToken(),
               })
             );
             setLastEvent(`TEMP ${kind} STORED — SLOT ${parsed.slot}`);
@@ -377,6 +396,7 @@ export function useLockState({ transmit, virtualNow }: UseLockStateOptions) {
     scanFingerprint,
     triggerLowBattery,
     setMechanicalKey,
+    revokeCredential,
     handleFrame,
   };
 }
