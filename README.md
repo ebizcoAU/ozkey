@@ -8,9 +8,15 @@ billing systems.
 ozkey/
 ├── ozkeyserv/          Node.js API Gateway + Rule Engine + MySQL manager  (port 3200)
 │   └── server.js
-└── ozkey/           Next.js dark-mode cockpit (Web Serial + pairing)   (port 3300)
-    └── pages/index.js
+├── ozkey/           Next.js dark-mode cockpit (Web Serial + pairing)   (port 3300)
+│   └── pages/index.js
+└── locksim/            Next.js smart-lock simulator (Tuya MCU + MQTT-over-WS)  (port 3100)
+    └── app/page.tsx
 ```
+
+The three components speak the contract in [`docs/ozkey-02.md`](docs/ozkey-02.md)
+(server ⇄ lock handshake) and [`docs/ozkey-03.md`](docs/ozkey-03.md) (BLE Phase 0).
+`locksim` was merged in from its standalone repo with history preserved.
 
 ## Prerequisites
 
@@ -30,6 +36,9 @@ cd ozkeyserv && npm install && npm start        # http://localhost:3200
 
 # Terminal 2 — cockpit
 cd ozkey     && npm install && npm run dev      # http://localhost:3300
+
+# Terminal 3 — lock simulator (optional; Chrome for MQTT-over-WS)
+cd locksim   && npm install && npm run dev      # http://localhost:3100
 ```
 
 ## MQTT contract
