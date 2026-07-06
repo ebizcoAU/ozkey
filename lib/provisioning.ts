@@ -8,11 +8,22 @@
 /** Factory-burned hardware address advertised during onboarding. */
 export const DEVICE_MAC = "AA:BB:CC:11:22:33";
 
-/** Broker uplink topic the device announces itself on. */
+/**
+ * Legacy label for the announce payload; the canonical MQTT destination is
+ * ANNOUNCE_TOPIC (see ozkey-02 §3.1). Kept only for backward compatibility.
+ */
 export const BROADCAST_TOPIC = "OZKEYSERV/provision/announce";
 
-/** MQTT topic the assignment handshake is expected to arrive on. */
+/** Canonical discovery topic the lock announces its MAC on (lock → server). */
+export const ANNOUNCE_TOPIC = "hotel/locks/unpaired/heartbeat";
+
+/** MQTT topic filter the room-assignment handshake / commands arrive on. */
 export const ONBOARDING_TOPIC = "hotel/rooms/+/lock/command";
+
+/** Steady-state heartbeat topic for a provisioned room (lock → server). */
+export function heartbeatTopic(roomNo: string): string {
+  return `hotel/rooms/${roomNo}/lock/heartbeat`;
+}
 
 const STORAGE_KEY = "locksim.provisioning.v1";
 

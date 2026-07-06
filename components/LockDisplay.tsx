@@ -11,7 +11,7 @@ interface LockDisplayProps {
   alarm: boolean;
   lastEvent: string;
   virtualNowMs: number;
-  bleMode: boolean;
+  registering: boolean;
   pairedBanner: string | null;
   roomNo?: string;
 }
@@ -30,7 +30,7 @@ export default function LockDisplay({
   alarm,
   lastEvent,
   virtualNowMs,
-  bleMode,
+  registering,
   pairedBanner,
   roomNo,
 }: LockDisplayProps) {
@@ -42,9 +42,9 @@ export default function LockDisplay({
   if (pairedBanner) {
     primary = pairedBanner;
     primaryColor = "text-emerald-400";
-  } else if (bleMode) {
+  } else if (registering) {
     primary = "UNPROVISIONED";
-    primaryColor = "text-blue-400 animate-ble";
+    primaryColor = "text-sky-400 animate-ble";
   } else {
     primary = sleeping ? "SLEEPING (7µA)" : lockState;
     primaryColor = alarm
@@ -58,8 +58,8 @@ export default function LockDisplay({
 
   const subline = pairedBanner
     ? "NETWORK REGISTERED • OZKEYSERV/ SESSION ACTIVE"
-    : bleMode
-      ? "BLE ADVERTISING • AWAITING OZKEYSERV/ HANDSHAKE"
+    : registering
+      ? "ANNOUNCED MAC • AWAITING ROOM ASSIGNMENT"
       : sleeping
         ? "DEEP SLEEP • RADIO OFF • GPIO WAKE_INT: LOW"
         : "WAKING (45mA) • GPIO WAKE_INT: HIGH";
@@ -72,7 +72,7 @@ export default function LockDisplay({
           SYS {new Date(virtualNowMs).toLocaleTimeString("en-GB")}
         </span>
         <div className="flex items-center gap-2">
-          {roomNo && !bleMode && (
+          {roomNo && !registering && (
             <span className="rounded bg-emerald-950/70 px-1.5 py-0.5 text-emerald-300">
               RM {roomNo}
             </span>

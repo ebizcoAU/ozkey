@@ -2,9 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  DEVICE_MAC,
   ONBOARDING_TOPIC,
-  buildBroadcastPayload,
   clearProvisioning,
   loadProvisioning,
   parseOnboardingPayload,
@@ -13,9 +11,9 @@ import {
 } from "@/lib/provisioning";
 
 interface UseProvisioningOptions {
-  /** Publish a payload up to the OZKEYSERV/ broker (TX log + optional wire). */
-  uplink: (payload: string, label: string) => void;
-  /** Record an inbound MQTT payload in the RX stream. */
+  /** This lock's hardware MAC (from broker settings). */
+  mac: string;
+  /** Record an inbound handshake payload in the RX stream. */
   logInbound: (text: string, notes: string[], error?: boolean) => void;
   /** Surface a one-line status message on the lock's event ticker. */
   onEvent: (message: string) => void;
@@ -24,22 +22,24 @@ interface UseProvisioningOptions {
 const PAIRED_BANNER_MS = 6000;
 
 /**
- * BLE provisioning state machine. Drives the unprovisioned advertising state,
- * the MAC broadcast, and the OZKEYSERV/ handshake capture that pairs the lock to
- * a room and persists its network identity to LocalStorage.
+ * Provisioning state machine. Tracks registration (announce → awaiting room),
+ * captures the OZKEYSERV room-assignment handshake, persists the network
+ * identity, and drives the LED green-x3 confirmation on a successful pair.
+ * Transport-agnostic: registration announces are published by the caller (MQTT),
+ * this hook only owns state + handshake validation.
  */
-export function useProvisioning({ uplink, logInbound, onEvent }: UseProvisioningOptions) {
-  const [bleMode, setBleModeState] = useState(false);
+export function useProvisioning({ mac, logInbound, onEvent }: UseProvisioningOptions) {
+  const [registering, setRegistering] = useState(false);
   const [provisioning, setProvisioning] = useState<NetworkProvisioning | null>(null);
   const [pairedBanner, setPairedBanner] = useState<string | null>(null);
   // Incremented on each successful registration to retrigger the LED green-x3 pulse.
   const [confirmPulse, setConfirmPulse] = useState(0);
 
   const bannerTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const macRef = useRef(mac);
+  macRef.current = mac;
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
-  const uplinkRef = useRef(uplink);
-  uplinkRef.current = uplink;
   const logInboundRef = useRef(logInbound);
   logInboundRef.current = logInbound;
 
@@ -47,40 +47,29 @@ export function useProvisioning({ uplink, logInbound, onEvent }: UseProvisioning
     setProvisioning(loadProvisioning());
   }, []);
 
-  /** Toggle BLE Provisioning Mode. Turning on wipes the existing pairing. */
-  const setBleMode = useCallback((on: boolean) => {
-    setBleModeState(on);
-    if (on) {
-      clearProvisioning();
-      setProvisioning(null);
-      setPairedBanner(null);
-      onEventRef.current(`BLE PROVISIONING ON — DEVICE UNPROVISIONED (MAC ${DEVICE_MAC})`);
-    } else {
-      onEventRef.current("BLE PROVISIONING OFF");
-    }
-  }, []);
-
-  /** Advertise the hardware MAC up to the OZKEYSERV/ broker layer. */
-  const broadcastMac = useCallback(() => {
-    const payload = buildBroadcastPayload(DEVICE_MAC);
-    uplinkRef.current(payload, `BLE ADV → OZKEYSERV/ (MAC ${DEVICE_MAC})`);
-    onEventRef.current(`BROADCAST MAC ${DEVICE_MAC} → OZKEYSERV/ broker`);
+  /** Enter the unprovisioned "awaiting room" state (wipes any prior pairing). */
+  const beginRegistration = useCallback(() => {
+    clearProvisioning();
+    setProvisioning(null);
+    setPairedBanner(null);
+    setRegistering(true);
+    onEventRef.current(`REGISTERING — announced MAC ${macRef.current}, awaiting room assignment`);
   }, []);
 
   /**
-   * Capture an inbound MQTT payload. A structurally valid onboarding handshake
-   * for this device halts BLE advertising, persists the network variables, and
-   * fires the green registration confirmation.
+   * Capture an inbound room-assignment handshake. A structurally valid payload
+   * for this device persists the network variables, stops the registering
+   * state, and fires the green registration confirmation.
    */
   const handleMqttPayload = useCallback((raw: string) => {
-    const result = parseOnboardingPayload(raw, DEVICE_MAC);
+    const result = parseOnboardingPayload(raw, macRef.current);
     if (!result.ok) {
-      logInboundRef.current(raw.trim(), [`OZKEYSERV ONBOARDING REJECTED — ${result.error}`], true);
+      logInboundRef.current(raw.trim(), [`ONBOARDING REJECTED — ${result.error}`], true);
       return;
     }
 
     logInboundRef.current(raw.trim(), [
-      `MQTT ${result.topic} (matches ${ONBOARDING_TOPIC})`,
+      `${result.topic} (matches ${ONBOARDING_TOPIC})`,
       `Onboarding validated — MAC ${result.mac} → Room ${result.roomNo}`,
       `Network vars: server_ip=${result.serverIp}, mac_token=${result.macToken}`,
     ]);
@@ -94,8 +83,7 @@ export function useProvisioning({ uplink, logInbound, onEvent }: UseProvisioning
     };
     saveProvisioning(record);
     setProvisioning(record);
-
-    setBleModeState(false); // halt the BLE blue flashing loop instantly
+    setRegistering(false);
     setConfirmPulse((n) => n + 1); // LED green x3 confirmation
 
     const banner = `PAIRED - ROOM ${result.roomNo}`;
@@ -112,17 +100,13 @@ export function useProvisioning({ uplink, logInbound, onEvent }: UseProvisioning
     []
   );
 
-  const bleFlashing = bleMode && pairedBanner === null;
-
   return {
-    bleMode,
+    registering,
     provisioning,
     pairedBanner,
     confirmPulse,
-    bleFlashing,
-    deviceMac: DEVICE_MAC,
-    setBleMode,
-    broadcastMac,
+    linkFlashing: registering && pairedBanner === null,
+    beginRegistration,
     handleMqttPayload,
   };
 }

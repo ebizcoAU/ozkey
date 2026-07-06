@@ -7,17 +7,17 @@ interface StatusLedsProps {
   powerState: PowerState;
   lowBattery: boolean;
   alarm: boolean;
-  bleFlashing: boolean;
+  linkFlashing: boolean;
   provisioned: boolean;
   confirmPulse: number;
 }
 
-/** Power/Status LED, BLE provisioning indicator, and the Wi-Fi radio indicator. */
+/** Power/Status LED, server-link (registration) indicator, and Wi-Fi radio. */
 export default function StatusLeds({
   powerState,
   lowBattery,
   alarm,
-  bleFlashing,
+  linkFlashing,
   provisioned,
   confirmPulse,
 }: StatusLedsProps) {
@@ -64,24 +64,24 @@ export default function StatusLeds({
         <span className="text-[10px] uppercase tracking-widest text-neutral-500">{ledLabel}</span>
       </div>
 
-      {/* BLE provisioning indicator */}
+      {/* Server-link / registration indicator */}
       <div className="flex items-center gap-1.5">
         <svg
           viewBox="0 0 24 24"
           className={`h-4 w-4 ${
-            bleFlashing
-              ? "animate-ble text-blue-400"
+            linkFlashing
+              ? "animate-ble text-sky-400"
               : provisioned
-                ? "text-blue-500/70"
+                ? "text-sky-500/70"
                 : "text-neutral-700"
           }`}
           fill="currentColor"
-          aria-label="Bluetooth provisioning"
+          aria-label="Server link"
         >
-          <path d="M12 2 17 7l-3.5 3.5L17 14l-5 5v-7.2L8.5 15l-1.4-1.4L11 10 7.1 6.1 8.5 4.7 12 8.2V2zm1.5 3.6L12 4.1v3l1.5-1.5zm0 8.3L12 15.4v3l1.5-1.5-1.5-1.5z" />
+          <path d="M6.8 15a4 4 0 0 1 .3-8 5.5 5.5 0 0 1 10.6 1.3A3.5 3.5 0 0 1 17 15H6.8zm5.2-6-3 3h2v3h2v-3h2l-3-3z" />
         </svg>
         <span className="text-[10px] uppercase tracking-widest text-neutral-500">
-          {bleFlashing ? "BLE ADV" : provisioned ? "BLE PAIRED" : "BLE OFF"}
+          {linkFlashing ? "REGISTERING" : provisioned ? "PAIRED" : "UNLINKED"}
         </span>
       </div>
 

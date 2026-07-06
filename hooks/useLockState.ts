@@ -44,6 +44,8 @@ interface UseLockStateOptions {
   transmit: (command: Byte, payload: ByteArray, ...notes: string[]) => ByteArray;
   /** Virtual Master Clock getter — all temporal checks go through this. */
   virtualNow: () => number;
+  /** Fired when the deep-sleep heartbeat timer elapses (Mode A: publish MQTT). */
+  onHeartbeat?: () => void;
 }
 
 type Timer = ReturnType<typeof setTimeout>;
@@ -52,7 +54,7 @@ type Timer = ReturnType<typeof setTimeout>;
  * The lock motherboard state machine: deep-sleep power management, GPIO wake
  * interrupts, credential validation, clutch motor cycles and heartbeat loop.
  */
-export function useLockState({ transmit, virtualNow }: UseLockStateOptions) {
+export function useLockState({ transmit, virtualNow, onHeartbeat }: UseLockStateOptions) {
   const [powerState, setPowerState] = useState<PowerState>("SLEEPING");
   const [lockState, setLockState] = useState<LockState>("LOCKED");
   const [pinBuffer, setPinBuffer] = useState("");
@@ -73,6 +75,8 @@ export function useLockState({ transmit, virtualNow }: UseLockStateOptions) {
   const credentialsRef = useRef<StoredCredential[]>([]);
   const transmitRef = useRef(transmit);
   transmitRef.current = transmit;
+  const onHeartbeatRef = useRef(onHeartbeat);
+  onHeartbeatRef.current = onHeartbeat;
   const nowRef = useRef(virtualNow);
   nowRef.current = virtualNow;
 
@@ -173,6 +177,7 @@ export function useLockState({ transmit, virtualNow }: UseLockStateOptions) {
       [],
       "MQTT heartbeat ping -> Tuya broker (10-min timer wake)"
     );
+    onHeartbeatRef.current?.();
     setCountdown(HEARTBEAT_SECONDS);
   }, [countdown, wake]);
 

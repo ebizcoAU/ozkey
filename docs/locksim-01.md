@@ -39,17 +39,21 @@ hooks/
   useSerialLink.ts    Mode B transport: Web Serial API. connect()/disconnect()/
                       write(Uint8Array); read loop reassembles frames via
                       extractFrames(). status/portLabel/ready/supported.
-  useProvisioning.ts  BLE onboarding state machine: bleMode, MAC broadcast,
-                      OZKEYSERV/ handshake capture, green-x3 confirm pulse,
-                      persisted NetworkProvisioning.
+  useProvisioning.ts  Registration state machine: beginRegistration (announce →
+                      awaiting room), OZKEYSERV handshake capture, green-x3
+                      confirm pulse, persisted NetworkProvisioning.
+  useMqttLink.ts      Mode A network transport: MQTT-over-WebSocket (mqtt.js) to
+                      the OZKEYSERV broker. connect(settings)/disconnect/publish;
+                      subscribes command + pair-confirm topics; onMessage.
   useElementWidth.ts  ResizeObserver width measurement driving the responsive
-                      layout (promotes onboarding to a 3rd column ≥1280px).
+                      layout (promotes conversation panel to a 3rd column ≥1280px).
 components/
-  PhoneShell, StatusLeds (power + BLE + Wi-Fi LEDs), LockDisplay, Keypad,
-  PeripheralControls, KeySlider, BleProvisioning (BLE switch + MAC broadcast),
+  PhoneShell, StatusLeds (power + server-link + Wi-Fi LEDs), LockDisplay, Keypad,
+  PeripheralControls, KeySlider,
   SerialConsole (virtual clock + dual terminals + injector + server-push),
-  OnboardingPanel (OZKEYSERV/ MQTT handshake editor — its own 3rd column when
-  the measured page width ≥1280px, else folds under the console),
+  ConversationPanel (live lock ⇄ server MQTT transcript + Register Doorlock +
+  Server Settings — its own 3rd column ≥1280px, else folds under the console),
+  SettingsDialog (broker host/ws-port/path/MAC modal + connect controls),
   DeviceRegistry (Sovereign Device Registry DB grid),
   HardwarePipelineToggle (compact single-row Mode A / Mode B segmented control).
 app/
@@ -139,6 +143,33 @@ Checksum = sum of all preceding bytes % 256.
     (Publish to Lock, plus valid/mismatch presets), and the main hex injector —
     any input starting with `{` is auto-routed to the provisioning parser instead
     of the Tuya hex decoder.
+
+## Mode A networking — MQTT-over-WebSocket (2026-07-06)
+
+LockSim (browser) now speaks **MQTT-over-WS directly** to the OZKEYSERV broker —
+the simulated ESP32 radio. No HTTP `/sim/*` bridge needed. See `ozkey-02.md`
+(handshake contract) in `~/Documents/Dev/ozkey/docs`.
+
+- **Server Settings** dialog (gear in the conversation panel): broker host, WS
+  port, WS path, device MAC → `ws://host:port/path`. Persisted to
+  `locksim.broker.v1`. Lab default `ws://10.1.1.21:9001/mqtt` (Mosquitto
+  `mosquitto.dev.conf` in nexus already has `listener 9001 / protocol websockets`).
+- **Register Doorlock** button: publishes `buildBroadcastPayload(mac)` to
+  `hotel/locks/unpaired/heartbeat` → lock enters UNPROVISIONED/awaiting-room.
+- LockSim subscribes `hotel/rooms/+/lock/command` (+ `hotel/locks/+/pair/confirm`).
+  Inbound routing (`handleInboundJson`): JSON with `payload_hex` → unwrap → Tuya
+  parser (closes ozkey-02 gap #5); JSON with `mac`+`room_no` → `parseOnboardingPayload`
+  (real MQTT topic injected when not embedded) → pair. Heartbeat tick publishes
+  `hotel/rooms/<room>/lock/heartbeat` (closes gap #4).
+- **OZKEYSERV/ Onboarding Handshake** panel is now a live **conversation
+  transcript** (lock→server right, server→lock left) instead of a JSON editor.
+- BLE Provisioning Mode toggle + Broadcast button were **removed** (ozkey-03 BLE
+  Phase 0 is deferred; "assume network connected"). Provisioning *state* stays.
+
+⚠ Cross-repo dependency: full auto-pairing still needs OZKEYSERV to emit the
+ozkey-02 §3.2 handshake shape on `hotel/rooms/<room>/lock/command` (gap #2) and
+DPID 21/23 DP_REPORT credential frames (gap #3). Until then, paste a §3.2 sample
+into the console inject bar (JSON auto-routes to the provisioning parser).
 
 ## Credentials for testing
 - Master PIN: `123456#`  ·  Master card UID: `7B 3F 91 D2`
