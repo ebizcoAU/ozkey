@@ -68,11 +68,14 @@ Single file, ~600 lines. Key structures:
 - `eventRing` (max 500) + `logEvent(level, message)` — feeds both console and
   the dashboard terminal via `GET /events?after=<id>`. Levels used:
   `info|warn|error|pair|key|sync`.
-- **Tuya frame builder**: `55 AA | version 00 | cmd | len(2,BE) | data | checksum`
-  (checksum = sum of all preceding bytes & 0xFF). Commands (lab convention):
-  `0x65` CREDENTIAL_WRITE, `0x66` CREDENTIAL_REVOKE, `0x02` PAIR_ACK.
-  Credential data payload: `[type 1B][slot 1B][valueLen 1B][value NB][validFrom u32BE][validTo u32BE]`,
-  type codes pin=01 rfid=02 fingerprint=03.
+- **Tuya frame codec** (rewritten 2026-07-06 for LockSim conformance — gap #3):
+  `55 AA | version 00 | cmd | len(2,BE) | payload | checksum` (checksum = sum of
+  preceding bytes & 0xFF). Credentials are **DP_REPORT (cmd 0x06)** frames with
+  DP wrapper `[dpid 1B][type 1B][len 2B BE][value]`: DPID 21 add-PIN / 23
+  add-RFID (RAW value `[slot 2B BE][cred bytes][start u32 BE][end u32 BE]`,
+  PIN = ASCII digits, RFID = raw UID bytes) and DPID 22/24 deletes
+  (`[slot 2B BE]`). Byte-matches `locksim/lib/tuya.ts` samples. `fingerprint`
+  type is held (422). The old custom `0x65/0x66/0x02` command IDs are gone.
 - MySQL boot: create DB if missing → pool → create tables → seed. Retries
   forever every 5 s if MySQL is down (HTTP doesn't listen until DB is up).
 - MQTT: reconnects every 5 s; QoS 1 everywhere.
@@ -82,7 +85,7 @@ Single file, ~600 lines. Key structures:
 | Topic | Dir | Purpose |
 |---|---|---|
 | `hotel/locks/unpaired/heartbeat` | lock→srv | Factory lock broadcasts MAC (bare string **or** JSON `{mac, rssi, fw}`) → cached for discovery |
-| `hotel/locks/<mac-no-colons-lowercase>/pair/confirm` | srv→lock | Pair confirmation: JSON with room_no, command/heartbeat topics, PAIR_ACK hex |
+| `hotel/rooms/<room_no>/lock/command` (pairing) | srv→lock | `provision_assign` handshake on pair (gap #2): `{topic, op, mac, room_no, server_ip, server_port, mac_token, issued_by}` — no `payload_hex` key. Duplicated on `hotel/locks/<mac-no-colons-lowercase>/pair/confirm` as a debug side channel |
 | `hotel/rooms/<room_no>/lock/heartbeat` | lock→srv | 30 s heartbeat; triggers `flushQueueForRoom(room_no)` |
 | `hotel/rooms/<room_no>/lock/command` | srv→lock | JSON envelope `{msg_id, room_no, action, credential_id, payload_hex, issued_at, source}` |
 

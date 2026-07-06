@@ -191,21 +191,26 @@ contract: `ozkey/docs/ozkey-02.md` (see §8 "LockSim team response") and `ozkey-
 - ⚠ Not yet verified: in-browser MQTT connect and the full pairing happy path
   (needs a real Chrome tab + the two server fixes below).
 
-### OPEN — OZKEYSERV (`ozkeyserv/server.js`), blocks live pairing
-- **gap #2 (the blocker):** `POST /locks/pair` must **publish the ozkey-02 §3.2
-  handshake JSON to `hotel/rooms/<room_no>/lock/command`**. Required: key **`mac`**
-  (not `mac_address`) + `room_no` (+ `server_ip` as a consistency value). LockSim now
-  injects the real MQTT topic before validating, so the embedded `topic` field is
-  **optional**. Today the server sends `mac_address` on the wrong topic → LockSim rejects it.
-- **gap #3:** rewrite the frame builder to emit **DPID 21/23 DP_REPORT (cmd 0x06)**
-  in `payload_hex`, not the custom cmd `0x65`. Conformance: byte-match
-  `SAMPLE_ADD_TEMP_PIN_FRAME` in `locksim/lib/tuya.ts` (slot 14, PIN 482915).
-  DP layouts in ozkey-02 §4 / `locksim/lib/tuya.ts` (`buildTempCredential`).
+### DONE — OZKEYSERV (2026-07-06): gaps #2 and #3 landed
+- **gap #2 ✅** — `POST /locks/pair` now publishes the `provision_assign`
+  handshake to `hotel/rooms/<room_no>/lock/command` with key `mac`, `room_no`,
+  `server_ip`, `server_port`, and a persisted `mac_token` (new `rooms.mac_token`
+  column). No `payload_hex` key, so LockSim's `{`-router sends it to the
+  provisioning parser. Verified live over the broker against
+  `parseOnboardingPayload`'s rules.
+- **gap #3 ✅** — frame builder rewritten to DP_REPORT (cmd 0x06) DPID 21/23,
+  RAW `[slot 2B][cred][start u32][end u32]`; byte-matches
+  `SAMPLE_ADD_TEMP_PIN_FRAME` and `SAMPLE_ADD_TEMP_RFID_FRAME` exactly. PIN
+  validated digits-only, RFID even-length hex. DPID 22/24 delete builder
+  (`buildDeleteFrame`) is already in place for #8.
+- **fingerprint ✅ (held)** — `/pms/issue-key` returns 422 for `fingerprint`.
+
+### OPEN — OZKEYSERV (`ozkeyserv/server.js`)
 - **gap #8 (revoke):** add `POST /pms/revoke-key` → DPID 22/24 delete frame,
-  `action_type = 'revoke-key'`. LockSim already fires + parses these.
-- **fingerprint:** ozkey `credentials.type` allows `fingerprint` but LockSim has no
-  temp-fingerprint DPID (only 21–24 pin/rfid). Server should hold/reject fingerprint
-  issues destined for LockSim benches, or we add a DPID pair.
+  `action_type = 'revoke-key'` (frame builder exists; endpoint + queue wiring
+  still to add). LockSim already fires + parses these.
+- **In-browser happy path:** with #2/#3 landed, the blocker list is empty — run
+  the real Chrome acceptance pass (Register → cockpit PAIR → PIN 482915 → unlock).
 
 ### Other LockSim follow-ups (non-blocking)
 - No automated tests yet; `lib/tuya.ts` and `lib/provisioning.ts` are pure and unit-testable.

@@ -295,10 +295,10 @@ reachability `GET /health` probe. **No credential ever flows over :3200.**
 | # | Status |
 |---|---|
 | 1 announce topic | **DONE (LockSim)** — publishes canonical topic over MQTT-WS |
-| 2 handshake shape/topic | **OPEN (OZKEYSERV)** — the one blocker for live pairing |
-| 3 DPID frames | **OPEN (OZKEYSERV)** |
+| 2 handshake shape/topic | **DONE (OZKEYSERV, 2026-07-06)** — `/locks/pair` publishes `provision_assign` (`mac`, `room_no`, `server_ip`, `server_port`, `mac_token`, no `payload_hex`) to `hotel/rooms/<room>/lock/command`; token persisted in `rooms.mac_token`. Verified live over the broker against LockSim's validator rules |
+| 3 DPID frames | **DONE (OZKEYSERV, 2026-07-06)** — DP_REPORT (cmd 0x06) DPID 21/23 add + 22/24 delete builders; byte-matches `SAMPLE_ADD_TEMP_PIN_FRAME` and `SAMPLE_ADD_TEMP_RFID_FRAME` exactly. PIN validated digits-only, RFID even-length hex |
 | 4 heartbeat | **DONE (LockSim)** |
 | 5 payload_hex unwrap | **DONE (LockSim)** |
-| 6 fingerprint | still both — server holds fingerprint issues for now |
+| 6 fingerprint | **HELD (OZKEYSERV, 2026-07-06)** — `/pms/issue-key` returns 422 for `fingerprint` until a DPID pair exists |
 | 7 poll channel | **DROPPED** — WS subscribe replaces it |
-| 8 revoke endpoint | **OPEN (OZKEYSERV)** |
+| 8 revoke endpoint | **OPEN (OZKEYSERV)** — `buildDeleteFrame()` (DPID 22/24) already exists server-side; endpoint still to add |

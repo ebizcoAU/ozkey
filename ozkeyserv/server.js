@@ -23,12 +23,25 @@ const express = require('express');
 const cors = require('cors');
 const mysql = require('mysql2/promise');
 const mqtt = require('mqtt');
+const os = require('os');
+
+/** First non-internal IPv4 of this host — the lock's consistency value for
+ *  the gateway address (ozkey-02 §3.2). Override with OZKEY_SERVER_IP. */
+function detectLanIp() {
+  for (const ifaces of Object.values(os.networkInterfaces())) {
+    for (const iface of ifaces || []) {
+      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+    }
+  }
+  return '127.0.0.1';
+}
 
 /* ---------------------------------------------------------------------------
  * Configuration
  * ------------------------------------------------------------------------- */
 const CONFIG = {
   HTTP_PORT: 3200,
+  SERVER_IP: process.env.OZKEY_SERVER_IP || detectLanIp(),
   DB: {
     host: 'localhost',
     user: 'root',
@@ -77,30 +90,51 @@ function normalizeMac(raw) {
 }
 
 /* ---------------------------------------------------------------------------
- * Tuya 55 AA frame builder
+ * Tuya 55 AA frame codec — conformant with LockSim's decoder (lib/tuya.ts),
+ * which is the hardware truth (ozkey-02 §4).
  *
- *   [0x55][0xAA][version][command][len_hi][len_lo][ ...data... ][checksum]
- *   checksum = (sum of every preceding byte) & 0xFF
+ *   Frame:      [0x55][0xAA][ver 00][cmd][len 2B BE][payload][checksum]
+ *               checksum = (sum of every preceding byte) & 0xFF
+ *   DP payload: [dpid 1B][type 1B][len 2B BE][value]
+ *   Temp cred:  [slot 2B BE][credential var][start u32 BE][end u32 BE]
+ *               PIN credential = ASCII digit bytes; RFID = raw UID bytes
  * ------------------------------------------------------------------------- */
 const TUYA_CMD = {
-  CREDENTIAL_WRITE: 0x65, // lab command id: inject credential into slot
-  CREDENTIAL_REVOKE: 0x66, // lab command id: clear slot
-  PAIR_ACK: 0x02, // lab command id: pairing confirmation
+  HEARTBEAT: 0x00,
+  DP_REPORT: 0x06,
 };
 
-const CRED_TYPE_CODE = { pin: 0x01, rfid: 0x02, fingerprint: 0x03 };
+const DPID = {
+  ADD_TEMP_PIN: 21,
+  DELETE_PIN: 22,
+  ADD_TEMP_RFID: 23,
+  DELETE_RFID: 24,
+};
 
-function buildTuyaFrame(command, dataBuf) {
+const DP_TYPE = { RAW: 0x00, BOOL: 0x01, VALUE: 0x02, STRING: 0x03, ENUM: 0x04 };
+
+/** Credential types the DP codec can express. `fingerprint` is held (gap #6). */
+const SUPPORTED_CRED_TYPES = ['pin', 'rfid'];
+
+function buildTuyaFrame(command, payloadBuf) {
   const head = Buffer.alloc(6);
   head[0] = 0x55;
   head[1] = 0xaa;
   head[2] = 0x00; // protocol version
   head[3] = command & 0xff;
-  head.writeUInt16BE(dataBuf.length, 4);
-  const body = Buffer.concat([head, dataBuf]);
+  head.writeUInt16BE(payloadBuf.length, 4);
+  const body = Buffer.concat([head, payloadBuf]);
   let sum = 0;
   for (const b of body) sum = (sum + b) & 0xff;
   return Buffer.concat([body, Buffer.from([sum])]);
+}
+
+function buildDpPayload(dpId, dpType, valueBuf) {
+  const head = Buffer.alloc(4);
+  head[0] = dpId & 0xff;
+  head[1] = dpType & 0xff;
+  head.writeUInt16BE(valueBuf.length, 2);
+  return Buffer.concat([head, valueBuf]);
 }
 
 function toSpacedHex(buf) {
@@ -111,33 +145,65 @@ function toSpacedHex(buf) {
     .join(' ');
 }
 
+/** PIN -> ASCII digit bytes; RFID -> raw UID bytes from a hex string. */
+function credentialValueBytes(type, rawValue) {
+  const value = String(rawValue).trim();
+  if (type === 'pin') {
+    if (!/^\d+$/.test(value)) {
+      throw new Error(`PIN must be digits only (got "${value}")`);
+    }
+    return Buffer.from(value, 'ascii');
+  }
+  // rfid: accept "04 A3 7F 1C", "04:A3:7F:1C" or "04A37F1C"
+  const hex = value.replace(/[^0-9a-fA-F]/g, '');
+  if (hex.length === 0 || hex.length % 2 !== 0) {
+    throw new Error(`RFID UID must be an even-length hex string (got "${value}")`);
+  }
+  return Buffer.from(hex, 'hex');
+}
+
 /**
- * Credential DP payload layout (lab convention):
- *   [type:1][slot:1][valueLen:1][value:N][validFrom:4 BE unix][validTo:4 BE unix]
+ * DP_REPORT frame carrying DPID 21 (Add Temp PIN) / 23 (Add Temp RFID), RAW:
+ *   [slot 2B BE][credential][start u32 BE][end u32 BE]
+ * Byte-compatible with LockSim's buildTempCredential()/parseTempCredential().
  */
 function buildCredentialFrame({ type, slotNumber, rawValue, dateFrom, dateTo }) {
-  const typeCode = CRED_TYPE_CODE[type];
-  const valueBuf = Buffer.from(String(rawValue), 'utf8');
+  if (!SUPPORTED_CRED_TYPES.includes(type)) {
+    throw new Error(`unsupported credential type "${type}" for the DP codec`);
+  }
+  const credBytes = credentialValueBytes(type, rawValue);
   const fromTs = Math.floor(new Date(dateFrom).getTime() / 1000) || 0;
   const toTs = Math.floor(new Date(dateTo).getTime() / 1000) || 0;
 
-  const data = Buffer.alloc(3 + valueBuf.length + 8);
-  let o = 0;
-  data[o++] = typeCode;
-  data[o++] = slotNumber & 0xff;
-  data[o++] = valueBuf.length & 0xff;
-  valueBuf.copy(data, o);
-  o += valueBuf.length;
-  data.writeUInt32BE(fromTs >>> 0, o);
-  o += 4;
-  data.writeUInt32BE(toTs >>> 0, o);
+  const value = Buffer.alloc(2 + credBytes.length + 8);
+  value.writeUInt16BE(slotNumber & 0xffff, 0);
+  credBytes.copy(value, 2);
+  value.writeUInt32BE(fromTs >>> 0, 2 + credBytes.length);
+  value.writeUInt32BE(toTs >>> 0, 2 + credBytes.length + 4);
 
-  return buildTuyaFrame(TUYA_CMD.CREDENTIAL_WRITE, data);
+  const dpId = type === 'pin' ? DPID.ADD_TEMP_PIN : DPID.ADD_TEMP_RFID;
+  return buildTuyaFrame(TUYA_CMD.DP_REPORT, buildDpPayload(dpId, DP_TYPE.RAW, value));
 }
 
-function buildPairAckFrame(roomNo, mac) {
-  const data = Buffer.from(`${roomNo}|${mac}`, 'utf8');
-  return buildTuyaFrame(TUYA_CMD.PAIR_ACK, data);
+/** DP_REPORT frame carrying DPID 22/24 (Delete PIN/RFID), RAW: [slot 2B BE]. */
+function buildDeleteFrame({ type, slotNumber }) {
+  if (!SUPPORTED_CRED_TYPES.includes(type)) {
+    throw new Error(`unsupported credential type "${type}" for the DP codec`);
+  }
+  const value = Buffer.alloc(2);
+  value.writeUInt16BE(slotNumber & 0xffff, 0);
+  const dpId = type === 'pin' ? DPID.DELETE_PIN : DPID.DELETE_RFID;
+  return buildTuyaFrame(TUYA_CMD.DP_REPORT, buildDpPayload(dpId, DP_TYPE.RAW, value));
+}
+
+/** Broker-side network token issued at pairing (ozkey-02 §3.2). */
+function makeMacToken() {
+  const seg = () =>
+    Math.floor(Math.random() * 0x10000)
+      .toString(16)
+      .toUpperCase()
+      .padStart(4, '0');
+  return `OZK-${seg()}-${seg()}-${seg()}`;
 }
 
 /* ---------------------------------------------------------------------------
@@ -172,6 +238,17 @@ async function initDatabase() {
       mac_address VARCHAR(17) UNIQUE NULL,
       status VARCHAR(50) DEFAULT 'Available'
     ) ENGINE=InnoDB`);
+
+  // Broker-side network token issued at pairing (ozkey-02 §3.2); additive
+  // migration for tables created before the column existed.
+  const [[{ hasTokenCol }]] = await pool.query(
+    `SELECT COUNT(*) AS hasTokenCol FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'rooms' AND column_name = 'mac_token'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasTokenCol) {
+    await pool.query('ALTER TABLE rooms ADD COLUMN mac_token VARCHAR(50) NULL');
+  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -371,15 +448,17 @@ function initMqtt() {
 }
 
 /** Periodically expire unpaired MACs that stopped broadcasting. */
-setInterval(() => {
-  const cutoff = Date.now() - CONFIG.UNPAIRED_TTL_MS;
-  for (const [mac, entry] of unpairedCache) {
-    if (entry.lastSeen < cutoff) {
-      unpairedCache.delete(mac);
-      logEvent('warn', `Unpaired lock ${mac} went silent — dropped from discovery cache`);
+function startDiscoveryPruneInterval() {
+  setInterval(() => {
+    const cutoff = Date.now() - CONFIG.UNPAIRED_TTL_MS;
+    for (const [mac, entry] of unpairedCache) {
+      if (entry.lastSeen < cutoff) {
+        unpairedCache.delete(mac);
+        logEvent('warn', `Unpaired lock ${mac} went silent — dropped from discovery cache`);
+      }
     }
-  }
-}, 30_000);
+  }, 30_000);
+}
 
 /* ---------------------------------------------------------------------------
  * REST API
@@ -480,27 +559,36 @@ api.post('/locks/pair', async (req, res) => {
       });
     }
 
+    // Issue (or reuse) the broker-side network token for this room binding.
+    const macToken = room.mac_token || makeMacToken();
     await pool.query(
-      "UPDATE rooms SET mac_address = ?, status = 'Available' WHERE room_no = ?",
-      [mac, room_no]
+      "UPDATE rooms SET mac_address = ?, mac_token = ?, status = 'Available' WHERE room_no = ?",
+      [mac, macToken, room_no]
     );
     unpairedCache.delete(mac);
 
-    // MQTT confirmation back down to the physical device.
-    const ackFrame = buildPairAckFrame(room_no, mac);
-    const confirmTopic = CONFIG.topicPairConfirm(mac);
-    mqttPublish(confirmTopic, {
-      action: 'pair_confirm',
-      room_no,
-      mac_address: mac,
-      command_topic: CONFIG.topicRoomCommand(room_no),
-      heartbeat_topic: `hotel/rooms/${room_no}/lock/heartbeat`,
-      payload_hex: toSpacedHex(ackFrame),
+    // Gap #2 (ozkey-02 §3.2/§8.4): provision_assign handshake on the room
+    // command topic — key is `mac`, NEVER `payload_hex` (that key would route
+    // the JSON to the lock's Tuya parser instead of its provisioning parser).
+    const commandTopic = CONFIG.topicRoomCommand(room_no);
+    const handshake = {
+      topic: commandTopic, // optional for LockSim since §8.4, kept for manual paste
+      op: 'provision_assign',
+      mac,
+      room_no: String(room_no),
+      server_ip: CONFIG.SERVER_IP,
+      server_port: CONFIG.HTTP_PORT,
+      mac_token: macToken,
+      issued_by: 'OZKEYSERV/',
       issued_at: new Date().toISOString(),
-    });
+    };
+    mqttPublish(commandTopic, handshake);
 
-    logEvent('pair', `PAIRED ${mac} -> room ${room_no} (confirm sent on ${confirmTopic})`);
-    res.json({ ok: true, room_no, mac_address: mac, status: 'Available' });
+    // Legacy MAC-scoped confirm — debug side channel only (ozkey-02 §3.2).
+    mqttPublish(CONFIG.topicPairConfirm(mac), handshake);
+
+    logEvent('pair', `PAIRED ${mac} -> room ${room_no} (provision_assign sent on ${commandTopic})`);
+    res.json({ ok: true, room_no, mac_address: mac, mac_token: macToken, status: 'Available' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -546,10 +634,17 @@ api.post('/pms/issue-key', async (req, res) => {
         .status(400)
         .json({ ok: false, error: 'room_no, guest_name and raw_value are required' });
     }
-    if (!CRED_TYPE_CODE[type]) {
+    if (type === 'fingerprint') {
+      // Gap #6 hold (ozkey-02 §8.5): LockSim has no temp-fingerprint DPID.
+      return res.status(422).json({
+        ok: false,
+        error: 'fingerprint credentials are on hold — the lock-side DP codec only supports pin/rfid (ozkey-02 §4)',
+      });
+    }
+    if (!SUPPORTED_CRED_TYPES.includes(type)) {
       return res
         .status(400)
-        .json({ ok: false, error: `type must be one of: ${Object.keys(CRED_TYPE_CODE).join(', ')}` });
+        .json({ ok: false, error: `type must be one of: ${SUPPORTED_CRED_TYPES.join(', ')}` });
     }
 
     const [[room]] = await conn.query('SELECT * FROM rooms WHERE room_no = ?', [room_no]);
@@ -563,6 +658,22 @@ api.post('/pms/issue-key', async (req, res) => {
 
     const from = date_from || new Date().toISOString();
     const to = date_to || new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+
+    // Build the frame before opening the transaction so malformed input
+    // (non-digit PIN, odd-length RFID hex) returns 400, not a rollback.
+    let frame;
+    try {
+      frame = buildCredentialFrame({
+        type,
+        slotNumber: slot_number,
+        rawValue: raw_value,
+        dateFrom: from,
+        dateTo: to,
+      });
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+    const payloadHex = toSpacedHex(frame);
 
     await conn.beginTransaction();
 
@@ -579,15 +690,6 @@ api.post('/pms/issue-key', async (req, res) => {
       [room.id, userId, type, slot_number, raw_value, from, to]
     );
     const credentialId = credResult.insertId;
-
-    const frame = buildCredentialFrame({
-      type,
-      slotNumber: slot_number,
-      rawValue: raw_value,
-      dateFrom: from,
-      dateTo: to,
-    });
-    const payloadHex = toSpacedHex(frame);
 
     const [queueResult] = await conn.query(
       `INSERT INTO pending_queue (room_no, credential_id, action_type, payload_hex, status)
@@ -719,4 +821,22 @@ process.on('unhandledRejection', (err) => {
   logEvent('error', `Unhandled rejection: ${err && err.message ? err.message : err}`);
 });
 
-boot();
+if (require.main === module) {
+  startDiscoveryPruneInterval();
+  boot();
+} else {
+  // Required as a library (conformance tests): expose the codec, don't boot.
+  module.exports = {
+    CONFIG,
+    TUYA_CMD,
+    DPID,
+    DP_TYPE,
+    buildTuyaFrame,
+    buildDpPayload,
+    buildCredentialFrame,
+    buildDeleteFrame,
+    toSpacedHex,
+    normalizeMac,
+    makeMacToken,
+  };
+}
