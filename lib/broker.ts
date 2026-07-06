@@ -8,12 +8,23 @@
 import { DEVICE_MAC } from "./provisioning";
 
 export interface BrokerSettings {
-  /** Broker host / doorlock-server IP. */
+  /**
+   * Doorlock-server host. In the lab the MQTT broker (Mosquitto) and the
+   * OZKEYSERV gateway (Express) run on the same box, so one host with two ports.
+   */
   host: string;
-  /** WebSocket listener port (Mosquitto `listener 9001` / `protocol websockets`). */
+  /** MQTT-over-WebSocket listener port (Mosquitto `listener 9001` / websockets). */
   wsPort: number;
   /** WebSocket path (mqtt.js convention: `/mqtt`). */
   path: string;
+  /**
+   * OZKEYSERV gateway HTTP API port. This is the REST endpoint host
+   * (`http://host:3200/ozkeyserv/api/...`) — control-plane only. The lock's
+   * credential/handshake traffic rides the broker (wsPort), not this port.
+   */
+  gatewayPort: number;
+  /** Gateway REST base path. */
+  gatewayBasePath: string;
   /** This simulated lock's hardware MAC. */
   mac: string;
 }
@@ -22,15 +33,23 @@ export const DEFAULT_BROKER: BrokerSettings = {
   host: "10.1.1.21",
   wsPort: 9001,
   path: "/mqtt",
+  gatewayPort: 3200,
+  gatewayBasePath: "/ozkeyserv/api",
   mac: DEVICE_MAC,
 };
 
 const STORAGE_KEY = "locksim.broker.v1";
 
-/** Build the `ws://host:port/path` URL mqtt.js connects to. */
+/** Build the `ws://host:port/path` URL mqtt.js connects to (broker data path). */
 export function brokerUrl(s: BrokerSettings): string {
   const path = s.path.startsWith("/") ? s.path : `/${s.path}`;
   return `ws://${s.host}:${s.wsPort}${path}`;
+}
+
+/** Build the OZKEYSERV gateway REST base URL (`http://host:3200/ozkeyserv/api`). */
+export function gatewayUrl(s: BrokerSettings): string {
+  const base = s.gatewayBasePath.startsWith("/") ? s.gatewayBasePath : `/${s.gatewayBasePath}`;
+  return `http://${s.host}:${s.gatewayPort}${base}`;
 }
 
 export function loadBrokerSettings(): BrokerSettings {
