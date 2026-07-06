@@ -176,10 +176,48 @@ into the console inject bar (JSON auto-routes to the provisioning parser).
 - Inject preset "Add Temp PIN 482915 (Slot 14)" then enter `482915#`. Warp the
   clock past 2026-12-31 to see the Expired rejection path.
 
-## Known follow-ups / not yet done
-- No automated tests yet (protocol engine in lib/tuya.ts is pure and unit-testable).
-- Fingerprint pass/fail is a deterministic alternation, not a stored enrolment.
-- Incoming heartbeat auto-responds; no MQTT transport modelling beyond the log line.
+## Outstanding work — to close the live Mode A pairing loop (2026-07-06)
+
+LockSim is now a monorepo component: `ozkey/locksim/`. The remaining work to make
+cockpit → LockSim pairing complete **over the real broker** (no copy-paste) is
+almost entirely **server-side** in the sibling `ozkeyserv/server.js`. Authoritative
+contract: `ozkey/docs/ozkey-02.md` (see §8 "LockSim team response") and `ozkey-03.md §10`.
+
+### DONE on the LockSim side (verified: build + node-level MQTT round-trip)
+- gap #1 — "Register Doorlock" publishes `{mac,...}` to `hotel/locks/unpaired/heartbeat`.
+- gap #4 — heartbeat tick publishes `hotel/rooms/<room>/lock/heartbeat`.
+- gap #5 — inbound JSON with `payload_hex` is unwrapped and fed to the Tuya parser.
+- Settings dialog exposes broker (WS :9001) + gateway API (:3200 `/health`) separately.
+- ⚠ Not yet verified: in-browser MQTT connect and the full pairing happy path
+  (needs a real Chrome tab + the two server fixes below).
+
+### OPEN — OZKEYSERV (`ozkeyserv/server.js`), blocks live pairing
+- **gap #2 (the blocker):** `POST /locks/pair` must **publish the ozkey-02 §3.2
+  handshake JSON to `hotel/rooms/<room_no>/lock/command`**. Required: key **`mac`**
+  (not `mac_address`) + `room_no` (+ `server_ip` as a consistency value). LockSim now
+  injects the real MQTT topic before validating, so the embedded `topic` field is
+  **optional**. Today the server sends `mac_address` on the wrong topic → LockSim rejects it.
+- **gap #3:** rewrite the frame builder to emit **DPID 21/23 DP_REPORT (cmd 0x06)**
+  in `payload_hex`, not the custom cmd `0x65`. Conformance: byte-match
+  `SAMPLE_ADD_TEMP_PIN_FRAME` in `locksim/lib/tuya.ts` (slot 14, PIN 482915).
+  DP layouts in ozkey-02 §4 / `locksim/lib/tuya.ts` (`buildTempCredential`).
+- **gap #8 (revoke):** add `POST /pms/revoke-key` → DPID 22/24 delete frame,
+  `action_type = 'revoke-key'`. LockSim already fires + parses these.
+- **fingerprint:** ozkey `credentials.type` allows `fingerprint` but LockSim has no
+  temp-fingerprint DPID (only 21–24 pin/rfid). Server should hold/reject fingerprint
+  issues destined for LockSim benches, or we add a DPID pair.
+
+### Other LockSim follow-ups (non-blocking)
+- No automated tests yet; `lib/tuya.ts` and `lib/provisioning.ts` are pure and unit-testable.
+- server_ip in the handshake is still *required* by `parseOnboardingPayload`; ozkey-03
+  wants it relaxed to a warn-on-mismatch consistency check — not yet done.
+
+### Bench acceptance checklist
+See ozkey-02 §7. Short form: Register → MAC in cockpit UNPAIRED HW → PAIR → LockSim
+`PAIRED - ROOM X` + green ×3 → issue PIN 482915 slot 14 → registry ACTIVE → keypad
+`482915#` unlocks → warp clock past window → EXPIRED + DPID 8 `02` on TX.
 
 ## Git
-Remote: https://github.com/ebizcoAU/locksim.git
+Merged into the OZKEY monorepo: https://github.com/ebizcoAU/ozkey.git (`locksim/`).
+Standalone origin https://github.com/ebizcoAU/locksim.git is being decommissioned —
+do future work in `~/Documents/Dev/ozkey/locksim/`.
