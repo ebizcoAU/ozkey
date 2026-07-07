@@ -30,7 +30,8 @@ import { accessDenied, accessGranted, keyClick, motorWhirr } from "@/lib/audio";
 export type PowerState = "SLEEPING" | "WAKING";
 export type LockState = "LOCKED" | "UNLOCKED";
 
-export const HEARTBEAT_SECONDS = 600; // 10-minute MQTT heartbeat loop
+export const HEARTBEAT_SECONDS = 600; // fallback MQTT heartbeat loop (10 min)
+const HEARTBEAT_MIN_SECONDS = 5; // floor for the configurable wake interval
 export const MASTER_PIN = "123456";
 export const MASTER_CARD_UID = "7B 3F 91 D2";
 const WAKE_HOLD_MS = 1000; // return to sleep after 1s of inactivity
@@ -46,6 +47,15 @@ interface UseLockStateOptions {
   virtualNow: () => number;
   /** Fired when the deep-sleep heartbeat timer elapses (Mode A: publish MQTT). */
   onHeartbeat?: () => void;
+  /** Timer-wake interval in seconds (System Settings; falls back to 10 min). */
+  heartbeatSeconds?: number;
+  /** Fired on every door access transaction (Mode A: push usage log to MQTT). */
+  onAccess?: (evt: AccessEvent) => void;
+}
+
+export interface AccessEvent {
+  result: "granted" | "denied" | "expired";
+  detail: string;
 }
 
 type Timer = ReturnType<typeof setTimeout>;
@@ -54,11 +64,18 @@ type Timer = ReturnType<typeof setTimeout>;
  * The lock motherboard state machine: deep-sleep power management, GPIO wake
  * interrupts, credential validation, clutch motor cycles and heartbeat loop.
  */
-export function useLockState({ transmit, virtualNow, onHeartbeat }: UseLockStateOptions) {
+export function useLockState({
+  transmit,
+  virtualNow,
+  onHeartbeat,
+  heartbeatSeconds,
+  onAccess,
+}: UseLockStateOptions) {
+  const hbSeconds = Math.max(HEARTBEAT_MIN_SECONDS, Math.round(heartbeatSeconds || HEARTBEAT_SECONDS));
   const [powerState, setPowerState] = useState<PowerState>("SLEEPING");
   const [lockState, setLockState] = useState<LockState>("LOCKED");
   const [pinBuffer, setPinBuffer] = useState("");
-  const [countdown, setCountdown] = useState(HEARTBEAT_SECONDS);
+  const [countdown, setCountdown] = useState(hbSeconds);
   const [lowBattery, setLowBattery] = useState(false);
   const [mechanicalKey, setMechanicalKeyState] = useState(false);
   const [motorActive, setMotorActive] = useState(false);
@@ -66,6 +83,8 @@ export function useLockState({ transmit, virtualNow, onHeartbeat }: UseLockState
   const [lastEvent, setLastEvent] = useState("COLD BOOT — ENTERED DEEP SLEEP");
   const [credentials, setCredentials] = useState<StoredCredential[]>([]);
 
+  /** Source of truth for keypad entry; `pinBuffer` state mirrors it for the display. */
+  const pinBufferRef = useRef("");
   const sleepTimer = useRef<Timer | null>(null);
   const relockTimer = useRef<Timer | null>(null);
   const motorTimer = useRef<Timer | null>(null);
@@ -77,6 +96,8 @@ export function useLockState({ transmit, virtualNow, onHeartbeat }: UseLockState
   transmitRef.current = transmit;
   const onHeartbeatRef = useRef(onHeartbeat);
   onHeartbeatRef.current = onHeartbeat;
+  const onAccessRef = useRef(onAccess);
+  onAccessRef.current = onAccess;
   const nowRef = useRef(virtualNow);
   nowRef.current = virtualNow;
 
@@ -121,6 +142,7 @@ export function useLockState({ transmit, virtualNow, onHeartbeat }: UseLockState
   const unlockCycle = useCallback(
     (source: string) => {
       accessGranted();
+      onAccessRef.current?.({ result: "granted", detail: source });
       wake(`ACCESS GRANTED — ${source}`, UNLOCK_HOLD_MS + 1500);
       setLockState("UNLOCKED");
       fireMotor();
@@ -138,6 +160,10 @@ export function useLockState({ transmit, virtualNow, onHeartbeat }: UseLockState
   const deny = useCallback(
     (reason: string, result: AccessResult) => {
       accessDenied();
+      onAccessRef.current?.({
+        result: result === AccessResult.EXPIRED ? "expired" : "denied",
+        detail: reason,
+      });
       flashAlarm();
       setLastEvent(`ACCESS ${result === AccessResult.EXPIRED ? "EXPIRED" : "DENIED"} — ${reason}`);
       transmitRef.current(
@@ -162,12 +188,17 @@ export function useLockState({ transmit, virtualNow, onHeartbeat }: UseLockState
   );
 
   // ---------------------------------------------------------------------
-  // 10-minute heartbeat loop
+  // Timer-wake heartbeat loop (interval set in System Settings)
   // ---------------------------------------------------------------------
   useEffect(() => {
     const iv = setInterval(() => setCountdown((c) => (c > 0 ? c - 1 : c)), 1000);
     return () => clearInterval(iv);
   }, []);
+
+  // Re-arm the countdown when the configured interval changes.
+  useEffect(() => {
+    setCountdown(hbSeconds);
+  }, [hbSeconds]);
 
   useEffect(() => {
     if (countdown !== 0) return;
@@ -175,11 +206,11 @@ export function useLockState({ transmit, virtualNow, onHeartbeat }: UseLockState
     transmitRef.current(
       TuyaCommand.HEARTBEAT,
       [],
-      "MQTT heartbeat ping -> Tuya broker (10-min timer wake)"
+      `MQTT heartbeat ping -> Tuya broker (${hbSeconds}s timer wake)`
     );
     onHeartbeatRef.current?.();
-    setCountdown(HEARTBEAT_SECONDS);
-  }, [countdown, wake]);
+    setCountdown(hbSeconds);
+  }, [countdown, wake, hbSeconds]);
 
   // ---------------------------------------------------------------------
   // Credential validation against the Virtual Master Clock
@@ -221,21 +252,26 @@ export function useLockState({ transmit, virtualNow, onHeartbeat }: UseLockState
       keyClick();
       wake(`KEYPAD INTERRUPT — KEY '${key}'`);
       if (key === "*") {
+        pinBufferRef.current = "";
         setPinBuffer("");
         return;
       }
       if (key === "#") {
-        setPinBuffer((buffer) => {
-          if (buffer.length === 6) {
-            submitPin(buffer);
-          } else {
-            setLastEvent(`PIN REJECTED — NEED 6 DIGITS (GOT ${buffer.length})`);
-          }
-          return "";
-        });
+        // Submit OUTSIDE the state updater — StrictMode runs updaters twice,
+        // which double-fired the TX frame + usage-log publish per attempt.
+        const buffer = pinBufferRef.current;
+        pinBufferRef.current = "";
+        setPinBuffer("");
+        if (buffer.length === 6) {
+          submitPin(buffer);
+        } else {
+          setLastEvent(`PIN REJECTED — NEED 6 DIGITS (GOT ${buffer.length})`);
+        }
         return;
       }
-      setPinBuffer((buffer) => (buffer.length < 6 ? buffer + key : buffer));
+      const next = pinBufferRef.current.length < 6 ? pinBufferRef.current + key : pinBufferRef.current;
+      pinBufferRef.current = next;
+      setPinBuffer(next);
     },
     [wake, submitPin]
   );
@@ -301,6 +337,7 @@ export function useLockState({ transmit, virtualNow, onHeartbeat }: UseLockState
       fireMotor();
       if (engaged) {
         setLockState("UNLOCKED");
+        onAccessRef.current?.({ result: "granted", detail: "MECHANICAL KEY OVERRIDE" });
         wake("MECHANICAL KEY OVERRIDE — CLUTCH FORCED OPEN");
       } else {
         setLockState("LOCKED");

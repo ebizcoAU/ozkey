@@ -67,7 +67,7 @@ export default function LockDisplay({
   return (
     <div className="mx-5 rounded-2xl border border-neutral-800 bg-black/80 px-4 py-3 font-mono">
       {/* System clock + heartbeat countdown */}
-      <div className="flex items-center justify-between text-[10px] text-neutral-500">
+      <div className="flex h-5 items-center justify-between text-[10px] text-neutral-500">
         <span suppressHydrationWarning>
           SYS {new Date(virtualNowMs).toLocaleTimeString("en-GB")}
         </span>
@@ -83,16 +83,21 @@ export default function LockDisplay({
         </div>
       </div>
 
-      {/* Primary status readout */}
+      {/* Primary status readout — single-line rows so the panel height never
+          shifts as the state text changes (e.g. sleep/wake on keypress). */}
       <div className="flex items-center justify-between py-2">
-        <div>
-          <div className={`text-2xl font-bold tracking-widest ${primaryColor}`}>{primary}</div>
-          <div className="mt-1 text-[10px] tracking-wider text-neutral-500">{subline}</div>
+        <div className="min-w-0 flex-1">
+          <div className={`truncate text-2xl font-bold tracking-widest ${primaryColor}`} title={primary}>
+            {primary}
+          </div>
+          <div className="mt-1 truncate text-[10px] tracking-wider text-neutral-500" title={subline}>
+            {subline}
+          </div>
         </div>
         {/* Clutch motor */}
         <svg
           viewBox="0 0 24 24"
-          className={`h-8 w-8 ${motorActive ? "animate-motor text-emerald-400" : "text-neutral-700"}`}
+          className={`h-8 w-8 shrink-0 ${motorActive ? "animate-motor text-emerald-400" : "text-neutral-700"}`}
           fill="currentColor"
           aria-label="Clutch motor"
         >

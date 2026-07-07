@@ -88,6 +88,7 @@ Single file, ~600 lines. Key structures:
 | `hotel/rooms/<room_no>/lock/command` (pairing) | srv→lock | `provision_assign` handshake on pair (gap #2): `{topic, op, mac, room_no, server_ip, server_port, mac_token, issued_by}` — no `payload_hex` key. Duplicated on `hotel/locks/<mac-no-colons-lowercase>/pair/confirm` as a debug side channel |
 | `hotel/rooms/<room_no>/lock/heartbeat` | lock→srv | 30 s heartbeat; triggers `flushQueueForRoom(room_no)` |
 | `hotel/rooms/<room_no>/lock/command` | srv→lock | JSON envelope `{msg_id, room_no, action, credential_id, payload_hex, issued_at, source}` |
+| `hotel/locks/<mac-no-colons-lc>/log` | lock→srv | Door access transactions `{mac, room_no?, result: granted\|denied\|expired, detail, ts}` → stored in `lock_logs` (rooms table resolves MAC→room, payload room ignored), echoed to event feed as level `lock` (added 2026-07-07; first MAC-scoped channel) |
 
 ### REST API (base `http://localhost:3200/ozkeyserv/api`)
 
@@ -99,7 +100,9 @@ Single file, ~600 lines. Key structures:
 | `/locks/pair` | POST | `{room_no, mac_address}`; 409 on double-bind either direction; publishes pair confirm |
 | `/locks/unpair` | POST | `{room_no}` — lab convenience, releases lock |
 | `/pms/issue-key` | POST | `{room_no, guest_name, role?, type, raw_value, slot_number?, date_from?, date_to?}` — transactional: INSERT user + credential + queue row, room→`PendingUpdate`, then opportunistic immediate flush |
+| `/pms/revoke-key` | POST | `{credential_id}` — queues DPID 22/24 delete (`action_type 'revoke-key'`), credential `revoking`→`revoked` on flush; 409 on double revoke or unpaired room, 404 unknown id |
 | `/queue`, `/credentials` | GET | introspection (last 100) |
+| `/locks/log?room_no=&mac=` | GET | door access transactions, newest first (last 100), both filters optional |
 | `/events?after=<id>` | GET | terminal feed |
 | `/sim/unpaired-heartbeat` | POST | `{mac_address}` — fake discovery without broker/hardware |
 | `/sim/room-heartbeat` | POST | `{room_no}` — fake heartbeat, flushes queue |
@@ -108,7 +111,9 @@ Single file, ~600 lines. Key structures:
 
 `mac_address NULL` (gray, unpaired) → pair → `Available` (green) → issue-key →
 `PendingUpdate` (red) → heartbeat flush drains queue → `Occupied` (blue).
-Flush marks queue rows `sent` and credentials `synced`.
+Flush marks queue rows `sent` and credentials `synced` (`revoked` for
+revoke-key jobs). After a drain, the room settles to `Occupied` if it still
+has live (`pending`/`synced`) credentials, else back to `Available`.
 
 ## 5. Cockpit design (`ozkey/pages/index.js`)
 
@@ -117,7 +122,8 @@ Palette: bg `#0F172A`, panels `#1E293B`, edges `#334155`; status colors
 gray `#475569` / green `#22C55E` / blue `#3B82F6` / red `#EF4444`.
 
 - Polls gateway every **2.5 s**: `/health`, `/rooms`, `/locks/unpaired`,
-  `/events?after=lastId` (merged into terminal, ring-capped at 400 lines).
+  `/events?after=lastId` (merged into terminal, ring-capped at 400 lines),
+  `/credentials` (feeds the ROOM KEYS tab).
 - **Layout (after the 2026-07-05 "compact chrome" pass — user wants minimal
   labels / max real estate):**
   1. Slim header row: `OZKEY // LOCK COCKPIT` + GATEWAY/MQTT/SERIAL status dots.
@@ -125,12 +131,18 @@ gray `#475569` / green `#22C55E` / blue `#3B82F6` / red `#EF4444`.
      tag MQTT/SERIAL/SIM) → target-room `<select>` (unpaired rooms only) →
      `PAIR LOCK TO ROOM` button.
   3. Main split: left = 10-column room grid (30 tiles, click gray tile →
-     selects as pair target; click paired tile → selects in injector);
+     selects as pair target; click paired tile → selects in injector; any
+     click also sets `inspectedRoom` for the terminal tabs);
      right = Credential Injector (paired-rooms dropdown, name, type
      pin/rfid/fingerprint, slot, value, datetime-local validity range) +
      Web Serial connect/disconnect button.
-  4. `Lab Terminal` — black scroll box, auto-scroll, color-coded levels,
-     merges server events + local UI actions.
+  4. **Multi-tab terminal (2026-07-07)** — one 260 px black scroll box with a
+     tab bar: `LAB TERMINAL` (full event stream, auto-scroll, color-coded
+     levels, merges server events + local UI actions), `ROOM KEYS · <room>`
+     (issued-credential table for the inspected room — id/type/slot/user/
+     value/validity/sync_status + per-row REVOKE button → `/pms/revoke-key`),
+     `DOORLOCK LOG · <room>` (event stream filtered to lines mentioning the
+     inspected room's MAC, `room <no>`, or `/rooms/<no>/` topics).
 - **Web Serial:** 115200 baud, line-buffered read loop; regex-scans the stream
   for MACs (`XX:XX:...` or 12 bare hex); every new MAC → local chip list +
   `POST /sim/unpaired-heartbeat` so the gateway can pair it. Uses a
@@ -176,8 +188,9 @@ If `EADDRINUSE`: a stray background instance is holding the port —
       rotate `Cableman` if the repo is public.
 - [ ] Terminal height is fixed at 260 px — candidate improvement: flex-fill the
       remaining viewport (user hinted interest).
-- [ ] `credentials` REVOKE flow exists as a frame command (`0x66`) but has no
-      endpoint/UI yet.
+- [x] ~~`credentials` REVOKE flow has no endpoint yet~~ — `POST /pms/revoke-key`
+      added 2026-07-07 (gap #8); REVOKE buttons live in the cockpit's ROOM KEYS
+      terminal tab (same day).
 - [ ] Real lock hardware not yet tested end-to-end (only sim + broker); Web
       Serial path untested against a physical desk module.
 - [ ] `docs/app_creation.md` is the user's own doc — do not overwrite.

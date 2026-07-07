@@ -88,7 +88,7 @@ export default function SettingsDialog({ open, settings, mqtt, onClose, onSave }
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-1 flex items-center justify-between">
-          <h2 className="text-sm font-bold tracking-tight text-neutral-100">Doorlock Server Settings</h2>
+          <h2 className="text-sm font-bold tracking-tight text-neutral-100">System Settings</h2>
           <button
             type="button"
             onClick={onClose}
@@ -120,6 +120,17 @@ export default function SettingsDialog({ open, settings, mqtt, onClose, onSave }
         <div className="grid grid-cols-2 gap-3">
           {field("API Port", draft.gatewayPort, (v) => setDraft({ ...draft, gatewayPort: Number(v) || 0 }), "number", "3200")}
           {field("API Base Path", draft.gatewayBasePath, (v) => setDraft({ ...draft, gatewayBasePath: v }), "text", "/ozkeyserv/api")}
+        </div>
+
+        <div className="mb-1 mt-4 text-[10px] font-bold uppercase tracking-widest text-emerald-400">
+          Lock System (firmware)
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          {field("Timer Wake Interval (s)", draft.heartbeatSeconds, (v) => setDraft({ ...draft, heartbeatSeconds: Number(v) || 0 }), "number", "60")}
+          <div className="flex flex-col justify-end pb-1 text-[10px] leading-snug text-neutral-500">
+            Deep-sleep wake to pull queued MQTT tasks. Touch/keypad also wakes the
+            lock. Minimum 5 s.
+          </div>
         </div>
 
         <div className="mt-3 rounded border border-neutral-800 bg-black/50 px-3 py-2 font-mono text-[11px]">

@@ -27,6 +27,8 @@ export interface BrokerSettings {
   gatewayBasePath: string;
   /** This simulated lock's hardware MAC. */
   mac: string;
+  /** Deep-sleep timer-wake interval in seconds (lock "firmware" heartbeat). */
+  heartbeatSeconds: number;
 }
 
 export const DEFAULT_BROKER: BrokerSettings = {
@@ -36,9 +38,23 @@ export const DEFAULT_BROKER: BrokerSettings = {
   gatewayPort: 3200,
   gatewayBasePath: "/ozkeyserv/api",
   mac: DEVICE_MAC,
+  heartbeatSeconds: 60,
 };
 
 const STORAGE_KEY = "locksim.broker.v1";
+
+/**
+ * Mint an ESP32-style factory MAC: Espressif OUI (A4:CF:12) + 3 random bytes.
+ * Minted once per browser profile, then persisted — the software analogue of
+ * the eFuse-burned base MAC real hardware surrenders at provisioning. Lets
+ * many LockSim copies (one per Chrome profile) coexist on one broker/gateway.
+ */
+export function generateDeviceMac(): string {
+  const bytes = new Uint8Array(3);
+  crypto.getRandomValues(bytes);
+  const tail = Array.from(bytes, (b) => b.toString(16).toUpperCase().padStart(2, "0"));
+  return `A4:CF:12:${tail.join(":")}`;
+}
 
 /** Build the `ws://host:port/path` URL mqtt.js connects to (broker data path). */
 export function brokerUrl(s: BrokerSettings): string {
@@ -56,7 +72,15 @@ export function loadBrokerSettings(): BrokerSettings {
   if (typeof window === "undefined") return DEFAULT_BROKER;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    return raw ? { ...DEFAULT_BROKER, ...(JSON.parse(raw) as Partial<BrokerSettings>) } : DEFAULT_BROKER;
+    const stored = raw ? (JSON.parse(raw) as Partial<BrokerSettings>) : {};
+    const settings = { ...DEFAULT_BROKER, ...stored };
+    // Fresh profile (or pre-MAC settings blob): burn this profile's factory
+    // MAC now so it survives reloads, like eFuse on a real ESP32.
+    if (!stored.mac) {
+      settings.mac = generateDeviceMac();
+      saveBrokerSettings(settings);
+    }
+    return settings;
   } catch {
     return DEFAULT_BROKER;
   }

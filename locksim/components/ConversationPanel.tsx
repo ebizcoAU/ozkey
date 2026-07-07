@@ -61,7 +61,7 @@ export default function ConversationPanel({
           onClick={onOpenSettings}
           className="rounded border border-neutral-700 bg-neutral-800 px-2 py-1 text-[10px] text-neutral-300 hover:bg-neutral-700"
         >
-          ⚙ Server Settings
+          ⚙ System Settings
         </button>
       </div>
 
@@ -76,7 +76,7 @@ export default function ConversationPanel({
         </button>
         <span className="text-[10px] text-neutral-500">
           {!connected
-            ? "link offline — open Server Settings to connect"
+            ? "link offline — open System Settings to connect"
             : registering
               ? "awaiting room assignment from cockpit…"
               : paired

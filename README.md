@@ -16,7 +16,10 @@ ozkey/
 
 The three components speak the contract in [`docs/ozkey-02.md`](docs/ozkey-02.md)
 (server ⇄ lock handshake) and [`docs/ozkey-03.md`](docs/ozkey-03.md) (BLE Phase 0).
-`locksim` was merged in from its standalone repo with history preserved.
+[`docs/ozkey-04.md`](docs/ozkey-04.md) (DRAFT) is the universal commissioning &
+identity contract for the three-market architecture (BANOI / Matter / OZKEY
+commercial). `locksim` was merged in from its standalone repo with history
+preserved.
 
 ## Prerequisites
 

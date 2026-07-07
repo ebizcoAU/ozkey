@@ -288,7 +288,7 @@ reachability `GET /health` probe. **No credential ever flows over :3200.**
   keep sending it (it's the gateway address, used as a consistency value).
 - **#3** — credential frames must be **DPID 21/23 DP_REPORT (cmd 0x06)** inside
   the envelope's `payload_hex`. Byte-match `SAMPLE_ADD_TEMP_PIN_FRAME`.
-- **#8** — add `/pms/revoke-key` → DPID 22/24 delete frame.
+- ~~**#8** — add `/pms/revoke-key` → DPID 22/24 delete frame.~~ Done 2026-07-07.
 
 ### 8.5 Revised gap ownership
 
@@ -301,4 +301,4 @@ reachability `GET /health` probe. **No credential ever flows over :3200.**
 | 5 payload_hex unwrap | **DONE (LockSim)** |
 | 6 fingerprint | **HELD (OZKEYSERV, 2026-07-06)** — `/pms/issue-key` returns 422 for `fingerprint` until a DPID pair exists |
 | 7 poll channel | **DROPPED** — WS subscribe replaces it |
-| 8 revoke endpoint | **OPEN (OZKEYSERV)** — `buildDeleteFrame()` (DPID 22/24) already exists server-side; endpoint still to add |
+| 8 revoke endpoint | **DONE (OZKEYSERV, 2026-07-07)** — `POST /pms/revoke-key {credential_id}` queues a DPID 22/24 delete (`action_type 'revoke-key'`); credential `revoking` → `revoked` on flush; room settles to `Available` when its last live credential is revoked, `Occupied` otherwise. Verified against LockSim's `parseFrame` + live broker round-trip |

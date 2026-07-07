@@ -127,6 +127,18 @@ export default function Cockpit() {
   const termRef = useRef(null);
   const logSeqRef = useRef(0);
 
+  /* -- multi-tab terminal: lab feed | room key list | per-lock log -- */
+  const [termTab, setTermTab] = useState('terminal');
+  const [inspectedRoom, setInspectedRoom] = useState('');
+  const [credentials, setCredentials] = useState([]);
+  const [revokeBusyId, setRevokeBusyId] = useState(null);
+  const [lockLog, setLockLog] = useState([]);
+  /* ref mirror so the long-lived poll loop reads the current selection */
+  const inspectedRoomRef = useRef('');
+  useEffect(() => {
+    inspectedRoomRef.current = inspectedRoom;
+  }, [inspectedRoom]);
+
   const appendLog = useCallback((level, message) => {
     setLogs((prev) => {
       const next = [
@@ -145,11 +157,12 @@ export default function Cockpit() {
 
     async function poll() {
       try {
-        const [healthRes, roomsRes, unpairedRes, eventsRes] = await Promise.all([
+        const [healthRes, roomsRes, unpairedRes, eventsRes, credsRes] = await Promise.all([
           fetch(`${API}/health`).then((r) => r.json()),
           fetch(`${API}/rooms`).then((r) => r.json()),
           fetch(`${API}/locks/unpaired`).then((r) => r.json()),
           fetch(`${API}/events?after=${lastEventIdRef.current}`).then((r) => r.json()),
+          fetch(`${API}/credentials`).then((r) => r.json()),
         ]);
         if (!alive) return;
 
@@ -157,6 +170,15 @@ export default function Cockpit() {
         setMqttUp(!!healthRes.mqtt);
         if (roomsRes.ok) setRooms(roomsRes.rooms);
         if (unpairedRes.ok) setUnpaired(unpairedRes.unpaired);
+        if (credsRes.ok) setCredentials(credsRes.credentials);
+
+        if (inspectedRoomRef.current) {
+          const logRes = await fetch(
+            `${API}/locks/log?room_no=${encodeURIComponent(inspectedRoomRef.current)}`
+          ).then((r) => r.json());
+          if (!alive) return;
+          if (logRes.ok) setLockLog(logRes.log);
+        }
         if (eventsRes.ok && eventsRes.events.length) {
           lastEventIdRef.current = eventsRes.events[eventsRes.events.length - 1].id;
           setLogs((prev) => {
@@ -187,10 +209,25 @@ export default function Cockpit() {
     };
   }, []);
 
-  /* autoscroll the terminal */
+  /* refresh the door transaction log as soon as a room is selected */
   useEffect(() => {
-    if (termRef.current) termRef.current.scrollTop = termRef.current.scrollHeight;
-  }, [logs]);
+    if (!inspectedRoom) {
+      setLockLog([]);
+      return;
+    }
+    fetch(`${API}/locks/log?room_no=${encodeURIComponent(inspectedRoom)}`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.ok) setLockLog(d.log);
+      })
+      .catch(() => {});
+  }, [inspectedRoom]);
+
+  /* autoscroll the terminal (log-style tabs only, not the key table) */
+  useEffect(() => {
+    if (termTab !== 'keys' && termRef.current)
+      termRef.current.scrollTop = termRef.current.scrollHeight;
+  }, [logs, lockLog, termTab]);
 
   /* Web Serial capability check (client only) */
   useEffect(() => {
@@ -359,6 +396,28 @@ export default function Cockpit() {
     }
   };
 
+  const doRevoke = async (cred) => {
+    setRevokeBusyId(cred.id);
+    appendLog('key', `Revoking cred #${cred.id} (${cred.type} slot ${cred.slot_number}) room ${cred.room_no} ...`);
+    try {
+      const res = await fetch(`${API}/pms/revoke-key`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential_id: cred.id }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        appendLog('key', `REVOKE QUEUED — cred #${data.credential_id} DPID delete frame: ${data.payload_hex}`);
+      } else {
+        appendLog('error', `REVOKE REJECTED — ${data.error}`);
+      }
+    } catch (err) {
+      appendLog('error', `Gateway unreachable: ${err.message}`);
+    } finally {
+      setRevokeBusyId(null);
+    }
+  };
+
   /* -------------------------------------------------------------------------
    * Derived data
    * ----------------------------------------------------------------------- */
@@ -387,8 +446,33 @@ export default function Cockpit() {
       key: '#C084FC',
       sync: '#2DD4BF',
       serial: '#FBBF24',
+      lock: '#38BDF8',
       rx: C.dim,
     }[level] || C.termGreen);
+
+  const credStatusColor = (s) =>
+    ({ pending: C.amber, synced: C.green, revoking: C.red, revoked: C.gray }[s] || C.dim);
+
+  /* -- inspected-room views for the ROOM KEYS / DOORLOCK LOG tabs -- */
+  const inspected = rooms.find((r) => r.room_no === inspectedRoom) || null;
+  const roomKeys = credentials.filter((c) => c.room_no === inspectedRoom);
+  // /locks/log returns newest-first; the terminal renders oldest-first.
+  const lockTransactions = [...lockLog].reverse();
+
+  const accessResultColor = (r) =>
+    ({ granted: C.green, denied: C.red, expired: C.amber }[r] || C.dim);
+
+  const renderLogLine = (l) => (
+    <div key={l.key} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+      <span style={{ color: '#334155' }}>
+        {new Date(l.ts).toLocaleTimeString('en-AU', { hour12: false })}{' '}
+      </span>
+      <span style={{ color: levelColor(l.level), fontWeight: 700 }}>
+        [{String(l.level).toUpperCase().padEnd(6, ' ')}]
+      </span>{' '}
+      <span style={{ color: C.termGreen }}>{l.message}</span>
+    </div>
+  );
 
   /* -------------------------------------------------------------------------
    * Render
@@ -567,6 +651,7 @@ export default function Cockpit() {
                     room.mac_address ? `\nMAC ${room.mac_address}` : '\nNo lock bound'
                   }`}
                   onClick={() => {
+                    setInspectedRoom(room.room_no);
                     if (!room.mac_address) setSelectedRoom(room.room_no);
                     else setForm((f) => ({ ...f, room_no: room.room_no }));
                   }}
@@ -737,9 +822,48 @@ export default function Cockpit() {
         </div>
       </div>
 
-      {/* == Lab logging terminal =========================================== */}
+      {/* == Multi-tab lab terminal ========================================= */}
       <div style={{ ...panelStyle, marginTop: 10 }}>
-        <PanelTitle dot={C.termGreen}>Lab Terminal</PanelTitle>
+        <div style={{ display: 'flex', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
+          {[
+            ['terminal', 'Lab Terminal', C.termGreen],
+            ['keys', `Room Keys${inspectedRoom ? ` · ${inspectedRoom}` : ''}`, '#C084FC'],
+            ['lock', `Doorlock Log${inspectedRoom ? ` · ${inspectedRoom}` : ''}`, '#38BDF8'],
+          ].map(([id, label, col]) => (
+            <button
+              key={id}
+              onClick={() => setTermTab(id)}
+              style={{
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: 1.2,
+                textTransform: 'uppercase',
+                padding: '6px 12px',
+                borderRadius: 5,
+                border: `1px solid ${termTab === id ? col : C.panelEdge}`,
+                background: termTab === id ? '#020617' : 'transparent',
+                color: termTab === id ? col : C.dim,
+              }}
+            >
+              <span
+                style={{
+                  width: 7,
+                  height: 7,
+                  borderRadius: '50%',
+                  background: col,
+                  boxShadow: termTab === id ? `0 0 6px ${col}` : 'none',
+                }}
+              />
+              {label}
+            </button>
+          ))}
+        </div>
+
         <div
           ref={termRef}
           style={{
@@ -753,20 +877,144 @@ export default function Cockpit() {
             lineHeight: 1.7,
           }}
         >
-          {logs.length === 0 && (
-            <div style={{ color: C.dim }}>ozkey@lab:~$ waiting for gateway event stream…</div>
+          {/* -- Tab 1: full gateway event stream -- */}
+          {termTab === 'terminal' && (
+            <>
+              {logs.length === 0 && (
+                <div style={{ color: C.dim }}>ozkey@lab:~$ waiting for gateway event stream…</div>
+              )}
+              {logs.map(renderLogLine)}
+            </>
           )}
-          {logs.map((l) => (
-            <div key={l.key} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-              <span style={{ color: '#334155' }}>
-                {new Date(l.ts).toLocaleTimeString('en-AU', { hour12: false })}{' '}
-              </span>
-              <span style={{ color: levelColor(l.level), fontWeight: 700 }}>
-                [{String(l.level).toUpperCase().padEnd(6, ' ')}]
-              </span>{' '}
-              <span style={{ color: C.termGreen }}>{l.message}</span>
-            </div>
-          ))}
+
+          {/* -- Tab 2: issued keys for the inspected room -- */}
+          {termTab === 'keys' &&
+            (!inspectedRoom ? (
+              <div style={{ color: C.dim }}>
+                ozkey@lab:~$ click a room tile in the matrix to list its issued keys…
+              </div>
+            ) : (
+              <>
+                <div style={{ color: C.dim, marginBottom: 8 }}>
+                  room {inspectedRoom}
+                  {inspected?.mac_address
+                    ? ` · lock ${inspected.mac_address}`
+                    : ' · no lock bound'}{' '}
+                  · {roomKeys.length} credential{roomKeys.length === 1 ? '' : 's'}
+                </div>
+                {roomKeys.length === 0 && (
+                  <div style={{ color: C.dim }}>— no keys issued to this room yet —</div>
+                )}
+                {roomKeys.length > 0 && (
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                    <thead>
+                      <tr>
+                        {['ID', 'TYPE', 'SLOT', 'USER', 'VALUE', 'VALID (FROM → TO)', 'STATUS', ''].map(
+                          (h) => (
+                            <th
+                              key={h}
+                              style={{
+                                textAlign: 'left',
+                                color: C.dim,
+                                fontWeight: 700,
+                                letterSpacing: 1,
+                                fontSize: 9,
+                                padding: '2px 8px 6px 0',
+                                borderBottom: `1px solid ${C.panelEdge}`,
+                              }}
+                            >
+                              {h}
+                            </th>
+                          )
+                        )}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {roomKeys.map((c) => (
+                        <tr key={c.id}>
+                          <td style={{ padding: '5px 8px 5px 0', color: C.dim }}>#{c.id}</td>
+                          <td style={{ padding: '5px 8px 5px 0', color: '#C084FC', fontWeight: 700 }}>
+                            {String(c.type).toUpperCase()}
+                          </td>
+                          <td style={{ padding: '5px 8px 5px 0' }}>{c.slot_number}</td>
+                          <td style={{ padding: '5px 8px 5px 0' }}>{c.user_name || '—'}</td>
+                          <td style={{ padding: '5px 8px 5px 0', color: C.termGreen }}>{c.raw_value}</td>
+                          <td style={{ padding: '5px 8px 5px 0', color: C.dim }}>
+                            {String(c.date_from || '').slice(0, 16)} → {String(c.date_to || '').slice(0, 16)}
+                          </td>
+                          <td
+                            style={{
+                              padding: '5px 8px 5px 0',
+                              color: credStatusColor(c.sync_status),
+                              fontWeight: 700,
+                            }}
+                          >
+                            {String(c.sync_status).toUpperCase()}
+                          </td>
+                          <td style={{ padding: '5px 0' }}>
+                            {['pending', 'synced'].includes(c.sync_status) && (
+                              <button
+                                onClick={() => doRevoke(c)}
+                                disabled={revokeBusyId === c.id}
+                                style={{
+                                  cursor: revokeBusyId === c.id ? 'wait' : 'pointer',
+                                  fontFamily: 'inherit',
+                                  fontSize: 9,
+                                  fontWeight: 800,
+                                  letterSpacing: 1,
+                                  padding: '3px 8px',
+                                  borderRadius: 4,
+                                  border: `1px solid ${C.red}`,
+                                  background: 'transparent',
+                                  color: C.red,
+                                }}
+                              >
+                                {revokeBusyId === c.id ? '…' : 'REVOKE'}
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </>
+            ))}
+
+          {/* -- Tab 3: door access transactions pushed by the lock -- */}
+          {termTab === 'lock' &&
+            (!inspectedRoom ? (
+              <div style={{ color: C.dim }}>
+                ozkey@lab:~$ click a room tile in the matrix to tail its doorlock log…
+              </div>
+            ) : (
+              <>
+                <div style={{ color: C.dim, marginBottom: 8 }}>
+                  lock {inspected?.mac_address || '— unbound —'} · room {inspectedRoom} ·{' '}
+                  {lockTransactions.length} door transaction
+                  {lockTransactions.length === 1 ? '' : 's'} (latest 100)
+                </div>
+                {lockTransactions.length === 0 && (
+                  <div style={{ color: C.dim }}>
+                    — no door transactions recorded for this lock yet —
+                  </div>
+                )}
+                {lockTransactions.map((t) => (
+                  <div key={t.id} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                    <span style={{ color: '#334155' }}>
+                      {new Date(t.lock_ts || t.created_at).toLocaleTimeString('en-AU', {
+                        hour12: false,
+                      })}{' '}
+                    </span>
+                    <span style={{ color: accessResultColor(t.result), fontWeight: 700 }}>
+                      [{String(t.result).toUpperCase().padEnd(7, ' ')}]
+                    </span>{' '}
+                    <span style={{ color: C.termGreen }}>{t.detail || '—'}</span>
+                    <span style={{ color: C.dim }}> · {t.mac}</span>
+                  </div>
+                ))}
+              </>
+            ))}
         </div>
       </div>
 

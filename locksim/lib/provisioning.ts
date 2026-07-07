@@ -25,6 +25,11 @@ export function heartbeatTopic(roomNo: string): string {
   return `hotel/rooms/${roomNo}/lock/heartbeat`;
 }
 
+/** Usage-log channel: door access transactions, MAC-scoped (lock → server). */
+export function lockLogTopic(mac: string): string {
+  return `hotel/locks/${mac.replace(/:/g, "").toLowerCase()}/log`;
+}
+
 const STORAGE_KEY = "locksim.provisioning.v1";
 
 /** Network identity written to flash once the lock is paired to a room. */

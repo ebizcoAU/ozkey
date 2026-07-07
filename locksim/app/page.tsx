@@ -15,6 +15,7 @@ import {
   ONBOARDING_TOPIC,
   buildBroadcastPayload,
   heartbeatTopic,
+  lockLogTopic,
   topicMatches,
 } from "@/lib/provisioning";
 import {
@@ -136,10 +137,33 @@ export default function Page() {
     }
   }, [mqtt, pushConversation]);
 
+  // Push door access transactions up the MAC-scoped usage-log channel so the
+  // gateway can persist them (cockpit DOORLOCK LOG tab).
+  const publishAccessLog = useCallback(
+    (evt: { result: "granted" | "denied" | "expired"; detail: string }) => {
+      const p = provisioningRef.current;
+      const mac = (p?.mac || settings.mac).toUpperCase();
+      const topic = lockLogTopic(mac);
+      const payload = JSON.stringify({
+        mac,
+        room_no: p?.assigned_room_no,
+        result: evt.result,
+        detail: evt.detail,
+        ts: Date.now(),
+      });
+      if (mqtt.publish(topic, payload)) {
+        pushConversation("up", topic, `Access ${evt.result.toUpperCase()} — ${evt.detail}`, payload);
+      }
+    },
+    [mqtt, pushConversation, settings.mac]
+  );
+
   const lock = useLockState({
     transmit: protocol.transmit,
     virtualNow: clock.now,
     onHeartbeat: publishHeartbeat,
+    heartbeatSeconds: settings.heartbeatSeconds,
+    onAccess: publishAccessLog,
   });
   lockEventRef.current = lock.pushEvent;
 
@@ -209,7 +233,7 @@ export default function Page() {
     const ok = mqtt.publish(ANNOUNCE_TOPIC, payload);
     pushConversation("up", ANNOUNCE_TOPIC, `Announce MAC ${settings.mac}`, payload, !ok);
     if (ok) provisioning.beginRegistration();
-    else lock.pushEvent("REGISTER FAILED — broker link offline (open Server Settings)");
+    else lock.pushEvent("REGISTER FAILED — broker link offline (open System Settings)");
   }, [settings.mac, mqtt, pushConversation, provisioning, lock]);
 
   const handleModeChange = useCallback(

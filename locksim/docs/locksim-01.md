@@ -91,8 +91,12 @@ Checksum = sum of all preceding bytes % 256.
 - **Mechanical key slider**: forces clutch open, holds bolt against auto-relock.
 - **Power management**: default DEEP SLEEP (7µA, radio off). Every physical input
   is a GPIO wake interrupt -> WAKING (45mA) -> back to sleep after 1s idle.
-- **10-min heartbeat**: countdown from 600s; at 0 bursts WAKING for 200ms, fires
-  a HEARTBEAT (MQTT ping) TX frame, resets.
+- **Timer-wake heartbeat** (configurable 2026-07-07): countdown from
+  `heartbeatSeconds` (System Settings dialog, default 60 s, floor 5 s,
+  persisted per-profile in `locksim.broker.v1`; falls back to 600 s if unset);
+  at 0 bursts WAKING for 200ms, fires a HEARTBEAT (MQTT ping) TX frame, resets.
+  The "⚙ System Settings" dialog (ex "Server Settings") also holds broker,
+  gateway and Device MAC config.
 - **Incoming remote unlock**: DP_REPORT / DP 1 BOOL value 1 -> UNLOCKED 5s +
   clutch motor animation -> auto-relock.
 - **Time-restricted entry**: temp PIN/RFID checked against Virtual Master Clock.
@@ -130,9 +134,16 @@ Checksum = sum of all preceding bytes % 256.
   - "BLE Provisioning Mode" switch inside the lock face. On → device goes
     UNPROVISIONED (any prior pairing wiped), BLE LED flashes blue, main display
     reads "UNPROVISIONED".
-  - "Broadcast Hardware MAC ID" button advertises MAC `AA:BB:CC:11:22:33` up to
+  - "Broadcast Hardware MAC ID" button advertises this device's MAC up to
     the OZKEYSERV/ broker (`buildBroadcastPayload`) — logged on TX, and in Mode B
     written out the USB-UART bridge as newline-terminated bytes via Web Serial.
+  - **Factory MAC (2026-07-07):** each fresh browser profile mints its own MAC
+    on first load — Espressif OUI `A4:CF:12` + 3 random bytes
+    (`generateDeviceMac()` in `lib/broker.ts`), persisted in
+    `locksim.broker.v1` like eFuse. Run one LockSim per Chrome profile to
+    simulate a fleet of locks; profiles that stored a MAC before this change
+    keep it (editable in Settings). The legacy `DEVICE_MAC`
+    `AA:BB:CC:11:22:33` remains only as the SSR/default placeholder.
   - Handshake capture: the inbound stream parser accepts JSON on the MQTT topic
     filter `hotel/rooms/+/lock/command`. A payload whose `mac` matches this device
     and that carries a `room_no` (+ `server_ip`) is validated by
@@ -204,12 +215,15 @@ contract: `ozkey/docs/ozkey-02.md` (see §8 "LockSim team response") and `ozkey-
   validated digits-only, RFID even-length hex. DPID 22/24 delete builder
   (`buildDeleteFrame`) is already in place for #8.
 - **fingerprint ✅ (held)** — `/pms/issue-key` returns 422 for `fingerprint`.
+- **gap #8 ✅ (2026-07-07)** — `POST /pms/revoke-key {credential_id}` queues a
+  DPID 22/24 delete frame (`action_type = 'revoke-key'`), marks the credential
+  `revoking` → `revoked` on flush, and settles the room back to `Available`
+  when its last live credential is gone. Frames verified against LockSim's
+  `parseFrame`/`parseSlotPayload` ("Delete PIN, Slot: N"). 409 on double
+  revoke / unpaired room, 404 on unknown credential.
 
 ### OPEN — OZKEYSERV (`ozkeyserv/server.js`)
-- **gap #8 (revoke):** add `POST /pms/revoke-key` → DPID 22/24 delete frame,
-  `action_type = 'revoke-key'` (frame builder exists; endpoint + queue wiring
-  still to add). LockSim already fires + parses these.
-- **In-browser happy path:** with #2/#3 landed, the blocker list is empty — run
+- **In-browser happy path:** with #2/#3/#8 landed, the blocker list is empty — run
   the real Chrome acceptance pass (Register → cockpit PAIR → PIN 482915 → unlock).
 
 ### Other LockSim follow-ups (non-blocking)

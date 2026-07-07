@@ -54,6 +54,7 @@ const CONFIG = {
   MQTT_URL: 'mqtt://10.1.1.21:1883',
   TOPIC_UNPAIRED_HEARTBEAT: 'hotel/locks/unpaired/heartbeat',
   TOPIC_ROOM_HEARTBEAT: 'hotel/rooms/+/lock/heartbeat',
+  TOPIC_LOCK_LOG: 'hotel/locks/+/log',
   topicRoomCommand: (roomNo) => `hotel/rooms/${roomNo}/lock/command`,
   topicPairConfirm: (mac) => `hotel/locks/${mac.replace(/:/g, '').toLowerCase()}/pair/confirm`,
   UNPAIRED_TTL_MS: 120_000, // forget an unpaired MAC if silent for 2 minutes
@@ -283,6 +284,18 @@ async function initDatabase() {
       status VARCHAR(50) DEFAULT 'queued'
     ) ENGINE=InnoDB`);
 
+  // Door access transactions pushed by locks on hotel/locks/<mac>/log.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lock_logs (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      mac VARCHAR(17),
+      room_no VARCHAR(50) NULL,
+      result VARCHAR(20),
+      detail VARCHAR(255),
+      lock_ts VARCHAR(50),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB`);
+
   // 4. Auto-seed: Block A, floors 1-3, 10 rooms/floor => 101..110 ... 301..310.
   const [[{ cnt }]] = await pool.query('SELECT COUNT(*) AS cnt FROM rooms');
   if (cnt === 0) {
@@ -346,7 +359,9 @@ async function flushQueueForRoom(roomNo) {
 
     await pool.query("UPDATE pending_queue SET status = 'sent' WHERE id = ?", [job.id]);
     if (job.credential_id) {
-      await pool.query("UPDATE credentials SET sync_status = 'synced' WHERE id = ?", [
+      const newStatus = job.action_type === 'revoke-key' ? 'revoked' : 'synced';
+      await pool.query('UPDATE credentials SET sync_status = ? WHERE id = ?', [
+        newStatus,
         job.credential_id,
       ]);
     }
@@ -356,15 +371,22 @@ async function flushQueueForRoom(roomNo) {
     );
   }
 
-  // Everything drained -> room settles into Occupied (live credentials on lock).
+  // Everything drained -> room settles into Occupied (live credentials on
+  // lock) or back to Available if revokes wiped the last one.
   const [[{ remaining }]] = await pool.query(
     "SELECT COUNT(*) AS remaining FROM pending_queue WHERE room_no = ? AND status = 'queued'",
     [roomNo]
   );
   if (remaining === 0) {
-    await pool.query(
-      "UPDATE rooms SET status = 'Occupied' WHERE room_no = ? AND status = 'PendingUpdate'",
+    const [[{ live }]] = await pool.query(
+      `SELECT COUNT(*) AS live FROM credentials c
+         JOIN rooms r ON r.id = c.room_id
+        WHERE r.room_no = ? AND c.sync_status IN ('pending', 'synced')`,
       [roomNo]
+    );
+    await pool.query(
+      "UPDATE rooms SET status = ? WHERE room_no = ? AND status = 'PendingUpdate'",
+      [live > 0 ? 'Occupied' : 'Available', roomNo]
     );
   }
   return queued.length;
@@ -380,14 +402,14 @@ function initMqtt() {
   mqttClient.on('connect', () => {
     logEvent('info', `MQTT online — TalkPOS broker ${CONFIG.MQTT_URL}`);
     mqttClient.subscribe(
-      [CONFIG.TOPIC_UNPAIRED_HEARTBEAT, CONFIG.TOPIC_ROOM_HEARTBEAT],
+      [CONFIG.TOPIC_UNPAIRED_HEARTBEAT, CONFIG.TOPIC_ROOM_HEARTBEAT, CONFIG.TOPIC_LOCK_LOG],
       { qos: 1 },
       (err) => {
         if (err) logEvent('error', `MQTT subscribe failed: ${err.message}`);
         else
           logEvent(
             'info',
-            `Subscribed: ${CONFIG.TOPIC_UNPAIRED_HEARTBEAT} + ${CONFIG.TOPIC_ROOM_HEARTBEAT}`
+            `Subscribed: ${CONFIG.TOPIC_UNPAIRED_HEARTBEAT} + ${CONFIG.TOPIC_ROOM_HEARTBEAT} + ${CONFIG.TOPIC_LOCK_LOG}`
           );
       }
     );
@@ -428,6 +450,41 @@ function initMqtt() {
           fw,
         });
         if (!existing) logEvent('pair', `Discovered unprovisioned lock ${mac} on MQTT`);
+        return;
+      }
+
+      /* -- Channel 3: door access transactions pushed by the lock --------- */
+      const logMatch = topic.match(/^hotel\/locks\/([^/]+)\/log$/);
+      if (logMatch) {
+        let obj = {};
+        try {
+          obj = JSON.parse(payload);
+        } catch (_) {
+          /* tolerate non-JSON; fields default below */
+        }
+        const mac = normalizeMac(obj.mac || logMatch[1]);
+        if (!mac) {
+          logEvent('warn', `Lock log with unusable MAC on ${topic}: "${payload.slice(0, 60)}"`);
+          return;
+        }
+        const result = String(obj.result || 'unknown').slice(0, 20);
+        const detail = String(obj.detail || '').slice(0, 255);
+        const lockTs = obj.ts ? new Date(obj.ts).toISOString() : new Date().toISOString();
+        // The rooms table is authoritative for MAC -> room, not the payload.
+        const [[room]] = await pool.query('SELECT room_no FROM rooms WHERE mac_address = ?', [
+          mac,
+        ]);
+        const roomNo = room ? room.room_no : null;
+        await pool.query(
+          'INSERT INTO lock_logs (mac, room_no, result, detail, lock_ts) VALUES (?, ?, ?, ?, ?)',
+          [mac, roomNo, result, detail, lockTs]
+        );
+        logEvent(
+          'lock',
+          `Door ${result.toUpperCase()} — ${detail || 'no detail'} @ ${
+            roomNo ? `room ${roomNo}` : 'unpaired lock'
+          } (${mac})`
+        );
         return;
       }
 
@@ -730,12 +787,136 @@ api.post('/pms/issue-key', async (req, res) => {
   }
 });
 
+/* -- PMS bypass: credential revocation (gap #8, ozkey-02 §8.5) -------------- */
+api.post('/pms/revoke-key', async (req, res) => {
+  if (!guardDb(res)) return;
+  const conn = await pool.getConnection();
+  try {
+    const { credential_id } = req.body || {};
+    if (!credential_id) {
+      return res.status(400).json({ ok: false, error: 'credential_id is required' });
+    }
+
+    const [[cred]] = await conn.query(
+      `SELECT c.*, r.room_no, r.mac_address, u.name AS user_name
+         FROM credentials c
+         JOIN rooms r ON r.id = c.room_id
+         LEFT JOIN users u ON u.id = c.user_id
+        WHERE c.id = ?`,
+      [credential_id]
+    );
+    if (!cred) {
+      return res.status(404).json({ ok: false, error: `Credential #${credential_id} not found` });
+    }
+    if (cred.sync_status === 'revoked') {
+      return res
+        .status(409)
+        .json({ ok: false, error: `Credential #${credential_id} is already revoked` });
+    }
+    const [[dupe]] = await conn.query(
+      `SELECT id FROM pending_queue
+        WHERE credential_id = ? AND action_type = 'revoke-key' AND status = 'queued'`,
+      [credential_id]
+    );
+    if (dupe) {
+      return res.status(409).json({
+        ok: false,
+        error: `Credential #${credential_id} already has revoke queue #${dupe.id} pending`,
+      });
+    }
+    if (!cred.mac_address) {
+      return res.status(409).json({
+        ok: false,
+        error: `Room ${cred.room_no} has no paired lock — nothing to revoke against`,
+      });
+    }
+
+    let frame;
+    try {
+      frame = buildDeleteFrame({ type: cred.type, slotNumber: cred.slot_number });
+    } catch (err) {
+      // fingerprint rows (pre-hold legacy) have no delete DPID — same 422 as issue.
+      return res.status(422).json({ ok: false, error: err.message });
+    }
+    const payloadHex = toSpacedHex(frame);
+
+    await conn.beginTransaction();
+
+    const [queueResult] = await conn.query(
+      `INSERT INTO pending_queue (room_no, credential_id, action_type, payload_hex, status)
+       VALUES (?, ?, 'revoke-key', ?, 'queued')`,
+      [cred.room_no, credential_id, payloadHex]
+    );
+    await conn.query("UPDATE credentials SET sync_status = 'revoking' WHERE id = ?", [
+      credential_id,
+    ]);
+    await conn.query("UPDATE rooms SET status = 'PendingUpdate' WHERE room_no = ?", [
+      cred.room_no,
+    ]);
+    await conn.commit();
+
+    logEvent(
+      'key',
+      `Revoked ${cred.type.toUpperCase()} for "${cred.user_name || 'unknown'}" -> room ${cred.room_no} ` +
+        `slot ${cred.slot_number} (cred #${credential_id}, queue #${queueResult.insertId}) — awaiting heartbeat`
+    );
+
+    // Opportunistic push: if the lock is chatty right now, don't wait 30s.
+    flushQueueForRoom(cred.room_no).catch(() => {});
+
+    res.json({
+      ok: true,
+      credential_id: Number(credential_id),
+      queue_id: queueResult.insertId,
+      room_no: cred.room_no,
+      slot_number: cred.slot_number,
+      type: cred.type,
+      payload_hex: payloadHex,
+      sync_status: 'revoking',
+    });
+  } catch (err) {
+    try {
+      await conn.rollback();
+    } catch (_) {
+      /* connection already dead */
+    }
+    res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
 /* -- Queue + credentials introspection -------------------------------------- */
 api.get('/queue', async (req, res) => {
   if (!guardDb(res)) return;
   try {
     const [rows] = await pool.query('SELECT * FROM pending_queue ORDER BY id DESC LIMIT 100');
     res.json({ ok: true, queue: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+api.get('/locks/log', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const { room_no, mac } = req.query;
+    const where = [];
+    const params = [];
+    if (room_no) {
+      where.push('room_no = ?');
+      params.push(room_no);
+    }
+    if (mac) {
+      where.push('mac = ?');
+      params.push(mac);
+    }
+    const [rows] = await pool.query(
+      `SELECT * FROM lock_logs ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+        ORDER BY id DESC LIMIT 100`,
+      params
+    );
+    res.json({ ok: true, log: rows });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
