@@ -1,5 +1,5 @@
 {
-  "name": "ozkey-ui",
+  "name": "ozkey",
   "version": "1.0.0",
   "description": "OZKEY Core Cockpit - 100-Room Matrix, Pairing & Credential Injection",
   "scripts": {

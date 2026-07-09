@@ -137,7 +137,24 @@ Checksum = sum of all preceding bytes % 256.
   - "Broadcast Hardware MAC ID" button advertises this device's MAC up to
     the OZKEYSERV/ broker (`buildBroadcastPayload`) — logged on TX, and in Mode B
     written out the USB-UART bridge as newline-terminated bytes via Web Serial.
-  - **Factory MAC (2026-07-07):** each fresh browser profile mints its own MAC
+  - **Mode C · OZLOCK (2026-07-07):** third segment on the pipeline toggle —
+  personal-cloud enrollment per ozkey-05. Get a provision payload from the
+  OZLOCK app (:4300 ADD DOORLOCK), paste it into SERVER PUSH; LockSim
+  subscribes its `ozkey/<site>/locks/<device_id>/command` topic, publishes the
+  enroll message, and on `enrollment_ack` persists `{mode:'ozlock', site_id,
+  device_id, label}` in `locksim.provisioning.v1`. Heartbeats + door logs then
+  ride the device-scoped topics; command envelopes (`payload_hex`) reuse the
+  same Tuya parser. Selecting Mode A wipes the enrollment (back to room
+  pairing).
+- **OZLOCK identity (trust-model v2, XF-42 §13):** the OZLOCK app self-generates
+  its `app_id` and **grants the lock a random `device_id`** at pairing — both
+  ride in the provision payload (`parseOzlockProvision`), and the lock enrolls
+  under the granted `device_id` (falls back to `ozk-<mac hex>` only if the
+  payload omits it). System Settings gains a read-only **OZLOCK Personal Cloud**
+  section showing device_id / paired app_id / site / name once bonded — the lock
+  does not self-configure these. OZLOCK authenticates neither side; app↔lock AES
+  envelope is deferred to ozkey-06.
+- **Factory MAC (2026-07-07):** each fresh browser profile mints its own MAC
     on first load — Espressif OUI `A4:CF:12` + 3 random bytes
     (`generateDeviceMac()` in `lib/broker.ts`), persisted in
     `locksim.broker.v1` like eFuse. Run one LockSim per Chrome profile to

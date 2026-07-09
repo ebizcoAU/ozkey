@@ -57,6 +57,39 @@ export function useProvisioning({ mac, logInbound, onEvent }: UseProvisioningOpt
   }, []);
 
   /**
+   * Adopt a provisioning record produced outside the room-handshake parser
+   * (OZLOCK enrollment ack, ozkey-04 §6). Persists, confirms, banners.
+   */
+  const adoptProvisioning = useCallback((record: NetworkProvisioning, banner: string) => {
+    saveProvisioning(record);
+    setProvisioning(record);
+    setRegistering(false);
+    setConfirmPulse((n) => n + 1);
+    setPairedBanner(banner);
+    onEventRef.current(`NETWORK REGISTERED — ${banner}`);
+    if (bannerTimer.current) clearTimeout(bannerTimer.current);
+    bannerTimer.current = setTimeout(() => setPairedBanner(null), PAIRED_BANNER_MS);
+  }, []);
+
+  /** Enter the awaiting-enrollment state (OZLOCK mode; wipes prior pairing). */
+  const beginEnrollment = useCallback((deviceId: string, siteId: string) => {
+    clearProvisioning();
+    setProvisioning(null);
+    setPairedBanner(null);
+    setRegistering(true);
+    onEventRef.current(`ENROLLING — ${deviceId} → OZLOCK site '${siteId}', awaiting ack`);
+  }, []);
+
+  /** Wipe provisioning without entering a registering state (mode switch). */
+  const resetProvisioning = useCallback((reason: string) => {
+    clearProvisioning();
+    setProvisioning(null);
+    setPairedBanner(null);
+    setRegistering(false);
+    onEventRef.current(reason);
+  }, []);
+
+  /**
    * Capture an inbound room-assignment handshake. A structurally valid payload
    * for this device persists the network variables, stops the registering
    * state, and fires the green registration confirmation.
@@ -107,6 +140,9 @@ export function useProvisioning({ mac, logInbound, onEvent }: UseProvisioningOpt
     confirmPulse,
     linkFlashing: registering && pairedBanner === null,
     beginRegistration,
+    beginEnrollment,
+    adoptProvisioning,
+    resetProvisioning,
     handleMqttPayload,
   };
 }

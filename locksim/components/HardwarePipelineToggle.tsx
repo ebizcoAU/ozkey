@@ -7,6 +7,9 @@ interface HardwarePipelineToggleProps {
   mode: HardwareMode;
   onModeChange: (mode: HardwareMode) => void;
   serial: SerialLinkApi;
+  /** Mode C: this lock is enrolled (or enrolling) with OZLOCK personal cloud. */
+  ozlockActive: boolean;
+  onSelectOzlock: () => void;
 }
 
 const STATUS_TEXT: Record<SerialStatus, string> = {
@@ -26,16 +29,20 @@ const STATUS_DOT: Record<SerialStatus, string> = {
 };
 
 /**
- * Master Hardware Pipeline Selection toggle — switches the whole simulator
- * backend between Mode A (pure software emulation) and Mode B (physical wire).
+ * Master Pipeline Selection toggle — Mode A (software emulation, OZKEYSERV
+ * room pairing), Mode B (physical ESP32 wire), Mode C (software emulation,
+ * OZLOCK personal-cloud enrollment, ozkey-05).
  * Rendered as a compact single-row segmented control to conserve screen estate.
  */
 export default function HardwarePipelineToggle({
   mode,
   onModeChange,
   serial,
+  ozlockActive,
+  onSelectOzlock,
 }: HardwarePipelineToggleProps) {
   const hardware = mode === "HARDWARE";
+  const activeSeg: "A" | "B" | "C" = hardware ? "B" : ozlockActive ? "C" : "A";
 
   const segment = (active: boolean, onClick: () => void, tag: string, title: string, activeCls: string) => (
     <button
@@ -62,18 +69,25 @@ export default function HardwarePipelineToggle({
 
       <div className="flex items-center gap-1 rounded-lg border border-neutral-800 bg-black/40 p-0.5">
         {segment(
-          !hardware,
+          activeSeg === "A",
           () => onModeChange("SOFTWARE"),
-          "Mode A · Software",
-          "Pure Software Emulation (No ESP32): the app simulates the Zhongshan lock motherboard and the missing Wi-Fi chip; frames loop into the internal parser.",
+          "Mode A · OZKEY",
+          "Pure Software Emulation, hotel/commercial pairing: OZKEYSERV assigns this lock to a room; frames ride MQTT-over-WS.",
           "bg-emerald-950/60 text-emerald-300"
         )}
         {segment(
-          hardware,
+          activeSeg === "B",
           () => onModeChange("HARDWARE"),
           "Mode B · ESP32 Wire",
           "Physical Wire Integration (ESP32-C6): Web Serial binds a 3.3V USB-UART COM port; keypad/peripheral frames stream out as a Uint8Array to the desk-side core.",
           "bg-sky-950/60 text-sky-300"
+        )}
+        {segment(
+          activeSeg === "C",
+          onSelectOzlock,
+          "Mode C · OZLOCK",
+          "Personal-cloud enrollment (ozkey-05): the OZLOCK app grants this lock an identity + pairing; device-scoped topics, no rooms. Enroll by pasting the app's provision payload into SERVER PUSH.",
+          "bg-teal-950/60 text-teal-300"
         )}
       </div>
 

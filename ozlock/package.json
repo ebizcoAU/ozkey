@@ -1,0 +1,15 @@
+{
+  "name": "ozlock",
+  "version": "0.1.0",
+  "description": "OZLOCK Personal Keyring - BANOI stand-in: enroll doorlocks, grant keys, watch door transactions",
+  "scripts": {
+    "dev": "next dev -p 4300",
+    "build": "next build",
+    "start": "next start -p 4300"
+  },
+  "dependencies": {
+    "next": "^14.2.15",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

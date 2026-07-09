@@ -10,16 +10,23 @@ ozkey/
 │   └── server.js
 ├── ozkey/           Next.js dark-mode cockpit (Web Serial + pairing)   (port 3300)
 │   └── pages/index.js
+├── ozlockserv/      OZLOCK rendezvous directory — market-A personal cloud, lab
+│   └── server.js    deployment (port 4200, MySQL db `ozlock`, ozkey-05)
+├── ozlock/          OZLOCK personal keyring — BANOI stand-in front end (port 4300)
+│   └── pages/index.js
 └── locksim/            Next.js smart-lock simulator (Tuya MCU + MQTT-over-WS)  (port 3100)
-    └── app/page.tsx
+    └── app/page.tsx     Mode A = OZKEY room pairing · Mode C = OZLOCK enrollment
 ```
 
 The three components speak the contract in [`docs/ozkey-02.md`](docs/ozkey-02.md)
 (server ⇄ lock handshake) and [`docs/ozkey-03.md`](docs/ozkey-03.md) (BLE Phase 0).
 [`docs/ozkey-04.md`](docs/ozkey-04.md) (DRAFT) is the universal commissioning &
 identity contract for the three-market architecture (BANOI / Matter / OZKEY
-commercial). `locksim` was merged in from its standalone repo with history
-preserved.
+commercial). [`docs/ozkey-05.md`](docs/ozkey-05.md) designs the OZLOCK cloud
+rendezvous (market A) — implemented as `ozlockserv/` + `ozlock/` + LockSim
+Mode C. [`docs/ozkey-06.md`](docs/ozkey-06.md) (DRAFT) freezes the AES-256-GCM
+end-to-end envelope (with byte vectors) and the BLE transport half.
+`locksim` was merged in from its standalone repo with history preserved.
 
 ## Prerequisites
 

@@ -30,9 +30,74 @@ export function lockLogTopic(mac: string): string {
   return `hotel/locks/${mac.replace(/:/g, "").toLowerCase()}/log`;
 }
 
+/* ---------------------------------------------------------------------------
+ * OZLOCK personal-cloud mode (ozkey-04 §5/§6, ozkey-05) — device-scoped topics
+ * ------------------------------------------------------------------------- */
+
+/** Lab interim device id (real hardware derives this from a keypair, ozkey-04 §3). */
+export function deviceIdFromMac(mac: string): string {
+  return `ozk-${mac.replace(/:/g, "").toLowerCase()}`;
+}
+
+/** ozkey-04 §9 topic scheme: ozkey/<site>/locks/<device_id>/<kind>. */
+export function ozlockTopic(
+  siteId: string,
+  deviceId: string,
+  kind: "enroll" | "heartbeat" | "log" | "command"
+): string {
+  return `ozkey/${siteId}/locks/${deviceId}/${kind}`;
+}
+
+/** The ozkey-04 §5 provision payload BANOI writes over BLE (lab: pasted/MQTT). */
+export interface OzlockProvision {
+  siteId: string;
+  enrollmentToken: string;
+  /** device_id granted by the app at the pairing ceremony (XF-42 §13.1). */
+  deviceId: string;
+  /** the paired app's self-generated identity (unauthenticated by OZLOCK). */
+  appId: string;
+  serverIp: string;
+  serverPort: number;
+  heartbeatS: number | null;
+}
+
+export type OzlockProvisionResult = { ok: true } & OzlockProvision | { ok: false; error: string };
+
+export function parseOzlockProvision(
+  obj: Record<string, unknown>,
+  fallbackMac: string
+): OzlockProvisionResult {
+  const mode = typeof obj.mode === "string" ? obj.mode : "";
+  if (mode !== "ozkey-cloud" && mode !== "ozkey-local") {
+    return { ok: false, error: `unsupported provision mode "${mode}"` };
+  }
+  const siteId = typeof obj.site_id === "string" ? obj.site_id.trim() : "";
+  if (!siteId) return { ok: false, error: "missing 'site_id'" };
+  // Trust-model v2 (XF-42 §13.2): no enrollment_token — the device_id itself is
+  // the bearer rendezvous handle. Still accepted if a legacy payload carries it.
+  const enrollmentToken =
+    typeof obj.enrollment_token === "string" ? obj.enrollment_token.trim() : "";
+  // device_id is granted by the app; fall back to the MAC-derived id (pre-v2).
+  const deviceId =
+    typeof obj.device_id === "string" && obj.device_id.trim()
+      ? obj.device_id.trim()
+      : deviceIdFromMac(fallbackMac);
+  if (!deviceId) return { ok: false, error: "missing 'device_id' (app must grant one)" };
+  return {
+    ok: true,
+    siteId,
+    enrollmentToken,
+    deviceId,
+    appId: typeof obj.app_id === "string" ? obj.app_id.trim() : "",
+    serverIp: typeof obj.server_ip === "string" ? obj.server_ip : "",
+    serverPort: Number(obj.server_port) || 0,
+    heartbeatS: Number(obj.heartbeat_s) || null,
+  };
+}
+
 const STORAGE_KEY = "locksim.provisioning.v1";
 
-/** Network identity written to flash once the lock is paired to a room. */
+/** Network identity written to flash once the lock is paired/enrolled. */
 export interface NetworkProvisioning {
   mac: string;
   assigned_room_no: string;
@@ -40,6 +105,13 @@ export interface NetworkProvisioning {
   mac_token: string;
   /** Wall-clock ms when registration completed. */
   provisionedAt: number;
+  /** 'ozkey' room pairing (default) or 'ozlock' personal-cloud enrollment. */
+  mode?: "ozkey" | "ozlock";
+  site_id?: string;
+  device_id?: string;
+  /** the app this lock is paired to (OZLOCK mode, XF-42 §13). */
+  app_id?: string;
+  label?: string;
 }
 
 export type OnboardingResult =

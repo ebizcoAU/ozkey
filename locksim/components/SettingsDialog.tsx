@@ -3,11 +3,16 @@
 import { useEffect, useState } from "react";
 import { brokerUrl, gatewayUrl, type BrokerSettings } from "@/lib/broker";
 import type { MqttLinkApi } from "@/hooks/useMqttLink";
+import type { NetworkProvisioning } from "@/lib/provisioning";
 
 interface SettingsDialogProps {
   open: boolean;
   settings: BrokerSettings;
   mqtt: MqttLinkApi;
+  /** Current provisioning record — surfaces the OZLOCK pairing bond (read-only). */
+  provisioning: NetworkProvisioning | null;
+  /** Lab interim device id derived from the MAC (shown before pairing). */
+  deviceId: string;
   onClose: () => void;
   onSave: (next: BrokerSettings) => void;
 }
@@ -20,7 +25,15 @@ const STATUS_STYLE: Record<string, string> = {
 };
 
 /** Modal for the doorlock server (MQTT broker) connection settings. */
-export default function SettingsDialog({ open, settings, mqtt, onClose, onSave }: SettingsDialogProps) {
+export default function SettingsDialog({
+  open,
+  settings,
+  mqtt,
+  provisioning,
+  deviceId,
+  onClose,
+  onSave,
+}: SettingsDialogProps) {
   const [draft, setDraft] = useState<BrokerSettings>(settings);
   const [health, setHealth] = useState<{ ok: boolean; text: string } | null>(null);
   const [checking, setChecking] = useState(false);
@@ -72,6 +85,17 @@ export default function SettingsDialog({ open, settings, mqtt, onClose, onSave }
       />
     </label>
   );
+
+  const readField = (label: string, value: string) => (
+    <label className="flex flex-col gap-1">
+      <span className="text-[10px] uppercase tracking-wider text-neutral-400">{label}</span>
+      <div className="select-all break-all rounded border border-neutral-800 bg-black/60 px-3 py-2 font-mono text-[11px] text-teal-300">
+        {value}
+      </div>
+    </label>
+  );
+
+  const ozlockPaired = provisioning?.mode === "ozlock";
 
   const save = () => {
     onSave(draft);
@@ -132,6 +156,35 @@ export default function SettingsDialog({ open, settings, mqtt, onClose, onSave }
             lock. Minimum 5 s.
           </div>
         </div>
+
+        <div className="mb-1 mt-4 text-[10px] font-bold uppercase tracking-widest text-teal-400">
+          OZLOCK Personal Cloud (pairing identity)
+        </div>
+        {ozlockPaired ? (
+          <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+            {readField("Device ID", provisioning!.device_id || deviceId)}
+            {readField("Paired App ID", provisioning!.app_id || "—")}
+            {readField("Site", provisioning!.site_id || "—")}
+            {readField("Name", provisioning!.label || "—")}
+            <div className="col-span-2 text-[10px] leading-snug text-neutral-500">
+              Granted by the OZLOCK app at pairing (Mode C) — the lock does not
+              self-configure these. The app self-generates its ID and grants this
+              device its ID; OZLOCK authenticates neither, so app↔lock traffic will
+              be end-to-end encrypted (XF-42 §13; AES envelope lands with ozkey-06).
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+            {readField("Device ID (unpaired)", deviceId)}
+            {field("Site ID", draft.ozlockSiteId, (v) => setDraft({ ...draft, ozlockSiteId: v }), "text", "lab")}
+            <div className="col-span-2 text-[10px] leading-snug text-neutral-500">
+              Not paired yet. <span className="text-teal-300">Copy the Device ID above</span> and
+              add it in the OZLOCK app (:4300 → ADD DOORLOCK → Device ID field), then click{" "}
+              <span className="text-teal-300">Enroll with OZLOCK</span> in Mode C — both sides
+              rendezvous by this id (no BLE, no payload paste needed).
+            </div>
+          </div>
+        )}
 
         <div className="mt-3 rounded border border-neutral-800 bg-black/50 px-3 py-2 font-mono text-[11px]">
           <div>

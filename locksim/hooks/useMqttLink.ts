@@ -26,6 +26,9 @@ export function useMqttLink({ subscriptions, onMessage }: UseMqttLinkOptions) {
   const clientRef = useRef<MqttClient | null>(null);
   const subsRef = useRef(subscriptions);
   subsRef.current = subscriptions;
+  /** Topics added at runtime (e.g. the OZLOCK command topic after enrollment);
+   *  kept separate from the prop list so re-renders can't wipe them. */
+  const dynamicSubsRef = useRef<Set<string>>(new Set());
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
 
@@ -60,6 +63,7 @@ export function useMqttLink({ subscriptions, onMessage }: UseMqttLinkOptions) {
         setStatus("connected");
         setError("");
         for (const topic of subsRef.current) client.subscribe(topic, { qos: 1 });
+        for (const topic of dynamicSubsRef.current) client.subscribe(topic, { qos: 1 });
       });
       client.on("reconnect", () => setStatus("connecting"));
       client.on("close", () => {
@@ -86,6 +90,14 @@ export function useMqttLink({ subscriptions, onMessage }: UseMqttLinkOptions) {
     return true;
   }, []);
 
+  /** Subscribe to an extra topic now and on every future reconnect. */
+  const subscribe = useCallback((topic: string) => {
+    if (dynamicSubsRef.current.has(topic)) return;
+    dynamicSubsRef.current.add(topic);
+    const client = clientRef.current;
+    if (client && client.connected) client.subscribe(topic, { qos: 1 });
+  }, []);
+
   useEffect(
     () => () => {
       clientRef.current?.end(true);
@@ -93,7 +105,7 @@ export function useMqttLink({ subscriptions, onMessage }: UseMqttLinkOptions) {
     []
   );
 
-  return { status, error, url, connected: status === "connected", connect, disconnect, publish };
+  return { status, error, url, connected: status === "connected", connect, disconnect, publish, subscribe };
 }
 
 export type MqttLinkApi = ReturnType<typeof useMqttLink>;

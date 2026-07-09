@@ -10,7 +10,10 @@ interface ConversationPanelProps {
   brokerUrl: string;
   registering: boolean;
   paired: boolean;
+  /** Mode C: swap the announce button to OZLOCK direct enrollment. */
+  ozlockMode: boolean;
   onRegister: () => void;
+  onEnrollOzlock: () => void;
   onOpenSettings: () => void;
   onClear: () => void;
 }
@@ -34,7 +37,9 @@ export default function ConversationPanel({
   brokerUrl,
   registering,
   paired,
+  ozlockMode,
   onRegister,
+  onEnrollOzlock,
   onOpenSettings,
   onClear,
 }: ConversationPanelProps) {
@@ -68,20 +73,28 @@ export default function ConversationPanel({
       <div className="flex flex-wrap items-center gap-2 border-b border-neutral-800 px-3 py-2">
         <button
           type="button"
-          onClick={onRegister}
+          onClick={ozlockMode ? onEnrollOzlock : onRegister}
           disabled={!connected}
-          className="rounded border border-blue-700 bg-blue-900/40 px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider text-blue-200 hover:bg-blue-800/40 disabled:cursor-not-allowed disabled:opacity-40"
+          className={`rounded border px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider disabled:cursor-not-allowed disabled:opacity-40 ${
+            ozlockMode
+              ? "border-teal-700 bg-teal-900/40 text-teal-200 hover:bg-teal-800/40"
+              : "border-blue-700 bg-blue-900/40 text-blue-200 hover:bg-blue-800/40"
+          }`}
         >
-          ⇈ Register Doorlock
+          {ozlockMode ? "⇈ Enroll with OZLOCK" : "⇈ Register Doorlock"}
         </button>
         <span className="text-[10px] text-neutral-500">
           {!connected
             ? "link offline — open System Settings to connect"
             : registering
-              ? "awaiting room assignment from cockpit…"
+              ? ozlockMode
+                ? "awaiting OZLOCK enrollment ack…"
+                : "awaiting room assignment from cockpit…"
               : paired
                 ? "paired — heartbeats flush queued commands"
-                : "announce this lock to the broker"}
+                : ozlockMode
+                  ? "register this device_id in the OZLOCK app, then enroll"
+                  : "announce this lock to the broker"}
         </span>
         <button
           type="button"

@@ -29,6 +29,8 @@ export interface BrokerSettings {
   mac: string;
   /** Deep-sleep timer-wake interval in seconds (lock "firmware" heartbeat). */
   heartbeatSeconds: number;
+  /** OZLOCK site (tenant) this lock enrolls into (Mode C). Lab default 'lab'. */
+  ozlockSiteId: string;
 }
 
 export const DEFAULT_BROKER: BrokerSettings = {
@@ -39,6 +41,7 @@ export const DEFAULT_BROKER: BrokerSettings = {
   gatewayBasePath: "/ozkeyserv/api",
   mac: DEVICE_MAC,
   heartbeatSeconds: 60,
+  ozlockSiteId: "lab",
 };
 
 const STORAGE_KEY = "locksim.broker.v1";
