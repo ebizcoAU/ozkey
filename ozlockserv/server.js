@@ -339,6 +339,20 @@ async function initDatabase() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB`);
 
+  // App-attributed control-plane audit trail: every action an app performs
+  // through OZLOCK (register pairing, grant/revoke a key, remote unlock,
+  // settings). Distinct from lock_logs (physical door events at the lock).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      app_id VARCHAR(80) NULL,
+      device_id VARCHAR(64) NULL,
+      site_id VARCHAR(50),
+      action VARCHAR(30),
+      detail VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB`);
+
   // Seed the single lab owner + site (ozkey-05 lab simplification).
   const [[{ ownerCnt }]] = await pool.query('SELECT COUNT(*) AS ownerCnt FROM owners');
   if (ownerCnt === 0) {
@@ -640,6 +654,7 @@ async function registerPairing(appId, deviceId, label) {
     'pair',
     `Pairing registered: app ${appId || '(anon)'} ⇄ device ${deviceId} — awaiting doorlock contact`
   );
+  await recordAudit(appId, deviceId, 'pair', `registered pairing (label "${label || 'New Doorlock'}")`);
 }
 
 /* -- Pairing registration (trust-model v2, XF-42 §13.2) ---------------------- */
@@ -724,6 +739,82 @@ api.get('/locks', async (req, res) => {
   }
 });
 
+/* ===========================================================================
+ * Registry / observability lookups (OZLOCK console — no actions, ozkey-05)
+ * ========================================================================= */
+
+/** Enumerate the apps (users) OZLOCK knows, with how many locks each holds. */
+api.get('/apps', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const [rows] = await pool.query(
+      `SELECT app_id,
+              COUNT(*) AS lock_count,
+              SUM(status = 'enrolled') AS enrolled_count,
+              MAX(last_seen_at) AS last_seen_at
+         FROM locks
+        WHERE app_id IS NOT NULL
+        GROUP BY app_id
+        ORDER BY lock_count DESC`
+    );
+    res.json({ ok: true, apps: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/** Given an app (user id) → all its doorlocks. */
+api.get('/apps/:appId/locks', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, app_id, mac, label, status, power_profile, heartbeat_s, last_seen_at, enrolled_at
+         FROM locks WHERE app_id = ? ORDER BY enrolled_at DESC`,
+      [req.params.appId]
+    );
+    res.json({ ok: true, app_id: req.params.appId, locks: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/** Given an app (user id) → its control-plane activity (grant/revoke/unlock…). */
+api.get('/apps/:appId/activity', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const { where, params } = rangeWhere('app_id = ?', [req.params.appId], req.query);
+    const { limit, offset } = pageParams(req.query);
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM audit_log WHERE ${where}`,
+      params
+    );
+    const [rows] = await pool.query(
+      `SELECT * FROM audit_log WHERE ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+    res.json({ ok: true, app_id: req.params.appId, activity: rows, total, limit, offset });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/** Given a doorlock (device id) → the app it's bound to + its record. */
+api.get('/locks/:id', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const [[lock]] = await pool.query(
+      `SELECT id, app_id, site_id, mac, label, status, power_profile, heartbeat_s,
+              last_seen_at, enrolled_at
+         FROM locks WHERE id = ?`,
+      [req.params.id]
+    );
+    if (!lock) return res.status(404).json({ ok: false, error: `Lock ${req.params.id} not found` });
+    res.json({ ok: true, lock });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 api.patch('/locks/:id', async (req, res) => {
   if (!guardDb(res)) return;
   try {
@@ -765,6 +856,56 @@ async function purgeLockRows(conn, where, args) {
   await conn.query(`DELETE FROM grants WHERE ${where}`, args);
   await conn.query(`DELETE FROM pending_queue WHERE ${where}`, args);
   await conn.query(`DELETE FROM lock_logs WHERE ${where}`, args);
+  await conn.query(`DELETE FROM audit_log WHERE ${where}`, args);
+}
+
+/** Parse pagination query (?limit=&offset=), clamped; default 12 rows/page. */
+function pageParams(query) {
+  const limit = Math.min(200, Math.max(1, Number(query.limit) || 12));
+  const offset = Math.max(0, Number(query.offset) || 0);
+  return { limit, offset };
+}
+
+/**
+ * Append an optional inclusive date range (?from=YYYY-MM-DD&to=YYYY-MM-DD) on
+ * created_at to a base WHERE. `to` is inclusive (matches through end-of-day).
+ * Returns { where, params } for interpolation (base clause is caller-literal).
+ */
+function rangeWhere(baseClause, baseParams, query) {
+  const clauses = [baseClause];
+  const params = [...baseParams];
+  // Compare whole calendar dates (both ends inclusive) so a from=to=today
+  // range matches regardless of time-of-day / UTC-vs-local boundary skew.
+  if (query.from) {
+    clauses.push('DATE(created_at) >= ?');
+    params.push(String(query.from));
+  }
+  if (query.to) {
+    clauses.push('DATE(created_at) <= ?');
+    params.push(String(query.to));
+  }
+  return { where: clauses.join(' AND '), params };
+}
+
+/**
+ * Record a control-plane action in the app-attributed audit trail. If appId is
+ * omitted it's resolved from the device's current pairing. Best-effort — never
+ * throws into the caller (an audit failure must not fail the real action).
+ */
+async function recordAudit(appId, deviceId, action, detail) {
+  try {
+    let aid = appId;
+    if (!aid && deviceId) {
+      const [[l]] = await pool.query('SELECT app_id FROM locks WHERE id = ?', [deviceId]);
+      aid = l ? l.app_id : null;
+    }
+    await pool.query(
+      'INSERT INTO audit_log (app_id, device_id, site_id, action, detail) VALUES (?, ?, ?, ?, ?)',
+      [aid || null, deviceId || null, CONFIG.SITE_ID, action, String(detail || '').slice(0, 255)]
+    );
+  } catch (err) {
+    logEvent('warn', `audit_log write failed (${action}): ${err.message}`);
+  }
 }
 
 api.delete('/locks', async (req, res) => {
@@ -883,6 +1024,12 @@ api.post('/locks/:id/grants', async (req, res) => {
       `Granted ${type.toUpperCase()} to "${user_name}" -> "${lock.label}" slot ${slot_number} ` +
         `(grant #${grantId}, queue #${queueResult.insertId}) — awaiting wake`
     );
+    await recordAudit(
+      lock.app_id,
+      deviceId,
+      'grant',
+      `grant ${type.toUpperCase()} slot ${slot_number} to "${user_name}" (grant #${grantId})`
+    );
 
     flushQueueForDevice(lock.site_id, deviceId).catch(() => {});
 
@@ -943,6 +1090,7 @@ api.post('/locks/:id/unlock', async (req, res) => {
     );
 
     logEvent('key', `Remote UNLOCK queued for "${lock.label}" (queue #${queueResult.insertId}, expires 60s)`);
+    await recordAudit(lock.app_id, deviceId, 'unlock', `remote unlock "${lock.label}"`);
     const sent = await flushQueueForDevice(lock.site_id, deviceId);
 
     res.json({
@@ -1008,6 +1156,12 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
       `Revoking ${grant.type.toUpperCase()} for "${grant.user_name}" on ${deviceId} slot ${grant.slot_number} ` +
         `(grant #${grantId}, queue #${queueResult.insertId}) — awaiting wake`
     );
+    await recordAudit(
+      null,
+      deviceId,
+      'revoke',
+      `revoke ${grant.type.toUpperCase()} slot ${grant.slot_number} for "${grant.user_name}" (grant #${grantId})`
+    );
 
     flushQueueForDevice(grant.site_id, deviceId).catch(() => {});
 
@@ -1031,15 +1185,21 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
   }
 });
 
-/* -- Door transaction log ----------------------------------------------------- */
+/* -- Door transaction log (paginated + optional date range) ------------------- */
 api.get('/locks/:id/log', async (req, res) => {
   if (!guardDb(res)) return;
   try {
-    const [rows] = await pool.query(
-      'SELECT * FROM lock_logs WHERE device_id = ? ORDER BY id DESC LIMIT 100',
-      [req.params.id]
+    const { where, params } = rangeWhere('device_id = ?', [req.params.id], req.query);
+    const { limit, offset } = pageParams(req.query);
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM lock_logs WHERE ${where}`,
+      params
     );
-    res.json({ ok: true, log: rows });
+    const [rows] = await pool.query(
+      `SELECT * FROM lock_logs WHERE ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+    res.json({ ok: true, log: rows, total, limit, offset });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
