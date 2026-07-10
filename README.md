@@ -12,8 +12,9 @@ ozkey/
 │   └── pages/index.js
 ├── ozlockserv/      OZLOCK rendezvous directory — market-A personal cloud, lab
 │   └── server.js    deployment (port 4200, MySQL db `ozlock`, ozkey-05)
-├── ozlock/          OZLOCK personal keyring — BANOI stand-in front end (port 4300)
-│   └── pages/index.js
+├── ozlock/          OZLOCK registry console — read-only operator view (port 4300):
+│   └── pages/index.js   app→locks, lock→app, door-transaction + app-activity logs
+│                        (the BANOI app itself performs grants/pairing, not this)
 └── locksim/            Next.js smart-lock simulator (Tuya MCU + MQTT-over-WS)  (port 3100)
     └── app/page.tsx     Mode A = OZKEY room pairing · Mode C = OZLOCK enrollment
 ```
@@ -26,6 +27,9 @@ commercial). [`docs/ozkey-05.md`](docs/ozkey-05.md) designs the OZLOCK cloud
 rendezvous (market A) — implemented as `ozlockserv/` + `ozlock/` + LockSim
 Mode C. [`docs/ozkey-06.md`](docs/ozkey-06.md) (DRAFT) freezes the AES-256-GCM
 end-to-end envelope (with byte vectors) and the BLE transport half.
+[`docs/ozkey-07.md`](docs/ozkey-07.md) (DRAFT) is the OZKEYSERV commercial /
+managed-fleet contract (Mode A) — hotel PMS roster sync (`POST /pms/rooms`) +
+managed-fleet RBAC/delegation.
 `locksim` was merged in from its standalone repo with history preserved.
 
 ## Prerequisites

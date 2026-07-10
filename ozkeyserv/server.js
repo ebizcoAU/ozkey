@@ -58,6 +58,9 @@ const CONFIG = {
   topicRoomCommand: (roomNo) => `hotel/rooms/${roomNo}/lock/command`,
   topicPairConfirm: (mac) => `hotel/locks/${mac.replace(/:/g, '').toLowerCase()}/pair/confirm`,
   UNPAIRED_TTL_MS: 120_000, // forget an unpaired MAC if silent for 2 minutes
+  // Shared secret for PMS write endpoints (ozkey-07 §4.4). Unset = open (lab);
+  // set OZKEY_PMS_SECRET to enforce `X-OZKEY-Secret` on /pms/* writes.
+  PMS_SECRET: process.env.OZKEY_PMS_SECRET || '',
 };
 
 /* ---------------------------------------------------------------------------
@@ -251,6 +254,41 @@ async function initDatabase() {
     await pool.query('ALTER TABLE rooms ADD COLUMN mac_token VARCHAR(50) NULL');
   }
 
+  // PMS roster-sync columns (ozkey-07 §4): MAOI is the source of truth for room
+  // definitions; these mirror what the PMS pushes. Additive migrations.
+  //   maoi_id       — PMS stable row id, the upsert/join key (ozkey-07 §4.3)
+  //   name/type     — display label + room-type label (rich model stays in PMS)
+  //   capacity      — occupancy
+  //   lock_device_id— the room↔lock binding, carried in-band (ozkey-07 §6)
+  //   active        — 0 = deactivated (removed in a reconcile, kept non-destructively)
+  //   last_synced_at— per-row sync stamp for GET /pms/rooms/status
+  const pmsCols = [
+    ['maoi_id', 'VARCHAR(64) NULL'],
+    ['name', 'VARCHAR(255) NULL'],
+    ['room_type', 'VARCHAR(100) NULL'],
+    ['capacity', 'INT DEFAULT 1'],
+    ['lock_device_id', 'VARCHAR(64) NULL'],
+    ['active', 'TINYINT DEFAULT 1'],
+    ['last_synced_at', 'DATETIME NULL'],
+  ];
+  for (const [col, def] of pmsCols) {
+    const [[{ has }]] = await pool.query(
+      `SELECT COUNT(*) AS has FROM information_schema.columns
+        WHERE table_schema = ? AND table_name = 'rooms' AND column_name = ?`,
+      [CONFIG.DB.database, col]
+    );
+    if (!has) await pool.query(`ALTER TABLE rooms ADD COLUMN ${col} ${def}`);
+  }
+  // Unique index on maoi_id so upserts join cleanly (nullable → legacy rows OK).
+  const [[{ hasIdx }]] = await pool.query(
+    `SELECT COUNT(*) AS hasIdx FROM information_schema.statistics
+      WHERE table_schema = ? AND table_name = 'rooms' AND index_name = 'uniq_maoi_id'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasIdx) {
+    await pool.query('ALTER TABLE rooms ADD UNIQUE INDEX uniq_maoi_id (maoi_id)');
+  }
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -296,9 +334,12 @@ async function initDatabase() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB`);
 
-  // 4. Auto-seed: Block A, floors 1-3, 10 rooms/floor => 101..110 ... 301..310.
+  // 4. Room roster. RETIRED the auto-seed (ozkey-07 §4): the PMS (MAOI) is the
+  //    source of truth for rooms and pushes them via POST /pms/rooms. The old
+  //    Block-A 101..310 seed only runs if OZKEY_SEED_ROOMS=1 (pure-lab bench
+  //    without a PMS).
   const [[{ cnt }]] = await pool.query('SELECT COUNT(*) AS cnt FROM rooms');
-  if (cnt === 0) {
+  if (cnt === 0 && process.env.OZKEY_SEED_ROOMS === '1') {
     const rows = [];
     for (let floor = 1; floor <= 3; floor++) {
       for (let door = 1; door <= 10; door++) {
@@ -310,9 +351,9 @@ async function initDatabase() {
       'INSERT INTO rooms (building, floor, room_no, mac_address, status) VALUES ?',
       [rows]
     );
-    logEvent('info', `Schema empty — auto-provisioned ${rows.length} rooms (Block A, floors 1-3)`);
+    logEvent('info', `OZKEY_SEED_ROOMS=1 — seeded ${rows.length} lab rooms (Block A, floors 1-3)`);
   } else {
-    logEvent('info', `Room matrix already provisioned (${cnt} rooms)`);
+    logEvent('info', `Room roster: ${cnt} room(s) (source of truth = PMS via POST /pms/rooms)`);
   }
 
   logEvent('info', `MySQL online — ${CONFIG.DB.host}/${CONFIG.DB.database}`);
@@ -552,9 +593,155 @@ api.get('/rooms', async (req, res) => {
   if (!guardDb(res)) return;
   try {
     const [rows] = await pool.query(
-      'SELECT id, building, floor, room_no, mac_address, status FROM rooms ORDER BY floor, room_no'
+      `SELECT id, maoi_id, building, floor, room_no, name, room_type, capacity,
+              mac_address, lock_device_id, active, status, last_synced_at
+         FROM rooms ORDER BY floor, room_no`
     );
     res.json({ ok: true, rooms: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* ===========================================================================
+ * PMS roster sync (ozkey-07 §4) — MAOI is the source of truth for rooms;
+ * OZKEYSERV is a read-only mirror for pairing + command routing.
+ * ========================================================================= */
+
+/** ozkey-07 §4.4: enforce X-OZKEY-Secret on PMS writes when a secret is set. */
+function guardPmsSecret(req, res) {
+  if (!CONFIG.PMS_SECRET) return true; // lab: open when no secret configured
+  if (req.get('X-OZKEY-Secret') === CONFIG.PMS_SECRET) return true;
+  res.status(401).json({ ok: false, error: 'missing or invalid X-OZKEY-Secret' });
+  return false;
+}
+
+/** True if a room currently has a lock bound (device or legacy MAC). */
+function roomIsBound(room) {
+  return !!(room.lock_device_id || room.mac_address);
+}
+
+api.post('/pms/rooms', async (req, res) => {
+  if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
+  try {
+    const { mode = 'upsert', rooms } = req.body || {};
+    if (!Array.isArray(rooms)) {
+      return res.status(400).json({ ok: false, error: 'rooms[] is required' });
+    }
+    if (!['upsert', 'reconcile'].includes(mode)) {
+      return res.status(400).json({ ok: false, error: "mode must be 'upsert' or 'reconcile'" });
+    }
+
+    const conflicts = [];
+    let upserted = 0;
+    const seenMaoiIds = [];
+
+    for (const r of rooms) {
+      const maoiId = r.id ? String(r.id).slice(0, 64) : null;
+      const roomNo = r.room_no != null ? String(r.room_no).slice(0, 50) : null;
+      if (!maoiId || !roomNo) {
+        conflicts.push({ room_no: roomNo, issue: 'row skipped — missing id or room_no' });
+        continue;
+      }
+      seenMaoiIds.push(maoiId);
+      const fields = {
+        room_no: roomNo,
+        name: r.name != null ? String(r.name).slice(0, 255) : null,
+        room_type: r.type != null ? String(r.type).slice(0, 100) : null,
+        floor: Number.isFinite(r.floor) ? r.floor : null,
+        capacity: Number.isFinite(r.capacity) ? r.capacity : 1,
+        lock_device_id: r.lock_device_id ? String(r.lock_device_id).slice(0, 64) : null,
+      };
+
+      const [[existing]] = await pool.query('SELECT * FROM rooms WHERE maoi_id = ?', [maoiId]);
+      // Guard: a different room already uses this room_no (unique) → report, skip.
+      const [[clash]] = await pool.query(
+        'SELECT maoi_id FROM rooms WHERE room_no = ? AND (maoi_id IS NULL OR maoi_id <> ?)',
+        [roomNo, maoiId]
+      );
+      if (clash) {
+        conflicts.push({ room_no: roomNo, issue: `room_no already used by another room — not applied` });
+        continue;
+      }
+
+      if (existing) {
+        await pool.query(
+          `UPDATE rooms SET room_no = ?, name = ?, room_type = ?, floor = ?, capacity = ?,
+             lock_device_id = COALESCE(?, lock_device_id), active = 1, last_synced_at = NOW()
+           WHERE maoi_id = ?`,
+          [fields.room_no, fields.name, fields.room_type, fields.floor, fields.capacity, fields.lock_device_id, maoiId]
+        );
+      } else {
+        await pool.query(
+          `INSERT INTO rooms (maoi_id, room_no, name, room_type, floor, capacity, lock_device_id,
+             status, active, last_synced_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'Available', 1, NOW())`,
+          [maoiId, fields.room_no, fields.name, fields.room_type, fields.floor, fields.capacity, fields.lock_device_id]
+        );
+      }
+      upserted++;
+    }
+
+    // Reconcile: rooms in the mirror (that came from the PMS) but absent from the
+    // full payload → deactivate NON-destructively; surface bound/live-PIN ones.
+    let deactivated = 0;
+    if (mode === 'reconcile') {
+      const [mirror] = await pool.query('SELECT * FROM rooms WHERE maoi_id IS NOT NULL');
+      for (const room of mirror) {
+        if (seenMaoiIds.includes(room.maoi_id)) continue;
+        // live (unexpired, non-revoked) credentials on this room?
+        const [[{ live }]] = await pool.query(
+          `SELECT COUNT(*) AS live FROM credentials
+            WHERE room_id = ? AND sync_status IN ('pending','synced')`,
+          [room.id]
+        );
+        if (roomIsBound(room) || live > 0) {
+          conflicts.push({
+            room_no: room.room_no,
+            issue:
+              `removed room still has ` +
+              [roomIsBound(room) ? 'a bound lock' : null, live > 0 ? `${live} live credential(s)` : null]
+                .filter(Boolean)
+                .join(' + '),
+            lock_device_id: room.lock_device_id || null,
+            action: 'kept inactive — resolve at the room',
+          });
+        }
+        await pool.query("UPDATE rooms SET active = 0, status = 'Inactive' WHERE id = ?", [room.id]);
+        deactivated++;
+      }
+    }
+
+    logEvent(
+      'info',
+      `PMS roster ${mode}: ${upserted} upserted` +
+        (mode === 'reconcile' ? `, ${deactivated} deactivated` : '') +
+        (conflicts.length ? `, ${conflicts.length} conflict(s)` : '')
+    );
+    res.json({ ok: true, upserted, deactivated, conflicts });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+api.get('/pms/rooms/status', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const [[s]] = await pool.query(
+      `SELECT MAX(last_synced_at) AS last_synced_at,
+              SUM(active = 1) AS active_count,
+              SUM(lock_device_id IS NOT NULL) AS bound_count,
+              COUNT(*) AS room_count
+         FROM rooms WHERE maoi_id IS NOT NULL`
+    );
+    res.json({
+      ok: true,
+      last_synced_at: s.last_synced_at,
+      room_count: Number(s.room_count) || 0,
+      active_count: Number(s.active_count) || 0,
+      bound_count: Number(s.bound_count) || 0,
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -673,6 +860,7 @@ api.post('/locks/unpair', async (req, res) => {
 /* -- PMS bypass: direct credential injection -------------------------------- */
 api.post('/pms/issue-key', async (req, res) => {
   if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
   const conn = await pool.getConnection();
   try {
     const {
@@ -790,6 +978,7 @@ api.post('/pms/issue-key', async (req, res) => {
 /* -- PMS bypass: credential revocation (gap #8, ozkey-02 §8.5) -------------- */
 api.post('/pms/revoke-key', async (req, res) => {
   if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
   const conn = await pool.getConnection();
   try {
     const { credential_id } = req.body || {};
