@@ -122,6 +122,9 @@ export type OnboardingResult =
       roomNo: string;
       serverIp: string;
       macToken: string;
+      /** ozkey-07 §10: present when the server routes device-scoped. */
+      siteId: string | null;
+      deviceId: string | null;
     }
   | { ok: false; error: string };
 
@@ -169,6 +172,8 @@ export function buildSampleOnboarding(mac: string, room = "412"): string {
       op: "provision_assign",
       mac,
       room_no: room,
+      site_id: "hotel",
+      device_id: deviceIdFromMac(mac),
       server_ip: "10.20.0.5",
       mac_token: "OZK-7F3A-C210-9E4D",
       issued_by: "OZKEYSERV/",
@@ -235,7 +240,23 @@ export function parseOnboardingPayload(raw: string, expectedMac: string): Onboar
   const macToken =
     typeof obj.mac_token === "string" && obj.mac_token.trim() ? obj.mac_token.trim() : makeMacToken();
 
-  return { ok: true, topic, mac: mac.toUpperCase(), roomNo, serverIp, macToken };
+  // ozkey-07 §10: the handshake may grant a device-scoped identity. Both or
+  // neither — a device_id without its site can't form a topic, so ignore it.
+  const siteId = typeof obj.site_id === "string" && obj.site_id.trim() ? obj.site_id.trim() : null;
+  const deviceId =
+    typeof obj.device_id === "string" && obj.device_id.trim() ? obj.device_id.trim() : null;
+  const deviceScoped = siteId !== null && deviceId !== null;
+
+  return {
+    ok: true,
+    topic,
+    mac: mac.toUpperCase(),
+    roomNo,
+    serverIp,
+    macToken,
+    siteId: deviceScoped ? siteId : null,
+    deviceId: deviceScoped ? deviceId : null,
+  };
 }
 
 export function loadProvisioning(): NetworkProvisioning | null {

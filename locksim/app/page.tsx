@@ -135,16 +135,19 @@ export default function Page() {
   const provisioningRef = useRef(provisioning.provisioning);
   provisioningRef.current = provisioning.provisioning;
 
-  // Timer-wake heartbeat: room topic in OZKEY mode (ozkey-02 §3.3), device
-  // topic in OZLOCK mode (ozkey-04 §9). Both flush the server-side queue.
+  // Timer-wake heartbeat. Device-scoped (ozkey-04 §9 / ozkey-07 §10) whenever
+  // the lock holds a site_id + device_id — OZLOCK enrollment or an ozkey-07
+  // hotel pairing; the pre-§10 room topic only for legacy pairings without one.
+  // Either way the server flushes its queue on receipt.
   const publishHeartbeat = useCallback(() => {
     const p = provisioningRef.current;
     if (!p) return;
-    if (p.mode === "ozlock" && p.site_id && p.device_id) {
+    if (p.site_id && p.device_id) {
       const topic = ozlockTopic(p.site_id, p.device_id, "heartbeat");
       const payload = JSON.stringify({ device_id: p.device_id, mac: p.mac, ts: Date.now() });
       if (mqtt.publish(topic, payload)) {
-        pushConversation("up", topic, `Heartbeat (${p.label || p.device_id})`, payload);
+        const who = p.label || (p.assigned_room_no ? `room ${p.assigned_room_no}` : p.device_id);
+        pushConversation("up", topic, `Heartbeat (${who})`, payload);
       }
       return;
     }
@@ -161,14 +164,16 @@ export default function Page() {
     (evt: { result: "granted" | "denied" | "expired"; detail: string }) => {
       const p = provisioningRef.current;
       const mac = (p?.mac || settings.mac).toUpperCase();
-      const isOzlock = p?.mode === "ozlock" && p.site_id && p.device_id;
-      const topic = isOzlock
-        ? ozlockTopic(p.site_id!, p.device_id!, "log")
+      // Device-scoped whenever an identity was granted (ozkey-07 §10) — the
+      // server resolves device → room; room_no rides along as a label only.
+      const isDeviceScoped = Boolean(p?.site_id && p.device_id);
+      const topic = isDeviceScoped
+        ? ozlockTopic(p!.site_id!, p!.device_id!, "log")
         : lockLogTopic(mac);
       const payload = JSON.stringify({
-        device_id: isOzlock ? p.device_id : undefined,
+        device_id: isDeviceScoped ? p!.device_id : undefined,
         mac,
-        room_no: isOzlock ? undefined : p?.assigned_room_no,
+        room_no: p?.assigned_room_no || undefined,
         result: evt.result,
         detail: evt.detail,
         ts: Date.now(),
@@ -283,6 +288,17 @@ export default function Page() {
       }
       // §3.4 command envelope: unwrap and feed the hex to the Tuya parser (gap #5).
       if (obj.payload_hex) {
+        // ozkey-07 §10 transition: the server dual-publishes every command on
+        // the legacy room topic AND our device topic. Once device-scoped, drop
+        // the room-topic copy (still received via the onboarding wildcard sub)
+        // or every credential write would execute twice.
+        const p = provisioningRef.current;
+        if (p?.site_id && p.device_id && topic && topicMatches(ONBOARDING_TOPIC, topic)) {
+          protocol.pushRxLog(raw.trim(), [
+            `legacy room-topic copy ignored — device-scoped routing active (${p.device_id})`,
+          ]);
+          return;
+        }
         const bytes = fromHexString(String(obj.payload_hex));
         if (bytes) protocol.receiveBytes(bytes);
         else protocol.pushRxLog(raw.trim(), ["command envelope has invalid payload_hex"], true);
@@ -339,11 +355,12 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // An enrolled OZLOCK lock listens on its device command topic across
+  // A device-scoped lock (OZLOCK enrollment, or an ozkey-07 hotel pairing that
+  // granted site_id + device_id) listens on its device command topic across
   // reloads/reconnects (dynamic subs survive reconnect inside useMqttLink).
   useEffect(() => {
     const p = provisioning.provisioning;
-    if (p?.mode === "ozlock" && p.site_id && p.device_id) {
+    if (p?.site_id && p.device_id) {
       mqtt.subscribe(ozlockTopic(p.site_id, p.device_id, "command"));
     }
   }, [provisioning.provisioning, mqtt]);

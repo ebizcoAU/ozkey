@@ -67,9 +67,12 @@ const CONFIG = {
     ws_path: '/mqtt',
   },
   // ozkey-04 §9 topic scheme (site-prefixed, device-scoped, room-free).
-  SUB_ENROLL: 'ozkey/+/locks/+/enroll',
-  SUB_HEARTBEAT: 'ozkey/+/locks/+/heartbeat',
-  SUB_LOG: 'ozkey/+/locks/+/log',
+  // Site-pinned (NOT wildcard) so multiple servers can share one broker —
+  // OZKEYSERV (site 'hotel', ozkey-07) publishes device-scoped on the same
+  // ozkey/<site>/... root; each server must only consume its own site.
+  SUB_ENROLL: 'ozkey/lab/locks/+/enroll',
+  SUB_HEARTBEAT: 'ozkey/lab/locks/+/heartbeat',
+  SUB_LOG: 'ozkey/lab/locks/+/log',
   topicCommand: (site, deviceId) => `ozkey/${site}/locks/${deviceId}/command`,
   ENROLL_TOKEN_TTL_MS: 10 * 60 * 1000, // ozkey-05 §7.5
   DEFAULT_HEARTBEAT_S: 60,

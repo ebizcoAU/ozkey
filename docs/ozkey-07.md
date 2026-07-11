@@ -12,12 +12,34 @@
 > `lock_device_id`, `active`, `last_synced_at`). Verified: upsert, rename-by-id
 > (no orphan), reconcile deactivates absent rooms non-destructively + reports a
 > bound room as a conflict without dropping its binding, and the secret gate
-> (401 without / 200 with, reads open). **Deferred (fast-follow, non-gating —
-> §11):** the device-scoped topic refactor (§10) and the `room_no→device_id`
-> routing resolution (§5) — until they land, locks still pair/route the existing
-> room-scoped way (mac_address + `hotel/rooms/<room_no>/…`); the pushed
-> `lock_device_id` is stored as the binding of record but not yet the routing
-> key. `issue-key`/`revoke-key` are unchanged and still work end-to-end.
+> (401 without / 200 with, reads open).
+>
+> **Device-scoped topic refactor (§10) + `room_no→device_id` resolution (§5)
+> BUILT 2026-07-11, bundled (not fast-followed).** `POST /locks/pair` now
+> writes `lock_device_id` (PMS-pushed value if present, else derived from the
+> paired MAC) and the `provision_assign` handshake carries `site_id` +
+> `device_id` alongside the legacy `room_no`. Every queue flush
+> (`flushQueueForRoom`) resolves the room's bound device once and
+> **dual-publishes** each command — the legacy `hotel/rooms/<room_no>/lock/
+> command` topic and the new `ozkey/<site_id>/locks/<device_id>/command` topic
+> — so either a legacy-paired or device-scoped lock stays in sync during the
+> transition. OZKEYSERV subscribes `ozkey/<SITE_ID>/locks/+/{heartbeat,log}`
+> (site-pinned, not wildcarded — `OZKEY_SITE_ID`, default `hotel`, keeps it
+> distinct from ozlockserv's `lab` site on the same shared broker) and resolves
+> inbound device_id → room via `lock_device_id` or the MAC-derived id. LockSim
+> (`locksim/lib/provisioning.ts`, `hooks/useProvisioning.ts`, `app/page.tsx`)
+> adopts the granted `site_id`/`device_id` from the handshake and moves its
+> heartbeat/log/command traffic to the device-scoped topics, ignoring the
+> legacy room-topic command copy once device-scoped (avoids double-executing
+> credential writes). Verified end-to-end over the live broker + MySQL: pair →
+> handshake carries `site_id`/`device_id` → `lock_device_id` persisted → queue
+> flush dual-publishes on both topics → device-scoped heartbeat/log resolve to
+> the correct room and land in `lock_logs`; legacy handshakes without
+> `site_id`/`device_id` still parse and pair the old room-scoped way (no
+> regression for not-yet-migrated locks). `issue-key`/`revoke-key` unchanged,
+> still work end-to-end. Not yet done: MAOI never sees or sends `device_id`
+> (still §5-invisible, per spec) — this refactor is server + lock internals
+> only, no API-surface change to `/pms/*`.
 >
 > **DRAFT 2026-07-11.** The ozkey-team contract for **Mode A** (on-prem
 > OZKEYSERV `:3200` + cockpit `:3300`) covering the two commercial shapes that
@@ -243,11 +265,11 @@ resolution + the auth gate (§9).
 | Piece | Status |
 |---|---|
 | issue-key / revoke-key / queue / DPID frames / lock_logs | **DONE** (ozkey-02 + gap #8, verified) |
-| `POST /pms/rooms` (upsert/reconcile, conflict guard, in-band binding) | **NEW — this doc §4** |
-| `GET /pms/rooms/status`; retire auto-seed; cockpit read view-only | **NEW — small** |
-| `room_no → device_id` resolution in issue/revoke/log | **NEW — small (§5)** |
-| Write-auth gate on `/pms/*` (shared secret, LAN) | **NEW — §9** |
-| Device-scoped topic refactor | **NEW — internal (§10)** |
+| `POST /pms/rooms` (upsert/reconcile, conflict guard, in-band binding) | **DONE** — this doc §4 |
+| `GET /pms/rooms/status`; retire auto-seed; cockpit read view-only | **DONE** |
+| `room_no → device_id` resolution in issue/revoke/log | **DONE** (§5, 2026-07-11) |
+| Write-auth gate on `/pms/*` (shared secret, LAN) | **DONE** — §9 |
+| Device-scoped topic refactor | **DONE** (§10, 2026-07-11, bundled not fast-followed) |
 | Full RBAC (orgs/roles/scopes), enable-disable, revocation lists, owner-root delegation | **NEW — the fleet build (§3/§8)** |
 | e2e envelope with org-escrowed KMS | **ozkey-06 implementation + KMS** |
 

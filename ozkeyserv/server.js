@@ -52,11 +52,19 @@ const CONFIG = {
     queueLimit: 0,
   },
   MQTT_URL: 'mqtt://10.1.1.21:1883',
+  // This deployment's site (tenant) prefix on the device-scoped topic root.
+  // Distinct from ozlockserv's 'lab' — multiple servers share the broker and
+  // each must own its own site (ozkey-07 §10 / ozkey-04 §9).
+  SITE_ID: process.env.OZKEY_SITE_ID || 'hotel',
   TOPIC_UNPAIRED_HEARTBEAT: 'hotel/locks/unpaired/heartbeat',
   TOPIC_ROOM_HEARTBEAT: 'hotel/rooms/+/lock/heartbeat',
   TOPIC_LOCK_LOG: 'hotel/locks/+/log',
   topicRoomCommand: (roomNo) => `hotel/rooms/${roomNo}/lock/command`,
   topicPairConfirm: (mac) => `hotel/locks/${mac.replace(/:/g, '').toLowerCase()}/pair/confirm`,
+  // Device-scoped scheme (ozkey-04 §9): room is a label, routing is by device.
+  topicDevice: (siteId, deviceId, kind) => `ozkey/${siteId}/locks/${deviceId}/${kind}`,
+  subDeviceHeartbeat: (siteId) => `ozkey/${siteId}/locks/+/heartbeat`,
+  subDeviceLog: (siteId) => `ozkey/${siteId}/locks/+/log`,
   UNPAIRED_TTL_MS: 120_000, // forget an unpaired MAC if silent for 2 minutes
   // Shared secret for PMS write endpoints (ozkey-07 §4.4). Unset = open (lab);
   // set OZKEY_PMS_SECRET to enforce `X-OZKEY-Secret` on /pms/* writes.
@@ -91,6 +99,19 @@ function normalizeMac(raw) {
   const hex = raw.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
   if (hex.length !== 12) return null;
   return hex.match(/.{2}/g).join(':');
+}
+
+/** Lab interim device id (ozkey-04 §3: real hardware derives from a keypair). */
+function deviceIdFromMac(mac) {
+  return `ozk-${mac.replace(/:/g, '').toLowerCase()}`;
+}
+
+/** The routing device id for a room row: the PMS-pushed binding of record wins,
+ *  else derived from the paired MAC (lab interim). Null when nothing is bound. */
+function deviceIdForRoom(room) {
+  if (room.lock_device_id) return room.lock_device_id;
+  if (room.mac_address) return deviceIdFromMac(room.mac_address);
+  return null;
 }
 
 /* ---------------------------------------------------------------------------
@@ -383,11 +404,21 @@ async function flushQueueForRoom(roomNo) {
   );
   if (queued.length === 0) return 0;
 
+  // Device-scoped routing (ozkey-07 §5/§10): resolve the room's bound device
+  // once per flush; commands are dual-published (legacy room topic + device
+  // topic) during the transition so either lock subscription works.
+  const [[roomRow]] = await pool.query(
+    'SELECT lock_device_id, mac_address FROM rooms WHERE room_no = ?',
+    [roomNo]
+  );
+  const deviceId = roomRow ? deviceIdForRoom(roomRow) : null;
+
   for (const job of queued) {
     const commandTopic = CONFIG.topicRoomCommand(roomNo);
     const envelope = {
       msg_id: `oz-${job.id}-${Date.now()}`,
       room_no: roomNo,
+      device_id: deviceId || undefined,
       action: job.action_type,
       credential_id: job.credential_id,
       payload_hex: job.payload_hex,
@@ -397,6 +428,9 @@ async function flushQueueForRoom(roomNo) {
 
     const ok = mqttPublish(commandTopic, envelope);
     if (!ok) break; // broker dropped mid-flush; keep remaining jobs queued
+    if (deviceId) {
+      mqttPublish(CONFIG.topicDevice(CONFIG.SITE_ID, deviceId, 'command'), envelope);
+    }
 
     await pool.query("UPDATE pending_queue SET status = 'sent' WHERE id = ?", [job.id]);
     if (job.credential_id) {
@@ -442,18 +476,18 @@ function initMqtt() {
 
   mqttClient.on('connect', () => {
     logEvent('info', `MQTT online — TalkPOS broker ${CONFIG.MQTT_URL}`);
-    mqttClient.subscribe(
-      [CONFIG.TOPIC_UNPAIRED_HEARTBEAT, CONFIG.TOPIC_ROOM_HEARTBEAT, CONFIG.TOPIC_LOCK_LOG],
-      { qos: 1 },
-      (err) => {
-        if (err) logEvent('error', `MQTT subscribe failed: ${err.message}`);
-        else
-          logEvent(
-            'info',
-            `Subscribed: ${CONFIG.TOPIC_UNPAIRED_HEARTBEAT} + ${CONFIG.TOPIC_ROOM_HEARTBEAT} + ${CONFIG.TOPIC_LOCK_LOG}`
-          );
-      }
-    );
+    const subs = [
+      CONFIG.TOPIC_UNPAIRED_HEARTBEAT,
+      CONFIG.TOPIC_ROOM_HEARTBEAT,
+      CONFIG.TOPIC_LOCK_LOG,
+      // Device-scoped inbound (ozkey-07 §5/§10) — site-pinned, legacy kept.
+      CONFIG.subDeviceHeartbeat(CONFIG.SITE_ID),
+      CONFIG.subDeviceLog(CONFIG.SITE_ID),
+    ];
+    mqttClient.subscribe(subs, { qos: 1 }, (err) => {
+      if (err) logEvent('error', `MQTT subscribe failed: ${err.message}`);
+      else logEvent('info', `Subscribed: ${subs.join(' + ')}`);
+    });
   });
 
   mqttClient.on('reconnect', () => logEvent('warn', 'MQTT reconnecting...'));
@@ -538,6 +572,53 @@ function initMqtt() {
           // Quiet heartbeat — nothing pending; keep the terminal readable.
           return;
         }
+        return;
+      }
+
+      /* -- Channel 4: device-scoped inbound (ozkey-07 §5) ------------------ */
+      // ozkey/<site>/locks/<device_id>/heartbeat|log — room is a label; the
+      // server resolves device -> room (binding of record or MAC-derived).
+      const devMatch = topic.match(/^ozkey\/([^/]+)\/locks\/([^/]+)\/(heartbeat|log)$/);
+      if (devMatch) {
+        const [, siteId, deviceId, kind] = devMatch;
+        if (siteId !== CONFIG.SITE_ID) return; // not our site
+        const [[room]] = await pool.query(
+          `SELECT * FROM rooms
+            WHERE lock_device_id = ?
+               OR (mac_address IS NOT NULL
+                   AND CONCAT('ozk-', REPLACE(LOWER(mac_address), ':', '')) = ?)`,
+          [deviceId, deviceId]
+        );
+        if (!room) {
+          logEvent('warn', `Device ${deviceId} on ${kind} has no bound room — ignored`);
+          return;
+        }
+
+        if (kind === 'heartbeat') {
+          await flushQueueForRoom(room.room_no);
+          return;
+        }
+
+        // kind === 'log': door transaction, resolved through the device.
+        let obj = {};
+        try {
+          obj = JSON.parse(payload);
+        } catch (_) {
+          /* tolerate non-JSON; fields default below */
+        }
+        const mac = normalizeMac(obj.mac) || room.mac_address || null;
+        const result = String(obj.result || 'unknown').slice(0, 20);
+        const detail = String(obj.detail || '').slice(0, 255);
+        const lockTs = obj.ts ? new Date(obj.ts).toISOString() : new Date().toISOString();
+        await pool.query(
+          'INSERT INTO lock_logs (mac, room_no, result, detail, lock_ts) VALUES (?, ?, ?, ?, ?)',
+          [mac, room.room_no, result, detail, lockTs]
+        );
+        logEvent(
+          'lock',
+          `Door ${result.toUpperCase()} — ${detail || 'no detail'} @ room ${room.room_no} (${deviceId})`
+        );
+        return;
       }
     } catch (err) {
       logEvent('error', `MQTT message handler fault on ${topic}: ${err.message}`);
@@ -804,22 +885,29 @@ api.post('/locks/pair', async (req, res) => {
     }
 
     // Issue (or reuse) the broker-side network token for this room binding.
+    // Also record the device-scoped binding of record (ozkey-07 §5): keep a
+    // PMS-pushed lock_device_id if present, else derive the lab-interim id.
     const macToken = room.mac_token || makeMacToken();
+    const deviceId = room.lock_device_id || deviceIdFromMac(mac);
     await pool.query(
-      "UPDATE rooms SET mac_address = ?, mac_token = ?, status = 'Available' WHERE room_no = ?",
-      [mac, macToken, room_no]
+      "UPDATE rooms SET mac_address = ?, mac_token = ?, lock_device_id = ?, status = 'Available' WHERE room_no = ?",
+      [mac, macToken, deviceId, room_no]
     );
     unpairedCache.delete(mac);
 
     // Gap #2 (ozkey-02 §3.2/§8.4): provision_assign handshake on the room
     // command topic — key is `mac`, NEVER `payload_hex` (that key would route
     // the JSON to the lock's Tuya parser instead of its provisioning parser).
+    // Since ozkey-07 it also carries site_id + device_id so the lock can move
+    // its heartbeat/log/command traffic to the device-scoped topics.
     const commandTopic = CONFIG.topicRoomCommand(room_no);
     const handshake = {
       topic: commandTopic, // optional for LockSim since §8.4, kept for manual paste
       op: 'provision_assign',
       mac,
       room_no: String(room_no),
+      site_id: CONFIG.SITE_ID,
+      device_id: deviceId,
       server_ip: CONFIG.SERVER_IP,
       server_port: CONFIG.HTTP_PORT,
       mac_token: macToken,
@@ -845,7 +933,7 @@ api.post('/locks/unpair', async (req, res) => {
     const { room_no } = req.body || {};
     if (!room_no) return res.status(400).json({ ok: false, error: 'room_no is required' });
     const [result] = await pool.query(
-      "UPDATE rooms SET mac_address = NULL, status = 'Available' WHERE room_no = ?",
+      "UPDATE rooms SET mac_address = NULL, lock_device_id = NULL, status = 'Available' WHERE room_no = ?",
       [room_no]
     );
     if (result.affectedRows === 0)
@@ -1208,5 +1296,6 @@ if (require.main === module) {
     toSpacedHex,
     normalizeMac,
     makeMacToken,
+    deviceIdFromMac,
   };
 }

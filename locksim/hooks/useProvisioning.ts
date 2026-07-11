@@ -105,6 +105,9 @@ export function useProvisioning({ mac, logInbound, onEvent }: UseProvisioningOpt
       `${result.topic} (matches ${ONBOARDING_TOPIC})`,
       `Onboarding validated — MAC ${result.mac} → Room ${result.roomNo}`,
       `Network vars: server_ip=${result.serverIp}, mac_token=${result.macToken}`,
+      ...(result.deviceId
+        ? [`Device-scoped identity: site=${result.siteId}, device_id=${result.deviceId} (ozkey-07 §10)`]
+        : []),
     ]);
 
     const record: NetworkProvisioning = {
@@ -113,6 +116,10 @@ export function useProvisioning({ mac, logInbound, onEvent }: UseProvisioningOpt
       server_ip: result.serverIp,
       mac_token: result.macToken,
       provisionedAt: Date.now(),
+      // ozkey-07 §10: adopt the granted device identity — heartbeat/log/command
+      // move to ozkey/<site>/locks/<device_id>/… while room_no stays a label.
+      site_id: result.siteId ?? undefined,
+      device_id: result.deviceId ?? undefined,
     };
     saveProvisioning(record);
     setProvisioning(record);
