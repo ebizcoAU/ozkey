@@ -715,6 +715,7 @@ api.post('/pms/rooms', async (req, res) => {
     }
 
     const conflicts = [];
+    const adopted = []; // pre-PMS rows claimed by room_no (binding preserved)
     let upserted = 0;
     const seenMaoiIds = [];
 
@@ -726,39 +727,99 @@ api.post('/pms/rooms', async (req, res) => {
         continue;
       }
       seenMaoiIds.push(maoiId);
+      // Binding semantics (§4.2): key ABSENT = keep the stored binding; key
+      // PRESENT with null/empty = guarded clear; key present with a value =
+      // bind (refused with a conflict if it disagrees with a paired lock).
+      const hasLockKey = Object.prototype.hasOwnProperty.call(r, 'lock_device_id');
+      const pushedLockId = hasLockKey && r.lock_device_id ? String(r.lock_device_id).slice(0, 64) : null;
       const fields = {
         room_no: roomNo,
         name: r.name != null ? String(r.name).slice(0, 255) : null,
         room_type: r.type != null ? String(r.type).slice(0, 100) : null,
         floor: Number.isFinite(r.floor) ? r.floor : null,
         capacity: Number.isFinite(r.capacity) ? r.capacity : 1,
-        lock_device_id: r.lock_device_id ? String(r.lock_device_id).slice(0, 64) : null,
       };
 
       const [[existing]] = await pool.query('SELECT * FROM rooms WHERE maoi_id = ?', [maoiId]);
-      // Guard: a different room already uses this room_no (unique) → report, skip.
       const [[clash]] = await pool.query(
-        'SELECT maoi_id FROM rooms WHERE room_no = ? AND (maoi_id IS NULL OR maoi_id <> ?)',
+        'SELECT * FROM rooms WHERE room_no = ? AND (maoi_id IS NULL OR maoi_id <> ?)',
         [roomNo, maoiId]
       );
-      if (clash) {
+      // A row OWNED by another PMS id on this room_no is a true collision; so is
+      // renaming a PMS-owned row onto a pre-PMS row's number (two rows, one
+      // number — merging is a manual decision). Report, skip.
+      if (clash && (clash.maoi_id || existing)) {
         conflicts.push({ room_no: roomNo, issue: `room_no already used by another room — not applied` });
         continue;
       }
+      // ADOPTION: this PMS id is new and a pre-PMS row (maoi_id NULL — old lab
+      // seed or cockpit-created) holds the room_no → claim that row instead of
+      // erroring. The app correlates by room_no; the lock binding, credentials
+      // and pairing state on the row are PRESERVED — never overwritten.
+      const target = existing || (clash && !clash.maoi_id ? clash : null);
+      const isAdoption = !existing && target !== null;
 
-      if (existing) {
+      if (target) {
+        // Resolve the binding this row should end up with.
+        let nextLockId = target.lock_device_id; // default: key absent → keep
+        if (hasLockKey && pushedLockId === null) {
+          // Explicit clear (unbind pushed from the app). Guarded, not silent:
+          // live credentials are surfaced but the clear still applies — a
+          // paired room self-heals onto its MAC-derived route (§5 fallback).
+          nextLockId = null;
+          if (target.lock_device_id) {
+            const [[{ live }]] = await pool.query(
+              `SELECT COUNT(*) AS live FROM credentials
+                WHERE room_id = ? AND sync_status IN ('pending','synced')`,
+              [target.id]
+            );
+            if (live > 0) {
+              conflicts.push({
+                room_no: roomNo,
+                issue: `binding cleared while room has ${live} live credential(s)`,
+                lock_device_id: target.lock_device_id,
+                action: target.mac_address
+                  ? 'cleared — routing falls back to the paired MAC-derived device id'
+                  : 'cleared — room has no paired lock; queued commands cannot route',
+              });
+            }
+          }
+        } else if (pushedLockId !== null) {
+          // A paired lock adopted its binding-of-record at pair time and drops
+          // legacy room-topic command copies (§10) — overwriting with a
+          // disagreeing id would silently strand command delivery. Refuse the
+          // binding (roster fields still apply) and surface a conflict.
+          const bindingOfRecord = deviceIdForRoom(target);
+          if (target.mac_address && pushedLockId !== bindingOfRecord) {
+            conflicts.push({
+              room_no: roomNo,
+              issue: `pushed lock_device_id '${pushedLockId}' disagrees with the paired lock's binding '${bindingOfRecord}' — binding not applied`,
+              lock_device_id: bindingOfRecord,
+              action: 'unpair/re-pair the lock, or clear the binding first (lock_device_id: null)',
+            });
+          } else {
+            nextLockId = pushedLockId;
+          }
+        }
         await pool.query(
-          `UPDATE rooms SET room_no = ?, name = ?, room_type = ?, floor = ?, capacity = ?,
-             lock_device_id = COALESCE(?, lock_device_id), active = 1, last_synced_at = NOW()
-           WHERE maoi_id = ?`,
-          [fields.room_no, fields.name, fields.room_type, fields.floor, fields.capacity, fields.lock_device_id, maoiId]
+          `UPDATE rooms SET maoi_id = ?, room_no = ?, name = ?, room_type = ?, floor = ?, capacity = ?,
+             lock_device_id = ?, active = 1, last_synced_at = NOW()
+           WHERE id = ?`,
+          [maoiId, fields.room_no, fields.name, fields.room_type, fields.floor, fields.capacity, nextLockId, target.id]
         );
+        if (isAdoption) {
+          adopted.push({
+            room_no: roomNo,
+            mac_address: target.mac_address || null,
+            lock_device_id: nextLockId || null,
+          });
+        }
       } else {
         await pool.query(
           `INSERT INTO rooms (maoi_id, room_no, name, room_type, floor, capacity, lock_device_id,
              status, active, last_synced_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'Available', 1, NOW())`,
-          [maoiId, fields.room_no, fields.name, fields.room_type, fields.floor, fields.capacity, fields.lock_device_id]
+          [maoiId, fields.room_no, fields.name, fields.room_type, fields.floor, fields.capacity, pushedLockId]
         );
       }
       upserted++;
@@ -797,10 +858,11 @@ api.post('/pms/rooms', async (req, res) => {
     logEvent(
       'info',
       `PMS roster ${mode}: ${upserted} upserted` +
+        (adopted.length ? `, ${adopted.length} adopted` : '') +
         (mode === 'reconcile' ? `, ${deactivated} deactivated` : '') +
         (conflicts.length ? `, ${conflicts.length} conflict(s)` : '')
     );
-    res.json({ ok: true, upserted, deactivated, conflicts });
+    res.json({ ok: true, upserted, deactivated, adopted, conflicts });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -823,6 +885,37 @@ api.get('/pms/rooms/status', async (req, res) => {
       active_count: Number(s.active_count) || 0,
       bound_count: Number(s.bound_count) || 0,
     });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * Factory-reset the mirror — wipes rooms, credentials, queue, door logs and
+ * guest users. NEVER automatic (§4.2: removal is guarded, not silent): the
+ * operator must confirm with body {"confirm":"ERASE"}, and the endpoint sits
+ * behind the same X-OZKEY-Secret gate as every /pms/* write. Exists for the
+ * lab/first-commissioning case where stale pre-PMS rows block the roster push.
+ */
+api.post('/pms/reset', async (req, res) => {
+  if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
+  try {
+    const { confirm } = req.body || {};
+    if (confirm !== 'ERASE') {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'destructive reset requires body {"confirm":"ERASE"}' });
+    }
+    const wiped = {};
+    // FK order: credentials reference rooms + users; wipe children first.
+    for (const table of ['credentials', 'pending_queue', 'lock_logs', 'users', 'rooms']) {
+      const [r] = await pool.query(`DELETE FROM ${table}`);
+      wiped[table] = r.affectedRows;
+    }
+    unpairedCache.clear();
+    logEvent('warn', `PMS RESET — mirror wiped (operator-confirmed): ${JSON.stringify(wiped)}`);
+    res.json({ ok: true, wiped });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }

@@ -41,6 +41,26 @@
 > (still §5-invisible, per spec) — this refactor is server + lock internals
 > only, no API-surface change to `/pms/*`.
 >
+> **ROSTER-PUSH RECONCILIATION 2026-07-12 (lab-verified).** Driven by MAOI's
+> manual "Gắn khoá" lock-bind UI and first real roster pushes hitting stale
+> pre-PMS rows ("room already exists" app errors). Three additive changes to
+> `POST /pms/rooms` + one new endpoint, all in §4.2: **adoption** (a pushed
+> room_no matching a `maoi_id`-NULL row claims it, preserving its pairing +
+> binding + credentials; new `adopted[]` in the response), the
+> **`lock_device_id` tri-state** (absent = keep; explicit null = guarded clear
+> with a live-credential warning; value = bind, refused with a conflict when it
+> disagrees with a paired lock's binding of record — prevents the §10
+> stranded-commands hazard), and **`POST /pms/reset`** (operator-confirmed
+> `{"confirm":"ERASE"}` mirror wipe behind the §4.4 gate, exposed as the
+> cockpit's type-to-confirm RESET MIRROR button). Verified live: adopt
+> preserves a paired row's binding; mismatched bind refused + reported while
+> roster fields still apply; explicit-null clear applies and warns on live
+> credentials; owned-row `room_no` collisions still refuse; reset wipes all
+> five tables and requires the confirm literal. **MAOI to-dos:** send
+> `lock_device_id: null` explicitly on "Gỡ khoá" (an omitted key no longer
+> clears — it keeps), and surface `adopted[]`/`conflicts[]` from the push
+> response to the operator.
+>
 > **DRAFT 2026-07-11.** The ozkey-team contract for **Mode A** (on-prem
 > OZKEYSERV `:3200` + cockpit `:3300`) covering the two commercial shapes that
 > share one server: (1) **hotel/motel PMS** — MAOI front desk, roster sync +
@@ -156,6 +176,9 @@ Base: `http://<onprem-host>:3200/ozkeyserv/api`. Idempotent; one endpoint, two m
   "ok": true,
   "upserted": 12,
   "deactivated": 1,              // reconcile only
+  "adopted": [                   // pre-PMS rows claimed by room_no (§4.2)
+    { "room_no": "101", "mac_address": "AA:…", "lock_device_id": "ozk-…" }
+  ],
   "conflicts": [
     { "room_no": "103", "issue": "removed room has a bound lock + 1 live guest PIN",
       "lock_device_id": "ozk-…", "action": "kept inactive — resolve at the room" }
@@ -168,10 +191,33 @@ Base: `http://<onprem-host>:3200/ozkeyserv/api`. Idempotent; one endpoint, two m
   absent from the payload are untouched.
 - **`reconcile`** (manual full-roster button): payload is the *complete* roster;
   mirror rooms absent from it are marked **`active = 0`** — **never hard-deleted**.
+- **Adoption (added 2026-07-12).** A pushed room whose `room_no` matches a
+  **pre-PMS row** (`maoi_id` NULL — old lab seed or cockpit-created) **claims
+  that row** instead of erroring: the PMS `id` and labels are written onto it
+  and its pairing state (`mac_address`, `mac_token`, `lock_device_id`) and
+  credentials are **preserved, never overwritten**. Reported in `adopted[]`.
+  A `room_no` held by a row **owned by a different PMS id** — or renaming an
+  owned row onto a pre-PMS row's number (a two-row merge) — is still a
+  `conflicts[]` refusal.
+- **`lock_device_id` tri-state (added 2026-07-12).** Key **absent** → keep the
+  stored binding (so pushes from an app that doesn't know the binding never
+  clear it). Key present with **null/empty** → **guarded clear**: applied, but
+  if the room has live credentials a `conflicts[]` warning names them (a paired
+  room self-heals onto its MAC-derived §5 route). Key present with a **value**
+  → bind — **unless the room has a paired lock and the value disagrees with the
+  binding of record**, in which case the binding is refused with a `conflicts[]`
+  entry (roster fields still apply): the lock adopted its id at pair time and
+  drops legacy room-topic copies (§10), so overwriting would silently strand
+  command delivery.
 - **Removal is guarded, not silent.** Deactivating a room with a bound lock or
   live (unexpired) credentials does **not** drop the lock/queue/credentials — it
   returns a `conflicts[]` entry so the app warns the operator. Opposite of the
   lab's destructive `DELETE /locks`.
+- **`POST /pms/reset` (added 2026-07-12)** — factory-reset the mirror for
+  first commissioning: wipes rooms, credentials, pending queue, door logs and
+  guest users. Never automatic: requires body `{"confirm":"ERASE"}` behind the
+  §4.4 secret gate; the cockpit `:3300` exposes it as a type-to-confirm
+  **RESET MIRROR** button so the wipe is always an operator decision.
 - `GET /rooms` (unchanged) feeds the view-only cockpit; `GET /pms/rooms/status`
   → `{last_synced_at, room_count, active_count, bound_count}` for the sync
   button's status line.
@@ -209,6 +255,42 @@ The property↔lock binding writes `lock_device_id` in the app's room editor (vi
 `ozkey_commissioner`, XF-42) and **rides the §4 roster push** — so definition and
 binding stay in sync through one channel, no racing second write. OZKEYSERV
 stores it on the mirror row and uses it for §5 resolution.
+
+### 6.1 Doorlock replacement procedure (added 2026-07-12)
+
+The room row is the stable thing; the lock is the replaceable part. Cockpit
+`:3300` exposes both halves (PAIR and UNPAIR in the pairing row). The order
+matters because **unpair is a server-side row change only — nothing is sent to
+the old lock, and credentials burned into it keep opening the door until they
+are revoked, expire, or the lock is factory-reset.**
+
+1. **Revoke live credentials while the old lock still heartbeats** —
+   `POST /pms/revoke-key` per credential (cockpit ROOM KEYS tab → REVOKE). The
+   DPID delete frames queue and flush on the old lock's next heartbeat. If the
+   lock is dead/being retired anyway, skip this and rely on factory-resetting
+   the hardware instead.
+2. **Unpair the room** — cockpit UNPAIR or `POST /locks/unpair {room_no}`.
+   Clears `mac_address` + `lock_device_id` on the row (the `mac_token` is kept
+   and reused at the next pair); the MAC returns to the discovery pool. The
+   room keeps its roster identity, credential history and door logs.
+3. **Swap the hardware; factory-reset the old lock** (LockSim: REGISTER wipes
+   its provisioning). An un-reset old lock keeps heartbeating its stale
+   identity — harmless to routing (the row no longer points at it) but noisy,
+   and its on-device credentials still open it if step 1 was skipped.
+4. **Pair the new lock to the same `room_no`** — it announces on the unpaired
+   channel, appears in cockpit discovery, PAIR binds it. It gets a **new**
+   `lock_device_id` (derived from the new MAC, or a PMS-pushed binding if MAOI
+   re-pushed one after the unpair) and the §10 handshake moves it straight to
+   device-scoped topics.
+5. **Re-issue credentials.** Credential rows survive in the DB but frames
+   already `synced` to the old lock are **not** re-pushed automatically —
+   re-issue keys for guests who must keep access (slots can be reused).
+   Still-`queued` jobs DO survive and flush to the new lock's first heartbeat.
+6. **Update the MAOI binding.** The new `device_id` differs from the old one,
+   and a push carrying the stale id is now **refused** by the §4.2 mismatch
+   guard. Either clear the binding before the swap (`Gỡ khoá` → explicit
+   `lock_device_id: null`) and re-bind after, or type the new `ozk-…` id in
+   `Gắn khoá`. (Simplest safe habit: unbind before swap, re-bind after.)
 
 ## 7. Credential lifecycle — mostly ALREADY BUILT
 

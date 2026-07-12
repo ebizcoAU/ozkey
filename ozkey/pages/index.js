@@ -100,6 +100,8 @@ export default function Cockpit() {
   const [selectedMac, setSelectedMac] = useState('');
   const [selectedRoom, setSelectedRoom] = useState('');
   const [pairBusy, setPairBusy] = useState(false);
+  const [unpairRoom, setUnpairRoom] = useState('');
+  const [unpairBusy, setUnpairBusy] = useState(false);
 
   /* -- credential injector -- */
   const [form, setForm] = useState({
@@ -364,6 +366,43 @@ export default function Cockpit() {
     }
   };
 
+  /** Release a room's lock back to the discovery pool (doorlock replacement,
+   *  ozkey-07 §6.1). Server-side row change only — credentials already burned
+   *  into the physical lock survive until it is factory-reset at the door. */
+  const doUnpair = async () => {
+    if (!unpairRoom) {
+      appendLog('warn', 'Select a paired room to unpair first');
+      return;
+    }
+    const room = rooms.find((r) => r.room_no === unpairRoom);
+    const sure = window.confirm(
+      `Unpair the lock from room ${unpairRoom}?` +
+        (room?.mac_address ? `\n\nMAC ${room.mac_address} returns to the discovery pool.` : '') +
+        `\n\nCredentials already on the physical lock KEEP WORKING until the lock is factory-reset or they are revoked/expire. For a doorlock swap follow ozkey-07 §6.1: revoke live keys first, unpair, swap hardware, pair the new lock, re-issue.`
+    );
+    if (!sure) return;
+    setUnpairBusy(true);
+    appendLog('pair', `Unpairing room ${unpairRoom} ...`);
+    try {
+      const res = await fetch(`${API}/locks/unpair`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room_no: unpairRoom }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        appendLog('pair', `UNPAIRED — room ${data.room_no} released; lock free for re-pairing`);
+        setUnpairRoom('');
+      } else {
+        appendLog('error', `UNPAIR REJECTED — ${data.error}`);
+      }
+    } catch (err) {
+      appendLog('error', `Gateway unreachable: ${err.message}`);
+    } finally {
+      setUnpairBusy(false);
+    }
+  };
+
   const doIssueKey = async () => {
     if (!form.room_no || !form.guest_name || !form.raw_value) {
       appendLog('warn', 'Injector needs room, guest name and a credential value');
@@ -415,6 +454,40 @@ export default function Cockpit() {
       appendLog('error', `Gateway unreachable: ${err.message}`);
     } finally {
       setRevokeBusyId(null);
+    }
+  };
+
+  /** ozkey-07 §4: operator-confirmed mirror wipe (rooms/creds/queue/logs/users)
+   *  for first commissioning — clears stale pre-PMS rows so the PMS roster
+   *  push starts from a blank mirror. Type-to-confirm; never automatic. */
+  const doResetMirror = async () => {
+    const typed = window.prompt(
+      'FACTORY-RESET the room mirror?\n\nThis wipes ALL rooms, credentials, the pending queue, door logs and guest users on OZKEYSERV. Locks must be re-paired and the PMS must re-push its roster.\n\nType ERASE to confirm:'
+    );
+    if (typed === null) return;
+    if (typed.trim() !== 'ERASE') {
+      appendLog('warn', 'Mirror reset aborted — confirmation text did not match');
+      return;
+    }
+    try {
+      const res = await fetch(`${API}/pms/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: 'ERASE' }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        appendLog(
+          'warn',
+          `MIRROR RESET — wiped ${Object.entries(data.wiped)
+            .map(([t, n]) => `${t}:${n}`)
+            .join(' ')}`
+        );
+      } else {
+        appendLog('error', `RESET REJECTED — ${data.error}`);
+      }
+    } catch (err) {
+      appendLog('error', `Gateway unreachable: ${err.message}`);
     }
   };
 
@@ -504,7 +577,7 @@ export default function Cockpit() {
         <div style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1.5 }}>
           OZKEY <span style={{ color: C.green }}>//</span> LOCK COCKPIT
         </div>
-        <div style={{ display: 'flex', gap: 14, fontSize: 10 }}>
+        <div style={{ display: 'flex', gap: 14, fontSize: 10, alignItems: 'center' }}>
           {[
             ['GATEWAY', gatewayUp],
             ['MQTT', mqttUp],
@@ -523,6 +596,23 @@ export default function Cockpit() {
               <span style={{ color: up ? C.text : C.dim }}>{label}</span>
             </div>
           ))}
+          <button
+            onClick={doResetMirror}
+            title="Wipe rooms, credentials, queue, door logs and guest users — for first commissioning from the PMS"
+            style={{
+              fontFamily: 'inherit',
+              fontSize: 9,
+              letterSpacing: 1,
+              padding: '4px 10px',
+              borderRadius: 4,
+              border: `1px solid ${C.red}`,
+              background: 'transparent',
+              color: C.red,
+              cursor: 'pointer',
+            }}
+          >
+            RESET MIRROR
+          </button>
         </div>
       </div>
 
@@ -614,6 +704,41 @@ export default function Cockpit() {
           }}
         >
           {pairBusy ? 'BINDING…' : 'PAIR LOCK TO ROOM'}
+        </button>
+
+        {/* -- Unpair (doorlock replacement, ozkey-07 §6.1) ---------------- */}
+        <span style={{ width: 1, alignSelf: 'stretch', background: C.panelEdge }} />
+        <select
+          value={unpairRoom}
+          onChange={(e) => setUnpairRoom(e.target.value)}
+          style={{ ...inputStyle, width: 'auto', flex: '0 1 190px', padding: '6px 8px', fontSize: 12 }}
+        >
+          <option value="">— paired room —</option>
+          {pairedRooms.map((r) => (
+            <option key={r.id} value={r.room_no}>
+              {r.room_no} — {r.mac_address}
+            </option>
+          ))}
+        </select>
+        <button
+          onClick={doUnpair}
+          disabled={unpairBusy || !unpairRoom}
+          title="Release this room's lock back to the discovery pool (doorlock swap: revoke keys → unpair → swap → pair new → re-issue)"
+          style={{
+            cursor: unpairBusy || !unpairRoom ? 'not-allowed' : 'pointer',
+            fontFamily: 'inherit',
+            fontWeight: 800,
+            letterSpacing: 1,
+            fontSize: 11,
+            padding: '7px 14px',
+            borderRadius: 5,
+            border: `1px solid ${unpairBusy || !unpairRoom ? C.gray : C.red}`,
+            background: 'transparent',
+            color: unpairBusy || !unpairRoom ? C.gray : C.red,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {unpairBusy ? 'RELEASING…' : 'UNPAIR'}
         </button>
       </div>
 
