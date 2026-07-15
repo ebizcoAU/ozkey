@@ -103,6 +103,12 @@ export default function Cockpit() {
   const [unpairRoom, setUnpairRoom] = useState('');
   const [unpairBusy, setUnpairBusy] = useState(false);
 
+  /* -- emergency takeover (ozkey-07 §6.2 / XF-43 §7.6 rule 4) --
+   * The cockpit is a monitor by default; declaring an emergency arms the
+   * X-OZKEY-Secret on every cockpit write so it can act as the fallback
+   * writer while MAOI is lost. Operator-declared, never automatic. */
+  const [emergencySecret, setEmergencySecret] = useState('');
+
   /* -- credential injector -- */
   const [form, setForm] = useState({
     room_no: '',
@@ -337,6 +343,40 @@ export default function Cockpit() {
   /* -------------------------------------------------------------------------
    * Actions
    * ----------------------------------------------------------------------- */
+  /** Headers for cockpit writes: carries the armed emergency secret, if any.
+   *  With no server secret configured (lab) writes are open and this is moot. */
+  const writeHeaders = () => ({
+    'Content-Type': 'application/json',
+    ...(emergencySecret ? { 'X-OZKEY-Secret': emergencySecret } : {}),
+  });
+
+  /* Re-arm a takeover that survived a page reload. */
+  useEffect(() => {
+    const stored = window.localStorage.getItem('ozkey.cockpit.emergencySecret');
+    if (stored) setEmergencySecret(stored);
+  }, []);
+
+  const declareEmergency = () => {
+    const secret = window.prompt(
+      'DECLARE EMERGENCY TAKEOVER?\n\nUse only when MAOI is lost/damaged/unreachable (ozkey-07 §6.2). The cockpit becomes the fallback writer for door ops — every write will carry X-OZKEY-Secret and is logged server-side. End the takeover when MAOI is back.\n\nEnter the OZKEYSERV shared secret:'
+    );
+    if (secret === null) return;
+    if (!secret.trim()) {
+      appendLog('warn', 'Emergency takeover aborted — empty secret');
+      return;
+    }
+    window.localStorage.setItem('ozkey.cockpit.emergencySecret', secret.trim());
+    setEmergencySecret(secret.trim());
+    appendLog('warn', 'EMERGENCY TAKEOVER DECLARED — cockpit is the fallback writer (X-OZKEY-Secret armed on all writes). End it when MAOI resumes authority.');
+  };
+
+  const endEmergency = () => {
+    if (!window.confirm('End the emergency takeover? The cockpit reverts to monitoring; MAOI is the authority again.')) return;
+    window.localStorage.removeItem('ozkey.cockpit.emergencySecret');
+    setEmergencySecret('');
+    appendLog('warn', 'Emergency takeover ENDED — cockpit reverts to monitoring. Run "Khôi phục khoá từ máy chủ" on the returning MAOI so it re-learns bindings.');
+  };
+
   const doPair = async () => {
     if (!selectedMac || !selectedRoom) {
       appendLog('warn', 'Select both a discovered MAC and a target room before pairing');
@@ -347,7 +387,7 @@ export default function Cockpit() {
     try {
       const res = await fetch(`${API}/locks/pair`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: writeHeaders(),
         body: JSON.stringify({ room_no: selectedRoom, mac_address: selectedMac }),
       });
       const data = await res.json();
@@ -386,7 +426,7 @@ export default function Cockpit() {
     try {
       const res = await fetch(`${API}/locks/unpair`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: writeHeaders(),
         body: JSON.stringify({ room_no: unpairRoom }),
       });
       const data = await res.json();
@@ -413,7 +453,7 @@ export default function Cockpit() {
     try {
       const res = await fetch(`${API}/pms/issue-key`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: writeHeaders(),
         body: JSON.stringify({
           ...form,
           slot_number: Number(form.slot_number) || 1,
@@ -441,7 +481,7 @@ export default function Cockpit() {
     try {
       const res = await fetch(`${API}/pms/revoke-key`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: writeHeaders(),
         body: JSON.stringify({ credential_id: cred.id }),
       });
       const data = await res.json();
@@ -472,7 +512,7 @@ export default function Cockpit() {
     try {
       const res = await fetch(`${API}/pms/reset`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: writeHeaders(),
         body: JSON.stringify({ confirm: 'ERASE' }),
       });
       const data = await res.json();
@@ -596,6 +636,28 @@ export default function Cockpit() {
               <span style={{ color: up ? C.text : C.dim }}>{label}</span>
             </div>
           ))}
+          <button
+            onClick={emergencySecret ? endEmergency : declareEmergency}
+            title={
+              emergencySecret
+                ? 'Cockpit is the FALLBACK WRITER (X-OZKEY-Secret armed on all writes). Click to end the takeover and revert to monitoring.'
+                : 'Cockpit is a monitor. Declare an emergency takeover (MAOI lost/damaged) to arm the shared secret on cockpit writes — ozkey-07 §6.2'
+            }
+            style={{
+              fontFamily: 'inherit',
+              fontSize: 9,
+              letterSpacing: 1,
+              padding: '4px 10px',
+              borderRadius: 4,
+              border: `1px solid ${C.amber}`,
+              background: emergencySecret ? C.amber : 'transparent',
+              color: emergencySecret ? '#1a1203' : C.amber,
+              fontWeight: emergencySecret ? 800 : 400,
+              cursor: 'pointer',
+            }}
+          >
+            {emergencySecret ? '⚠ EMERGENCY WRITER — END' : 'DECLARE EMERGENCY'}
+          </button>
           <button
             onClick={doResetMirror}
             title="Wipe rooms, credentials, queue, door logs and guest users — for first commissioning from the PMS"

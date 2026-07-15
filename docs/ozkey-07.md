@@ -56,10 +56,48 @@
 > preserves a paired row's binding; mismatched bind refused + reported while
 > roster fields still apply; explicit-null clear applies and warns on live
 > credentials; owned-row `room_no` collisions still refuse; reset wipes all
-> five tables and requires the confirm literal. **MAOI to-dos:** send
-> `lock_device_id: null` explicitly on "Gỡ khoá" (an omitted key no longer
-> clears — it keeps), and surface `adopted[]`/`conflicts[]` from the push
-> response to the operator.
+> five tables and requires the confirm literal.
+>
+> **RECONCILED WITH THE APP 2026-07-12 (XF-43 §7.4–§7.6).** FtposPM confirmed
+> the contract and corrected one earlier ask: MAOI's **bulk roster push emits
+> `lock_device_id` only when bound** (omit-when-unbound → tri-state "keep"),
+> NOT explicit null — a bulk null would guarded-clear every binding MAOI
+> doesn't locally know (cockpit-paired rooms, post-reset tablets). **Deliberate
+> unbind ("Gỡ khoá") = `POST /locks/unpair` per room**, never the bulk path.
+> The explicit-null guarded clear remains a server capability for per-room
+> deliberate ops. Authority model adopted (§6.2): MAOI originates · OZKEYSERV
+> records · cockpit observes (fallback writer only under declared emergency).
+> Accordingly `/locks/pair` + `/locks/unpair` now sit behind the same
+> `X-OZKEY-Secret` gate as all `/pms/*` writes (lab: open while no secret is
+> configured). MAOI's recovery half is built app-side: `serverBindings()` +
+> "Khôi phục khoá từ máy chủ" re-learn bindings from `GET /rooms` after a
+> tablet loss; `adopted[]`/`conflicts[]` surface in the sync dialog. The
+> cockpit's **DECLARE EMERGENCY** takeover control (arms the secret on cockpit
+> writes, §6.2) is built and the widened gate verified 401/pass. Incoming
+> firmware asks from XF-43 §7.5 (BLE bootstrap) recorded in §11.
+>
+> **FLEET SLICE V1 BUILT 2026-07-14 (lab-verified).** The §3/§8/§9 core on
+> OZKEYSERV: `orgs` (with the §2.1 `root_mode` company|owner recorded per
+> org — the reclaim ceremony is later), `operators` (role + bearer token, the
+> ozkey-05 §4 auth-gap v1), `operator_scopes` (portfolio = one-op reassign),
+> `revocations`, persistent `audit_log`, `rooms.suspended`,
+> `credentials.issued_by`. `/pms/issue-key`+`/pms/revoke-key` now accept EITHER
+> the shared secret (full scope) OR `X-OZKEY-Operator-Token` (scoped,
+> revocable): invalid token 401, disabled operator 403, out-of-scope room 403,
+> suspended door 409. **Disable an operator = §9 scenario 1 end-to-end:**
+> token authority dies instantly AND every live credential they issued is
+> auto-revoked (DPID delete frames queued per room, land on next heartbeat).
+> New endpoints: `POST/GET /fleet/operators`, `/fleet/operators/:id/
+> scope|disable|enable`, `GET /fleet/audit`, `POST /locks/suspend|resume`,
+> and **`POST /locks/resync`** (closes the §6.1 step 5 lock-swap gap:
+> re-queues all live unexpired credentials for a room so a replacement lock
+> receives the full set on first heartbeat; expired/revoking excluded,
+> idempotent). All admin surfaces behind the §4.4 secret. Verified live:
+> scoped issue 200 + attribution, out-of-scope 403, bogus token 401,
+> suspend 409/resume, disable→auto-revoke(1)+403, re-enable, resync
+> requeue, audit trail app-attributed. Still outstanding: owner-root reclaim
+> ceremony, org hierarchy/regions, revocation lists for app-key (BLE)
+> credentials, e2e envelope + KMS (ozkey-06).
 >
 > **DRAFT 2026-07-11.** The ozkey-team contract for **Mode A** (on-prem
 > OZKEYSERV `:3200` + cockpit `:3300`) covering the two commercial shapes that
@@ -209,6 +247,10 @@ Base: `http://<onprem-host>:3200/ozkeyserv/api`. Idempotent; one endpoint, two m
   entry (roster fields still apply): the lock adopted its id at pair time and
   drops legacy room-topic copies (§10), so overwriting would silently strand
   command delivery.
+  *Reconciled with the app (XF-43 §7.4):* MAOI's bulk push **omits the key when
+  unbound** — it never emits the null. A bulk null would clear bindings MAOI
+  doesn't locally know (cockpit-paired rooms, a re-adopting replacement
+  tablet). Deliberate unbind is the per-room `POST /locks/unpair`, not a push.
 - **Removal is guarded, not silent.** Deactivating a room with a bound lock or
   live (unexpired) credentials does **not** drop the lock/queue/credentials — it
   returns a `conflicts[]` entry so the app warns the operator. Opposite of the
@@ -240,6 +282,12 @@ it on every push. This is the v1 gate for the on-prem LAN deployment; the fuller
 principal-auth/RBAC story is §9/§11. (Reads — `GET /rooms`, cockpit — stay open
 on the LAN as today.)
 
+**Scope widened 2026-07-12 (XF-43 §7.6 rule 4):** the gate covers **every
+door-fact write**, not just `/pms/*` — `POST /locks/pair` and
+`POST /locks/unpair` included. Every writer authenticates: MAOI holds the
+secret for normal ops; the cockpit supplies it only under a declared emergency
+takeover (§6.2). Unset secret = lab-open, unchanged.
+
 ## 5. `room_no` → `device_id` resolution (keeps the app simple)
 
 The app references properties by **`room_no`** everywhere — roster, issue,
@@ -258,11 +306,13 @@ stores it on the mirror row and uses it for §5 resolution.
 
 ### 6.1 Doorlock replacement procedure (added 2026-07-12)
 
-The room row is the stable thing; the lock is the replaceable part. Cockpit
-`:3300` exposes both halves (PAIR and UNPAIR in the pairing row). The order
-matters because **unpair is a server-side row change only — nothing is sent to
-the old lock, and credentials burned into it keep opening the door until they
-are revoked, expire, or the lock is factory-reset.**
+The room row is the stable thing; the lock is the replaceable part. Per the
+§6.2 authority model the **normal actor is MAOI** ("Gỡ khoá" = unpair, "Ghép
+khoá vật lý" = discovery+pair); the cockpit `:3300` exposes the same halves
+(PAIR / UNPAIR in the pairing row) for the lab and for emergency takeover. The
+order matters because **unpair is a server-side row change only — nothing is
+sent to the old lock, and credentials burned into it keep opening the door
+until they are revoked, expire, or the lock is factory-reset.**
 
 1. **Revoke live credentials while the old lock still heartbeats** —
    `POST /pms/revoke-key` per credential (cockpit ROOM KEYS tab → REVOKE). The
@@ -282,15 +332,57 @@ are revoked, expire, or the lock is factory-reset.**
    `lock_device_id` (derived from the new MAC, or a PMS-pushed binding if MAOI
    re-pushed one after the unpair) and the §10 handshake moves it straight to
    device-scoped topics.
-5. **Re-issue credentials.** Credential rows survive in the DB but frames
-   already `synced` to the old lock are **not** re-pushed automatically —
-   re-issue keys for guests who must keep access (slots can be reused).
-   Still-`queued` jobs DO survive and flush to the new lock's first heartbeat.
-6. **Update the MAOI binding.** The new `device_id` differs from the old one,
-   and a push carrying the stale id is now **refused** by the §4.2 mismatch
-   guard. Either clear the binding before the swap (`Gỡ khoá` → explicit
-   `lock_device_id: null`) and re-bind after, or type the new `ozk-…` id in
-   `Gắn khoá`. (Simplest safe habit: unbind before swap, re-bind after.)
+5. **Resync credentials — `POST /locks/resync {room_no}`** (gap closed
+   2026-07-14): re-queues the DPID issue frame for every live, unexpired
+   credential on the room, so the replacement lock receives the full set on
+   its first heartbeat. Idempotent (skips already-queued), excludes
+   expired/revoking rows. Still-`queued` jobs survive the swap anyway.
+6. **MAOI binding — already handled by steps 2 + 4** (reconciled, XF-43 §7.4):
+   "Gỡ khoá" (step 2) clears the server row AND the stale local id — so the
+   mismatch guard won't refuse the next sync — and "Ghép khoá vật lý" (step 4)
+   reads the server-assigned new `device_id` back and mirrors it locally. No
+   separate re-bind step. (Only when the swap was done from the cockpit during
+   an emergency does MAOI need "Khôi phục khoá từ máy chủ" to re-learn, §6.2.)
+
+### 6.2 Authority model — adopted from XF-43 §7.6 (2026-07-12)
+
+**MAOI originates · OZKEYSERV records · cockpit observes.** The full rule-set
+and emergency-takeover procedure live in `XFtposDecisions-43.md` §7.6; this is
+the server-side view of the three roles:
+
+| System | Role | Writes in normal operation |
+|---|---|---|
+| **MAOI** (tablet) | Authority for operations | room defs · bindings (pair/unpair) · credential issuance · housekeeping |
+| **OZKEYSERV `:3200`** | System of record + router | only server-minted facts (`device_id`, `mac_token`, `credential_id`, door logs) — MAOI reads them back |
+| **Cockpit `:3300`** | Assisting tool | **nothing normally** — monitor/audit/sync-status; fallback writer only in a declared emergency |
+
+Server-side consequences (all shipped):
+- **Every door-fact write authenticates** — `X-OZKEY-Secret` gates `/pms/*`
+  AND `/locks/pair` + `/locks/unpair` (§4.4). Single active writer per fact is
+  an operating rule, not a lock: the gate + event log make the writer visible.
+  Verified (2026-07-12, secret-enabled instance): pair/unpair 401 without the
+  header, pass with it; reads stay open.
+- **Declared takeover is a cockpit feature (BUILT 2026-07-12).** The cockpit
+  header has **DECLARE EMERGENCY**: the operator enters the shared secret,
+  which arms `X-OZKEY-Secret` on every cockpit write (pair/unpair/issue/
+  revoke/reset) and shows a persistent **⚠ EMERGENCY WRITER** badge until the
+  operator ends the takeover (secret cleared, cockpit reverts to monitoring;
+  the end-of-takeover log line reminds the operator to run "Khôi phục khoá từ
+  máy chủ" on the returning MAOI). Survives a page reload (localStorage).
+  With no server secret configured (lab) cockpit writes remain open and the
+  declaration is a no-op ceremony.
+- **Bulk sync never clears** — the §4.2 tri-state (absent = keep) is what
+  makes rule 3 safe; deliberate unbind is the per-room `POST /locks/unpair`.
+- **Re-adoption on MAOI return** — a replacement tablet learns state back via
+  `GET /rooms` (app: `serverBindings()` / "Khôi phục khoá từ máy chủ") and the
+  push response's `adopted[]`; the server is the merge point for anything the
+  cockpit did during the gap. It never blindly clears what it doesn't
+  recognize — enforced server-side by tri-state + the mismatch guard.
+- **RESET MIRROR is cockpit-only** (§4.2) — the nuclear wipe never lives on
+  the tablet.
+- **Physical lock = last resort** — with MAOI *and* server down, burned-in
+  credentials still open the door; factory-reset + BLE re-commissioning
+  (XF-43 §7.5) recovers the lock with no cloud dependency.
 
 ## 7. Credential lifecycle — mostly ALREADY BUILT
 
@@ -316,8 +408,14 @@ resolution + the auth gate (§9).
   ozkey-06 §6 revocation-list pattern). Server authority dies immediately; any
   cached at-the-door BLE delegation on the phone dies within **one heartbeat
   cycle even fully offline.**
+  *BUILT v1 (2026-07-14):* `POST /fleet/operators/:id/disable` — token refused
+  instantly (403) and every live credential they issued auto-revokes via DPID
+  delete frames on next heartbeat. Broker ACLs + BLE-delegation revocation
+  lists are stage 2 (PIN/RFID revocation is fully covered).
 - **Disable a door (a lock):** `suspended` flag → server refuses to queue new
   credentials; optional lockdown command purges/disables on-device credentials.
+  *BUILT v1 (2026-07-14):* `POST /locks/suspend|resume` — issue refuses 409
+  while suspended; the lockdown purge command is stage 2.
 
 ## 9. The two revocation scenarios, resolved
 
@@ -352,8 +450,10 @@ resolution + the auth gate (§9).
 | `room_no → device_id` resolution in issue/revoke/log | **DONE** (§5, 2026-07-11) |
 | Write-auth gate on `/pms/*` (shared secret, LAN) | **DONE** — §9 |
 | Device-scoped topic refactor | **DONE** (§10, 2026-07-11, bundled not fast-followed) |
-| Full RBAC (orgs/roles/scopes), enable-disable, revocation lists, owner-root delegation | **NEW — the fleet build (§3/§8)** |
+| Fleet slice v1: operators (token auth) + scopes + enable/disable w/ auto-revoke + door suspend + persistent audit + `root_mode` recorded per org + `/locks/resync` | **DONE (2026-07-14, lab-verified)** |
+| Fleet stage 2: owner-root reclaim ceremony, org hierarchy/regions, per-device broker ACLs, revocation lists for app-key (BLE) credentials | **NEW — remaining fleet work (§2.1/§8)** |
 | e2e envelope with org-escrowed KMS | **ozkey-06 implementation + KMS** |
+| BLE bootstrap firmware (XF-43 §7.5 asks): `ozkey_commissioner` ProvisionPayload for OZKEY (broker/site_id/mode), factory trust anchor (QR pubkey), Matter-takeover semantics, ESP32-C6 reference peripheral | **CONTRACT DRAFTED — ozkey-08 (2026-07-13)**: GATT profile v1, payload schema, trust anchor, phased build plan on the Waveshare ESP32-C6 Touch 1.47″; firmware starts after operator board bring-up. **mDNS `_ozkey._tcp` addressing SHIPPED + verified** in ozkeyserv |
 
 **Sequence:** ship the **hotel slice first** (`/pms/rooms` + status + resolution
 + the §4.4 shared-secret gate + auto-issue reuse) — that unblocks XF-43 P7 and is
@@ -390,3 +490,6 @@ stage for the property-management case.
 4. Check-in issues a PIN via `/pms/issue-key` referencing `room_no`; server
    resolves to the bound lock and flushes on heartbeat; checkout auto-revokes.
 5. A write to `/pms/rooms` without the shared secret is rejected.
+6. With a secret configured, `POST /locks/pair` / `POST /locks/unpair` without
+   the header are rejected (401); the cockpit can only perform them after
+   DECLARE EMERGENCY arms the secret, and reads stay open throughout.

@@ -40,7 +40,7 @@ function detectLanIp() {
  * Configuration
  * ------------------------------------------------------------------------- */
 const CONFIG = {
-  HTTP_PORT: 3200,
+  HTTP_PORT: Number(process.env.OZKEY_HTTP_PORT) || 3200,
   SERVER_IP: process.env.OZKEY_SERVER_IP || detectLanIp(),
   DB: {
     host: 'localhost',
@@ -354,6 +354,84 @@ async function initDatabase() {
       lock_ts VARCHAR(50),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB`);
+
+  // Fleet slice v1 (ozkey-07 §3/§8): principals, scopes, revocations, audit.
+  // The org roots the delegation tree; root_mode records the §2.1 decision
+  // per org (hotel = company-root; multi-party fleet = owner-root) — v1
+  // records the mode, the owner-root reclaim ceremony is the later stage.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS orgs (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      root_mode ENUM('company','owner') DEFAULT 'company',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB`);
+  await pool.query(
+    "INSERT INTO orgs (id, name, root_mode) VALUES (1, 'default', 'company') ON DUPLICATE KEY UPDATE id = id"
+  );
+
+  // Operator = role + scope (§3): a revocable, delegated principal — never a
+  // key owner. token is the v1 bearer credential (ozkey-05 §4 auth gap).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS operators (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      org_id INT DEFAULT 1,
+      name VARCHAR(255) NOT NULL,
+      role VARCHAR(50) DEFAULT 'manager',
+      token VARCHAR(64) UNIQUE,
+      active TINYINT DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (org_id) REFERENCES orgs(id)
+    ) ENGINE=InnoDB`);
+
+  // The operator's property subset (a manager's ~100 units; §3). Reassigning
+  // a departed operator's portfolio is a scope swap — one DB op (§9).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS operator_scopes (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      operator_id INT NOT NULL,
+      room_id INT NOT NULL,
+      UNIQUE KEY uniq_scope (operator_id, room_id),
+      FOREIGN KEY (operator_id) REFERENCES operators(id),
+      FOREIGN KEY (room_id) REFERENCES rooms(id)
+    ) ENGINE=InnoDB`);
+
+  // Principal revocation events (§8): who was disabled, why, and how many
+  // live credentials were pulled from their in-scope locks as a result.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS revocations (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      operator_id INT NOT NULL,
+      reason VARCHAR(255) NULL,
+      credentials_revoked INT DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (operator_id) REFERENCES operators(id)
+    ) ENGINE=InnoDB`);
+
+  // Persistent app-attributed audit trail (§3) — the eventRing is ephemeral.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      actor VARCHAR(100),
+      action VARCHAR(50),
+      detail VARCHAR(512)
+    ) ENGINE=InnoDB`);
+
+  // Additive columns: rooms.suspended (§8 disable-a-door) and
+  // credentials.issued_by (operator attribution → revoke-on-disable).
+  const fleetCols = [
+    ['rooms', 'suspended', 'TINYINT DEFAULT 0'],
+    ['credentials', 'issued_by', 'INT NULL'],
+  ];
+  for (const [table, col, def] of fleetCols) {
+    const [[{ has }]] = await pool.query(
+      `SELECT COUNT(*) AS has FROM information_schema.columns
+        WHERE table_schema = ? AND table_name = ? AND column_name = ?`,
+      [CONFIG.DB.database, table, col]
+    );
+    if (!has) await pool.query(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+  }
 
   // 4. Room roster. RETIRED the auto-seed (ozkey-07 §4): the PMS (MAOI) is the
   //    source of truth for rooms and pushes them via POST /pms/rooms. The old
@@ -702,6 +780,64 @@ function roomIsBound(room) {
   return !!(room.lock_device_id || room.mac_address);
 }
 
+/* ---------------------------------------------------------------------------
+ * Fleet slice v1 (ozkey-07 §3/§8) — operator principals + audit
+ * ------------------------------------------------------------------------- */
+
+/** v1 bearer credential for an operator principal (ozkey-05 §4 auth gap). */
+function makeOperatorToken() {
+  return `OPR-${require('crypto').randomBytes(24).toString('base64url')}`;
+}
+
+/** Persistent app-attributed audit trail (§3). Fire-and-forget: an audit
+ *  insert must never fail the operation it describes. */
+function audit(actor, action, detail) {
+  if (!pool) return;
+  pool
+    .query('INSERT INTO audit_log (actor, action, detail) VALUES (?, ?, ?)', [
+      String(actor).slice(0, 100),
+      String(action).slice(0, 50),
+      String(detail).slice(0, 512),
+    ])
+    .catch(() => {});
+}
+
+/**
+ * Credential-writer auth (§8): EITHER the org-level shared secret (MAOI /
+ * declared-emergency cockpit — full scope) OR an operator bearer token
+ * (X-OZKEY-Operator-Token) — scoped, revocable. Returns:
+ *   { actor, operator }  — authorized (operator null for secret auth)
+ *   null                 — response already written (401/403)
+ */
+async function authorizeKeyWriter(req, res) {
+  const token = req.get('X-OZKEY-Operator-Token');
+  if (token) {
+    const [[op]] = await pool.query('SELECT * FROM operators WHERE token = ?', [token]);
+    if (!op) {
+      res.status(401).json({ ok: false, error: 'invalid operator token' });
+      return null;
+    }
+    if (!op.active) {
+      // §9 scenario 1: disabled principal — authority died server-side.
+      res.status(403).json({ ok: false, error: `operator "${op.name}" is disabled` });
+      return null;
+    }
+    return { actor: `operator:${op.id}:${op.name}`, operator: op };
+  }
+  if (!guardPmsSecret(req, res)) return null;
+  return { actor: 'shared-secret', operator: null };
+}
+
+/** Scope check: may this writer operate this room? (secret auth = full scope) */
+async function writerInScope(writer, roomId) {
+  if (!writer.operator) return true;
+  const [[row]] = await pool.query(
+    'SELECT id FROM operator_scopes WHERE operator_id = ? AND room_id = ?',
+    [writer.operator.id, roomId]
+  );
+  return !!row;
+}
+
 api.post('/pms/rooms', async (req, res) => {
   if (!guardDb(res)) return;
   if (!guardPmsSecret(req, res)) return;
@@ -915,6 +1051,7 @@ api.post('/pms/reset', async (req, res) => {
     }
     unpairedCache.clear();
     logEvent('warn', `PMS RESET — mirror wiped (operator-confirmed): ${JSON.stringify(wiped)}`);
+    audit('shared-secret', 'pms-reset', JSON.stringify(wiped));
     res.json({ ok: true, wiped });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -948,6 +1085,10 @@ api.get('/locks/unpaired', async (req, res) => {
 /* -- Physical onboarding: bind MAC -> room --------------------------------- */
 api.post('/locks/pair', async (req, res) => {
   if (!guardDb(res)) return;
+  // XF-43 §7.6 rule 4: EVERY door-fact writer authenticates — MAOI ("Ghép khoá
+  // vật lý") holds the secret; the cockpit supplies it only under a declared
+  // emergency takeover. Lab (no secret configured) stays open.
+  if (!guardPmsSecret(req, res)) return;
   try {
     const { room_no, mac_address } = req.body || {};
     const mac = normalizeMac(mac_address);
@@ -1013,6 +1154,7 @@ api.post('/locks/pair', async (req, res) => {
     mqttPublish(CONFIG.topicPairConfirm(mac), handshake);
 
     logEvent('pair', `PAIRED ${mac} -> room ${room_no} (provision_assign sent on ${commandTopic})`);
+    audit('shared-secret', 'pair', `${mac} → room ${room_no} (device ${deviceId})`);
     res.json({ ok: true, room_no, mac_address: mac, mac_token: macToken, status: 'Available' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -1022,6 +1164,9 @@ api.post('/locks/pair', async (req, res) => {
 /* -- Unpair (lab convenience: release a lock back to discovery) ------------ */
 api.post('/locks/unpair', async (req, res) => {
   if (!guardDb(res)) return;
+  // XF-43 §7.6 rule 3/4: deliberate unbind is THIS endpoint (per room, from
+  // MAOI's "Gỡ khoá"), never the bulk roster push; same writer gate as pair.
+  if (!guardPmsSecret(req, res)) return;
   try {
     const { room_no } = req.body || {};
     if (!room_no) return res.status(400).json({ ok: false, error: 'room_no is required' });
@@ -1032,6 +1177,7 @@ api.post('/locks/unpair', async (req, res) => {
     if (result.affectedRows === 0)
       return res.status(404).json({ ok: false, error: `Room ${room_no} not found` });
     logEvent('pair', `UNPAIRED room ${room_no} — lock released back to discovery pool`);
+    audit('shared-secret', 'unpair', `room ${room_no}`);
     res.json({ ok: true, room_no });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -1041,7 +1187,9 @@ api.post('/locks/unpair', async (req, res) => {
 /* -- PMS bypass: direct credential injection -------------------------------- */
 api.post('/pms/issue-key', async (req, res) => {
   if (!guardDb(res)) return;
-  if (!guardPmsSecret(req, res)) return;
+  // §8: shared secret (full scope) OR operator token (scoped, revocable).
+  const writer = await authorizeKeyWriter(req, res);
+  if (!writer) return;
   const conn = await pool.getConnection();
   try {
     const {
@@ -1081,6 +1229,19 @@ api.post('/pms/issue-key', async (req, res) => {
         error: `Room ${room_no} has no paired lock — pair hardware before issuing keys`,
       });
     }
+    if (room.suspended) {
+      // §8 disable-a-door: server refuses to queue new credentials.
+      return res.status(409).json({
+        ok: false,
+        error: `Room ${room_no} is suspended — resume the door before issuing keys`,
+      });
+    }
+    if (!(await writerInScope(writer, room.id))) {
+      return res.status(403).json({
+        ok: false,
+        error: `operator "${writer.operator.name}" has no scope over room ${room_no}`,
+      });
+    }
 
     const from = date_from || new Date().toISOString();
     const to = date_to || new Date(Date.now() + 24 * 3600 * 1000).toISOString();
@@ -1111,9 +1272,9 @@ api.post('/pms/issue-key', async (req, res) => {
 
     const [credResult] = await conn.query(
       `INSERT INTO credentials
-         (room_id, user_id, type, slot_number, raw_value, date_from, date_to, sync_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
-      [room.id, userId, type, slot_number, raw_value, from, to]
+         (room_id, user_id, type, slot_number, raw_value, date_from, date_to, sync_status, issued_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      [room.id, userId, type, slot_number, raw_value, from, to, writer.operator ? writer.operator.id : null]
     );
     const credentialId = credResult.insertId;
 
@@ -1131,6 +1292,7 @@ api.post('/pms/issue-key', async (req, res) => {
       `Issued ${type.toUpperCase()} for "${guest_name}" -> room ${room_no} slot ${slot_number} ` +
         `(cred #${credentialId}, queue #${queueResult.insertId}) — awaiting heartbeat`
     );
+    audit(writer.actor, 'issue-key', `cred #${credentialId} ${type} "${guest_name}" → room ${room_no} slot ${slot_number}`);
 
     // Opportunistic push: if the lock is chatty right now, don't wait 30s.
     flushQueueForRoom(room_no).catch(() => {});
@@ -1159,7 +1321,8 @@ api.post('/pms/issue-key', async (req, res) => {
 /* -- PMS bypass: credential revocation (gap #8, ozkey-02 §8.5) -------------- */
 api.post('/pms/revoke-key', async (req, res) => {
   if (!guardDb(res)) return;
-  if (!guardPmsSecret(req, res)) return;
+  const writer = await authorizeKeyWriter(req, res);
+  if (!writer) return;
   const conn = await pool.getConnection();
   try {
     const { credential_id } = req.body || {};
@@ -1177,6 +1340,12 @@ api.post('/pms/revoke-key', async (req, res) => {
     );
     if (!cred) {
       return res.status(404).json({ ok: false, error: `Credential #${credential_id} not found` });
+    }
+    if (!(await writerInScope(writer, cred.room_id))) {
+      return res.status(403).json({
+        ok: false,
+        error: `operator "${writer.operator.name}" has no scope over room ${cred.room_no}`,
+      });
     }
     if (cred.sync_status === 'revoked') {
       return res
@@ -1230,6 +1399,7 @@ api.post('/pms/revoke-key', async (req, res) => {
       `Revoked ${cred.type.toUpperCase()} for "${cred.user_name || 'unknown'}" -> room ${cred.room_no} ` +
         `slot ${cred.slot_number} (cred #${credential_id}, queue #${queueResult.insertId}) — awaiting heartbeat`
     );
+    audit(writer.actor, 'revoke-key', `cred #${credential_id} ${cred.type} "${cred.user_name || 'unknown'}" @ room ${cred.room_no}`);
 
     // Opportunistic push: if the lock is chatty right now, don't wait 30s.
     flushQueueForRoom(cred.room_no).catch(() => {});
@@ -1253,6 +1423,298 @@ api.post('/pms/revoke-key', async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   } finally {
     conn.release();
+  }
+});
+
+/* ---------------------------------------------------------------------------
+ * Fleet slice v1 (ozkey-07 §3/§8/§9) — operators, scopes, enable/disable,
+ * door suspend, audit. Admin surface: gated by the org shared secret (§4.4).
+ * ------------------------------------------------------------------------- */
+
+/** Create an operator principal; the bearer token is returned ONCE. */
+api.post('/fleet/operators', async (req, res) => {
+  if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
+  try {
+    const { name, role = 'manager', org_id = 1, room_nos = [] } = req.body || {};
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+    const token = makeOperatorToken();
+    const [result] = await pool.query(
+      'INSERT INTO operators (org_id, name, role, token, active) VALUES (?, ?, ?, ?, 1)',
+      [org_id, String(name).slice(0, 255), String(role).slice(0, 50), token]
+    );
+    const operatorId = result.insertId;
+    const scoped = [];
+    const unknown = [];
+    for (const rn of Array.isArray(room_nos) ? room_nos : []) {
+      const [[room]] = await pool.query('SELECT id FROM rooms WHERE room_no = ?', [String(rn)]);
+      if (!room) { unknown.push(String(rn)); continue; }
+      await pool.query(
+        'INSERT IGNORE INTO operator_scopes (operator_id, room_id) VALUES (?, ?)',
+        [operatorId, room.id]
+      );
+      scoped.push(String(rn));
+    }
+    logEvent('info', `Operator #${operatorId} "${name}" (${role}) created — scope: ${scoped.length ? scoped.join(', ') : '(none)'}`);
+    audit('shared-secret', 'operator-create', `#${operatorId} "${name}" role=${role} scope=[${scoped.join(',')}]`);
+    res.json({ ok: true, operator_id: operatorId, token, scoped, unknown_rooms: unknown });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/** List operators (tokens never leave the server after mint). */
+api.get('/fleet/operators', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const [rows] = await pool.query(
+      `SELECT o.id, o.org_id, o.name, o.role, o.active, o.created_at,
+              GROUP_CONCAT(r.room_no ORDER BY r.room_no) AS scope
+         FROM operators o
+         LEFT JOIN operator_scopes s ON s.operator_id = o.id
+         LEFT JOIN rooms r ON r.id = s.room_id
+        GROUP BY o.id ORDER BY o.id`
+    );
+    res.json({
+      ok: true,
+      operators: rows.map((r) => ({ ...r, scope: r.scope ? r.scope.split(',') : [] })),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/** Replace an operator's property scope — the §9 one-op portfolio reassign. */
+api.post('/fleet/operators/:id/scope', async (req, res) => {
+  if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
+  try {
+    const operatorId = Number(req.params.id);
+    const { room_nos } = req.body || {};
+    if (!Array.isArray(room_nos)) {
+      return res.status(400).json({ ok: false, error: 'room_nos[] is required (full replacement set)' });
+    }
+    const [[op]] = await pool.query('SELECT * FROM operators WHERE id = ?', [operatorId]);
+    if (!op) return res.status(404).json({ ok: false, error: `Operator #${operatorId} not found` });
+
+    const scoped = [];
+    const unknown = [];
+    await pool.query('DELETE FROM operator_scopes WHERE operator_id = ?', [operatorId]);
+    for (const rn of room_nos) {
+      const [[room]] = await pool.query('SELECT id FROM rooms WHERE room_no = ?', [String(rn)]);
+      if (!room) { unknown.push(String(rn)); continue; }
+      await pool.query(
+        'INSERT IGNORE INTO operator_scopes (operator_id, room_id) VALUES (?, ?)',
+        [operatorId, room.id]
+      );
+      scoped.push(String(rn));
+    }
+    logEvent('info', `Operator #${operatorId} "${op.name}" scope → ${scoped.length ? scoped.join(', ') : '(none)'}`);
+    audit('shared-secret', 'operator-scope', `#${operatorId} "${op.name}" scope=[${scoped.join(',')}]`);
+    res.json({ ok: true, operator_id: operatorId, scoped, unknown_rooms: unknown });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * Disable an operator (§8/§9 scenario 1: leaves, keeps their phone).
+ * Authority dies immediately (token refused), and every LIVE credential they
+ * issued is revoked — DPID delete frames queue per room and land on the next
+ * heartbeat, so even at-the-door access they minted dies within one cycle.
+ */
+api.post('/fleet/operators/:id/disable', async (req, res) => {
+  if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
+  try {
+    const operatorId = Number(req.params.id);
+    const reason = req.body && req.body.reason ? String(req.body.reason).slice(0, 255) : null;
+    const [[op]] = await pool.query('SELECT * FROM operators WHERE id = ?', [operatorId]);
+    if (!op) return res.status(404).json({ ok: false, error: `Operator #${operatorId} not found` });
+
+    await pool.query('UPDATE operators SET active = 0 WHERE id = ?', [operatorId]);
+
+    // Revoke everything live that this principal issued.
+    const [liveCreds] = await pool.query(
+      `SELECT c.*, r.room_no, r.mac_address
+         FROM credentials c JOIN rooms r ON r.id = c.room_id
+        WHERE c.issued_by = ? AND c.sync_status IN ('pending','synced')`,
+      [operatorId]
+    );
+    const revoked = [];
+    const skipped = [];
+    const touchedRooms = new Set();
+    for (const cred of liveCreds) {
+      if (!cred.mac_address) { skipped.push({ id: cred.id, why: 'room unpaired' }); continue; }
+      const [[dupe]] = await pool.query(
+        `SELECT id FROM pending_queue WHERE credential_id = ? AND action_type = 'revoke-key' AND status = 'queued'`,
+        [cred.id]
+      );
+      if (dupe) { skipped.push({ id: cred.id, why: 'revoke already queued' }); continue; }
+      let frame;
+      try {
+        frame = buildDeleteFrame({ type: cred.type, slotNumber: cred.slot_number });
+      } catch (err) {
+        skipped.push({ id: cred.id, why: err.message });
+        continue;
+      }
+      await pool.query(
+        `INSERT INTO pending_queue (room_no, credential_id, action_type, payload_hex, status)
+         VALUES (?, ?, 'revoke-key', ?, 'queued')`,
+        [cred.room_no, cred.id, toSpacedHex(frame)]
+      );
+      await pool.query("UPDATE credentials SET sync_status = 'revoking' WHERE id = ?", [cred.id]);
+      await pool.query("UPDATE rooms SET status = 'PendingUpdate' WHERE room_no = ?", [cred.room_no]);
+      revoked.push(cred.id);
+      touchedRooms.add(cred.room_no);
+    }
+    await pool.query(
+      'INSERT INTO revocations (operator_id, reason, credentials_revoked) VALUES (?, ?, ?)',
+      [operatorId, reason, revoked.length]
+    );
+    for (const roomNo of touchedRooms) flushQueueForRoom(roomNo).catch(() => {});
+
+    logEvent(
+      'warn',
+      `Operator #${operatorId} "${op.name}" DISABLED${reason ? ` (${reason})` : ''} — ` +
+        `${revoked.length} live credential(s) revoked across ${touchedRooms.size} room(s)`
+    );
+    audit('shared-secret', 'operator-disable', `#${operatorId} "${op.name}"${reason ? ` reason="${reason}"` : ''} revoked=${revoked.length}`);
+    res.json({ ok: true, operator_id: operatorId, revoked, skipped, rooms: [...touchedRooms] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/** Re-enable a principal (does NOT resurrect revoked credentials). */
+api.post('/fleet/operators/:id/enable', async (req, res) => {
+  if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
+  try {
+    const operatorId = Number(req.params.id);
+    const [result] = await pool.query('UPDATE operators SET active = 1 WHERE id = ?', [operatorId]);
+    if (result.affectedRows === 0)
+      return res.status(404).json({ ok: false, error: `Operator #${operatorId} not found` });
+    logEvent('info', `Operator #${operatorId} re-enabled`);
+    audit('shared-secret', 'operator-enable', `#${operatorId}`);
+    res.json({ ok: true, operator_id: operatorId });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/** Persistent audit trail (§3), newest first. Read-only, open on the LAN. */
+api.get('/fleet/audit', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+    const [rows] = await pool.query('SELECT * FROM audit_log ORDER BY id DESC LIMIT ?', [limit]);
+    res.json({ ok: true, audit: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/** §8 disable-a-door: suspended rooms refuse new credentials at issue time. */
+api.post('/locks/suspend', async (req, res) => {
+  if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
+  try {
+    const { room_no } = req.body || {};
+    if (!room_no) return res.status(400).json({ ok: false, error: 'room_no is required' });
+    const [result] = await pool.query('UPDATE rooms SET suspended = 1 WHERE room_no = ?', [room_no]);
+    if (result.affectedRows === 0)
+      return res.status(404).json({ ok: false, error: `Room ${room_no} not found` });
+    logEvent('warn', `Room ${room_no} SUSPENDED — new credentials refused until resume`);
+    audit('shared-secret', 'door-suspend', `room ${room_no}`);
+    res.json({ ok: true, room_no, suspended: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+api.post('/locks/resume', async (req, res) => {
+  if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
+  try {
+    const { room_no } = req.body || {};
+    if (!room_no) return res.status(400).json({ ok: false, error: 'room_no is required' });
+    const [result] = await pool.query('UPDATE rooms SET suspended = 0 WHERE room_no = ?', [room_no]);
+    if (result.affectedRows === 0)
+      return res.status(404).json({ ok: false, error: `Room ${room_no} not found` });
+    logEvent('info', `Room ${room_no} resumed — credential issuance re-enabled`);
+    audit('shared-secret', 'door-resume', `room ${room_no}`);
+    res.json({ ok: true, room_no, suspended: false });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * Re-push a room's live credentials (ozkey-07 §6.1 step 5 — the lock-swap
+ * gap): rebuilds the DPID issue frame for every live, unexpired credential
+ * and queues it, so a replacement lock receives the full set on its first
+ * heartbeat. Idempotent per credential (skips ones already queued).
+ */
+api.post('/locks/resync', async (req, res) => {
+  if (!guardDb(res)) return;
+  if (!guardPmsSecret(req, res)) return;
+  try {
+    const { room_no } = req.body || {};
+    if (!room_no) return res.status(400).json({ ok: false, error: 'room_no is required' });
+    const [[room]] = await pool.query('SELECT * FROM rooms WHERE room_no = ?', [room_no]);
+    if (!room) return res.status(404).json({ ok: false, error: `Room ${room_no} not found` });
+    if (!room.mac_address) {
+      return res.status(409).json({ ok: false, error: `Room ${room_no} has no paired lock — pair the replacement first` });
+    }
+
+    const [creds] = await pool.query(
+      `SELECT * FROM credentials WHERE room_id = ? AND sync_status IN ('pending','synced')`,
+      [room.id]
+    );
+    const requeued = [];
+    const skipped = [];
+    const now = Date.now();
+    for (const cred of creds) {
+      if (cred.date_to && new Date(cred.date_to).getTime() < now) {
+        skipped.push({ id: cred.id, why: 'expired' });
+        continue;
+      }
+      const [[dupe]] = await pool.query(
+        `SELECT id FROM pending_queue WHERE credential_id = ? AND action_type = 'issue-key' AND status = 'queued'`,
+        [cred.id]
+      );
+      if (dupe) { skipped.push({ id: cred.id, why: 'already queued' }); continue; }
+      let frame;
+      try {
+        frame = buildCredentialFrame({
+          type: cred.type,
+          slotNumber: cred.slot_number,
+          rawValue: cred.raw_value,
+          dateFrom: cred.date_from,
+          dateTo: cred.date_to,
+        });
+      } catch (err) {
+        skipped.push({ id: cred.id, why: err.message });
+        continue;
+      }
+      await pool.query(
+        `INSERT INTO pending_queue (room_no, credential_id, action_type, payload_hex, status)
+         VALUES (?, ?, 'issue-key', ?, 'queued')`,
+        [room_no, cred.id, toSpacedHex(frame)]
+      );
+      await pool.query("UPDATE credentials SET sync_status = 'pending' WHERE id = ?", [cred.id]);
+      requeued.push(cred.id);
+    }
+    if (requeued.length) {
+      await pool.query("UPDATE rooms SET status = 'PendingUpdate' WHERE id = ?", [room.id]);
+      flushQueueForRoom(room_no).catch(() => {});
+    }
+    logEvent('key', `RESYNC room ${room_no} — ${requeued.length} credential(s) re-queued, ${skipped.length} skipped`);
+    audit('shared-secret', 'room-resync', `room ${room_no} requeued=${requeued.length} skipped=${skipped.length}`);
+    res.json({ ok: true, room_no, requeued, skipped });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -1366,6 +1828,44 @@ async function boot() {
   app.listen(CONFIG.HTTP_PORT, () => {
     logEvent('info', `HTTP gateway listening on http://localhost:${CONFIG.HTTP_PORT}/ozkeyserv/api`);
   });
+
+  startMdns();
+}
+
+/**
+ * Stable server addressing (XF-43 §7.5 / ozkey-08 §5): advertise the gateway
+ * as `_ozkey._tcp` on mDNS so locks and tablets resolve it by name instead of
+ * a pinned DHCP IP — a lease change must not dark every lock at once. TXT
+ * carries the site and the broker endpoint, so a §7.5-provisioned lock needs
+ * only the service name to find both the HTTP API and MQTT.
+ */
+function startMdns() {
+  try {
+    const { Bonjour } = require('bonjour-service');
+    const bonjour = new Bonjour();
+    const name = `ozkeyserv-${CONFIG.SITE_ID}`;
+    const svc = bonjour.publish({
+      name,
+      type: 'ozkey',
+      protocol: 'tcp',
+      port: CONFIG.HTTP_PORT,
+      txt: {
+        site: CONFIG.SITE_ID,
+        api: '/ozkeyserv/api',
+        broker: CONFIG.MQTT_URL.replace('mqtt://', ''),
+      },
+    });
+    // Async failures (e.g. name already claimed by another instance) arrive
+    // as events, not throws — swallow them; mDNS is best-effort by design.
+    svc.on('error', (err) => logEvent('warn', `mDNS advertise error (non-fatal): ${err.message}`));
+    logEvent(
+      'info',
+      `mDNS advertising "${name}" as _ozkey._tcp:${CONFIG.HTTP_PORT} (txt: site=${CONFIG.SITE_ID}, broker=${CONFIG.MQTT_URL.replace('mqtt://', '')})`
+    );
+  } catch (err) {
+    // Non-fatal: pinned-IP configuration still works without mDNS.
+    logEvent('warn', `mDNS advertise failed (non-fatal): ${err.message}`);
+  }
 }
 
 process.on('unhandledRejection', (err) => {

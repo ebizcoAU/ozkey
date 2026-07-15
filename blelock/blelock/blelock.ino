@@ -1,0 +1,808 @@
+/*
+ * blelock — OZLOCK doorlock emulator v0 (ozkey-08 §10)
+ * Board : Waveshare ESP32-C6 Touch-LCD 1.47" (pin map: blelock/HARDWARE.md)
+ * Flow  : BLE "OZLOCK" advertise → BANOI writes ProvisionPayload →
+ *         WiFi → MQTT :1883 → enroll (ozkey/<site>/locks/<id>/enroll) →
+ *         enrollment_ack → OPERATIONAL: 3×4 touch keypad, DPID 21/22
+ *         credential frames, heartbeat, door log publishes.
+ * Wire  : identical to LockSim (ozlockserv untouched). Frames: ozkey-02 §4 /
+ *         ozkey_commissioner DpidFrames (55 AA 00 06 … checksum).
+ * Built from the PROVEN test sketches: BLE.ino (advertise+GATT),
+ * Wifi.ino (BLE+WiFi coex, BGR panel), Touch.ino (0x3B wake + 12-byte read),
+ * TicTacToe.ino (grid hit-testing).
+ */
+
+#include <Arduino_GFX_Library.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <time.h>
+
+// ── Hardware pins (HARDWARE.md, operator-verified) ──────────────────────────
+#define LCD_DC 15
+#define LCD_CS 14
+#define LCD_SCK 1
+#define LCD_DIN 2
+#define LCD_RST 22
+#define LCD_BL 23
+#define I2C_SDA 4
+#define I2C_SCL 5
+#define TOUCH_INT 3
+#define TOUCH_ADDR 0x3B
+
+// ── BGR-corrected palette (panel is BGR — Wifi.ino finding) ────────────────
+#define C_BLACK 0x0000
+#define C_WHITE 0xFFFF
+#define C_RED 0x001F    // red on BGR panel
+#define C_BLUE 0xF800   // blue on BGR panel
+#define C_GREEN 0x07E0  // green channel is symmetric
+#define C_AMBER 0x051F  // amber (r31 g41 b0) with R/B swapped
+#define C_GREY 0x8410
+#define C_DIM 0x39E7
+
+Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_DIN);
+Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 34, 0, 34, 0);
+
+// ── GATT contract (blelock/CONTRACT.md + ozkey-08 §10.3) ────────────────────
+#define BLE_NAME "OZLOCK"
+#define SVC_UUID "4f5a4b31-0001-4c4f-434b-000000000001"
+#define CHR_PROVISION "4f5a4b31-0002-4c4f-434b-000000000001"
+#define CHR_STATUS "4f5a4b31-0003-4c4f-434b-000000000001"
+#define CHR_INFO "4f5a4b31-0004-4c4f-434b-000000000001"
+#define FW_VERSION "blelock-0.1"
+
+// ── State machine (ozkey-08 §10.5) ──────────────────────────────────────────
+enum LockState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
+LockState state = ST_ADVERTISING;
+
+Preferences prefs;   // namespace "blelock" — provisioning + enrollment
+Preferences creds;   // namespace "creds"   — PIN slots
+
+// Provisioned config (NVS-backed)
+String cfgSsid, cfgPass, cfgBrokerHost, cfgServerIp, cfgSiteId, cfgName, cfgDeviceId;
+uint16_t cfgBrokerPort = 1883, cfgServerPort = 4200;
+uint32_t cfgHeartbeatS = 60;
+bool provisioned = false, enrolled = false;
+
+String deviceId, macStr; // ozk-<machex> minted from factory MAC (§10.2)
+
+// BLE
+BLEServer *bleServer = nullptr;
+BLECharacteristic *chrStatus = nullptr, *chrInfo = nullptr;
+volatile bool bleClientConnected = false;
+String provBuf; // chunked-write accumulator (a chunk starting '{' resets it)
+
+// Networking
+WiFiClient wifiTcp;
+PubSubClient mqtt(wifiTcp);
+unsigned long lastHeartbeat = 0, lastMqttAttempt = 0, wifiJoinStart = 0;
+unsigned long lastEnrollSent = 0;
+uint8_t enrollAttempts = 0;
+String topicCommand, topicEnroll, topicHeartbeat, topicLog;
+
+// Keypad / lock UI state
+String pinEntry;
+String lockStatus = "LOCKED"; // LOCKED | UNLOCKED
+unsigned long unlockAt = 0;
+const unsigned long UNLOCK_MS = 5000; // proven auto-relock
+uint8_t pinFails = 0;
+unsigned long lockoutUntil = 0;
+unsigned long hashHoldStart = 0; // '#' long-press = factory reset
+bool screenDirty = true;
+String joinLine1 = "", joinLine2 = "";
+
+// Touch
+bool touchWasDown = false;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utilities
+// ─────────────────────────────────────────────────────────────────────────────
+String asciiOnly(const String &s) {
+  String out;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c >= 32 && c < 127) out += c;
+  }
+  return out.length() ? out : String("Doorlock");
+}
+
+String isoNow() {
+  time_t now = time(nullptr);
+  if (now < 1600000000) return String(""); // NTP not yet synced
+  struct tm tmv;
+  gmtime_r(&now, &tmv);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+  return String(buf);
+}
+
+int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Status ladder (notify BANOI over BLE + serial log)
+// ─────────────────────────────────────────────────────────────────────────────
+void notifyStatus(const char *wire) {
+  Serial.printf("[STATUS] %s\n", wire);
+  if (chrStatus != nullptr) {
+    chrStatus->setValue((uint8_t *)wire, strlen(wire));
+    if (bleClientConnected) chrStatus->notify();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Screens (rotation 5 landscape 320×172, BGR palette)
+// ─────────────────────────────────────────────────────────────────────────────
+void drawAdvertising() {
+  gfx->fillScreen(C_BLACK);
+  gfx->drawRect(0, 0, 320, 172, C_AMBER);
+  gfx->setTextColor(C_AMBER);
+  gfx->setTextSize(1);
+  gfx->setCursor(15, 12);
+  gfx->println("OZLOCK DOORLOCK EMULATOR");
+  gfx->setCursor(15, 28);
+  gfx->print("BLE: ");
+  gfx->print(bleClientConnected ? "APP CONNECTED" : "ADVERTISING...");
+  gfx->setTextSize(3);
+  gfx->setTextColor(C_WHITE);
+  gfx->setCursor(52, 70);
+  gfx->println("OZLOCK");
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_GREY);
+  gfx->setCursor(15, 120);
+  gfx->print("device_id: ");
+  gfx->println(deviceId);
+  gfx->setCursor(15, 136);
+  gfx->print("mac: ");
+  gfx->println(macStr);
+  gfx->setCursor(15, 152);
+  gfx->setTextColor(C_DIM);
+  gfx->println("Mo BANOI > Khoa cua de ket noi");
+}
+
+void drawJoining() {
+  gfx->fillScreen(C_BLACK);
+  gfx->drawRect(0, 0, 320, 172, C_BLUE);
+  gfx->setTextColor(C_BLUE);
+  gfx->setTextSize(1);
+  gfx->setCursor(15, 12);
+  gfx->println("OZLOCK - DANG KET NOI");
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_WHITE);
+  gfx->setCursor(15, 36);
+  gfx->println(asciiOnly(cfgName.length() ? cfgName : deviceId));
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_GREY);
+  gfx->setCursor(15, 70);
+  gfx->println(joinLine1); // WiFi line (incl. IP address — operator req)
+  gfx->setCursor(15, 88);
+  gfx->println(joinLine2); // server line
+  gfx->setCursor(15, 120);
+  gfx->setTextColor(C_DIM);
+  gfx->print("device_id: ");
+  gfx->println(deviceId);
+}
+
+// keypad geometry (right half of the landscape panel)
+const int KP_X = 150, KP_Y = 26, KP_W = 54, KP_H = 34, KP_GX = 3, KP_GY = 3;
+const char KP_KEYS[4][3] = { {'1','2','3'}, {'4','5','6'}, {'7','8','9'}, {'*','0','#'} };
+
+void drawKeypad() {
+  for (int r = 0; r < 4; r++) {
+    for (int c = 0; c < 3; c++) {
+      int x = KP_X + c * (KP_W + KP_GX);
+      int y = KP_Y + r * (KP_H + KP_GY);
+      gfx->drawRoundRect(x, y, KP_W, KP_H, 6, C_GREY);
+      gfx->setTextSize(2);
+      gfx->setTextColor(C_WHITE);
+      gfx->setCursor(x + KP_W / 2 - 5, y + KP_H / 2 - 7);
+      gfx->print(KP_KEYS[r][c]);
+    }
+  }
+}
+
+void drawPinDots() {
+  gfx->fillRect(12, 96, 130, 20, C_BLACK);
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_AMBER);
+  gfx->setCursor(12, 98);
+  for (size_t i = 0; i < pinEntry.length(); i++) gfx->print('*');
+}
+
+void drawOperational() {
+  gfx->fillScreen(C_BLACK);
+  gfx->drawRect(0, 0, 320, 172, lockStatus == "UNLOCKED" ? C_BLUE : C_RED);
+  // left panel
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_GREY);
+  gfx->setCursor(12, 10);
+  gfx->println("OZLOCK");
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_WHITE);
+  gfx->setCursor(12, 26);
+  String nm = asciiOnly(cfgName.length() ? cfgName : deviceId);
+  if (nm.length() > 11) nm = nm.substring(0, 11);
+  gfx->println(nm);
+  // status dot + link state
+  bool up = (WiFi.status() == WL_CONNECTED) && mqtt.connected();
+  gfx->fillCircle(18, 62, 5, up ? C_GREEN : C_RED);
+  gfx->setTextSize(1);
+  gfx->setTextColor(up ? C_GREEN : C_RED);
+  gfx->setCursor(30, 58);
+  gfx->print(up ? "OZLOCK online" : "mat ket noi...");
+  // lock state
+  gfx->setTextSize(2);
+  gfx->setTextColor(lockStatus == "UNLOCKED" ? C_BLUE : C_RED);
+  gfx->setCursor(12, 130);
+  gfx->println(lockStatus == "UNLOCKED" ? "MO" : "KHOA");
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(12, 156);
+  gfx->print("* xoa   # mo cua");
+  drawPinDots();
+  drawKeypad();
+}
+
+void drawFlash(const char *msg, uint16_t color) {
+  gfx->fillScreen(C_BLACK);
+  gfx->drawRect(0, 0, 320, 172, color);
+  gfx->setTextSize(4);
+  gfx->setTextColor(color);
+  int16_t x = 160 - (int)strlen(msg) * 12;
+  gfx->setCursor(x > 0 ? x : 4, 70);
+  gfx->println(msg);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NVS
+// ─────────────────────────────────────────────────────────────────────────────
+void loadConfig() {
+  prefs.begin("blelock", true);
+  provisioned = prefs.getBool("prov", false);
+  enrolled = prefs.getBool("enrolled", false);
+  cfgSsid = prefs.getString("ssid", "");
+  cfgPass = prefs.getString("pass", "");
+  cfgBrokerHost = prefs.getString("bhost", "");
+  cfgBrokerPort = prefs.getUShort("bport", 1883);
+  cfgServerIp = prefs.getString("sip", "");
+  cfgServerPort = prefs.getUShort("sport", 4200);
+  cfgSiteId = prefs.getString("site", "lab");
+  cfgName = prefs.getString("name", "");
+  cfgHeartbeatS = prefs.getUInt("hb", 60);
+  prefs.end();
+}
+
+void saveConfig() {
+  prefs.begin("blelock", false);
+  prefs.putBool("prov", provisioned);
+  prefs.putBool("enrolled", enrolled);
+  prefs.putString("ssid", cfgSsid);
+  prefs.putString("pass", cfgPass);
+  prefs.putString("bhost", cfgBrokerHost);
+  prefs.putUShort("bport", cfgBrokerPort);
+  prefs.putString("sip", cfgServerIp);
+  prefs.putUShort("sport", cfgServerPort);
+  prefs.putString("site", cfgSiteId);
+  prefs.putString("name", cfgName);
+  prefs.putUInt("hb", cfgHeartbeatS);
+  prefs.end();
+}
+
+void factoryReset() {
+  Serial.println("[RESET] factory reset — wiping NVS");
+  prefs.begin("blelock", false); prefs.clear(); prefs.end();
+  creds.begin("creds", false); creds.clear(); creds.end();
+  drawFlash("RESET", C_AMBER);
+  delay(800);
+  ESP.restart();
+}
+
+// PIN slots: creds key "s<slot>" = "<pin>|<startUnix>|<endUnix>"
+void storePin(uint16_t slot, const String &pin, uint32_t startU, uint32_t endU) {
+  creds.begin("creds", false);
+  char key[8]; snprintf(key, sizeof(key), "s%u", slot);
+  creds.putString(key, pin + "|" + String(startU) + "|" + String(endU));
+  creds.end();
+  Serial.printf("[CRED] slot %u stored (valid %u..%u)\n", slot, startU, endU);
+}
+
+void deletePin(uint16_t slot) {
+  creds.begin("creds", false);
+  char key[8]; snprintf(key, sizeof(key), "s%u", slot);
+  creds.remove(key);
+  creds.end();
+  Serial.printf("[CRED] slot %u revoked\n", slot);
+}
+
+// returns matched slot or -1
+int checkPin(const String &entry) {
+  creds.begin("creds", true);
+  time_t now = time(nullptr);
+  int matched = -1;
+  for (uint16_t slot = 0; slot <= 64 && matched < 0; slot++) {
+    char key[8]; snprintf(key, sizeof(key), "s%u", slot);
+    String v = creds.getString(key, "");
+    if (!v.length()) continue;
+    int p1 = v.indexOf('|'), p2 = v.lastIndexOf('|');
+    if (p1 < 0 || p2 <= p1) continue;
+    String pin = v.substring(0, p1);
+    uint32_t startU = strtoul(v.substring(p1 + 1, p2).c_str(), nullptr, 10);
+    uint32_t endU = strtoul(v.substring(p2 + 1).c_str(), nullptr, 10);
+    if (pin != entry) continue;
+    // honor validity window only when the clock is synced
+    if (now > 1600000000 && (now < (time_t)startU || now > (time_t)endU)) continue;
+    matched = slot;
+  }
+  creds.end();
+  return matched;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DPID frame parse (ozkey-02 §4 / DpidFrames — the hardware truth)
+// 55 AA 00 06 <len:2BE> <dpid> <type> <len:2BE> <value…> <checksum>
+// ─────────────────────────────────────────────────────────────────────────────
+void handleDpidFrame(const uint8_t *f, size_t n) {
+  if (n < 8 || f[0] != 0x55 || f[1] != 0xAA) { Serial.println("[DPID] bad header"); return; }
+  uint8_t sum = 0;
+  for (size_t i = 0; i + 1 < n; i++) sum += f[i];
+  if (sum != f[n - 1]) { Serial.println("[DPID] bad checksum"); return; }
+  uint8_t dpid = f[6], type = f[7];
+  uint16_t vlen = ((uint16_t)f[8] << 8) | f[9];
+  const uint8_t *v = f + 10;
+  if (10 + vlen + 1 > n) { Serial.println("[DPID] length overflow"); return; }
+
+  if (dpid == 21 && type == 0x00 && vlen >= 11) { // add temp PIN
+    uint16_t slot = ((uint16_t)v[0] << 8) | v[1];
+    uint16_t pinLen = vlen - 2 - 8;
+    String pin;
+    for (uint16_t i = 0; i < pinLen; i++) pin += (char)v[2 + i];
+    uint32_t startU = ((uint32_t)v[2+pinLen] << 24) | ((uint32_t)v[3+pinLen] << 16) | ((uint32_t)v[4+pinLen] << 8) | v[5+pinLen];
+    uint32_t endU = ((uint32_t)v[6+pinLen] << 24) | ((uint32_t)v[7+pinLen] << 16) | ((uint32_t)v[8+pinLen] << 8) | v[9+pinLen];
+    storePin(slot, pin, startU, endU);
+    publishLog("key_synced", (String("slot ") + slot).c_str());
+    screenDirty = true;
+  } else if (dpid == 22 && type == 0x00 && vlen >= 2) { // revoke PIN
+    uint16_t slot = ((uint16_t)v[0] << 8) | v[1];
+    deletePin(slot);
+    publishLog("key_revoked", (String("slot ") + slot).c_str());
+  } else if (dpid == 1 && type == 0x01 && vlen >= 1 && v[0] == 0x01) { // remote unlock
+    doUnlock("remote unlock");
+  } else {
+    Serial.printf("[DPID] unhandled dpid=%u type=%u len=%u\n", dpid, type, vlen);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MQTT wire (LockSim-identical; ozlockserv untouched)
+// ─────────────────────────────────────────────────────────────────────────────
+void publishLog(const char *result, const char *detail) {
+  if (!mqtt.connected()) return;
+  JsonDocument doc;
+  doc["device_id"] = deviceId;
+  doc["mac"] = macStr;
+  doc["result"] = result;
+  doc["detail"] = detail;
+  String ts = isoNow();
+  if (ts.length()) doc["ts"] = ts;
+  String out; serializeJson(doc, out);
+  mqtt.publish(topicLog.c_str(), out.c_str());
+  Serial.printf("[LOG->] %s %s\n", result, detail);
+}
+
+void publishHeartbeat() {
+  if (!mqtt.connected()) return;
+  JsonDocument doc;
+  doc["device_id"] = deviceId;
+  doc["mac"] = macStr;
+  doc["fw"] = FW_VERSION;
+  String out; serializeJson(doc, out);
+  mqtt.publish(topicHeartbeat.c_str(), out.c_str());
+}
+
+void publishEnroll() {
+  JsonDocument doc;
+  doc["device_id"] = deviceId;
+  doc["mac"] = macStr;
+  doc["fw"] = FW_VERSION;
+  if (cfgName.length()) doc["name"] = cfgName;
+  String out; serializeJson(doc, out);
+  mqtt.publish(topicEnroll.c_str(), out.c_str());
+  lastEnrollSent = millis();
+  enrollAttempts++;
+  Serial.printf("[ENROLL->] attempt %u\n", enrollAttempts);
+}
+
+void doUnlock(const char *via) {
+  lockStatus = "UNLOCKED";
+  unlockAt = millis();
+  pinEntry = "";
+  pinFails = 0;
+  publishLog("granted", via);
+  drawFlash("MO CUA", C_BLUE);
+  screenDirty = false; // flash owns the screen until relock redraw
+}
+
+void onMqttMessage(char *topic, byte *payload, unsigned int length) {
+  String body; body.reserve(length);
+  for (unsigned int i = 0; i < length; i++) body += (char)payload[i];
+  Serial.printf("[MQTT<-] %s %s\n", topic, body.c_str());
+
+  JsonDocument doc;
+  if (deserializeJson(doc, body) != DeserializationError::Ok) return;
+
+  const char *op = doc["op"] | (const char *)nullptr;
+  if (op && strcmp(op, "enrollment_ack") == 0) {
+    enrolled = true;
+    const char *label = doc["label"] | "";
+    if (!cfgName.length() && strlen(label)) cfgName = label;
+    if (doc["heartbeat_s"].is<uint32_t>()) cfgHeartbeatS = doc["heartbeat_s"].as<uint32_t>();
+    // broker creds stored for the day the broker enforces them (lab: open)
+    prefs.begin("blelock", false);
+    prefs.putString("buser", doc["broker_username"] | "");
+    prefs.putString("bsecret", doc["broker_secret"] | "");
+    prefs.end();
+    saveConfig();
+    notifyStatus("ENROLLED");
+    state = ST_OPERATIONAL;
+    screenDirty = true;
+    return;
+  }
+  if (op && strcmp(op, "enrollment_nack") == 0) {
+    Serial.printf("[ENROLL] NACK: %s\n", (const char *)(doc["error"] | "?"));
+    notifyStatus("ENROLL_FAIL");
+    joinLine2 = "Server tu choi: chua dang ky pairing";
+    screenDirty = true;
+    return;
+  }
+  // command envelope {action, grant_id, payload_hex}
+  const char *hex = doc["payload_hex"] | (const char *)nullptr;
+  if (hex) {
+    size_t hl = strlen(hex);
+    if (hl < 4 || hl % 2) return;
+    static uint8_t frame[256];
+    size_t fn = 0;
+    for (size_t i = 0; i + 1 < hl && fn < sizeof(frame); i += 2) {
+      int hi = hexNibble(hex[i]), lo = hexNibble(hex[i + 1]);
+      if (hi < 0 || lo < 0) return;
+      frame[fn++] = (hi << 4) | lo;
+    }
+    handleDpidFrame(frame, fn);
+  }
+}
+
+void ensureMqtt() {
+  if (mqtt.connected()) { mqtt.loop(); return; }
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastMqttAttempt < 4000) return;
+  lastMqttAttempt = millis();
+  if (state == ST_JOINING) { joinLine2 = "Server: dang ket noi..."; screenDirty = true; notifyStatus("BROKER_JOINING"); }
+  Serial.printf("[MQTT] connecting %s:%u as %s\n", cfgBrokerHost.c_str(), cfgBrokerPort, deviceId.c_str());
+  mqtt.setServer(cfgBrokerHost.c_str(), cfgBrokerPort);
+  mqtt.setBufferSize(1024);
+  mqtt.setCallback(onMqttMessage);
+  if (mqtt.connect(deviceId.c_str())) {
+    mqtt.subscribe(topicCommand.c_str(), 1);
+    Serial.println("[MQTT] connected + subscribed command topic");
+    if (state == ST_JOINING) {
+      notifyStatus("BROKER_OK");
+      joinLine2 = "Server: OK — dang dang ky...";
+      screenDirty = true;
+      enrollAttempts = 0;
+      publishEnroll();
+    } else {
+      publishHeartbeat(); // flush any queued grants fast after reconnect
+    }
+  } else if (state == ST_JOINING) {
+    notifyStatus("BROKER_FAIL");
+    joinLine2 = "Server: KHONG TOI DUOC";
+    screenDirty = true;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Provisioning (BLE write → JOINING)
+// ─────────────────────────────────────────────────────────────────────────────
+void applyProvision(JsonDocument &doc) {
+  String mode = doc["mode"] | "";
+  if (mode != "ozkey-cloud" && mode != "ozkey-local") { notifyStatus("ENROLL_FAIL"); return; }
+  String pid = doc["device_id"] | "";
+  if (pid.length() && pid != deviceId) {
+    Serial.printf("[PROV] device_id mismatch (%s != %s)\n", pid.c_str(), deviceId.c_str());
+    notifyStatus("ENROLL_FAIL");
+    return;
+  }
+  cfgSsid = (const char *)(doc["ssid"] | "");
+  cfgPass = (const char *)(doc["password"] | "");
+  cfgBrokerHost = (const char *)(doc["broker_host"] | "");
+  cfgBrokerPort = doc["broker_tcp_port"] | 1883;
+  cfgServerIp = (const char *)(doc["server_ip"] | "");
+  cfgServerPort = doc["server_port"] | 4200;
+  cfgSiteId = (const char *)(doc["site_id"] | "lab");
+  cfgName = (const char *)(doc["name"] | "");
+  cfgHeartbeatS = doc["heartbeat_s"] | 60;
+  if (!cfgSsid.length() || !cfgBrokerHost.length()) { notifyStatus("ENROLL_FAIL"); return; }
+
+  provisioned = true;
+  enrolled = false;
+  saveConfig();
+  buildTopics();
+
+  state = ST_JOINING;
+  joinLine1 = "WiFi: dang vao " + cfgSsid + "...";
+  joinLine2 = "Server: " + cfgBrokerHost + ":" + String(cfgBrokerPort);
+  screenDirty = true;
+  notifyStatus("WIFI_JOINING");
+  WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+  wifiJoinStart = millis();
+}
+
+class ProvisionCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String chunk = String(c->getValue().c_str());
+    if (!chunk.length()) return;
+    if (chunk[0] == '{') provBuf = chunk; else provBuf += chunk;
+    JsonDocument doc;
+    if (deserializeJson(doc, provBuf) == DeserializationError::Ok) {
+      Serial.println("[PROV] payload complete");
+      provBuf = "";
+      applyProvision(doc);
+    }
+  }
+};
+
+class ServerCB : public BLEServerCallbacks {
+  void onConnect(BLEServer *) override {
+    bleClientConnected = true;
+    screenDirty = true;
+    notifyStatus("BLE_OK");
+  }
+  void onDisconnect(BLEServer *) override {
+    bleClientConnected = false;
+    screenDirty = true;
+    if (state == ST_ADVERTISING) { delay(300); BLEDevice::startAdvertising(); }
+  }
+};
+
+void startBle() {
+  BLEDevice::init(BLE_NAME);
+  bleServer = BLEDevice::createServer();
+  bleServer->setCallbacks(new ServerCB());
+  BLEService *svc = bleServer->createService(SVC_UUID);
+
+  BLECharacteristic *prov = svc->createCharacteristic(CHR_PROVISION, BLECharacteristic::PROPERTY_WRITE);
+  prov->setCallbacks(new ProvisionCB());
+
+  chrStatus = svc->createCharacteristic(CHR_STATUS,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  chrStatus->addDescriptor(new BLE2902());
+  chrStatus->setValue("BLE_OK");
+
+  chrInfo = svc->createCharacteristic(CHR_INFO, BLECharacteristic::PROPERTY_READ);
+  JsonDocument doc;
+  doc["device_id"] = deviceId;
+  doc["mac"] = macStr;
+  doc["fw"] = FW_VERSION;
+  doc["name"] = cfgName;
+  String info; serializeJson(doc, info);
+  chrInfo->setValue(info.c_str());
+
+  svc->start();
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SVC_UUID);
+  adv->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  Serial.println("[BLE] advertising as OZLOCK");
+}
+
+void buildTopics() {
+  String base = "ozkey/" + cfgSiteId + "/locks/" + deviceId + "/";
+  topicCommand = base + "command";
+  topicEnroll = base + "enroll";
+  topicHeartbeat = base + "heartbeat";
+  topicLog = base + "log";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Touch keypad
+// ─────────────────────────────────────────────────────────────────────────────
+void touchInit() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  pinMode(TOUCH_INT, INPUT_PULLUP);
+  // wake sequence (HARDWARE.md — Waveshare factory init)
+  Wire.beginTransmission(TOUCH_ADDR); Wire.write(0xAA); Wire.write(0xAA); Wire.endTransmission(); delay(20);
+  Wire.beginTransmission(TOUCH_ADDR); Wire.write(0x80); Wire.write(0x01); Wire.endTransmission(); delay(10);
+}
+
+// returns true + coords when a NEW touch-down happens (edge-triggered)
+bool touchRead(int &tx, int &ty, bool &held) {
+  Wire.beginTransmission(TOUCH_ADDR);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom(TOUCH_ADDR, 12) < 12) return false;
+  uint8_t buf[12];
+  for (int i = 0; i < 12; i++) buf[i] = Wire.read();
+  uint8_t count = buf[0];
+  bool down = (count > 0 && count < 5);
+  held = down;
+  if (!down) { touchWasDown = false; return false; }
+  int rawX = ((buf[1] & 0x0F) << 8) | buf[2];
+  int rawY = ((buf[3] & 0x0F) << 8) | buf[4];
+  tx = 320 - rawY; // HARDWARE.md transform for rotation 5
+  ty = rawX;
+  if (touchWasDown) return false; // still the same press
+  touchWasDown = true;
+  return true;
+}
+
+char keyAt(int tx, int ty) {
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 3; c++) {
+      int x = KP_X + c * (KP_W + KP_GX), y = KP_Y + r * (KP_H + KP_GY);
+      if (tx >= x && tx < x + KP_W && ty >= y && ty < y + KP_H) return KP_KEYS[r][c];
+    }
+  return 0;
+}
+
+void handleKey(char k) {
+  if (lockoutUntil && millis() < lockoutUntil) return; // lockout active
+  if (k == '*') { pinEntry = ""; drawPinDots(); return; }
+  if (k == '#') {
+    if (!pinEntry.length()) return;
+    int slot = checkPin(pinEntry);
+    if (slot >= 0) {
+      doUnlock((String("PIN slot ") + slot).c_str());
+    } else {
+      pinFails++;
+      publishLog("denied", "wrong PIN");
+      drawFlash("SAI MA", C_RED);
+      delay(1200);
+      pinEntry = "";
+      if (pinFails >= 5) {
+        lockoutUntil = millis() + 60000UL;
+        publishLog("lockout", "5 wrong PINs — 60s");
+      }
+      screenDirty = true;
+    }
+    return;
+  }
+  if (pinEntry.length() < 8) { pinEntry += k; drawPinDots(); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Setup / loop
+// ─────────────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n*** blelock v0 — OZLOCK doorlock emulator (ozkey-08 §10) ***");
+
+  pinMode(LCD_BL, OUTPUT);
+  digitalWrite(LCD_BL, HIGH);
+  gfx->begin();
+  gfx->setRotation(5);
+  gfx->fillScreen(C_BLACK);
+
+  touchInit();
+
+  WiFi.mode(WIFI_STA); // needed so the factory MAC is readable pre-join
+  macStr = WiFi.macAddress();
+  String machex = macStr; machex.replace(":", ""); machex.toLowerCase();
+  deviceId = "ozk-" + machex;
+  Serial.printf("[ID] device_id=%s mac=%s\n", deviceId.c_str(), macStr.c_str());
+
+  loadConfig();
+  buildTopics();
+
+  if (provisioned) {
+    // RECONNECT path: straight to network from NVS, no BLE (CONTRACT: stops
+    // advertising once provisioned; factory reset re-opens)
+    state = enrolled ? ST_OPERATIONAL : ST_JOINING;
+    joinLine1 = "WiFi: dang vao " + cfgSsid + "...";
+    joinLine2 = "Server: " + cfgBrokerHost + ":" + String(cfgBrokerPort);
+    WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+    wifiJoinStart = millis();
+  } else {
+    state = ST_ADVERTISING;
+    startBle();
+  }
+  screenDirty = true;
+}
+
+void loop() {
+  // ── WiFi progress (JOINING ladder + NTP once up) ──────────────────────────
+  static wl_status_t lastWifi = WL_IDLE_STATUS;
+  wl_status_t ws = WiFi.status();
+  if (ws != lastWifi) {
+    lastWifi = ws;
+    if (ws == WL_CONNECTED) {
+      configTime(0, 0, "pool.ntp.org"); // validity windows + log ts
+      if (state == ST_JOINING) {
+        notifyStatus("WIFI_OK");
+        joinLine1 = "WiFi: OK — IP " + WiFi.localIP().toString();
+        screenDirty = true;
+      }
+      Serial.printf("[WiFi] up, IP %s\n", WiFi.localIP().toString().c_str());
+    }
+  }
+  if (state == ST_JOINING && ws != WL_CONNECTED && provisioned &&
+      wifiJoinStart && millis() - wifiJoinStart > 25000) {
+    wifiJoinStart = 0;
+    notifyStatus("WIFI_FAIL");
+    joinLine1 = "WiFi: THAT BAI (sai mat khau?)";
+    screenDirty = true;
+    // stay re-provisionable: if BLE never started this boot, start it
+    if (bleServer == nullptr) startBle();
+  }
+
+  // ── MQTT + enroll retry ───────────────────────────────────────────────────
+  if (provisioned) ensureMqtt();
+  if (state == ST_JOINING && mqtt.connected() && !enrolled &&
+      lastEnrollSent && millis() - lastEnrollSent > 8000 && enrollAttempts < 5) {
+    publishEnroll();
+  }
+
+  // ── heartbeat ─────────────────────────────────────────────────────────────
+  if (mqtt.connected() && millis() - lastHeartbeat > cfgHeartbeatS * 1000UL) {
+    lastHeartbeat = millis();
+    publishHeartbeat();
+  }
+
+  // ── auto-relock ───────────────────────────────────────────────────────────
+  if (lockStatus == "UNLOCKED" && millis() - unlockAt >= UNLOCK_MS) {
+    lockStatus = "LOCKED";
+    publishLog("relocked", "auto 5s");
+    screenDirty = true;
+  }
+
+  // ── lockout expiry ────────────────────────────────────────────────────────
+  if (lockoutUntil && millis() >= lockoutUntil) {
+    lockoutUntil = 0;
+    pinFails = 0;
+    screenDirty = true;
+  }
+
+  // ── touch (OPERATIONAL keypad + '#' long-press factory reset) ────────────
+  if (state == ST_OPERATIONAL) {
+    int tx, ty; bool held = false;
+    bool newTouch = touchRead(tx, ty, held);
+    if (newTouch) {
+      char k = keyAt(tx, ty);
+      if (k) {
+        if (k == '#') hashHoldStart = millis();
+        handleKey(k);
+      }
+    }
+    if (!held) hashHoldStart = 0;
+    if (hashHoldStart && millis() - hashHoldStart > 5000) factoryReset();
+  } else {
+    // any state: 10s touch hold anywhere = factory reset escape hatch
+    int tx, ty; bool held = false;
+    touchRead(tx, ty, held);
+    static unsigned long holdStart = 0;
+    if (held && !holdStart) holdStart = millis();
+    if (!held) holdStart = 0;
+    if (holdStart && millis() - holdStart > 10000) factoryReset();
+  }
+
+  // ── screen ────────────────────────────────────────────────────────────────
+  if (screenDirty) {
+    screenDirty = false;
+    if (lockoutUntil && millis() < lockoutUntil) {
+      drawFlash("KHOA 60s", C_RED);
+    } else if (state == ST_ADVERTISING) drawAdvertising();
+    else if (state == ST_JOINING) drawJoining();
+    else drawOperational();
+  }
+
+  delay(15);
+}
