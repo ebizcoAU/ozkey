@@ -323,7 +323,15 @@ command parse) / `dpid` (payload_hex → add/revoke PIN, ≤16 slots) / `ui` /
 > 1.48 MB → needs **FlashSize=8M + PartitionScheme=default_8MB** (44% of 3 MB
 > app). Deps vendored to ~/Documents/Arduino/libraries: PubSubClient 2.8,
 > ArduinoJson 7.4.2. Flash + bench steps: `blelock/blelock/TESTING.md`.
-> **Awaiting on-device verify (operator flashes).** B4 (BANOI) next.
+> **Awaiting on-device verify (operator flashes).**
+>
+> **BUILD LOG 2026-07-16 (later): B4 BANOI leg BUILT + PUSHED** (ftpos
+> `edfcc52`, analyzer-clean, 59/59 package tests): flutter_blue_plus ^1.35.0 +
+> iOS/Android BLE permissions; `FlutterBlueOzkeyTransport` (scan by service
+> UUID + "OZLOCK" name fallback, MTU 247, chunked provision writes, status
+> notifies); `OzkeyBleSession.readInfo()`; `ProvisionPayload.name`; Khoá cửa
+> 20 s background scan → banner → `_BleCommissionSheet` 6-step ladder →
+> `addEnrolledLock`. **B4 awaits the flashed board for the end-to-end run.**
 
 | # | Deliverable | Proof |
 |---|---|---|
