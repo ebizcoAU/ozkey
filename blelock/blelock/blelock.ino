@@ -8,8 +8,8 @@
  * Wire  : identical to LockSim (ozlockserv untouched). Frames: ozkey-02 §4 /
  *         ozkey_commissioner DpidFrames (55 AA 00 06 … checksum).
  * Built from the PROVEN test sketches: BLE.ino (advertise+GATT),
- * Wifi.ino (BLE+WiFi coex, BGR panel), Touch.ino (0x3B wake + 12-byte read),
- * TicTacToe.ino (grid hit-testing).
+ * Wifi.ino (BLE+WiFi coex, BGR panel), Touch.ino (CST816-class @0x63,
+ * hw-reset GPIO20, 7-byte read), TicTacToe.ino (grid hit-testing).
  */
 
 #include <Arduino_GFX_Library.h>
@@ -31,10 +31,14 @@
 #define LCD_DIN 2
 #define LCD_RST 22
 #define LCD_BL 23
-#define I2C_SDA 4
-#define I2C_SCL 5
-#define TOUCH_INT 3
-#define TOUCH_ADDR 0x3B
+// Touch = CST816-class @0x63 on SDA18/SCL19 with hw reset GPIO20 — the
+// values Touch.ino/TicTacToe.ino verified on this batch. (HARDWARE.md's
+// original 0x3B/SDA4 section was wrong for this board.)
+#define I2C_SDA 18
+#define I2C_SCL 19
+#define TOUCH_RST 20
+#define TOUCH_INT 21
+#define TOUCH_ADDR 0x63
 
 // ── BGR-corrected palette (panel is BGR — Wifi.ino finding) ────────────────
 #define C_BLACK 0x0000
@@ -542,6 +546,8 @@ void applyProvision(JsonDocument &doc) {
   joinLine2 = "Server: " + cfgBrokerHost + ":" + String(cfgBrokerPort);
   screenDirty = true;
   notifyStatus("WIFI_JOINING");
+  Serial.printf("[WiFi] begin ssid='%s' passlen=%u\n", cfgSsid.c_str(),
+                cfgPass.length());
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
   wifiJoinStart = millis();
 }
@@ -616,11 +622,16 @@ void buildTopics() {
 // Touch keypad
 // ─────────────────────────────────────────────────────────────────────────────
 void touchInit() {
-  Wire.begin(I2C_SDA, I2C_SCL);
+  // Hardware power-reset of the touch processor (Touch.ino verified —
+  // replaces the old 0x3B I2C wake sequence, which this batch ignores).
   pinMode(TOUCH_INT, INPUT_PULLUP);
-  // wake sequence (HARDWARE.md — Waveshare factory init)
-  Wire.beginTransmission(TOUCH_ADDR); Wire.write(0xAA); Wire.write(0xAA); Wire.endTransmission(); delay(20);
-  Wire.beginTransmission(TOUCH_ADDR); Wire.write(0x80); Wire.write(0x01); Wire.endTransmission(); delay(10);
+  pinMode(TOUCH_RST, OUTPUT);
+  digitalWrite(TOUCH_RST, LOW);
+  delay(100);
+  digitalWrite(TOUCH_RST, HIGH);
+  delay(200);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  delay(50);
 }
 
 // returns true + coords when a NEW touch-down happens (edge-triggered)
@@ -628,16 +639,16 @@ bool touchRead(int &tx, int &ty, bool &held) {
   Wire.beginTransmission(TOUCH_ADDR);
   Wire.write(0x00);
   if (Wire.endTransmission() != 0) return false;
-  if (Wire.requestFrom(TOUCH_ADDR, 12) < 12) return false;
-  uint8_t buf[12];
-  for (int i = 0; i < 12; i++) buf[i] = Wire.read();
-  uint8_t count = buf[0];
-  bool down = (count > 0 && count < 5);
+  if (Wire.requestFrom(TOUCH_ADDR, 7) < 7) return false;
+  uint8_t buf[7];
+  for (int i = 0; i < 7; i++) buf[i] = Wire.read();
+  uint8_t count = buf[2]; // CST816 map: active point count at reg 0x02
+  bool down = (count > 0 && count <= 5);
   held = down;
   if (!down) { touchWasDown = false; return false; }
-  int rawX = ((buf[1] & 0x0F) << 8) | buf[2];
-  int rawY = ((buf[3] & 0x0F) << 8) | buf[4];
-  tx = 320 - rawY; // HARDWARE.md transform for rotation 5
+  int rawX = ((buf[3] & 0x0F) << 8) | buf[4];
+  int rawY = ((buf[5] & 0x0F) << 8) | buf[6];
+  tx = 320 - rawY; // landscape transform for rotation 5 (same as Touch.ino)
   ty = rawX;
   if (touchWasDown) return false; // still the same press
   touchWasDown = true;
@@ -695,6 +706,16 @@ void setup() {
   touchInit();
 
   WiFi.mode(WIFI_STA); // needed so the factory MAC is readable pre-join
+  // Join-failure diagnostics: the disconnect reason tells apart the cases the
+  // screen can't (201 NO_AP_FOUND = SSID invisible/5GHz-only; 15 4WAY
+  // handshake timeout / 2 AUTH_EXPIRE = wrong password; 210 NO_AP_FOUND_W_
+  // COMPATIBLE_SECURITY = WPA3-only AP).
+  WiFi.onEvent(
+      [](WiFiEvent_t e, WiFiEventInfo_t info) {
+        Serial.printf("[WiFi] disconnected, reason=%d\n",
+                      (int)info.wifi_sta_disconnected.reason);
+      },
+      WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   macStr = WiFi.macAddress();
   String machex = macStr; machex.replace(":", ""); machex.toLowerCase();
   deviceId = "ozk-" + machex;
@@ -709,6 +730,8 @@ void setup() {
     state = enrolled ? ST_OPERATIONAL : ST_JOINING;
     joinLine1 = "WiFi: dang vao " + cfgSsid + "...";
     joinLine2 = "Server: " + cfgBrokerHost + ":" + String(cfgBrokerPort);
+    Serial.printf("[WiFi] begin ssid='%s' passlen=%u\n", cfgSsid.c_str(),
+                  cfgPass.length());
     WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
     wifiJoinStart = millis();
   } else {
@@ -724,6 +747,7 @@ void loop() {
   wl_status_t ws = WiFi.status();
   if (ws != lastWifi) {
     lastWifi = ws;
+    Serial.printf("[WiFi] status=%d\n", (int)ws);
     if (ws == WL_CONNECTED) {
       configTime(0, 0, "pool.ntp.org"); // validity windows + log ts
       if (state == ST_JOINING) {

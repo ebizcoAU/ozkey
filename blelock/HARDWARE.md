@@ -24,26 +24,35 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, true, 172, 320, 34, 0, 34
 // col offset 34 both ends; operator sketch used setRotation(5) for landscape
 ```
 
-## Touch — I2C @ 0x3B (AXS5106L-class), needs wake sequence
+## Touch — CST816-class I2C @ **0x63**, hardware reset pin (verified 2026-07-16)
+
+⚠ The section that used to be here (0x3B + AA/80 wake sequence on SDA 4/SCL 5)
+was WRONG for this batch — blelock.ino shipped with it and touch was dead on
+real hardware. The values below are the ones Touch.ino / TicTacToe.ino verified
+on the actual board.
 
 | Signal | GPIO |
 |---|---|
-| SDA | 4 |
-| SCL | 5 |
-| INT | 3 (INPUT_PULLUP) |
+| SDA | 18 |
+| SCL | 19 |
+| RST | 20 (hardware power reset) |
+| INT | 21 (INPUT_PULLUP) |
 
-Wake sequence (required before the chip ACKs — from Waveshare factory init):
+Init — hardware reset, no I2C wake sequence:
 
 ```cpp
-Wire.beginTransmission(0x3B); Wire.write(0xAA); Wire.write(0xAA); Wire.endTransmission(); delay(20);
-Wire.beginTransmission(0x3B); Wire.write(0x80); Wire.write(0x01); Wire.endTransmission(); delay(10);
+pinMode(TOUCH_INT, INPUT_PULLUP);
+pinMode(TOUCH_RST, OUTPUT);
+digitalWrite(TOUCH_RST, LOW);  delay(100);
+digitalWrite(TOUCH_RST, HIGH); delay(200);
+Wire.begin(18, 19); delay(50);
 ```
 
-Read: write reg `0x00`, request **12 bytes**:
-- `buf[0]` = touch count (valid 1..4)
-- X raw = `((buf[1] & 0x0F) << 8) | buf[2]`
-- Y raw = `((buf[3] & 0x0F) << 8) | buf[4]`
-- Landscape transform used in the diagnostic: `touchX = 320 - rawY; touchY = rawX;`
+Read: write reg `0x00`, request **7 bytes** (CST816 register map):
+- `buf[2]` = active touch count (valid 1..5)
+- X raw = `((buf[3] & 0x0F) << 8) | buf[4]`
+- Y raw = `((buf[5] & 0x0F) << 8) | buf[6]`
+- Landscape transform (rotation 5): `touchX = 320 - rawY; touchY = rawX;`
 
 ## Peripheral bring-up checklist (pre-handover)
 
