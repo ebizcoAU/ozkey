@@ -66,14 +66,16 @@ curl -s -X POST http://10.1.1.21:4200/ozlock/api/locks/ozk-<machex>/grants \
 
 ## Factory reset
 
-Three ways, all wipe NVS (config + PINs) → reboot to ADVERTISING:
+**One on-device method, every screen: tap `*` then `5`** (instant, no hold).
+`*` on an empty PIN entry shows "RESET? 5=Y"; `5` wipes NVS (config + PINs)
+→ reboot to ADVERTISING; any other key cancels. `*` with digits typed just
+clears them, so normal PIN retries can't trip it. On the ADVERTISING /
+CONNECTING screens the keys aren't drawn but the same touch zones apply
+(right-half keypad area: `*` bottom-left, `5` centre).
 
-1. **From BANOI** — "Gỡ khoá khỏi BANOI": the app calls `DELETE /locks/:id`,
-   OZLOCK publishes `{op:"factory_reset"}` on the command topic, an ONLINE
-   lock resets itself (an offline lock misses it — use the keypad way).
-2. **Keypad (OPERATIONAL)** — press **#** with an empty PIN → "RESET? 5=Y"
-   → press **5** = instant reset. Any other key cancels. (No more 5 s hold.)
-3. **Any other screen** — hold anywhere 10 s (escape hatch).
+Separately, removing the lock in BANOI ("Gỡ khoá") makes OZLOCK publish
+`{op:"factory_reset"}` on the command topic — an ONLINE lock resets itself;
+an offline one needs the `*5` tap.
 
 ## Known v0 limits
 

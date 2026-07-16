@@ -171,6 +171,8 @@ void drawAdvertising() {
   gfx->setCursor(15, 152);
   gfx->setTextColor(C_DIM);
   gfx->println("Open BANOI > Doorlock to pair");
+  gfx->setCursor(15, 162);
+  gfx->println("reset: tap * then 5 (keypad zone)");
 }
 
 void drawJoining() {
@@ -194,6 +196,8 @@ void drawJoining() {
   gfx->setTextColor(C_DIM);
   gfx->print("device_id: ");
   gfx->println(deviceId);
+  gfx->setCursor(15, 152);
+  gfx->println("reset: tap * then 5 (keypad zone)");
 }
 
 // keypad geometry (right half of the landscape panel)
@@ -257,7 +261,7 @@ void drawOperational() {
   gfx->setTextSize(1);
   gfx->setTextColor(C_DIM);
   gfx->setCursor(12, 156);
-  gfx->print("* clear   # enter");
+  gfx->print("* clear  # enter  *5 reset");
   drawPinDots();
   drawKeypad();
 }
@@ -676,24 +680,33 @@ char keyAt(int tx, int ty) {
   return 0;
 }
 
-bool resetArm = false; // '#' on empty PIN arms; '5' fires (no long hold)
+// THE one factory-reset method (operator: single method, no waiting):
+// '*' pressed while the PIN entry is EMPTY arms it ("RESET? 5=Y"), '5'
+// fires. '*' with digits typed just clears them (normal), so a guest
+// clearing and retrying a PIN can never trip it. Works on every screen —
+// the keypad touch zones are evaluated even where keys aren't drawn.
+bool resetArm = false;
 
 void handleKey(char k) {
   if (lockoutUntil && millis() < lockoutUntil) return; // lockout active
   if (resetArm) {
-    // Operator combo "#5" = instant factory reset (replaces the 5s hold).
     resetArm = false;
     if (k == '5') { factoryReset(); return; }
     screenDirty = true; // any other key cancels, back to the keypad
     return;
   }
-  if (k == '*') { pinEntry = ""; drawPinDots(); return; }
-  if (k == '#') {
+  if (k == '*') {
     if (!pinEntry.length()) {
       resetArm = true;
       drawFlash("RESET? 5=Y", C_AMBER, C_BLACK);
       return;
     }
+    pinEntry = "";
+    drawPinDots();
+    return;
+  }
+  if (k == '#') {
+    if (!pinEntry.length()) return;
     int slot = checkPin(pinEntry);
     if (slot >= 0) {
       doUnlock((String("PIN slot ") + slot).c_str());
@@ -823,21 +836,27 @@ void loop() {
   }
 
   // ── touch (OPERATIONAL keypad + '#' long-press factory reset) ────────────
-  if (state == ST_OPERATIONAL) {
+  {
     int tx, ty; bool held = false;
     bool newTouch = touchRead(tx, ty, held);
     if (newTouch) {
       char k = keyAt(tx, ty);
-      if (k) handleKey(k); // factory reset = '#' then '5' (no hold)
+      if (state == ST_OPERATIONAL) {
+        if (k) handleKey(k);
+      } else if (k) {
+        // Same single reset method on every screen: '*' then '5' (the
+        // keypad zones apply even where keys aren't drawn — hint printed
+        // on the ADVERTISING/CONNECTING screens).
+        if (resetArm) {
+          resetArm = false;
+          if (k == '5') factoryReset();
+          else screenDirty = true;
+        } else if (k == '*') {
+          resetArm = true;
+          drawFlash("RESET? 5=Y", C_AMBER, C_BLACK);
+        }
+      }
     }
-  } else {
-    // any state: 10s touch hold anywhere = factory reset escape hatch
-    int tx, ty; bool held = false;
-    touchRead(tx, ty, held);
-    static unsigned long holdStart = 0;
-    if (held && !holdStart) holdStart = millis();
-    if (!held) holdStart = 0;
-    if (holdStart && millis() - holdStart > 10000) factoryReset();
   }
 
   // ── screen ────────────────────────────────────────────────────────────────
