@@ -6,7 +6,9 @@
 **Flash Size: 8MB** + **Partition Scheme: "8M with spiffs (3MB APP/1.5MB SPIFFS)"**
 (sketch is 1.48MB — the default 4MB/1.2MB-app scheme is too small), then Upload.
 
-**CLI** (same result):
+**CLI** (same result) — one-shot script: `blelock/flash.sh [4M|8M|16M] [sketch-dir]`
+(defaults: 8M, this sketch; auto-picks `/dev/cu.usbmodem*`, ends in the serial
+monitor, Ctrl+C to exit). Or by hand:
 ```sh
 arduino-cli compile --fqbn "esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=default_8MB" \
   ~/Documents/Dev/ozkey/blelock/blelock
@@ -64,8 +66,14 @@ curl -s -X POST http://10.1.1.21:4200/ozlock/api/locks/ozk-<machex>/grants \
 
 ## Factory reset
 
-OPERATIONAL: hold **#** 5 s. Any other screen: hold anywhere 10 s. Wipes NVS
-(config + PINs) → reboots to ADVERTISING.
+Three ways, all wipe NVS (config + PINs) → reboot to ADVERTISING:
+
+1. **From BANOI** — "Gỡ khoá khỏi BANOI": the app calls `DELETE /locks/:id`,
+   OZLOCK publishes `{op:"factory_reset"}` on the command topic, an ONLINE
+   lock resets itself (an offline lock misses it — use the keypad way).
+2. **Keypad (OPERATIONAL)** — press **#** with an empty PIN → "RESET? 5=Y"
+   → press **5** = instant reset. Any other key cancels. (No more 5 s hold.)
+3. **Any other screen** — hold anywhere 10 s (escape hatch).
 
 ## Known v0 limits
 

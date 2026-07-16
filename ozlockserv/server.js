@@ -938,13 +938,23 @@ api.delete('/locks/:id', async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const id = req.params.id;
+    // Unpair the physical lock too (BANOI "Gỡ khoá" must reset the device,
+    // not just the record): tell it to wipe NVS and return to ADVERTISING.
+    // Best-effort — an offline lock misses it and needs the on-device reset.
+    const [[lock]] = await conn.query('SELECT site_id FROM locks WHERE id = ?', [id]);
+    if (lock) {
+      mqttPublish(CONFIG.topicCommand(lock.site_id || CONFIG.SITE_ID, id), {
+        op: 'factory_reset',
+        ts: new Date().toISOString(),
+      });
+    }
     await conn.beginTransaction();
     await purgeLockRows(conn, 'device_id = ?', [id]);
     const [d] = await conn.query('DELETE FROM locks WHERE id = ?', [id]);
     await conn.commit();
     if (d.affectedRows === 0)
       return res.status(404).json({ ok: false, error: `Lock ${id} not found` });
-    logEvent('info', `Doorlock ${id} removed`);
+    logEvent('info', `Doorlock ${id} removed + factory_reset sent`);
     res.json({ ok: true, id });
   } catch (err) {
     try {

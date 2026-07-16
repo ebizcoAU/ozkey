@@ -97,7 +97,6 @@ unsigned long unlockAt = 0;
 const unsigned long UNLOCK_MS = 5000; // proven auto-relock
 uint8_t pinFails = 0;
 unsigned long lockoutUntil = 0;
-unsigned long hashHoldStart = 0; // '#' long-press = factory reset
 bool screenDirty = true;
 String joinLine1 = "", joinLine2 = "";
 
@@ -171,7 +170,7 @@ void drawAdvertising() {
   gfx->println(macStr);
   gfx->setCursor(15, 152);
   gfx->setTextColor(C_DIM);
-  gfx->println("Mo BANOI > Khoa cua de ket noi");
+  gfx->println("Open BANOI > Doorlock to pair");
 }
 
 void drawJoining() {
@@ -180,7 +179,7 @@ void drawJoining() {
   gfx->setTextColor(C_BLUE);
   gfx->setTextSize(1);
   gfx->setCursor(15, 12);
-  gfx->println("OZLOCK - DANG KET NOI");
+  gfx->println("OZLOCK - CONNECTING");
   gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE);
   gfx->setCursor(15, 36);
@@ -224,8 +223,14 @@ void drawPinDots() {
 }
 
 void drawOperational() {
+  // RED = LOCKED / GREEN = UNLOCKED (operator directive) — thick border +
+  // big state word, English labels.
+  bool open = lockStatus == "UNLOCKED";
+  uint16_t st = open ? C_GREEN : C_RED;
   gfx->fillScreen(C_BLACK);
-  gfx->drawRect(0, 0, 320, 172, lockStatus == "UNLOCKED" ? C_BLUE : C_RED);
+  gfx->drawRect(0, 0, 320, 172, st);
+  gfx->drawRect(1, 1, 318, 170, st);
+  gfx->drawRect(2, 2, 316, 168, st);
   // left panel
   gfx->setTextSize(1);
   gfx->setTextColor(C_GREY);
@@ -243,25 +248,25 @@ void drawOperational() {
   gfx->setTextSize(1);
   gfx->setTextColor(up ? C_GREEN : C_RED);
   gfx->setCursor(30, 58);
-  gfx->print(up ? "OZLOCK online" : "mat ket noi...");
+  gfx->print(up ? "online" : "offline...");
   // lock state
   gfx->setTextSize(2);
-  gfx->setTextColor(lockStatus == "UNLOCKED" ? C_BLUE : C_RED);
+  gfx->setTextColor(st);
   gfx->setCursor(12, 130);
-  gfx->println(lockStatus == "UNLOCKED" ? "MO" : "KHOA");
+  gfx->println(open ? "UNLOCKED" : "LOCKED");
   gfx->setTextSize(1);
   gfx->setTextColor(C_DIM);
   gfx->setCursor(12, 156);
-  gfx->print("* xoa   # mo cua");
+  gfx->print("* clear   # enter");
   drawPinDots();
   drawKeypad();
 }
 
-void drawFlash(const char *msg, uint16_t color) {
-  gfx->fillScreen(C_BLACK);
-  gfx->drawRect(0, 0, 320, 172, color);
+// Full-screen colour IS the state signal (operator: RED locked, GREEN open).
+void drawFlash(const char *msg, uint16_t bg, uint16_t fg) {
+  gfx->fillScreen(bg);
   gfx->setTextSize(4);
-  gfx->setTextColor(color);
+  gfx->setTextColor(fg);
   int16_t x = 160 - (int)strlen(msg) * 12;
   gfx->setCursor(x > 0 ? x : 4, 70);
   gfx->println(msg);
@@ -306,7 +311,7 @@ void factoryReset() {
   Serial.println("[RESET] factory reset — wiping NVS");
   prefs.begin("blelock", false); prefs.clear(); prefs.end();
   creds.begin("creds", false); creds.clear(); creds.end();
-  drawFlash("RESET", C_AMBER);
+  drawFlash("RESET", C_AMBER, C_BLACK);
   delay(800);
   ESP.restart();
 }
@@ -432,7 +437,7 @@ void doUnlock(const char *via) {
   pinEntry = "";
   pinFails = 0;
   publishLog("granted", via);
-  drawFlash("MO CUA", C_BLUE);
+  drawFlash("UNLOCKED", C_GREEN, C_BLACK); // whole screen GREEN = open
   screenDirty = false; // flash owns the screen until relock redraw
 }
 
@@ -445,6 +450,13 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   if (deserializeJson(doc, body) != DeserializationError::Ok) return;
 
   const char *op = doc["op"] | (const char *)nullptr;
+  if (op && (strcmp(op, "factory_reset") == 0 || strcmp(op, "unpair") == 0)) {
+    // Server-initiated unpair (BANOI "Gỡ khoá" → DELETE /locks/:id) — wipe
+    // and return to ADVERTISING so the lock is immediately re-pairable.
+    Serial.println("[MQTT<-] factory_reset (unpaired by app/server)");
+    factoryReset();
+    return;
+  }
   if (op && strcmp(op, "enrollment_ack") == 0) {
     enrolled = true;
     const char *label = doc["label"] | "";
@@ -464,7 +476,7 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   if (op && strcmp(op, "enrollment_nack") == 0) {
     Serial.printf("[ENROLL] NACK: %s\n", (const char *)(doc["error"] | "?"));
     notifyStatus("ENROLL_FAIL");
-    joinLine2 = "Server tu choi: chua dang ky pairing";
+    joinLine2 = "Server refused: pairing not registered";
     screenDirty = true;
     return;
   }
@@ -489,7 +501,7 @@ void ensureMqtt() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (millis() - lastMqttAttempt < 4000) return;
   lastMqttAttempt = millis();
-  if (state == ST_JOINING) { joinLine2 = "Server: dang ket noi..."; screenDirty = true; notifyStatus("BROKER_JOINING"); }
+  if (state == ST_JOINING) { joinLine2 = "Server: connecting..."; screenDirty = true; notifyStatus("BROKER_JOINING"); }
   Serial.printf("[MQTT] connecting %s:%u as %s\n", cfgBrokerHost.c_str(), cfgBrokerPort, deviceId.c_str());
   mqtt.setServer(cfgBrokerHost.c_str(), cfgBrokerPort);
   mqtt.setBufferSize(1024);
@@ -499,7 +511,7 @@ void ensureMqtt() {
     Serial.println("[MQTT] connected + subscribed command topic");
     if (state == ST_JOINING) {
       notifyStatus("BROKER_OK");
-      joinLine2 = "Server: OK — dang dang ky...";
+      joinLine2 = "Server: OK - enrolling...";
       screenDirty = true;
       enrollAttempts = 0;
       publishEnroll();
@@ -542,7 +554,7 @@ void applyProvision(JsonDocument &doc) {
   buildTopics();
 
   state = ST_JOINING;
-  joinLine1 = "WiFi: dang vao " + cfgSsid + "...";
+  joinLine1 = "WiFi: joining " + cfgSsid + "...";
   joinLine2 = "Server: " + cfgBrokerHost + ":" + String(cfgBrokerPort);
   screenDirty = true;
   notifyStatus("WIFI_JOINING");
@@ -664,25 +676,40 @@ char keyAt(int tx, int ty) {
   return 0;
 }
 
+bool resetArm = false; // '#' on empty PIN arms; '5' fires (no long hold)
+
 void handleKey(char k) {
   if (lockoutUntil && millis() < lockoutUntil) return; // lockout active
+  if (resetArm) {
+    // Operator combo "#5" = instant factory reset (replaces the 5s hold).
+    resetArm = false;
+    if (k == '5') { factoryReset(); return; }
+    screenDirty = true; // any other key cancels, back to the keypad
+    return;
+  }
   if (k == '*') { pinEntry = ""; drawPinDots(); return; }
   if (k == '#') {
-    if (!pinEntry.length()) return;
+    if (!pinEntry.length()) {
+      resetArm = true;
+      drawFlash("RESET? 5=Y", C_AMBER, C_BLACK);
+      return;
+    }
     int slot = checkPin(pinEntry);
     if (slot >= 0) {
       doUnlock((String("PIN slot ") + slot).c_str());
     } else {
       pinFails++;
+      pinEntry = ""; // clear the stale entry immediately
+      // UI first, network after — publishLog on a degraded link must never
+      // delay the operator's feedback.
+      drawFlash("WRONG PIN", C_RED, C_WHITE);
       publishLog("denied", "wrong PIN");
-      drawFlash("SAI MA", C_RED);
       delay(1200);
-      pinEntry = "";
       if (pinFails >= 5) {
         lockoutUntil = millis() + 60000UL;
         publishLog("lockout", "5 wrong PINs — 60s");
       }
-      screenDirty = true;
+      screenDirty = true; // redraw keypad with empty PIN dots
     }
     return;
   }
@@ -728,7 +755,7 @@ void setup() {
     // RECONNECT path: straight to network from NVS, no BLE (CONTRACT: stops
     // advertising once provisioned; factory reset re-opens)
     state = enrolled ? ST_OPERATIONAL : ST_JOINING;
-    joinLine1 = "WiFi: dang vao " + cfgSsid + "...";
+    joinLine1 = "WiFi: joining " + cfgSsid + "...";
     joinLine2 = "Server: " + cfgBrokerHost + ":" + String(cfgBrokerPort);
     Serial.printf("[WiFi] begin ssid='%s' passlen=%u\n", cfgSsid.c_str(),
                   cfgPass.length());
@@ -752,7 +779,7 @@ void loop() {
       configTime(0, 0, "pool.ntp.org"); // validity windows + log ts
       if (state == ST_JOINING) {
         notifyStatus("WIFI_OK");
-        joinLine1 = "WiFi: OK — IP " + WiFi.localIP().toString();
+        joinLine1 = "WiFi: OK - IP " + WiFi.localIP().toString();
         screenDirty = true;
       }
       Serial.printf("[WiFi] up, IP %s\n", WiFi.localIP().toString().c_str());
@@ -762,7 +789,7 @@ void loop() {
       wifiJoinStart && millis() - wifiJoinStart > 25000) {
     wifiJoinStart = 0;
     notifyStatus("WIFI_FAIL");
-    joinLine1 = "WiFi: THAT BAI (sai mat khau?)";
+    joinLine1 = "WiFi FAILED (wrong password?)";
     screenDirty = true;
     // stay re-provisionable: if BLE never started this boot, start it
     if (bleServer == nullptr) startBle();
@@ -801,13 +828,8 @@ void loop() {
     bool newTouch = touchRead(tx, ty, held);
     if (newTouch) {
       char k = keyAt(tx, ty);
-      if (k) {
-        if (k == '#') hashHoldStart = millis();
-        handleKey(k);
-      }
+      if (k) handleKey(k); // factory reset = '#' then '5' (no hold)
     }
-    if (!held) hashHoldStart = 0;
-    if (hashHoldStart && millis() - hashHoldStart > 5000) factoryReset();
   } else {
     // any state: 10s touch hold anywhere = factory reset escape hatch
     int tx, ty; bool held = false;
@@ -822,7 +844,7 @@ void loop() {
   if (screenDirty) {
     screenDirty = false;
     if (lockoutUntil && millis() < lockoutUntil) {
-      drawFlash("KHOA 60s", C_RED);
+      drawFlash("LOCKED 60s", C_RED, C_WHITE);
     } else if (state == ST_ADVERTISING) drawAdvertising();
     else if (state == ST_JOINING) drawJoining();
     else drawOperational();
