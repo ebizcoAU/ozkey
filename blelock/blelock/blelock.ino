@@ -59,7 +59,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 #define CHR_PROVISION "4f5a4b31-0002-4c4f-434b-000000000001"
 #define CHR_STATUS "4f5a4b31-0003-4c4f-434b-000000000001"
 #define CHR_INFO "4f5a4b31-0004-4c4f-434b-000000000001"
-#define FW_VERSION "blelock-0.1"
+#define FW_VERSION "blelock-1.0"
 
 // ── State machine (ozkey-08 §10.5) ──────────────────────────────────────────
 enum LockState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
@@ -665,6 +665,12 @@ void touchInit() {
   delay(200);
   Wire.begin(I2C_SDA, I2C_SCL);
   delay(50);
+  // Boot probe — err=0 means the CST816 ACKed at 0x63; anything else and
+  // the keypad is dead hardware-side, not a firmware mapping issue.
+  Wire.beginTransmission(TOUCH_ADDR);
+  int err = Wire.endTransmission();
+  Serial.printf("[TOUCH] probe 0x%02X err=%d %s\n", TOUCH_ADDR, err,
+                err == 0 ? "(ACK ok)" : "(NO ACK — touch dead)");
 }
 
 // returns true + coords when a NEW touch-down happens (edge-triggered)
@@ -758,7 +764,9 @@ void handleKey(char k) {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n*** blelock v0 — OZLOCK doorlock emulator (ozkey-08 §10) ***");
+  Serial.println("\n*** blelock v1 — OZLOCK doorlock emulator (ozkey-08 §10) ***");
+  // Compile stamp — the definitive "is my new sketch on the board?" check.
+  Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
 
   pinMode(LCD_BL, OUTPUT);
   digitalWrite(LCD_BL, HIGH);
@@ -879,6 +887,7 @@ void loop() {
     bool newTouch = touchRead(tx, ty, held);
     if (newTouch) {
       char k = keyAt(tx, ty);
+      Serial.printf("[TOUCH] %d,%d -> key '%c'\n", tx, ty, k ? k : '-');
       if (state == ST_OPERATIONAL) {
         if (k) handleKey(k);
       } else if (k) {
@@ -895,6 +904,20 @@ void loop() {
         }
       }
     }
+  }
+
+  // ── periodic monitor line (operator: attach serial anytime, see state) ────
+  static unsigned long lastMon = 0;
+  if (millis() - lastMon > 10000) {
+    lastMon = millis();
+    const char *st = state == ST_OPERATIONAL ? "OPERATIONAL"
+                     : state == ST_JOINING   ? "JOINING"
+                                             : "ADVERTISING";
+    Serial.printf("[MON] %s wifi=%s ip=%s mqtt=%s lock=%s heap=%u\n", st,
+                  WiFi.status() == WL_CONNECTED ? "up" : "down",
+                  WiFi.localIP().toString().c_str(),
+                  mqtt.connected() ? "up" : "down", lockStatus.c_str(),
+                  (unsigned)ESP.getFreeHeap());
   }
 
   // ── screen ────────────────────────────────────────────────────────────────
