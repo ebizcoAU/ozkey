@@ -200,8 +200,9 @@ void drawJoining() {
   gfx->println("reset: tap * then 5 (keypad zone)");
 }
 
-// keypad geometry (right half of the landscape panel)
-const int KP_X = 150, KP_Y = 26, KP_W = 54, KP_H = 34, KP_GX = 3, KP_GY = 3;
+// keypad geometry (right half of the landscape panel; KP_Y 26→21 operator
+// request — also keeps the bottom row inside the 172px panel)
+const int KP_X = 150, KP_Y = 21, KP_W = 54, KP_H = 34, KP_GX = 3, KP_GY = 3;
 const char KP_KEYS[4][3] = { {'1','2','3'}, {'4','5','6'}, {'7','8','9'}, {'*','0','#'} };
 
 void drawKeypad() {
@@ -326,7 +327,10 @@ void storePin(uint16_t slot, const String &pin, uint32_t startU, uint32_t endU) 
   char key[8]; snprintf(key, sizeof(key), "s%u", slot);
   creds.putString(key, pin + "|" + String(startU) + "|" + String(endU));
   creds.end();
-  Serial.printf("[CRED] slot %u stored (valid %u..%u)\n", slot, startU, endU);
+  // v0 bench: PIN in the clear on serial (TESTING.md known limits) — the
+  // "what PIN did the lock actually receive?" question must be answerable.
+  Serial.printf("[CRED] slot %u stored pin='%s' (valid %u..%u)\n",
+                slot, pin.c_str(), startU, endU);
 }
 
 void deletePin(uint16_t slot) {
@@ -342,10 +346,12 @@ int checkPin(const String &entry) {
   creds.begin("creds", true);
   time_t now = time(nullptr);
   int matched = -1;
+  int slots = 0;
   for (uint16_t slot = 0; slot <= 64 && matched < 0; slot++) {
     char key[8]; snprintf(key, sizeof(key), "s%u", slot);
     String v = creds.getString(key, "");
     if (!v.length()) continue;
+    slots++;
     int p1 = v.indexOf('|'), p2 = v.lastIndexOf('|');
     if (p1 < 0 || p2 <= p1) continue;
     String pin = v.substring(0, p1);
@@ -353,10 +359,21 @@ int checkPin(const String &entry) {
     uint32_t endU = strtoul(v.substring(p2 + 1).c_str(), nullptr, 10);
     if (pin != entry) continue;
     // honor validity window only when the clock is synced
-    if (now > 1600000000 && (now < (time_t)startU || now > (time_t)endU)) continue;
+    if (now > 1600000000 && (now < (time_t)startU || now > (time_t)endU)) {
+      Serial.printf("[PIN] slot %u matches but OUTSIDE window (now=%lu not in %u..%u)\n",
+                    slot, (unsigned long)now, startU, endU);
+      continue;
+    }
     matched = slot;
   }
   creds.end();
+  // Bench diagnostics: say WHY a PIN was rejected, not just "denied".
+  if (matched < 0) {
+    Serial.printf("[PIN] entered='%s' -> NO MATCH (%d slot(s) stored, now=%lu)\n",
+                  entry.c_str(), slots, (unsigned long)now);
+  } else {
+    Serial.printf("[PIN] entered='%s' -> slot %d MATCH\n", entry.c_str(), matched);
+  }
   return matched;
 }
 
@@ -686,9 +703,11 @@ char keyAt(int tx, int ty) {
 // clearing and retrying a PIN can never trip it. Works on every screen —
 // the keypad touch zones are evaluated even where keys aren't drawn.
 bool resetArm = false;
+unsigned long lastKeyAt = 0; // 5s idle → clear half-typed entry (retry fresh)
 
 void handleKey(char k) {
   if (lockoutUntil && millis() < lockoutUntil) return; // lockout active
+  lastKeyAt = millis();
   if (resetArm) {
     resetArm = false;
     if (k == '5') { factoryReset(); return; }
@@ -726,7 +745,11 @@ void handleKey(char k) {
     }
     return;
   }
-  if (pinEntry.length() < 8) { pinEntry += k; drawPinDots(); }
+  // Digit. Entry model is "<digits>#" (max 8 digits): typing past the max
+  // is an invalid entry — clear and start fresh with the new digit.
+  if (pinEntry.length() >= 8) pinEntry = "";
+  pinEntry += k;
+  drawPinDots();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -833,6 +856,21 @@ void loop() {
     lockoutUntil = 0;
     pinFails = 0;
     screenDirty = true;
+  }
+
+  // ── keypad idle timeout (operator): entry abandoned half-way — no key for
+  // 5s — clears itself (and cancels a pending RESET? prompt) so the next
+  // guest starts fresh.
+  if (state == ST_OPERATIONAL && lastKeyAt && millis() - lastKeyAt > 5000) {
+    lastKeyAt = 0;
+    if (resetArm) {
+      resetArm = false;
+      screenDirty = true; // flash owns the screen — full redraw
+    }
+    if (pinEntry.length()) {
+      pinEntry = "";
+      drawPinDots();
+    }
   }
 
   // ── touch (OPERATIONAL keypad + '#' long-press factory reset) ────────────
