@@ -77,6 +77,27 @@ Separately, removing the lock in BANOI ("Gỡ khoá") makes OZLOCK publish
 `{op:"factory_reset"}` on the command topic — an ONLINE lock resets itself;
 an offline one needs the `*5` tap.
 
+## B6 — MAOI hotel mode (`mode=ozkey-local`, OZKEYSERV :3200)
+
+Same firmware, different ceremony: no enroll handshake — the lock announces
+itself as an UNPAIRED hotel lock and MAOI binds it to a room.
+
+1. Prereqs: Mosquitto `*:1883` + **ozkeyserv `:3200`** (site `hotel`) running;
+   cockpit `:3300` optional (observer).
+2. Factory-fresh lock (`*5`) → ADVERTISING. MAOI → Hồ sơ DN → **Quản lý khoá
+   cửa** → amber "Phát hiện khoá OZLOCK" banner → sheet asks WiFi SSID/pass
+   only (host comes from the OZKEYSERV config) → ladder to BROKER_OK, then
+   the sheet waits for the MAC in `/locks/unpaired` (≤2 min).
+3. Serial: `[PAIR->] unpaired announce (waiting for room assign)` every 20s;
+   ozkeyserv logs `Discovered unprovisioned lock <mac> on MQTT`.
+4. Bind: Kho → Phòng & Giá → unpaired-lock banner → gắn vào phòng (or the
+   room editor "Gắn khoá"). Server sends `provision_assign`; serial shows
+   `[PAIR] assigned room <n> (site hotel)` and the lock's strip shows `P.<n>`.
+5. Keys: check-in a booking (Đặt Phòng folio) → auto door-PIN (4 digits) →
+   `[CRED] slot N stored pin='…'` on the next 30s heartbeat → type PIN + `#`
+   → UNLOCKED + ozkeyserv logs the door transaction against the room.
+6. Checkout/settle revokes; Quản lý khoá cửa issues master PINs + remote ops.
+
 ## Known v0 limits
 
 - v1 plaintext provisioning (bench only) — v2 envelope + trust anchor deferred.

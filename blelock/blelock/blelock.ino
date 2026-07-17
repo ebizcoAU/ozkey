@@ -73,6 +73,12 @@ String cfgSsid, cfgPass, cfgBrokerHost, cfgServerIp, cfgSiteId, cfgName, cfgDevi
 uint16_t cfgBrokerPort = 1883, cfgServerPort = 4200;
 uint32_t cfgHeartbeatS = 60;
 bool provisioned = false, enrolled = false;
+// Mode (ozkey-08 §0): "ozkey-cloud" = OZLOCK/BANOI (enroll handshake, v0);
+// "ozkey-local" = OZKEYSERV hotel (unpaired-announce → MAOI pairs lock to a
+// room → provision_assign). `enrolled` doubles as "room assigned" in local
+// mode. cfgRoomNo/cfgMacToken only used in local mode.
+String cfgMode = "ozkey-cloud", cfgRoomNo, cfgMacToken;
+bool isLocalMode() { return cfgMode == "ozkey-local"; }
 
 String deviceId, macStr; // ozk-<machex> minted from factory MAC (§10.2)
 
@@ -88,7 +94,10 @@ PubSubClient mqtt(wifiTcp);
 unsigned long lastHeartbeat = 0, lastMqttAttempt = 0, wifiJoinStart = 0;
 unsigned long lastEnrollSent = 0;
 uint8_t enrollAttempts = 0;
-String topicCommand, topicEnroll, topicHeartbeat, topicLog;
+unsigned long lastUnpairedAnnounce = 0; // ozkey-local discovery cadence
+String topicCommand, topicEnroll, topicHeartbeat, topicLog, topicPairConfirm;
+// OZKEYSERV's fixed discovery topic (legacy 'hotel' prefix, not site-scoped).
+#define TOPIC_UNPAIRED "hotel/locks/unpaired/heartbeat"
 
 // Keypad / lock UI state
 String pinEntry;
@@ -304,6 +313,9 @@ void loadConfig() {
   cfgSiteId = prefs.getString("site", "lab");
   cfgName = prefs.getString("name", "");
   cfgHeartbeatS = prefs.getUInt("hb", 60);
+  cfgMode = prefs.getString("mode", "ozkey-cloud");
+  cfgRoomNo = prefs.getString("room", "");
+  cfgMacToken = prefs.getString("mtoken", "");
   prefs.end();
 }
 
@@ -320,6 +332,9 @@ void saveConfig() {
   prefs.putString("site", cfgSiteId);
   prefs.putString("name", cfgName);
   prefs.putUInt("hb", cfgHeartbeatS);
+  prefs.putString("mode", cfgMode);
+  prefs.putString("room", cfgRoomNo);
+  prefs.putString("mtoken", cfgMacToken);
   prefs.end();
 }
 
@@ -463,6 +478,19 @@ void publishEnroll() {
   Serial.printf("[ENROLL->] attempt %u\n", enrollAttempts);
 }
 
+// ozkey-local discovery: announce the raw MAC on OZKEYSERV's unpaired topic
+// until MAOI binds this lock to a room (server cache TTL 120s → 20s cadence).
+void publishUnpairedAnnounce() {
+  if (!mqtt.connected()) return;
+  JsonDocument doc;
+  doc["mac"] = macStr;
+  doc["fw"] = FW_VERSION;
+  String out; serializeJson(doc, out);
+  mqtt.publish(TOPIC_UNPAIRED, out.c_str());
+  lastUnpairedAnnounce = millis();
+  Serial.println("[PAIR->] unpaired announce (waiting for room assign)");
+}
+
 void doUnlock(const char *via) {
   lockStatus = "UNLOCKED";
   unlockAt = millis();
@@ -487,6 +515,29 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     // and return to ADVERTISING so the lock is immediately re-pairable.
     Serial.println("[MQTT<-] factory_reset (unpaired by app/server)");
     factoryReset();
+    return;
+  }
+  if (op && strcmp(op, "provision_assign") == 0) {
+    // OZKEYSERV hotel pairing (ozkey-02 §3.2/§8.4): MAOI bound this lock to
+    // a room; the handshake carries room_no + site + mac_token. Key is `mac`
+    // (never payload_hex), published on our MAC-scoped pair/confirm topic.
+    String amac = doc["mac"] | "";
+    amac.replace(":", ""); amac.toLowerCase();
+    if (amac.length() && ("ozk-" + amac) != deviceId) return; // not ours
+    cfgRoomNo = String((const char *)(doc["room_no"] | ""));
+    cfgSiteId = (const char *)(doc["site_id"] | "hotel");
+    cfgMacToken = (const char *)(doc["mac_token"] | "");
+    if (cfgRoomNo.length()) cfgName = "P." + cfgRoomNo; // room IS the label
+    enrolled = true;
+    saveConfig();
+    buildTopics(); // site may differ from the provisioned guess
+    mqtt.subscribe(topicCommand.c_str(), 1);
+    Serial.printf("[PAIR] assigned room %s (site %s)\n", cfgRoomNo.c_str(),
+                  cfgSiteId.c_str());
+    notifyStatus("ENROLLED");
+    state = ST_OPERATIONAL;
+    screenDirty = true;
+    publishHeartbeat(); // pull any keys queued while we were pairing
     return;
   }
   if (op && strcmp(op, "enrollment_ack") == 0) {
@@ -549,13 +600,22 @@ void ensureMqtt() {
   mqtt.setCallback(onMqttMessage);
   if (mqtt.connect(deviceId.c_str())) {
     mqtt.subscribe(topicCommand.c_str(), 1);
+    if (isLocalMode() && !enrolled) mqtt.subscribe(topicPairConfirm.c_str(), 1);
     Serial.println("[MQTT] connected + subscribed command topic");
     if (state == ST_JOINING) {
       notifyStatus("BROKER_OK");
-      joinLine2 = "Server: OK - enrolling...";
-      screenDirty = true;
-      enrollAttempts = 0;
-      publishEnroll();
+      if (isLocalMode()) {
+        // Hotel mode: no enroll handshake — announce as an unpaired lock
+        // and wait for MAOI to bind us to a room (provision_assign).
+        joinLine2 = "Cho MAOI gan phong...";
+        screenDirty = true;
+        publishUnpairedAnnounce();
+      } else {
+        joinLine2 = "Server: OK - enrolling...";
+        screenDirty = true;
+        enrollAttempts = 0;
+        publishEnroll();
+      }
     } else {
       publishHeartbeat(); // flush any queued grants fast after reconnect
     }
@@ -589,6 +649,9 @@ void applyProvision(JsonDocument &doc) {
   cfgHeartbeatS = doc["heartbeat_s"] | 60;
   if (!cfgSsid.length() || !cfgBrokerHost.length()) { notifyStatus("ENROLL_FAIL"); return; }
 
+  cfgMode = mode;
+  cfgRoomNo = "";
+  cfgMacToken = "";
   provisioned = true;
   enrolled = false;
   saveConfig();
@@ -669,6 +732,9 @@ void buildTopics() {
   topicEnroll = base + "enroll";
   topicHeartbeat = base + "heartbeat";
   topicLog = base + "log";
+  // ozkey-local: MAC-scoped side channel OZKEYSERV publishes the
+  // provision_assign handshake on (deviceId = "ozk-" + machex).
+  topicPairConfirm = "hotel/locks/" + deviceId.substring(4) + "/pair/confirm";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -899,11 +965,15 @@ void loop() {
     if (bleServer == nullptr) startBle();
   }
 
-  // ── MQTT + enroll retry ───────────────────────────────────────────────────
+  // ── MQTT + enroll retry / unpaired announce ──────────────────────────────
   if (provisioned) ensureMqtt();
-  if (state == ST_JOINING && mqtt.connected() && !enrolled &&
+  if (!isLocalMode() && state == ST_JOINING && mqtt.connected() && !enrolled &&
       lastEnrollSent && millis() - lastEnrollSent > 8000 && enrollAttempts < 5) {
     publishEnroll();
+  }
+  if (isLocalMode() && mqtt.connected() && !enrolled &&
+      millis() - lastUnpairedAnnounce > 20000) {
+    publishUnpairedAnnounce(); // keep the discovery cache warm (TTL 120s)
   }
 
   // ── heartbeat ─────────────────────────────────────────────────────────────
