@@ -656,6 +656,12 @@ void applyProvision(JsonDocument &doc) {
   enrolled = false;
   saveConfig();
   buildTopics();
+  // Loudly state the ceremony — a stale (cloud-only) flash receiving an
+  // ozkey-local payload would silently ENROLL instead of announcing.
+  Serial.printf("[PROV] mode=%s site=%s broker=%s:%u -> %s\n", cfgMode.c_str(),
+                cfgSiteId.c_str(), cfgBrokerHost.c_str(), cfgBrokerPort,
+                isLocalMode() ? "HOTEL (announce+await room)"
+                              : "OZLOCK (enroll)");
 
   state = ST_JOINING;
   joinLine1 = "WiFi: joining " + cfgSsid + "...";
@@ -1063,7 +1069,11 @@ void loop() {
     const char *st = state == ST_OPERATIONAL ? "OPERATIONAL"
                      : state == ST_JOINING   ? "JOINING"
                                              : "ADVERTISING";
-    Serial.printf("[MON] %s wifi=%s ip=%s mqtt=%s lock=%s heap=%u\n", st,
+    String modeInfo = cfgMode;
+    if (isLocalMode())
+      modeInfo += cfgRoomNo.length() ? (" room=" + cfgRoomNo) : " (no room)";
+    Serial.printf("[MON] %s mode=%s wifi=%s ip=%s mqtt=%s lock=%s heap=%u\n",
+                  st, modeInfo.c_str(),
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
                   WiFi.localIP().toString().c_str(),
                   mqtt.connected() ? "up" : "down", lockStatus.c_str(),
