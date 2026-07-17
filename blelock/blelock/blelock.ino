@@ -99,6 +99,8 @@ uint8_t pinFails = 0;
 unsigned long lockoutUntil = 0;
 bool screenDirty = true;
 String joinLine1 = "", joinLine2 = "";
+char hlKey = 0;            // key currently drawn highlighted (feedback)
+unsigned long hlUntil = 0; // when to repaint it normal
 
 // Touch
 bool touchWasDown = false;
@@ -172,7 +174,7 @@ void drawAdvertising() {
   gfx->setTextColor(C_DIM);
   gfx->println("Open BANOI > Doorlock to pair");
   gfx->setCursor(15, 162);
-  gfx->println("reset: tap * then 5 (keypad zone)");
+  gfx->println("reset: tap * then 5 (left edge)");
 }
 
 void drawJoining() {
@@ -197,78 +199,87 @@ void drawJoining() {
   gfx->print("device_id: ");
   gfx->println(deviceId);
   gfx->setCursor(15, 152);
-  gfx->println("reset: tap * then 5 (keypad zone)");
+  gfx->println("reset: tap * then 5 (left edge)");
 }
 
-// keypad geometry (right half of the landscape panel; KP_Y 26→21 operator
-// request — also keeps the bottom row inside the 172px panel)
-const int KP_X = 150, KP_Y = 21, KP_W = 54, KP_H = 34, KP_GX = 3, KP_GY = 3;
-const char KP_KEYS[4][3] = { {'1','2','3'}, {'4','5','6'}, {'7','8','9'}, {'*','0','#'} };
+// Keypad geometry — FULL-SCREEN 3-row × 4-column grid. The touch panel's
+// VERTICAL axis is coarse/filtered while the horizontal one is fast and
+// accurate (bench calibration), so the layout leans on width: only 3 rows
+// on the bad axis, 4 columns on the good one. Every cell is maximal and
+// hit-testing has NO dead zones. Background colour IS the lock status:
+// RED = LOCKED, GREEN = UNLOCKED. 12px top strip: name + PIN dots + the
+// live key indicator + link dot.
+const int KP_Y = 12;      // top strip height
+const int KP_ROW_H = 53;  // 12 + 3×53 = 171 — grid fills the panel
+const char KP_KEYS[3][4] = {
+  {'1','2','3','4'},
+  {'5','6','7','8'},
+  {'*','9','0','#'},
+};
+
+uint16_t lockBg() { return lockStatus == "UNLOCKED" ? C_GREEN : C_RED; }
+uint16_t lockFg() { return lockStatus == "UNLOCKED" ? C_BLACK : C_WHITE; }
+
+void drawKey(int r, int c, bool hl) {
+  int x = 2 + c * 80, y = KP_Y + r * KP_ROW_H + 2;
+  int w = 76, h = KP_ROW_H - 4;
+  gfx->fillRoundRect(x, y, w, h, 8, hl ? C_WHITE : C_BLACK);
+  gfx->setTextSize(3);
+  gfx->setTextColor(hl ? C_BLACK : C_WHITE);
+  gfx->setCursor(x + w / 2 - 9, y + h / 2 - 11);
+  gfx->print(KP_KEYS[r][c]);
+}
 
 void drawKeypad() {
-  for (int r = 0; r < 4; r++) {
-    for (int c = 0; c < 3; c++) {
-      int x = KP_X + c * (KP_W + KP_GX);
-      int y = KP_Y + r * (KP_H + KP_GY);
-      gfx->drawRoundRect(x, y, KP_W, KP_H, 6, C_GREY);
-      gfx->setTextSize(2);
-      gfx->setTextColor(C_WHITE);
-      gfx->setCursor(x + KP_W / 2 - 5, y + KP_H / 2 - 7);
-      gfx->print(KP_KEYS[r][c]);
-    }
-  }
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 4; c++) drawKey(r, c, false);
+}
+
+// Pressed-key feedback (operator): the registered key flashes WHITE for
+// 200ms so a mis-decode is visible immediately.
+void highlightKey(char k) {
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 4; c++)
+      if (KP_KEYS[r][c] == k) {
+        drawKey(r, c, true);
+        hlKey = k;
+        hlUntil = millis() + 200;
+        return;
+      }
+}
+
+void unhighlightKey() {
+  if (!hlKey) return;
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 4; c++)
+      if (KP_KEYS[r][c] == hlKey) drawKey(r, c, false);
+  hlKey = 0;
 }
 
 void drawPinDots() {
-  gfx->fillRect(12, 96, 130, 20, C_BLACK);
-  gfx->setTextSize(2);
-  gfx->setTextColor(C_AMBER);
-  gfx->setCursor(12, 98);
+  gfx->fillRect(0, 0, 320, KP_Y, lockBg());
+  gfx->setTextSize(1);
+  gfx->setTextColor(lockFg());
+  gfx->setCursor(4, 2);
+  String nm = asciiOnly(cfgName.length() ? cfgName : deviceId);
+  if (nm.length() > 14) nm = nm.substring(0, 14);
+  gfx->print(nm);
+  gfx->setCursor(150, 2);
   for (size_t i = 0; i < pinEntry.length(); i++) gfx->print('*');
+  // link dot far right: black = online, amber = offline
+  bool up = (WiFi.status() == WL_CONNECTED) && mqtt.connected();
+  gfx->fillCircle(312, 6, 4, up ? C_BLACK : C_AMBER);
 }
 
 void drawOperational() {
-  // RED = LOCKED / GREEN = UNLOCKED (operator directive) — thick border +
-  // big state word, English labels.
-  bool open = lockStatus == "UNLOCKED";
-  uint16_t st = open ? C_GREEN : C_RED;
-  gfx->fillScreen(C_BLACK);
-  gfx->drawRect(0, 0, 320, 172, st);
-  gfx->drawRect(1, 1, 318, 170, st);
-  gfx->drawRect(2, 2, 316, 168, st);
-  // left panel
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_GREY);
-  gfx->setCursor(12, 10);
-  gfx->println("OZLOCK");
-  gfx->setTextSize(2);
-  gfx->setTextColor(C_WHITE);
-  gfx->setCursor(12, 26);
-  String nm = asciiOnly(cfgName.length() ? cfgName : deviceId);
-  if (nm.length() > 11) nm = nm.substring(0, 11);
-  gfx->println(nm);
-  // status dot + link state
-  bool up = (WiFi.status() == WL_CONNECTED) && mqtt.connected();
-  gfx->fillCircle(18, 62, 5, up ? C_GREEN : C_RED);
-  gfx->setTextSize(1);
-  gfx->setTextColor(up ? C_GREEN : C_RED);
-  gfx->setCursor(30, 58);
-  gfx->print(up ? "online" : "offline...");
-  // lock state
-  gfx->setTextSize(2);
-  gfx->setTextColor(st);
-  gfx->setCursor(12, 130);
-  gfx->println(open ? "UNLOCKED" : "LOCKED");
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_DIM);
-  gfx->setCursor(12, 156);
-  gfx->print("* clear  # enter  *5 reset");
+  gfx->fillScreen(lockBg()); // the colour is the state — RED/GREEN
   drawPinDots();
   drawKeypad();
 }
 
 // Full-screen colour IS the state signal (operator: RED locked, GREEN open).
 void drawFlash(const char *msg, uint16_t bg, uint16_t fg) {
+  hlKey = 0; // flash owns the screen — cancel any pending key un-highlight
   gfx->fillScreen(bg);
   gfx->setTextSize(4);
   gfx->setTextColor(fg);
@@ -501,19 +512,28 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     screenDirty = true;
     return;
   }
-  // command envelope {action, grant_id, payload_hex}
+  // command envelope {action, grant_id, payload_hex}. ⚠ OZLOCK publishes
+  // SPACED hex ("55 AA 00 06 …", toSpacedHex) — the original strict parser
+  // bailed on the first space, silently dropping EVERY credential frame
+  // (grants showed "synced" server-side while the lock stayed at 0 slots).
+  // Parse hex pairs, skipping whitespace, like LockSim does.
   const char *hex = doc["payload_hex"] | (const char *)nullptr;
   if (hex) {
-    size_t hl = strlen(hex);
-    if (hl < 4 || hl % 2) return;
     static uint8_t frame[256];
     size_t fn = 0;
-    for (size_t i = 0; i + 1 < hl && fn < sizeof(frame); i += 2) {
-      int hi = hexNibble(hex[i]), lo = hexNibble(hex[i + 1]);
-      if (hi < 0 || lo < 0) return;
-      frame[fn++] = (hi << 4) | lo;
+    int hi = -1;
+    for (const char *p = hex; *p && fn < sizeof(frame); p++) {
+      if (*p == ' ' || *p == ':') continue;
+      int v = hexNibble(*p);
+      if (v < 0) { Serial.println("[DPID] bad hex in payload_hex"); return; }
+      if (hi < 0) {
+        hi = v;
+      } else {
+        frame[fn++] = (hi << 4) | v;
+        hi = -1;
+      }
     }
-    handleDpidFrame(frame, fn);
+    if (fn >= 4) handleDpidFrame(frame, fn);
   }
 }
 
@@ -673,34 +693,69 @@ void touchInit() {
                 err == 0 ? "(ACK ok)" : "(NO ACK — touch dead)");
 }
 
-// returns true + coords when a NEW touch-down happens (edge-triggered)
-bool touchRead(int &tx, int &ty, bool &held) {
+static bool touchReadRegs(uint8_t *buf) {
   Wire.beginTransmission(TOUCH_ADDR);
   Wire.write(0x00);
   if (Wire.endTransmission() != 0) return false;
   if (Wire.requestFrom(TOUCH_ADDR, 7) < 7) return false;
-  uint8_t buf[7];
   for (int i = 0; i < 7; i++) buf[i] = Wire.read();
+  return true;
+}
+
+// Tap = decoded on RELEASE, using the LAST coordinates sampled during the
+// press. Bench finding: this controller low-pass-filters the short axis —
+// the X register converges toward the finger over ~100ms (early reads
+// return a blend with the PREVIOUS touch), while Y refreshes fast. So we
+// sample every loop while held (skipping the first, fully-stale one) and
+// trust the final settled value.
+int lastTapX = 0, lastTapY = 0;
+uint8_t tapSamples = 0;
+
+bool touchRead(int &tx, int &ty, bool &held) {
+  uint8_t buf[7];
+  if (!touchReadRegs(buf)) return false;
   uint8_t count = buf[2]; // CST816 map: active point count at reg 0x02
   bool down = (count > 0 && count <= 5);
   held = down;
-  if (!down) { touchWasDown = false; return false; }
-  int rawX = ((buf[3] & 0x0F) << 8) | buf[4];
-  int rawY = ((buf[5] & 0x0F) << 8) | buf[6];
-  tx = 320 - rawY; // landscape transform for rotation 5 (same as Touch.ino)
-  ty = rawX;
-  if (touchWasDown) return false; // still the same press
-  touchWasDown = true;
+  if (down) {
+    if (touchWasDown) { // skip the first sample of a press (stale regs)
+      int rawX = ((buf[3] & 0x0F) << 8) | buf[4];
+      int rawY = ((buf[5] & 0x0F) << 8) | buf[6];
+      lastTapX = 320 - rawY; // landscape transform for rotation 5
+      // Vertical axis: empirically INVERTED + 1.2× scaled on this batch —
+      // y = 180 − 1.2·rawX fit all 9 calibration taps (2026-07-17 bench,
+      // rawX spans ~8..140 bottom→top).
+      int y = 180 - (rawX * 6) / 5;
+      if (y < 0) y = 0;
+      if (y > 171) y = 171;
+      lastTapY = y;
+      if (tapSamples < 255) tapSamples++;
+    }
+    touchWasDown = true;
+    return false;
+  }
+  if (!touchWasDown) return false;
+  // release edge — emit the settled position
+  touchWasDown = false;
+  uint8_t n = tapSamples;
+  tapSamples = 0;
+  if (n == 0) return false; // too brief to get past the stale sample
+  tx = lastTapX;
+  ty = lastTapY;
+  Serial.printf("[TOUCH] release %d,%d (%u samples)\n", tx, ty, n);
   return true;
 }
 
 char keyAt(int tx, int ty) {
-  for (int r = 0; r < 4; r++)
-    for (int c = 0; c < 3; c++) {
-      int x = KP_X + c * (KP_W + KP_GX), y = KP_Y + r * (KP_H + KP_GY);
-      if (tx >= x && tx < x + KP_W && ty >= y && ty < y + KP_H) return KP_KEYS[r][c];
-    }
-  return 0;
+  // Full-coverage grid: every pixel maps to the nearest key — no dead
+  // zones, maximum tolerance for the coarse touch axis.
+  int r = ty <= KP_Y ? 0 : (ty - KP_Y) / KP_ROW_H;
+  if (r > 2) r = 2;
+  if (r < 0) r = 0;
+  int c = tx * 4 / 320;
+  if (c > 3) c = 3;
+  if (c < 0) c = 0;
+  return KP_KEYS[r][c];
 }
 
 // THE one factory-reset method (operator: single method, no waiting):
@@ -717,13 +772,17 @@ void handleKey(char k) {
   if (resetArm) {
     resetArm = false;
     if (k == '5') { factoryReset(); return; }
-    screenDirty = true; // any other key cancels, back to the keypad
+    drawPinDots(); // wipe the strip prompt, back to normal entry
     return;
   }
   if (k == '*') {
     if (!pinEntry.length()) {
       resetArm = true;
-      drawFlash("RESET? 5=Y", C_AMBER, C_BLACK);
+      // small prompt in the top strip (operator: no full-screen flash)
+      gfx->setTextSize(1);
+      gfx->setTextColor(lockFg());
+      gfx->setCursor(252, 2);
+      gfx->print("RESET? 5");
       return;
     }
     pinEntry = "";
@@ -751,9 +810,10 @@ void handleKey(char k) {
     }
     return;
   }
-  // Digit. Entry model is "<digits>#" (max 8 digits): typing past the max
-  // is an invalid entry — clear and start fresh with the new digit.
-  if (pinEntry.length() >= 8) pinEntry = "";
+  // Digit. Entry model is "<4 digits>#" (operator: 4-digit PINs for easy
+  // testing): typing past the max is an invalid entry — clear and start
+  // fresh with the new digit.
+  if (pinEntry.length() >= 4) pinEntry = "";
   pinEntry += k;
   drawPinDots();
 }
@@ -885,25 +945,45 @@ void loop() {
   {
     int tx, ty; bool held = false;
     bool newTouch = touchRead(tx, ty, held);
+    // Live indicator: while the finger is down, show which key the lock
+    // currently sees (top strip) — the reading converges over ~100ms, so
+    // the operator can watch it settle before releasing.
+    static char candShown = 0;
+    if (state == ST_OPERATIONAL && !resetArm) {
+      char cand = (held && tapSamples > 0) ? keyAt(lastTapX, lastTapY) : 0;
+      if (cand != candShown) {
+        candShown = cand;
+        gfx->fillRect(220, 0, 24, KP_Y, lockBg());
+        if (cand) {
+          gfx->setTextSize(1);
+          gfx->setTextColor(lockFg());
+          gfx->setCursor(228, 2);
+          gfx->print(cand);
+        }
+      }
+    }
     if (newTouch) {
       char k = keyAt(tx, ty);
       Serial.printf("[TOUCH] %d,%d -> key '%c'\n", tx, ty, k ? k : '-');
       if (state == ST_OPERATIONAL) {
-        if (k) handleKey(k);
+        if (k) {
+          if (!resetArm) highlightKey(k); // white flash = what registered
+          handleKey(k);
+        }
       } else if (k) {
         // Same single reset method on every screen: '*' then '5' (the
         // keypad zones apply even where keys aren't drawn — hint printed
-        // on the ADVERTISING/CONNECTING screens).
+        // on the ADVERTISING/CONNECTING screens). Arms silently.
         if (resetArm) {
           resetArm = false;
           if (k == '5') factoryReset();
-          else screenDirty = true;
         } else if (k == '*') {
           resetArm = true;
-          drawFlash("RESET? 5=Y", C_AMBER, C_BLACK);
+          Serial.println("[RESET] armed — tap 5 to wipe");
         }
       }
     }
+    if (hlKey && millis() > hlUntil) unhighlightKey();
   }
 
   // ── periodic monitor line (operator: attach serial anytime, see state) ────
