@@ -36,6 +36,11 @@ export const MASTER_PIN = "123456";
 export const MASTER_CARD_UID = "7B 3F 91 D2";
 const WAKE_HOLD_MS = 1000; // return to sleep after 1s of inactivity
 const HEARTBEAT_BURST_MS = 200;
+// Scramble / anti-peeping entry (ozkey-08 §0.3): the real PIN may be embedded
+// anywhere in a longer digit string — junk digits defeat shoulder-surfing AND
+// mask the wake-sync latency. Lockout (real MCUs) counts per ENTRY, never per
+// candidate substring.
+const SCRAMBLE_MAX_DIGITS = 20;
 const UNLOCK_HOLD_MS = 5000; // remote/credential unlock auto-relock delay
 const MOTOR_TRAVEL_MS = 900;
 const ALARM_FLASH_MS = 1600;
@@ -217,29 +222,37 @@ export function useLockState({
   // ---------------------------------------------------------------------
   const submitPin = useCallback(
     (pin: string) => {
+      // u32 report caps at 9 digits — longer scramble entries report as 0.
+      const numeric = pin.length <= 9 ? parseInt(pin, 10) : 0;
       transmitRef.current(
         TuyaCommand.DP_REPORT,
-        buildDpPayload(DpId.UNLOCK_CHANNEL, DpType.VALUE, u32be(parseInt(pin, 10))),
-        `Keypad PIN entry report: ${pin}`
+        buildDpPayload(DpId.UNLOCK_CHANNEL, DpType.VALUE, u32be(numeric)),
+        `Keypad PIN entry report: ${pin.length} digit(s)${pin.length > 9 ? " (scramble entry, value masked)" : ""}`
       );
-      if (pin === MASTER_PIN) {
+      // Scramble matching: any contiguous substring of the entry may be the
+      // real PIN. A valid-window credential wins over an expired match.
+      if (pin.includes(MASTER_PIN)) {
         grant("KEYPAD PIN (MASTER)");
         return;
       }
-      const cred = credentialsRef.current.find((c) => c.kind === "PIN" && c.value === pin);
-      if (!cred) {
-        deny("UNKNOWN PIN", AccessResult.DENIED);
+      const candidates = credentialsRef.current.filter(
+        (c) => c.kind === "PIN" && pin.includes(c.value)
+      );
+      if (!candidates.length) {
+        deny("NO STORED PIN IN ENTRY", AccessResult.DENIED);
         return;
       }
-      const window = checkWindow(cred, nowRef.current());
-      if (window === "VALID") {
-        grant(`TEMP PIN — SLOT ${cred.slot}`);
-      } else {
-        deny(
-          `TEMP PIN SLOT ${cred.slot} ${window === "EXPIRED" ? "EXPIRED" : "NOT YET ACTIVE"}`,
-          AccessResult.EXPIRED
-        );
+      const now = nowRef.current();
+      const valid = candidates.find((c) => checkWindow(c, now) === "VALID");
+      if (valid) {
+        grant(`TEMP PIN — SLOT ${valid.slot}`);
+        return;
       }
+      const first = candidates[0];
+      deny(
+        `TEMP PIN SLOT ${first.slot} ${checkWindow(first, now) === "EXPIRED" ? "EXPIRED" : "NOT YET ACTIVE"}`,
+        AccessResult.EXPIRED
+      );
     },
     [grant, deny]
   );
@@ -263,15 +276,17 @@ export function useLockState({
         pinBufferRef.current = "";
         setPinBuffer("");
         // 4-digit PINs arrived with the hotel/BANOI flow (server generatePin);
-        // the master + legacy samples stay 6 — accept the range.
-        if (buffer.length >= 4 && buffer.length <= 6) {
+        // scramble entry (§0.3) allows junk digits around the real PIN, so
+        // the ceiling is the anti-peep cap, not the PIN length.
+        if (buffer.length >= 4 && buffer.length <= SCRAMBLE_MAX_DIGITS) {
           submitPin(buffer);
         } else {
-          setLastEvent(`PIN REJECTED — NEED 4-6 DIGITS (GOT ${buffer.length})`);
+          setLastEvent(`PIN REJECTED — NEED 4-${SCRAMBLE_MAX_DIGITS} DIGITS (GOT ${buffer.length})`);
         }
         return;
       }
-      const next = pinBufferRef.current.length < 6 ? pinBufferRef.current + key : pinBufferRef.current;
+      const next =
+        pinBufferRef.current.length < SCRAMBLE_MAX_DIGITS ? pinBufferRef.current + key : pinBufferRef.current;
       pinBufferRef.current = next;
       setPinBuffer(next);
     },
