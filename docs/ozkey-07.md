@@ -113,6 +113,14 @@
 
 ---
 
+> **TERMINOLOGY UPDATE 2026-07-19 — the canonical mode taxonomy now lives in
+> ozkey-08 §0.** This doc's "**Mode A**" = the server-authoritative commercial
+> family = **Mode 3 (OZLOCK-HOTEL)** + **Mode 4 (OZLOCK-PMS)** in the new
+> numbering. The residential contrast ("OZLOCK", ozkey-05) = **Mode 2
+> (OZLOCK-HOME)**; the consumer Matter tier = **Mode 1 (MATTER)**. §14 below
+> names Mode 4 as a first-class product. Modes 2 and 3 are BUILT and verified
+> on real ESP32-C6 hardware (2026-07-17/18).
+
 ## 1. Positioning — and the sharp contrast with OZLOCK
 
 Mode A is the **opposite trust model** to OZLOCK (market A residential). Getting
@@ -493,3 +501,27 @@ stage for the property-management case.
 6. With a secret configured, `POST /locks/pair` / `POST /locks/unpair` without
    the header are rejected (401); the cockpit can only perform them after
    DECLARE EMERGENCY arms the secret, and reads stay open throughout.
+
+## 14. Mode 4 — OZLOCK-PMS (named as a product, 2026-07-19)
+
+The "managed fleet" shape sketched in §1 is now a first-class target: **Mode 4
+OZLOCK-PMS** (canonical taxonomy in ozkey-08 §0).
+
+- **Topology:** lock C6 (Wi-Fi) → **cloud-hosted MQTT broker + cloud server**
+  (this same OZKEYSERV codebase, hosted) → PMS app. Same wire contract as
+  Mode 3 — the lock only ever knows `broker_host:port`, so hotel-on-LAN vs
+  PMS-in-cloud is a deployment choice, not a firmware or protocol fork.
+- **Product:** a MAOI-family app with **three management levels** for rental
+  portfolios across Australia — e.g. platform/company → property manager /
+  regional operator → per-property staff or tenant. The RBAC scaffolding is
+  §3; the scoping model ("hierarchy of operators each scoped to a subset of
+  properties") is §1's fleet case verbatim.
+- **Root authority:** the §2.1 **owner-root delegation** model is the
+  recommended default here (each property owner can unilaterally revoke the
+  managing company's delegation) — this is the differentiator vs Tuya/TTLock
+  platform-holds-everyone-hostage models, and it aligns with the whitepaper's
+  §6.3b central-revocation story.
+- **Status: PLANNED.** Modes 2 and 3 are built and hardware-verified; Mode 4
+  reuses their entire lock/server/wire stack and adds: cloud hosting, the
+  3-level RBAC surface (§3 generalized beyond single-org hotel), and the
+  owner-root delegation tree (§2.1 decision #1 — still the operator's call).

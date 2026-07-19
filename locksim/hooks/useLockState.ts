@@ -262,10 +262,12 @@ export function useLockState({
         const buffer = pinBufferRef.current;
         pinBufferRef.current = "";
         setPinBuffer("");
-        if (buffer.length === 6) {
+        // 4-digit PINs arrived with the hotel/BANOI flow (server generatePin);
+        // the master + legacy samples stay 6 — accept the range.
+        if (buffer.length >= 4 && buffer.length <= 6) {
           submitPin(buffer);
         } else {
-          setLastEvent(`PIN REJECTED — NEED 6 DIGITS (GOT ${buffer.length})`);
+          setLastEvent(`PIN REJECTED — NEED 4-6 DIGITS (GOT ${buffer.length})`);
         }
         return;
       }

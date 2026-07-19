@@ -137,9 +137,9 @@ export default function OzlockConsole() {
   const [lockDetail, setLockDetail] = useState(null);
   const [inspectTab, setInspectTab] = useState('primary'); // primary|secondary
 
-  // Paginated + date-ranged logs (12 rows/page, fetched on demand — not polled,
+  // Paginated + date-ranged logs (16 rows/page, fetched on demand — not polled,
   // so page boundaries don't jitter while you browse history).
-  const PAGE = 12;
+  const PAGE = 16;
   const [appActivity, setAppActivity] = useState([]);
   const [actTotal, setActTotal] = useState(0);
   const [actPage, setActPage] = useState(0);
@@ -335,7 +335,7 @@ export default function OzlockConsole() {
     </div>
   );
 
-  const renderPager = (page, total, count, setPage, accent) => {
+  const renderPager = (page, total, count, setPage, accent, onExport) => {
     const start = total === 0 ? 0 : page * PAGE + 1;
     const end = page * PAGE + count;
     const hasPrev = page > 0;
@@ -344,10 +344,72 @@ export default function OzlockConsole() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8, fontSize: 10, color: C.dim }}>
         <span>{total === 0 ? 'no records in range' : `showing ${start}–${end} of ${total}`}</span>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          {onExport && (
+            <button disabled={total === 0} onClick={onExport} style={pagerBtn(total > 0, accent)} title="Download every record in the current date range as CSV">
+              ⤓ CSV
+            </button>
+          )}
           <button disabled={!hasPrev} onClick={() => setPage((p) => p - 1)} style={pagerBtn(hasPrev, accent)}>‹ prev</button>
           <button disabled={!hasNext} onClick={() => setPage((p) => p + 1)} style={pagerBtn(hasNext, accent)}>next ›</button>
         </div>
       </div>
+    );
+  };
+
+  /* -------------------------------------------------------------------------
+   * CSV export — whole date range, not just the visible page. The API clamps
+   * limit at 200/request, so page through until `total` rows are collected.
+   * ----------------------------------------------------------------------- */
+  const csvCell = (v) => {
+    const s = v == null ? '' : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+
+  const downloadCsv = (filename, header, rows) => {
+    const csv = [header, ...rows].map((r) => r.map(csvCell).join(',')).join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const fetchAllInRange = async (base, from, to, key) => {
+    const rows = [];
+    for (let offset = 0; ; offset += 200) {
+      const qs = new URLSearchParams({ limit: '200', offset: String(offset) });
+      if (from) qs.set('from', from);
+      if (to) qs.set('to', to);
+      const d = await fetch(`${base}?${qs}`).then((r) => r.json());
+      if (!d.ok || !d[key].length) break;
+      rows.push(...d[key]);
+      if (rows.length >= d.total) break;
+    }
+    return rows;
+  };
+
+  const stamp = () => new Date().toISOString().slice(0, 10);
+
+  const exportActivityCsv = async () => {
+    const rows = await fetchAllInRange(
+      `${API}/apps/${encodeURIComponent(sel.id)}/activity`, actFrom, actTo, 'activity'
+    );
+    downloadCsv(
+      `ozlock-activity-${sel.id.slice(0, 12)}-${stamp()}.csv`,
+      ['id', 'time_utc', 'action', 'detail', 'device_id'],
+      rows.map((a) => [a.id, a.created_at, a.action, a.detail, a.device_id || ''])
+    );
+  };
+
+  const exportDoorLogCsv = async () => {
+    const rows = await fetchAllInRange(
+      `${API}/locks/${encodeURIComponent(sel.id)}/log`, logFrom, logTo, 'log'
+    );
+    downloadCsv(
+      `ozlock-doorlog-${sel.id}-${stamp()}.csv`,
+      ['id', 'lock_time_utc', 'received_utc', 'result', 'detail'],
+      rows.map((t) => [t.id, t.lock_ts || '', t.created_at, t.result, t.detail || ''])
     );
   };
 
@@ -597,7 +659,7 @@ export default function OzlockConsole() {
               {inspectTab === 'secondary' && (
                 <>
                   {renderDateRange(actFrom, actTo, setActFrom, setActTo, setActPage)}
-                  <div style={{ background: '#050B14', border: `1px solid ${C.panelEdge}`, borderRadius: 6, padding: '10px 12px', fontSize: 12, lineHeight: 1.7, height: 264, overflowY: 'auto' }}>
+                  <div style={{ background: '#050B14', border: `1px solid ${C.panelEdge}`, borderRadius: 6, padding: '10px 12px', fontSize: 12, lineHeight: 1.7, height: 464, overflowY: 'auto' }}>
                     {appActivity.length === 0 && <div style={{ color: C.dim }}>— no activity in range —</div>}
                     {appActivity.map((a) => (
                       <div key={a.id} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
@@ -610,7 +672,7 @@ export default function OzlockConsole() {
                       </div>
                     ))}
                   </div>
-                  {renderPager(actPage, actTotal, appActivity.length, setActPage, C.violet)}
+                  {renderPager(actPage, actTotal, appActivity.length, setActPage, C.violet, exportActivityCsv)}
                 </>
               )}
             </>
@@ -668,7 +730,7 @@ export default function OzlockConsole() {
                     physical access events at the lock (granted / denied / expired), newest first
                   </div>
                   {renderDateRange(logFrom, logTo, setLogFrom, setLogTo, setLogPage)}
-                  <div style={{ background: '#050B14', border: `1px solid ${C.panelEdge}`, borderRadius: 6, padding: '10px 12px', fontSize: 12, lineHeight: 1.7, height: 264, overflowY: 'auto' }}>
+                  <div style={{ background: '#050B14', border: `1px solid ${C.panelEdge}`, borderRadius: 6, padding: '10px 12px', fontSize: 12, lineHeight: 1.7, height: 464, overflowY: 'auto' }}>
                     {lockLog.length === 0 && <div style={{ color: C.dim }}>— no door transactions in range —</div>}
                     {lockLog.map((t) => (
                       <div key={t.id} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
@@ -680,7 +742,7 @@ export default function OzlockConsole() {
                       </div>
                     ))}
                   </div>
-                  {renderPager(logPage, logTotal, lockLog.length, setLogPage, C.teal)}
+                  {renderPager(logPage, logTotal, lockLog.length, setLogPage, C.teal, exportDoorLogCsv)}
                 </>
               )}
 

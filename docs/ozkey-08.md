@@ -21,6 +21,182 @@
 
 ---
 
+## 0. THE FOUR MODES — canonical taxonomy (operator, 2026-07-19)
+
+One lock, one comm-module firmware, four network personalities. This table is
+the **canonical mode vocabulary** — it supersedes the earlier per-doc
+numberings (ozkey-07's "Mode A", this doc's build "phases", §10's internal
+mode 2/3 ladder). Those older labels remain valid in their historical context;
+new work references the modes below.
+
+| # | Mode | Transport chain | Server | App | Status |
+|---|------|----------------|--------|-----|--------|
+| **1** | **MATTER** (Matter over Thread) | lock → Thread border router (Apple TV / Google Nest / Alexa / Home Assistant) → owner's ecosystem | none of ours | owner's platform app | **planned** — whitepaper consumer tier |
+| **2** | **OZLOCK-HOME** | lock C6 (Wi-Fi) → MQTT broker → **ozlockserv** (personal cloud, `:4200`) | ozlockserv | **BANOI** (BLE commissioning built-in) | ✅ **BUILT + verified on real C6** (2026-07-17, no 2nd bridge needed) |
+| **3** | **OZLOCK-HOTEL** | lock C6 (Wi-Fi) → MQTT broker → **ozkeyserv** (local server, `:3200`) → MAOI | ozkeyserv (on-prem) | **MAOI** | ✅ **BUILT + verified on real C6** (2026-07-18, no 2nd bridge needed) |
+| **4** | **OZLOCK-PMS** | lock C6 (Wi-Fi) → cloud MQTT + **cloud server** → PMS app | ozkeyserv-family, cloud-hosted | MAOI-family, **3 management levels** (AUS-wide rental portfolios) | **planned** — contract seeds in ozkey-07 §1 "Fleet" + §2.1 owner-root delegation |
+
+Notes:
+- **The 2nd ESP32 (bridge C6 N16) is a DUAL-PERSONALITY box (operator,
+  2026-07-19)** — commissioning-time choice:
+  - **Personality A — Matter-over-Wi-Fi bridge (Mode 1b):** joins home Wi-Fi
+    and exposes the Thread lock as a **bridged Matter Door Lock endpoint over
+    Wi-Fi** (Hue-Bridge pattern). This is what reaches Thread-less
+    controllers — old Apple TV / Echo / PC-hosted HA are Matter controllers
+    with no Thread radio (and Apple won't use 3rd-party border routers), so
+    plain Thread-border-routing is NOT enough for them. For HA, the same box
+    can also act as a plain OpenThread border router (Mode 1a-adjacent).
+  - **Personality B — MQTT uplink (Modes 2–4):** lock →Thread→ bridge
+    →Wi-Fi→ broker → ozlockserv / ozkeyserv / cloud.
+  - Mode 1a (home already has a modern Apple TV 4K / Nest Hub / Echo v4+ as
+    border router) needs no OZ bridge at all. Wi-Fi+Thread coex on one C6 is
+    bench-proven (2026-07-13); Matter-bridge + OTBR + MQTT stacks coexisting
+    is the third justification for N16 flash. Concurrent A+B (multi-fabric +
+    MQTT at once) is technically open but deferred to gen-2 — v1 ships it as
+    a commissioning choice.
+- **Broker placement in Modes 2–4** is a deployment choice, not architecture:
+  the lab runs everything on one LAN host (10.1.1.21 — Mosquitto `:1883`,
+  ozlockserv `:4200`, ozkeyserv `:3200`); Mode 4 hosts the same broker+server
+  in the cloud. The lock config only ever holds `broker_host:port`.
+- **Firmware mode mapping (NVS `mode`):** `ozkey-cloud` = Mode 2 ·
+  `ozkey-local` = Mode 3 · Mode 4 reuses `ozkey-local` semantics against a
+  cloud host (value TBD if a distinct personality proves necessary) · Mode 1
+  is the Matter fabric, entered/exited per §4.2 takeover semantics.
+- **Comm-module split (2026-07-19):** `blelock/blecomm/` is the pure comm
+  module (Tuya TYWE3S-equivalent) — the lock MCU owns keypad/RFID/fingerprint
+  and ALL credential auth; blecomm only transports frames, plus a
+  10,000-event offline transaction buffer (LittleFS JSONL ring). `blelock/`
+  remains the all-in-one emulator (MCU+module on one board). Wire between
+  module and MCU (LockSim Mode B): raw Tuya 55 AA on UART1 GPIO16/17 @9600
+  8N1, wire-verified 2026-07-19.
+
+### 0.0.0 App-facing DL configuration menu (operator, 2026-07-19 — checked)
+
+The commissioning app presents SIX options (one lock, one firmware):
+
+| # | Config | Chain | Notes |
+|---|--------|-------|-------|
+| 1 | **Matter over Thread** | lock ─Thread→ owner's border router (new Apple TV 4K / Nest Hub / Google TV Streamer '24 / Echo v4+) | Mode 1a. Onboards via ecosystem's own Matter QR flow — no OZ app/account needed (sovereignty feature) |
+| 2 | **Matter via OZBRIDGE** | lock ─Thread→ OZBRIDGE (Matter-over-Wi-Fi node) → old/Thread-less Apple TV / Google TV / Alexa | Mode 1b |
+| 3 | **OZLOCK premium (5s)** | lock ─Thread→ OZBRIDGE ─Wi-Fi→ cloud MQTT → OZLOCK app | Mode 2. 5s downlink = SED poll (whitepaper Table-2 default) |
+| 4 | **OZLOCK economy (no bridge)** | lock ─Wi-Fi direct, 10-min + Touch2Wake → cloud MQTT → OZLOCK app | Mode 2 economy. Any router. Saves the bridge cost |
+| 5 | **OZKEY (hotel/motel)** | lock ─Wi-Fi direct, 10-min + Touch2Wake → local ozkeyserv → MQTT → OZKEY app | Mode 3. See PIN-race fix below |
+| 6 | **OZPMS (managed rentals)** | lock ─Wi-Fi direct, 10-min + Touch2Wake → cloud server + MQTT → OZPMS app | Mode 4 |
+
+- **Check-in PIN race fix (options 5/6):** touch triggers wake AND an
+  immediate heartbeat pull in parallel with PIN entry — ozkeyserv already
+  flushes queued credentials on heartbeat (verified bench behavior), so the
+  PIN lands during the 3–5s the guest spends typing it. Requires fast-connect
+  (<1s join) — the same work item as the battery claim. This makes 10-min+T2W
+  hotel-viable on ANY motel AP (no Wi-Fi-6 requirement); **TWT 30–60s is a
+  site-dependent UPGRADE** (instant remote unlock) where ax APs support it,
+  not the baseline.
+- **The 10-min interval is HOUSEKEEPING CADENCE, not user-facing latency**
+  (operator + team, 2026-07-19). Touch-pull collapses every human-at-the-door
+  flow to touch+join seconds: check-in PIN (pulled during the guest's own
+  entry; the walk-to-room time is bonus margin, not the guarantee) ·
+  **checkout revocation** (a departed guest's touch pulls the pending revoke
+  before their entry validates — the attempt defeats itself) · **remote
+  unlock** (the person at the door touches → lock pulls the queued command —
+  remote open is touch-assisted, and someone wanting in always touches). Only
+  logs/config/OTA checks actually wait the 10 min — and they can. Install
+  checklist: site-survey Wi-Fi AT THE DOOR positions (2.4GHz, steel frames —
+  motel Wi-Fi is planned for rooms, not corridor doors) + non-captive-portal
+  SSID/VLAN for locks.
+- **Guest-facing unlock is instant in EVERY option** (auth is local on the
+  lock MCU, network-free) — the tiers differ only in REMOTE latency. App copy
+  should state this so option 4 doesn't read as a "slow lock".
+- Options 3/4 are the same OZLOCK app — present as a speed/price toggle
+  ("have an OZBRIDGE?"), not separate products.
+
+### 0.0.1 Production silicon decision (operator, 2026-07-19; REVISED same day)
+
+- **Doorlock comm module = ESP32-C6 N8, ALL SKUs** (revised from H2 — the
+  video SKU decides it): the video doorlock variant uses a **Tuya peephole
+  media MCU that encodes H.264 itself**; the comm module only TRANSPORTS the
+  stream — to the bridge or **direct to the app via STUN/P2P** (broker =
+  signaling only; video never transits our servers — sovereignty win, note
+  for whitepaper v3). Thread/802.15.4 tops out ~250 kbps and can NEVER carry
+  H.264, so a shared module must be Wi-Fi-capable → **H2 is disqualified by
+  physics** for any video-sharing platform. C6 N8 = the exact bench-verified
+  chip+firmware (production module ≡ blecomm, headless).
+  ⚠ Video-SKU integration check: media-MCU→C6 link must be **SDIO/SPI**
+  (C6 has an SDIO slave; ESP-Hosted pattern) — UART cannot carry 1–4 Mbps.
+  Some Tuya media SoCs expect to own the Wi-Fi themselves; in that variant
+  the C6 stays lock-comm-only and video has its own radio. Decide per module
+  sourced.
+- Headless in production: **no LCD/touch** — status via one LED + the BLE
+  status/info characteristics (the app is the dashboard); factory reset via
+  MCU-initiated Tuya module-reset command (lock's own UI gesture) + strap-GPIO
+  recovery fallback.
+- **Transport (operator-revised 2026-07-19 PM): control plane is PER
+  DEPLOYMENT — the C6's dual radio is what makes this free.**
+  - **Residential (Modes 1/2) = THREAD**: lock ─Thread→ owner's border router
+    (Mode 1) or our N16 bridge (Mode 2) ─Wi-Fi→ MQTT → ozlockserv. Short
+    distances; Matter ecosystem; home APs rarely do TWT properly.
+  - **Hotel/PMS (Modes 3/4) = Wi-Fi 6 TWT DIRECT to the site's existing APs —
+    NO bridge.** Rationale (operator finding): Thread SEDs cannot route
+    (battery locks = leaf nodes, no lock-to-lock mesh — ⚠ whitepaper §6.2
+    currently overclaims this and must be fixed in v3), so through-concrete
+    range (~9–20m worst case) would demand chains of wall-powered repeaters
+    in guest corridors — unplugged/misplaced/stolen in practice. The motel
+    already has a Wi-Fi blanket; use it.
+  - Lock Wi-Fi additionally does video burst on the video SKU (peephole media
+    MCU → SDIO → C6 → STUN/P2P) in ANY deployment.
+- **TWT engineering truths (do not overclaim):** TWT keeps association via
+  LIGHT sleep (C6 ~130–200µA floor) — realistic average ≈ **100–250µA**, NOT
+  the ~11µA sometimes cited (deep sleep 7µA drops association → 2–5s rejoin).
+  2400mAh ÷ ~200µA ≈ **1.4 years** — fine for scheduled hotel battery swaps.
+  "Instant" is UPLINK-only (touch-wake transmit anytime); DOWNLINK (remote
+  unlock, **check-in PIN sync**) waits for the next TWT service period → the
+  TWT interval IS the whitepaper Table-2 poll knob; set **30–60s for hotels**
+  (PIN must beat the guest to the door), not 10 min. Deployment prereqs:
+  802.11ax APs with TWT actually ENABLED (many enterprise sites ship it off),
+  dedicated lock SSID/VLAN, per-AP-model TWT verification.
+- **Bridge = ESP32-C6 N16, RESIDENTIAL (Mode 2) + Matter-bridge (Mode 1b)
+  only** — no longer in the hotel chain. Jobs: Thread border router + MQTT
+  uplink + failover token cache + store-and-forward spool + lock-OTA host.
+- **Bridge value proposition & the bridge-less residential SKU (operator,
+  2026-07-19):** the bridge buys exactly three things — (1) INSTANT downlink
+  (remote unlock / PIN sync ~5s via Thread SED) at years-class battery,
+  (2) Matter for Thread-less homes, (3) home-router independence. If ~10-min
+  downlink + touch-to-wake is ACCEPTED, a **lock-only SKU needs no bridge on
+  any router**: deep sleep 7µA → touch interrupt → LOCAL MCU auth (guest
+  unlock is always instant, network-free) + 10-min heartbeat join to push
+  logs / pull PINs. ⚠ Battery there is dominated by the periodic Wi-Fi JOIN,
+  not sleep: naive 3–5s join ≈ 0.5mA avg (~6 months); fast-connect (PMK
+  cache, static IP, pinned channel, <1s join) ≈ 0.1–0.2mA → 1.5–3yr — the
+  fast-connect work is where the lock-only battery claim is earned. Product
+  ladder: lock-only economy (any router, no Matter) · lock+bridge combo
+  (instant remote + Matter — the whitepaper sub-$100 bundle) · Mode 1a
+  (owner's own border router, no bridge) · hotel TWT (site APs, no bridge).
+- **Firmware gap to production:** bench blelock/blecomm (Wi-Fi/MQTT direct)
+  = **near-production for the HOTEL path** — gen-1 delta is TWT negotiation +
+  sleep-state machine + touch-wake, not a protocol rewrite. OpenThread SED on
+  the lock + bridge firmware move to the RESIDENTIAL SKU's timeline. Servers/
+  apps unchanged either way.
+
+### 0.1 DP vocabulary decision — STRICT TUYA ONLY (2026-07-19)
+
+The doorlock speaks the **standard Tuya DP vocabulary and nothing else**:
+DP 1 (unlock channel), 2 (RFID), 3 (fingerprint), 5 (battery), 8
+(ACCESS_RESULT), 21–24 (credential add/delete). Rationale: lock makers will
+not modify MCU firmware for us, and the standard MCU↔module serial protocol
+is unauthenticated plaintext — a swapped-in OZ comm module works with any
+stock Tuya lock MCU with **no secret required** (the only Tuya secrets are
+module↔cloud auth, which we replace, and the optional offline-dynamic-PIN
+seed, which we don't need — our servers issue temp PINs via standard DPID 21).
+
+**DP 9 "ATTEMPT_REPORT" (tier-2 credential escalation) was built and then
+REJECTED 2026-07-19**: the standard protocol never transmits attempted
+credential values, so no stock MCU would ever emit it. Large-directory
+(>50-user) authentication belongs to a **separate access-control product**
+with its own keypad/RFID/fingerprint sensors that commands the lock via the
+standard remote-unlock DP — the commercial reader/controller model — not to
+the doorlock's comm module. Code reverted from blecomm + LockSim same day.
+
+---
+
 ## 1. Purpose — the wall LockSim can't close
 
 LockSim is a browser app: born network-resident (WebSocket→MQTT), it proves
@@ -347,3 +523,45 @@ command parse) / `dpid` (payload_hex → add/revoke PIN, ≤16 slots) / `ui` /
 "OZLOCK" — ✅ operator. 3. `name` added to ProvisionPayload (optional) — ✅.
 4. Keypad = on-screen 3×4 grid — ✅ operator. 5. OPEN: SSID autofill on iOS
 (NEHotspot entitlement) — fallback manual entry.
+
+
+
+# *************** OPERATION MODE ***************
++---+-----------------------------------+--------------------------------------+
+
+| # | Architecture Configuration        | Technical Review Notes               |
++---+-----------------------------------+--------------------------------------+
+
+| 1 | Matter/Thread -> New TV Hubs      | Mode 1a. Valid. Google hubs = Nest   |
+|   | (AppleTV, GoogleTV, Alexa)        | Hub 2nd-gen, Nest Wifi Pro, or Google|
+|   |                                   | TV Streamer. Older plain Google TVs  |
+|   |                                   | lack Thread (hence Option 2).        |
++---+-----------------------------------+--------------------------------------+
+
+| 2 | Matter/Wi-Fi via OZBRIDGE ->      | Mode 1b. Valid. OZBRIDGE acts as a   |
+|   | Legacy Hubs                       | Matter-over-Wi-Fi node. Exposes lock |
+|   | (AppleTV, GoogleTV, Alexa)        | as bridged endpoint. Lock-to-bridge  |
+|   |                                   | leg runs natively on Thread.         |
++---+-----------------------------------+--------------------------------------+
+
+| 3 | Thread -> OZBRIDGE ->             | Mode 2 Premium. Wording fix: Thread  |
+|   | Wi-Fi/MQTT Cloud -> OZLOCK        | to bridge, then Wi-Fi egress. The 5s |
+|   | (5s Opening Response)             | lag is the SED poll interval based   |
+|   |                                   | on Table-2 whitepaper defaults.      |
++---+-----------------------------------+--------------------------------------+
+
+| 4 | Direct Wi-Fi (10m + Touch2Wake)   | Mode 2 Economy. Lock-only SKU. Works |
+|   | -> Cloud MQTT -> OZLOCK           | natively on any standard router. No  |
+|   | (No Bridge Required)              | secondary bridge needed.             |
++---+-----------------------------------+--------------------------------------+
+
+| 5 | Direct Wi-Fi (10m + Touch2Wake)   | Mode 3. Valid local architecture.    |
+|   | -> Local Server -> OZKEY          | Requires single verification fix to  |
+|   |                                   | optimize local server timeout logs.  |
++---+-----------------------------------+--------------------------------------+
+
+| 6 | Direct Wi-Fi (10m + Touch2Wake)   | Mode 4. Mechanically identical to    |
+|   | -> Cloud Server + MQTT -> OZPMS   | Mode 5, but entirely cloud-hosted.   |
+|   |                                   | App integration naming is clean.     |
++---+-----------------------------------+--------------------------------------+
+

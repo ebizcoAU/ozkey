@@ -1,15 +1,23 @@
 /*
- * blelock — OZLOCK doorlock emulator v0 (ozkey-08 §10)
+ * blecomm — OZLOCK Wi-Fi COMM MODULE v0 (blelock fork, 2026-07-19)
  * Board : Waveshare ESP32-C6 Touch-LCD 1.47" (pin map: blelock/HARDWARE.md)
- * Flow  : BLE "OZLOCK" advertise → BANOI writes ProvisionPayload →
- *         WiFi → MQTT :1883 → enroll (ozkey/<site>/locks/<id>/enroll) →
- *         enrollment_ack → OPERATIONAL: 3×4 touch keypad, DPID 21/22
- *         credential frames, heartbeat, door log publishes.
- * Wire  : identical to LockSim (ozlockserv untouched). Frames: ozkey-02 §4 /
- *         ozkey_commissioner DpidFrames (55 AA 00 06 … checksum).
- * Built from the PROVEN test sketches: BLE.ino (advertise+GATT),
- * Wifi.ino (BLE+WiFi coex, BGR panel), Touch.ino (CST816-class @0x63,
- * hw-reset GPIO20, 7-byte read), TicTacToe.ino (grid hit-testing).
+ *
+ * ROLE SPLIT (real Tuya architecture): this sketch is PURELY the comm module
+ * (a TYWE3S equivalent). ALL lock duty — keypad, RFID, fingerprint, battery,
+ * credential storage/validation, motor — lives on the MCU = LockSim Mode B,
+ * connected over the Tuya 55 AA bus (Serial1 GPIO16/17 @9600 8N1 → CP2102).
+ *
+ *   server → module : MQTT payload_hex → RAW frame forwarded to MCU (never
+ *                     executed locally — the MCU owns credentials)
+ *   MCU → module    : 55 AA frames translated up: ACCESS_RESULT (DP 8) →
+ *                     granted/denied/expired door logs; other DPs → dp_report
+ *
+ * Provisioning/network spine is blelock-identical: BLE "OZLOCK" advertise →
+ * BANOI/MAOI ProvisionPayload → WiFi → MQTT → enroll (cloud) or
+ * unpaired-announce + provision_assign (hotel). Same NVS namespace, so a
+ * board flashed blelock↔blecomm keeps its enrollment.
+ * Factory reset: same invisible '*' then '5' touch zones, every screen.
+ * Screen = comm dashboard (no keypad): mode/WiFi/broker/MCU-link + counters.
  */
 
 #include <Arduino_GFX_Library.h>
@@ -22,6 +30,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <time.h>
 
 // ── Hardware pins (HARDWARE.md, operator-verified) ──────────────────────────
@@ -31,68 +40,57 @@
 #define LCD_DIN 2
 #define LCD_RST 22
 #define LCD_BL 23
-// Touch = CST816-class @0x63 on SDA18/SCL19 with hw reset GPIO20 — the
-// values Touch.ino/TicTacToe.ino verified on this batch. (HARDWARE.md's
-// original 0x3B/SDA4 section was wrong for this board.)
 #define I2C_SDA 18
 #define I2C_SCL 19
 #define TOUCH_RST 20
 #define TOUCH_INT 21
 #define TOUCH_ADDR 0x63
 
-// Tuya MCU bus (LockSim Mode B): raw 55 AA frames over UART1 @9600 8N1 to a
-// CP2102 on the laptop's second USB port. GPIO16/17 = the free TX/RX pads
-// (console rides USB-JTAG). Wire-verified 2026-07-19 (serial_wire_test).
+// Tuya MCU bus → LockSim Mode B (wire-verified 2026-07-19)
 #define TUYA_TX_PIN 16  // -> CP2102 RXD
 #define TUYA_RX_PIN 17  // <- CP2102 TXD
 
-// ── BGR-corrected palette (panel is BGR — Wifi.ino finding) ────────────────
+// ── BGR-corrected palette (panel is BGR) ────────────────────────────────────
 #define C_BLACK 0x0000
 #define C_WHITE 0xFFFF
-#define C_RED 0x001F    // red on BGR panel
-#define C_BLUE 0xF800   // blue on BGR panel
-#define C_GREEN 0x07E0  // green channel is symmetric
-#define C_AMBER 0x051F  // amber (r31 g41 b0) with R/B swapped
+#define C_RED 0x001F
+#define C_BLUE 0xF800
+#define C_GREEN 0x07E0
+#define C_AMBER 0x051F
 #define C_GREY 0x8410
 #define C_DIM 0x39E7
 
 Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_DIN);
 Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 34, 0, 34, 0);
 
-// ── GATT contract (blelock/CONTRACT.md + ozkey-08 §10.3) ────────────────────
+// ── GATT contract (blelock/CONTRACT.md — unchanged so BANOI/MAOI pair as-is) ─
 #define BLE_NAME "OZLOCK"
 #define SVC_UUID "4f5a4b31-0001-4c4f-434b-000000000001"
 #define CHR_PROVISION "4f5a4b31-0002-4c4f-434b-000000000001"
 #define CHR_STATUS "4f5a4b31-0003-4c4f-434b-000000000001"
 #define CHR_INFO "4f5a4b31-0004-4c4f-434b-000000000001"
-#define FW_VERSION "blelock-1.0"
+#define FW_VERSION "blecomm-1.0"
 
-// ── State machine (ozkey-08 §10.5) ──────────────────────────────────────────
-enum LockState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
-LockState state = ST_ADVERTISING;
+// ── State machine ───────────────────────────────────────────────────────────
+enum CommState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
+CommState state = ST_ADVERTISING;
 
-Preferences prefs;   // namespace "blelock" — provisioning + enrollment
-Preferences creds;   // namespace "creds"   — PIN slots
+Preferences prefs; // namespace "blelock" — shared with blelock deliberately
 
-// Provisioned config (NVS-backed)
 String cfgSsid, cfgPass, cfgBrokerHost, cfgServerIp, cfgSiteId, cfgName, cfgDeviceId;
 uint16_t cfgBrokerPort = 1883, cfgServerPort = 4200;
 uint32_t cfgHeartbeatS = 60;
 bool provisioned = false, enrolled = false;
-// Mode (ozkey-08 §0): "ozkey-cloud" = OZLOCK/BANOI (enroll handshake, v0);
-// "ozkey-local" = OZKEYSERV hotel (unpaired-announce → MAOI pairs lock to a
-// room → provision_assign). `enrolled` doubles as "room assigned" in local
-// mode. cfgRoomNo/cfgMacToken only used in local mode.
 String cfgMode = "ozkey-cloud", cfgRoomNo, cfgMacToken;
 bool isLocalMode() { return cfgMode == "ozkey-local"; }
 
-String deviceId, macStr; // ozk-<machex> minted from factory MAC (§10.2)
+String deviceId, macStr;
 
 // BLE
 BLEServer *bleServer = nullptr;
 BLECharacteristic *chrStatus = nullptr, *chrInfo = nullptr;
 volatile bool bleClientConnected = false;
-String provBuf; // chunked-write accumulator (a chunk starting '{' resets it)
+String provBuf;
 
 // Networking
 WiFiClient wifiTcp;
@@ -100,25 +98,82 @@ PubSubClient mqtt(wifiTcp);
 unsigned long lastHeartbeat = 0, lastMqttAttempt = 0, wifiJoinStart = 0;
 unsigned long lastEnrollSent = 0;
 uint8_t enrollAttempts = 0;
-unsigned long lastUnpairedAnnounce = 0; // ozkey-local discovery cadence
+unsigned long lastUnpairedAnnounce = 0;
 String topicCommand, topicEnroll, topicHeartbeat, topicLog, topicPairConfirm;
-// OZKEYSERV's fixed discovery topic (legacy 'hotel' prefix, not site-scoped).
 #define TOPIC_UNPAIRED "hotel/locks/unpaired/heartbeat"
 
-// Keypad / lock UI state
-String pinEntry;
-String lockStatus = "LOCKED"; // LOCKED | UNLOCKED
-unsigned long unlockAt = 0;
-const unsigned long UNLOCK_MS = 5000; // proven auto-relock
-uint8_t pinFails = 0;
-unsigned long lockoutUntil = 0;
 bool screenDirty = true;
 String joinLine1 = "", joinLine2 = "";
-char hlKey = 0;            // key currently drawn highlighted (feedback)
-unsigned long hlUntil = 0; // when to repaint it normal
-
-// Touch
 bool touchWasDown = false;
+
+// ── MCU bus health (drives the dashboard) ───────────────────────────────────
+uint32_t mcuTxFrames = 0;         // frames forwarded server → MCU
+uint32_t mcuRxFrames = 0;         // frames received MCU → module
+unsigned long lastMcuFrameAt = 0; // millis() of last frame FROM the MCU
+String lastMcuSummary = "";       // one-line description of it
+// LockSim heartbeats every 60s — no frame for 90s = MCU link considered down
+#define MCU_LINK_TIMEOUT_MS 90000UL
+bool mcuLinkUp() { return lastMcuFrameAt && millis() - lastMcuFrameAt < MCU_LINK_TIMEOUT_MS; }
+
+// Door status as REPORTED by the MCU traffic we relay (the MCU owns the bolt;
+// this is the comm module's mirror of it): granted/remote-unlock → UNLOCKED,
+// reverting after LockSim's known 5s auto-relock.
+String doorStatus = "LOCKED";
+unsigned long doorUnlockAt = 0;
+#define DOOR_UNLOCK_MS 5000UL
+void markDoorUnlocked() {
+  doorStatus = "UNLOCKED";
+  doorUnlockAt = millis();
+  screenDirty = true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRANSACTION LOG (LittleFS). ⚠ DP-9/tier-2 credential DB REMOVED 2026-07-19:
+// the doorlock speaks STRICT Tuya DP vocabulary only (the maker won't change
+// MCU firmware for us — attempted-credential values never cross the UART in
+// the standard protocol). Large-directory auth belongs to a separate
+// access-control device, not this comm module. See ozkey-08 §0.
+// ─────────────────────────────────────────────────────────────────────────────
+#define TXLOG_ROTATE_LINES 5000 // two files × 5000 = 10,000-event buffer
+
+bool fsUp = false;
+uint32_t txlogCount0 = 0, txlogCount1 = 0; // lines in /txlog.0 + /txlog.1
+
+// 10,000-event transaction buffer: JSONL ring across /txlog.0 (live) and
+// /txlog.1 (previous). Rotate at 5,000 lines each. Every event is captured
+// even with the network down — the upstream MQTT publish is best-effort.
+uint32_t txlogCountLines(const char *path) {
+  if (!LittleFS.exists(path)) return 0;
+  File f = LittleFS.open(path, "r");
+  if (!f) return 0;
+  uint32_t n = 0;
+  while (f.available()) if (f.read() == '\n') n++;
+  f.close();
+  return n;
+}
+
+void txlogAppend(const char *result, const char *detail) {
+  if (!fsUp) return;
+  if (txlogCount0 >= TXLOG_ROTATE_LINES) {
+    LittleFS.remove("/txlog.1");
+    LittleFS.rename("/txlog.0", "/txlog.1");
+    txlogCount1 = txlogCount0;
+    txlogCount0 = 0;
+  }
+  File f = LittleFS.open("/txlog.0", "a");
+  if (!f) return;
+  JsonDocument doc;
+  String ts = isoNow();
+  if (ts.length()) doc["ts"] = ts; else doc["up_ms"] = millis();
+  doc["result"] = result;
+  doc["detail"] = detail;
+  serializeJson(doc, f);
+  f.print('\n');
+  f.close();
+  txlogCount0++;
+}
+
+uint32_t txlogTotal() { return txlogCount0 + txlogCount1; }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilities
@@ -134,7 +189,7 @@ String asciiOnly(const String &s) {
 
 String isoNow() {
   time_t now = time(nullptr);
-  if (now < 1600000000) return String(""); // NTP not yet synced
+  if (now < 1600000000) return String("");
   struct tm tmv;
   gmtime_r(&now, &tmv);
   char buf[24];
@@ -169,14 +224,14 @@ void drawAdvertising() {
   gfx->setTextColor(C_AMBER);
   gfx->setTextSize(1);
   gfx->setCursor(15, 12);
-  gfx->println("OZLOCK DOORLOCK EMULATOR");
+  gfx->println("OZLOCK COMM MODULE (blecomm)");
   gfx->setCursor(15, 28);
   gfx->print("BLE: ");
   gfx->print(bleClientConnected ? "APP CONNECTED" : "ADVERTISING...");
   gfx->setTextSize(3);
   gfx->setTextColor(C_WHITE);
   gfx->setCursor(52, 70);
-  gfx->println("OZLOCK");
+  gfx->println("OZCOMM");
   gfx->setTextSize(1);
   gfx->setTextColor(C_GREY);
   gfx->setCursor(15, 120);
@@ -198,7 +253,7 @@ void drawJoining() {
   gfx->setTextColor(C_BLUE);
   gfx->setTextSize(1);
   gfx->setCursor(15, 12);
-  gfx->println("OZLOCK - CONNECTING");
+  gfx->println("OZCOMM - CONNECTING");
   gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE);
   gfx->setCursor(15, 36);
@@ -206,9 +261,9 @@ void drawJoining() {
   gfx->setTextSize(1);
   gfx->setTextColor(C_GREY);
   gfx->setCursor(15, 70);
-  gfx->println(joinLine1); // WiFi line (incl. IP address — operator req)
+  gfx->println(joinLine1);
   gfx->setCursor(15, 88);
-  gfx->println(joinLine2); // server line
+  gfx->println(joinLine2);
   gfx->setCursor(15, 120);
   gfx->setTextColor(C_DIM);
   gfx->print("device_id: ");
@@ -217,84 +272,69 @@ void drawJoining() {
   gfx->println("reset: tap * then 5 (left edge)");
 }
 
-// Keypad geometry — FULL-SCREEN 3-row × 4-column grid. The touch panel's
-// VERTICAL axis is coarse/filtered while the horizontal one is fast and
-// accurate (bench calibration), so the layout leans on width: only 3 rows
-// on the bad axis, 4 columns on the good one. Every cell is maximal and
-// hit-testing has NO dead zones. Background colour IS the lock status:
-// RED = LOCKED, GREEN = UNLOCKED. 12px top strip: name + PIN dots + the
-// live key indicator + link dot.
-const int KP_Y = 12;      // top strip height
-const int KP_ROW_H = 53;  // 12 + 3×53 = 171 — grid fills the panel
-const char KP_KEYS[3][4] = {
-  {'1','2','3','4'},
-  {'5','6','7','8'},
-  {'*','9','0','#'},
-};
-
-uint16_t lockBg() { return lockStatus == "UNLOCKED" ? C_GREEN : C_RED; }
-uint16_t lockFg() { return lockStatus == "UNLOCKED" ? C_BLACK : C_WHITE; }
-
-void drawKey(int r, int c, bool hl) {
-  int x = 2 + c * 80, y = KP_Y + r * KP_ROW_H + 2;
-  int w = 76, h = KP_ROW_H - 4;
-  gfx->fillRoundRect(x, y, w, h, 8, hl ? C_WHITE : C_BLACK);
-  gfx->setTextSize(3);
-  gfx->setTextColor(hl ? C_BLACK : C_WHITE);
-  gfx->setCursor(x + w / 2 - 9, y + h / 2 - 11);
-  gfx->print(KP_KEYS[r][c]);
-}
-
-void drawKeypad() {
-  for (int r = 0; r < 3; r++)
-    for (int c = 0; c < 4; c++) drawKey(r, c, false);
-}
-
-// Pressed-key feedback (operator): the registered key flashes WHITE for
-// 200ms so a mis-decode is visible immediately.
-void highlightKey(char k) {
-  for (int r = 0; r < 3; r++)
-    for (int c = 0; c < 4; c++)
-      if (KP_KEYS[r][c] == k) {
-        drawKey(r, c, true);
-        hlKey = k;
-        hlUntil = millis() + 200;
-        return;
-      }
-}
-
-void unhighlightKey() {
-  if (!hlKey) return;
-  for (int r = 0; r < 3; r++)
-    for (int c = 0; c < 4; c++)
-      if (KP_KEYS[r][c] == hlKey) drawKey(r, c, false);
-  hlKey = 0;
-}
-
-void drawPinDots() {
-  gfx->fillRect(0, 0, 320, KP_Y, lockBg());
-  gfx->setTextSize(1);
-  gfx->setTextColor(lockFg());
-  gfx->setCursor(4, 2);
-  String nm = asciiOnly(cfgName.length() ? cfgName : deviceId);
-  if (nm.length() > 14) nm = nm.substring(0, 14);
-  gfx->print(nm);
-  gfx->setCursor(150, 2);
-  for (size_t i = 0; i < pinEntry.length(); i++) gfx->print('*');
-  // link dot far right: black = online, amber = offline
-  bool up = (WiFi.status() == WL_CONNECTED) && mqtt.connected();
-  gfx->fillCircle(312, 6, 4, up ? C_BLACK : C_AMBER);
-}
-
+// OPERATIONAL dashboard (operator spec): DOOR STATUS is the hero element,
+// plus door name, IP, network status. Border colour = health summary:
+// GREEN = net + MCU link up · AMBER = one leg down · RED = both down.
 void drawOperational() {
-  gfx->fillScreen(lockBg()); // the colour is the state — RED/GREEN
-  drawPinDots();
-  drawKeypad();
+  bool netUp = (WiFi.status() == WL_CONNECTED) && mqtt.connected();
+  bool mcuUp = mcuLinkUp();
+  bool open = doorStatus == "UNLOCKED";
+  uint16_t border = (netUp && mcuUp) ? C_GREEN : (netUp || mcuUp) ? C_AMBER : C_RED;
+  gfx->fillScreen(C_BLACK);
+  gfx->drawRect(0, 0, 320, 172, border);
+  gfx->drawRect(1, 1, 318, 170, border);
+
+  // top strip: module id + mode
+  gfx->setTextSize(1);
+  gfx->setTextColor(border);
+  gfx->setCursor(15, 8);
+  gfx->print("OZCOMM ");
+  gfx->print(isLocalMode() ? "(hotel)" : "(ozlock)");
+  if (isLocalMode() && cfgRoomNo.length()) { // room lives in the header now
+    gfx->print(" P.");
+    gfx->print(cfgRoomNo);
+  }
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(220, 8);
+  gfx->print("reset: * then 5");
+
+  // DOOR STATUS — compact block (operator 2026-07-19: smaller status fonts,
+  // bigger white text lines — size-1 grey was unreadable on this panel)
+  gfx->fillRoundRect(15, 24, 150, 34, 8, open ? C_GREEN : C_RED);
+  gfx->setTextSize(2);
+  gfx->setTextColor(open ? C_BLACK : C_WHITE);
+  gfx->setCursor(open ? 42 : 54, 34); // centered in the 150px block
+  gfx->print(open ? "UNLOCKED" : "LOCKED");
+  // MCU link tag beside the block — door state is only as fresh as the link
+  gfx->setTextSize(2);
+  gfx->setCursor(185, 34);
+  gfx->setTextColor(C_WHITE);
+  gfx->print("MCU ");
+  gfx->setTextColor(mcuUp ? C_GREEN : C_RED);
+  gfx->print(mcuUp ? "UP" : "DOWN");
+
+  // NETWORK + IP + log lines — size 2, white on black
+  gfx->setTextSize(2);
+  int y = 72;
+  gfx->setCursor(15, y);
+  gfx->setTextColor(C_WHITE);
+  gfx->print("Net: ");
+  gfx->setTextColor(netUp ? C_GREEN : C_RED);
+  gfx->print(netUp ? "ONLINE" : "OFFLINE");
+  gfx->setTextColor(C_WHITE);
+  gfx->print(mqtt.connected() ? " MQTT OK" : " MQTT --");
+  y += 24;
+  gfx->setCursor(15, y);
+  gfx->print("IP : ");
+  gfx->print(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("---"));
+  y += 24;
+  gfx->setCursor(15, y);
+  gfx->print("Log: ");
+  gfx->print(txlogTotal());
+  gfx->print(" events");
 }
 
-// Full-screen colour IS the state signal (operator: RED locked, GREEN open).
 void drawFlash(const char *msg, uint16_t bg, uint16_t fg) {
-  hlKey = 0; // flash owns the screen — cancel any pending key un-highlight
   gfx->fillScreen(bg);
   gfx->setTextSize(4);
   gfx->setTextColor(fg);
@@ -304,7 +344,7 @@ void drawFlash(const char *msg, uint16_t bg, uint16_t fg) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// NVS
+// NVS (no "creds" namespace — the MCU owns credentials now)
 // ─────────────────────────────────────────────────────────────────────────────
 void loadConfig() {
   prefs.begin("blelock", true);
@@ -345,170 +385,109 @@ void saveConfig() {
 }
 
 void factoryReset() {
-  Serial.println("[RESET] factory reset — wiping NVS");
+  Serial.println("[RESET] factory reset — wiping NVS + txlog");
   prefs.begin("blelock", false); prefs.clear(); prefs.end();
-  creds.begin("creds", false); creds.clear(); creds.end();
+  if (fsUp) {
+    LittleFS.remove("/txlog.0");
+    LittleFS.remove("/txlog.1");
+  }
   drawFlash("RESET", C_AMBER, C_BLACK);
   delay(800);
   ESP.restart();
 }
 
-// PIN slots: creds key "s<slot>" = "<pin>|<startUnix>|<endUnix>"
-void storePin(uint16_t slot, const String &pin, uint32_t startU, uint32_t endU) {
-  creds.begin("creds", false);
-  char key[8]; snprintf(key, sizeof(key), "s%u", slot);
-  creds.putString(key, pin + "|" + String(startU) + "|" + String(endU));
-  creds.end();
-  // v0 bench: PIN in the clear on serial (TESTING.md known limits) — the
-  // "what PIN did the lock actually receive?" question must be answerable.
-  Serial.printf("[CRED] slot %u stored pin='%s' (valid %u..%u)\n",
-                slot, pin.c_str(), startU, endU);
-}
-
-void deletePin(uint16_t slot) {
-  creds.begin("creds", false);
-  char key[8]; snprintf(key, sizeof(key), "s%u", slot);
-  creds.remove(key);
-  creds.end();
-  Serial.printf("[CRED] slot %u revoked\n", slot);
-}
-
-// returns matched slot or -1
-int checkPin(const String &entry) {
-  creds.begin("creds", true);
-  time_t now = time(nullptr);
-  int matched = -1;
-  int slots = 0;
-  for (uint16_t slot = 0; slot <= 64 && matched < 0; slot++) {
-    char key[8]; snprintf(key, sizeof(key), "s%u", slot);
-    String v = creds.getString(key, "");
-    if (!v.length()) continue;
-    slots++;
-    int p1 = v.indexOf('|'), p2 = v.lastIndexOf('|');
-    if (p1 < 0 || p2 <= p1) continue;
-    String pin = v.substring(0, p1);
-    uint32_t startU = strtoul(v.substring(p1 + 1, p2).c_str(), nullptr, 10);
-    uint32_t endU = strtoul(v.substring(p2 + 1).c_str(), nullptr, 10);
-    if (pin != entry) continue;
-    // honor validity window only when the clock is synced
-    if (now > 1600000000 && (now < (time_t)startU || now > (time_t)endU)) {
-      Serial.printf("[PIN] slot %u matches but OUTSIDE window (now=%lu not in %u..%u)\n",
-                    slot, (unsigned long)now, startU, endU);
-      continue;
-    }
-    matched = slot;
-  }
-  creds.end();
-  // Bench diagnostics: say WHY a PIN was rejected, not just "denied".
-  if (matched < 0) {
-    Serial.printf("[PIN] entered='%s' -> NO MATCH (%d slot(s) stored, now=%lu)\n",
-                  entry.c_str(), slots, (unsigned long)now);
-  } else {
-    Serial.printf("[PIN] entered='%s' -> slot %d MATCH\n", entry.c_str(), matched);
-  }
-  return matched;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Tuya MCU wire (LockSim Mode B): raw binary frames on Serial1. ⚠ RAW BYTES,
-// never spaced-hex ASCII — LockSim's extractFrames() scans for the contiguous
-// 0x55 0xAA header and will never sync on text.
+// Tuya MCU wire (Serial1 → LockSim Mode B). ⚠ RAW BYTES, never spaced-hex —
+// LockSim's extractFrames() scans for the contiguous 0x55 0xAA header.
 // ─────────────────────────────────────────────────────────────────────────────
 void tuyaWireSend(const uint8_t *f, size_t n) {
   Serial1.write(f, n);
-  // hex trace on the debug console so both terminals tell the same story
+  mcuTxFrames++;
   String hex; hex.reserve(n * 3);
   for (size_t i = 0; i < n; i++) {
     char b[4]; snprintf(b, sizeof(b), "%02X ", f[i]); hex += b;
   }
   Serial.printf("[TUYA->] %s\n", hex.c_str());
+  screenDirty = true; // bus counters live on the dashboard
 }
 
-// DP_REPORT (cmd 0x06) builder: 55 AA 00 06 <len:2BE> <dpid><type><vlen:2BE><value…> <sum>
-void tuyaSendDp(uint8_t dpid, uint8_t type, const uint8_t *v, uint16_t vlen) {
-  static uint8_t f[64];
-  uint16_t plen = 4 + vlen;               // dpid + type + vlen(2) + value
-  if (plen + 7 > sizeof(f)) return;
-  size_t n = 0;
-  f[n++] = 0x55; f[n++] = 0xAA; f[n++] = 0x00; f[n++] = 0x06;
-  f[n++] = plen >> 8; f[n++] = plen & 0xFF;
-  f[n++] = dpid; f[n++] = type;
-  f[n++] = vlen >> 8; f[n++] = vlen & 0xFF;
-  for (uint16_t i = 0; i < vlen; i++) f[n++] = v[i];
+// Short human line for the console + dashboard ("what did the MCU say?")
+String describeDpid(const uint8_t *f, size_t n) {
+  if (n >= 4 && f[3] == 0x00) return String("MCU heartbeat");
+  if (n < 11 || f[3] != 0x06) return String("cmd 0x") + String(f[3], HEX);
+  uint8_t dpid = f[6], type = f[7];
+  uint16_t vlen = ((uint16_t)f[8] << 8) | f[9];
+  const uint8_t *v = f + 10;
+  if (dpid == 8 && type == 0x04 && vlen >= 1) {
+    const char *r = v[0] == 0 ? "SUCCESS" : v[0] == 1 ? "DENIED" : v[0] == 2 ? "EXPIRED" : "?";
+    return String("ACCESS_RESULT ") + r;
+  }
+  if (dpid == 1) return String("unlock channel report");
+  if (dpid == 5) return String("battery alarm");
+  return String("DP ") + dpid + " type " + type + " len " + vlen;
+}
+
+// MCU → server translation: the module's actual job. ACCESS_RESULT becomes
+// the door log the servers already understand; heartbeats prove the link;
+// anything else goes up raw as dp_report so nothing is silently dropped.
+void handleMcuFrame(const uint8_t *f, size_t n) {
+  // checksum gate (same rule both directions)
   uint8_t sum = 0;
-  for (size_t i = 0; i < n; i++) sum += f[i];
-  f[n++] = sum;
-  tuyaWireSend(f, n);
+  for (size_t i = 0; i + 1 < n; i++) sum += f[i];
+  if (sum != f[n - 1]) { Serial.println("[TUYA<-] bad checksum — dropped"); return; }
+
+  mcuRxFrames++;
+  lastMcuFrameAt = millis();
+  lastMcuSummary = describeDpid(f, n);
+  Serial.printf("[TUYA<-] %s (%u bytes)\n", lastMcuSummary.c_str(), (unsigned)n);
+  screenDirty = true;
+
+  if (n >= 4 && f[3] == 0x00) return; // MCU heartbeat = link-alive only
+
+  if (n >= 11 && f[3] == 0x06) {
+    uint8_t dpid = f[6], type = f[7];
+    uint16_t vlen = ((uint16_t)f[8] << 8) | f[9];
+    const uint8_t *v = f + 10;
+    if (dpid == 8 && type == 0x04 && vlen >= 1) { // ACCESS_RESULT → door log
+      const char *result = v[0] == 0 ? "granted" : v[0] == 1 ? "denied" : "expired";
+      if (v[0] == 0) markDoorUnlocked(); // mirror the bolt for the dashboard
+      publishLog(result, "MCU report");
+      return;
+    }
+    if (dpid == 5) { publishLog("battery_alarm", "MCU report"); return; }
+  }
+  // unrecognised — forward raw hex upstream rather than dropping
+  String hex; hex.reserve(n * 3);
+  for (size_t i = 0; i < n; i++) {
+    char b[4]; snprintf(b, sizeof(b), "%02X ", f[i]); hex += b;
+  }
+  hex.trim();
+  publishLog("dp_report", hex.c_str());
 }
 
-// ACCESS_RESULT (DP 8, ENUM): 0=SUCCESS 1=DENIED 2=EXPIRED — the MCU-side
-// report a real lock puts on the bus after every credential attempt.
-void tuyaSendAccessResult(uint8_t result) {
-  tuyaSendDp(8, 0x04, &result, 1);
-}
-
-// RX reassembly: LockSim keypad/injector frames arrive as raw bytes; rebuild
-// 55 AA frames (same layout as above) and feed the normal DPID pipeline.
+// RX reassembly off the wire (LockSim frames arrive as raw bytes)
 void tuyaWirePump() {
   static uint8_t buf[128];
   static size_t bn = 0;
   while (Serial1.available()) {
     uint8_t b = Serial1.read();
-    if (bn == 0 && b != 0x55) continue;        // hunt for header
+    if (bn == 0 && b != 0x55) continue;
     if (bn == 1 && b != 0xAA) { bn = 0; if (b == 0x55) bn = 1; continue; }
     if (bn < sizeof(buf)) buf[bn++] = b; else { bn = 0; continue; }
     if (bn >= 7) {
       uint16_t plen = ((uint16_t)buf[4] << 8) | buf[5];
-      size_t total = 6 + plen + 1;             // header..len + payload + sum
+      size_t total = 6 + plen + 1;
       if (total > sizeof(buf)) { bn = 0; continue; }
-      if (bn == total) {
-        Serial.printf("[TUYA<-] frame %u bytes\n", (unsigned)bn);
-        handleDpidFrame(buf, bn);
-        bn = 0;
-      }
+      if (bn == total) { handleMcuFrame(buf, bn); bn = 0; }
     }
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DPID frame parse (ozkey-02 §4 / DpidFrames — the hardware truth)
-// 55 AA 00 06 <len:2BE> <dpid> <type> <len:2BE> <value…> <checksum>
-// ─────────────────────────────────────────────────────────────────────────────
-void handleDpidFrame(const uint8_t *f, size_t n) {
-  if (n < 8 || f[0] != 0x55 || f[1] != 0xAA) { Serial.println("[DPID] bad header"); return; }
-  uint8_t sum = 0;
-  for (size_t i = 0; i + 1 < n; i++) sum += f[i];
-  if (sum != f[n - 1]) { Serial.println("[DPID] bad checksum"); return; }
-  uint8_t dpid = f[6], type = f[7];
-  uint16_t vlen = ((uint16_t)f[8] << 8) | f[9];
-  const uint8_t *v = f + 10;
-  if (10 + vlen + 1 > n) { Serial.println("[DPID] length overflow"); return; }
-
-  if (dpid == 21 && type == 0x00 && vlen >= 11) { // add temp PIN
-    uint16_t slot = ((uint16_t)v[0] << 8) | v[1];
-    uint16_t pinLen = vlen - 2 - 8;
-    String pin;
-    for (uint16_t i = 0; i < pinLen; i++) pin += (char)v[2 + i];
-    uint32_t startU = ((uint32_t)v[2+pinLen] << 24) | ((uint32_t)v[3+pinLen] << 16) | ((uint32_t)v[4+pinLen] << 8) | v[5+pinLen];
-    uint32_t endU = ((uint32_t)v[6+pinLen] << 24) | ((uint32_t)v[7+pinLen] << 16) | ((uint32_t)v[8+pinLen] << 8) | v[9+pinLen];
-    storePin(slot, pin, startU, endU);
-    publishLog("key_synced", (String("slot ") + slot).c_str());
-    screenDirty = true;
-  } else if (dpid == 22 && type == 0x00 && vlen >= 2) { // revoke PIN
-    uint16_t slot = ((uint16_t)v[0] << 8) | v[1];
-    deletePin(slot);
-    publishLog("key_revoked", (String("slot ") + slot).c_str());
-  } else if (dpid == 1 && type == 0x01 && vlen >= 1 && v[0] == 0x01) { // remote unlock
-    doUnlock("remote unlock");
-  } else {
-    Serial.printf("[DPID] unhandled dpid=%u type=%u len=%u\n", dpid, type, vlen);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MQTT wire (LockSim-identical; ozlockserv untouched)
+// MQTT wire (blelock-identical topics; ozlockserv/ozkeyserv untouched)
 // ─────────────────────────────────────────────────────────────────────────────
 void publishLog(const char *result, const char *detail) {
+  txlogAppend(result, detail); // transaction buffer first — works offline
   if (!mqtt.connected()) return;
   JsonDocument doc;
   doc["device_id"] = deviceId;
@@ -545,8 +524,6 @@ void publishEnroll() {
   Serial.printf("[ENROLL->] attempt %u\n", enrollAttempts);
 }
 
-// ozkey-local discovery: announce the raw MAC on OZKEYSERV's unpaired topic
-// until MAOI binds this lock to a room (server cache TTL 120s → 20s cadence).
 void publishUnpairedAnnounce() {
   if (!mqtt.connected()) return;
   JsonDocument doc;
@@ -556,17 +533,6 @@ void publishUnpairedAnnounce() {
   mqtt.publish(TOPIC_UNPAIRED, out.c_str());
   lastUnpairedAnnounce = millis();
   Serial.println("[PAIR->] unpaired announce (waiting for room assign)");
-}
-
-void doUnlock(const char *via) {
-  lockStatus = "UNLOCKED";
-  unlockAt = millis();
-  pinEntry = "";
-  pinFails = 0;
-  tuyaSendAccessResult(0); // SUCCESS on the MCU bus
-  publishLog("granted", via);
-  drawFlash("UNLOCKED", C_GREEN, C_BLACK); // whole screen GREEN = open
-  screenDirty = false; // flash owns the screen until relock redraw
 }
 
 void onMqttMessage(char *topic, byte *payload, unsigned int length) {
@@ -579,33 +545,28 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
 
   const char *op = doc["op"] | (const char *)nullptr;
   if (op && (strcmp(op, "factory_reset") == 0 || strcmp(op, "unpair") == 0)) {
-    // Server-initiated unpair (BANOI "Gỡ khoá" → DELETE /locks/:id) — wipe
-    // and return to ADVERTISING so the lock is immediately re-pairable.
     Serial.println("[MQTT<-] factory_reset (unpaired by app/server)");
     factoryReset();
     return;
   }
   if (op && strcmp(op, "provision_assign") == 0) {
-    // OZKEYSERV hotel pairing (ozkey-02 §3.2/§8.4): MAOI bound this lock to
-    // a room; the handshake carries room_no + site + mac_token. Key is `mac`
-    // (never payload_hex), published on our MAC-scoped pair/confirm topic.
     String amac = doc["mac"] | "";
     amac.replace(":", ""); amac.toLowerCase();
     if (amac.length() && ("ozk-" + amac) != deviceId) return; // not ours
     cfgRoomNo = String((const char *)(doc["room_no"] | ""));
     cfgSiteId = (const char *)(doc["site_id"] | "hotel");
     cfgMacToken = (const char *)(doc["mac_token"] | "");
-    if (cfgRoomNo.length()) cfgName = "P." + cfgRoomNo; // room IS the label
+    if (cfgRoomNo.length()) cfgName = "P." + cfgRoomNo;
     enrolled = true;
     saveConfig();
-    buildTopics(); // site may differ from the provisioned guess
+    buildTopics();
     mqtt.subscribe(topicCommand.c_str(), 1);
     Serial.printf("[PAIR] assigned room %s (site %s)\n", cfgRoomNo.c_str(),
                   cfgSiteId.c_str());
     notifyStatus("ENROLLED");
     state = ST_OPERATIONAL;
     screenDirty = true;
-    publishHeartbeat(); // pull any keys queued while we were pairing
+    publishHeartbeat();
     return;
   }
   if (op && strcmp(op, "enrollment_ack") == 0) {
@@ -613,7 +574,6 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     const char *label = doc["label"] | "";
     if (!cfgName.length() && strlen(label)) cfgName = label;
     if (doc["heartbeat_s"].is<uint32_t>()) cfgHeartbeatS = doc["heartbeat_s"].as<uint32_t>();
-    // broker creds stored for the day the broker enforces them (lab: open)
     prefs.begin("blelock", false);
     prefs.putString("buser", doc["broker_username"] | "");
     prefs.putString("bsecret", doc["broker_secret"] | "");
@@ -631,11 +591,9 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     screenDirty = true;
     return;
   }
-  // command envelope {action, grant_id, payload_hex}. ⚠ OZLOCK publishes
-  // SPACED hex ("55 AA 00 06 …", toSpacedHex) — the original strict parser
-  // bailed on the first space, silently dropping EVERY credential frame
-  // (grants showed "synced" server-side while the lock stayed at 0 slots).
-  // Parse hex pairs, skipping whitespace, like LockSim does.
+  // Command envelope {action, grant_id, payload_hex}: PURE FORWARD to the
+  // MCU — the comm module never executes credentials. (OZLOCK publishes
+  // SPACED hex; parse pairs skipping whitespace, then re-emit RAW bytes.)
   const char *hex = doc["payload_hex"] | (const char *)nullptr;
   if (hex) {
     static uint8_t frame[256];
@@ -644,7 +602,7 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     for (const char *p = hex; *p && fn < sizeof(frame); p++) {
       if (*p == ' ' || *p == ':') continue;
       int v = hexNibble(*p);
-      if (v < 0) { Serial.println("[DPID] bad hex in payload_hex"); return; }
+      if (v < 0) { Serial.println("[TUYA] bad hex in payload_hex"); return; }
       if (hi < 0) {
         hi = v;
       } else {
@@ -653,8 +611,12 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
       }
     }
     if (fn >= 4) {
-      tuyaWireSend(frame, fn); // mirror the server command onto the MCU bus
-      handleDpidFrame(frame, fn);
+      Serial.printf("[FWD] server cmd -> MCU: %s\n", describeDpid(frame, fn).c_str());
+      tuyaWireSend(frame, fn);
+      // remote unlock (DP 1 BOOL 01): LockSim unlocks on receipt — mirror it
+      if (fn >= 11 && frame[3] == 0x06 && frame[6] == 1 && frame[7] == 0x01 &&
+          frame[10] == 0x01)
+        markDoorUnlocked();
     }
   }
 }
@@ -676,8 +638,6 @@ void ensureMqtt() {
     if (state == ST_JOINING) {
       notifyStatus("BROKER_OK");
       if (isLocalMode()) {
-        // Hotel mode: no enroll handshake — announce as an unpaired lock
-        // and wait for MAOI to bind us to a room (provision_assign).
         joinLine2 = "Cho MAOI gan phong...";
         screenDirty = true;
         publishUnpairedAnnounce();
@@ -698,7 +658,7 @@ void ensureMqtt() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Provisioning (BLE write → JOINING)
+// Provisioning (BLE write → JOINING) — blelock-identical
 // ─────────────────────────────────────────────────────────────────────────────
 void applyProvision(JsonDocument &doc) {
   String mode = doc["mode"] | "";
@@ -727,8 +687,6 @@ void applyProvision(JsonDocument &doc) {
   enrolled = false;
   saveConfig();
   buildTopics();
-  // Loudly state the ceremony — a stale (cloud-only) flash receiving an
-  // ozkey-local payload would silently ENROLL instead of announcing.
   Serial.printf("[PROV] mode=%s site=%s broker=%s:%u -> %s\n", cfgMode.c_str(),
                 cfgSiteId.c_str(), cfgBrokerHost.c_str(), cfgBrokerPort,
                 isLocalMode() ? "HOTEL (announce+await room)"
@@ -809,17 +767,14 @@ void buildTopics() {
   topicEnroll = base + "enroll";
   topicHeartbeat = base + "heartbeat";
   topicLog = base + "log";
-  // ozkey-local: MAC-scoped side channel OZKEYSERV publishes the
-  // provision_assign handshake on (deviceId = "ozk-" + machex).
   topicPairConfirm = "hotel/locks/" + deviceId.substring(4) + "/pair/confirm";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Touch keypad
+// Touch — kept ONLY for the factory-reset ceremony ('*' zone then '5' zone,
+// same invisible grid as blelock so the operator muscle-memory transfers).
 // ─────────────────────────────────────────────────────────────────────────────
 void touchInit() {
-  // Hardware power-reset of the touch processor (Touch.ino verified —
-  // replaces the old 0x3B I2C wake sequence, which this batch ignores).
   pinMode(TOUCH_INT, INPUT_PULLUP);
   pinMode(TOUCH_RST, OUTPUT);
   digitalWrite(TOUCH_RST, LOW);
@@ -828,8 +783,6 @@ void touchInit() {
   delay(200);
   Wire.begin(I2C_SDA, I2C_SCL);
   delay(50);
-  // Boot probe — err=0 means the CST816 ACKed at 0x63; anything else and
-  // the keypad is dead hardware-side, not a firmware mapping issue.
   Wire.beginTransmission(TOUCH_ADDR);
   int err = Wire.endTransmission();
   Serial.printf("[TOUCH] probe 0x%02X err=%d %s\n", TOUCH_ADDR, err,
@@ -845,29 +798,19 @@ static bool touchReadRegs(uint8_t *buf) {
   return true;
 }
 
-// Tap = decoded on RELEASE, using the LAST coordinates sampled during the
-// press. Bench finding: this controller low-pass-filters the short axis —
-// the X register converges toward the finger over ~100ms (early reads
-// return a blend with the PREVIOUS touch), while Y refreshes fast. So we
-// sample every loop while held (skipping the first, fully-stale one) and
-// trust the final settled value.
 int lastTapX = 0, lastTapY = 0;
 uint8_t tapSamples = 0;
 
-bool touchRead(int &tx, int &ty, bool &held) {
+bool touchRead(int &tx, int &ty) {
   uint8_t buf[7];
   if (!touchReadRegs(buf)) return false;
-  uint8_t count = buf[2]; // CST816 map: active point count at reg 0x02
+  uint8_t count = buf[2];
   bool down = (count > 0 && count <= 5);
-  held = down;
   if (down) {
-    if (touchWasDown) { // skip the first sample of a press (stale regs)
+    if (touchWasDown) {
       int rawX = ((buf[3] & 0x0F) << 8) | buf[4];
       int rawY = ((buf[5] & 0x0F) << 8) | buf[6];
-      lastTapX = 320 - rawY; // landscape transform for rotation 5
-      // Vertical axis: empirically INVERTED + 1.2× scaled on this batch —
-      // y = 180 − 1.2·rawX fit all 9 calibration taps (2026-07-17 bench,
-      // rawX spans ~8..140 bottom→top).
+      lastTapX = 320 - rawY;
       int y = 180 - (rawX * 6) / 5;
       if (y < 0) y = 0;
       if (y > 171) y = 171;
@@ -878,20 +821,26 @@ bool touchRead(int &tx, int &ty, bool &held) {
     return false;
   }
   if (!touchWasDown) return false;
-  // release edge — emit the settled position
   touchWasDown = false;
   uint8_t n = tapSamples;
   tapSamples = 0;
-  if (n == 0) return false; // too brief to get past the stale sample
+  if (n == 0) return false;
   tx = lastTapX;
   ty = lastTapY;
-  Serial.printf("[TOUCH] release %d,%d (%u samples)\n", tx, ty, n);
   return true;
 }
 
+// blelock's keypad grid, hit-test only (nothing drawn): row 2 col 0 = '*',
+// row 2 col 1 = '9' … we only care about '*' (bottom-left) and '5' (mid).
+const int KP_Y = 12;
+const int KP_ROW_H = 53;
+const char KP_KEYS[3][4] = {
+  {'1','2','3','4'},
+  {'5','6','7','8'},
+  {'*','9','0','#'},
+};
+
 char keyAt(int tx, int ty) {
-  // Full-coverage grid: every pixel maps to the nearest key — no dead
-  // zones, maximum tolerance for the coarse touch axis.
   int r = ty <= KP_Y ? 0 : (ty - KP_Y) / KP_ROW_H;
   if (r > 2) r = 2;
   if (r < 0) r = 0;
@@ -901,66 +850,7 @@ char keyAt(int tx, int ty) {
   return KP_KEYS[r][c];
 }
 
-// THE one factory-reset method (operator: single method, no waiting):
-// '*' pressed while the PIN entry is EMPTY arms it ("RESET? 5=Y"), '5'
-// fires. '*' with digits typed just clears them (normal), so a guest
-// clearing and retrying a PIN can never trip it. Works on every screen —
-// the keypad touch zones are evaluated even where keys aren't drawn.
 bool resetArm = false;
-unsigned long lastKeyAt = 0; // 5s idle → clear half-typed entry (retry fresh)
-
-void handleKey(char k) {
-  if (lockoutUntil && millis() < lockoutUntil) return; // lockout active
-  lastKeyAt = millis();
-  if (resetArm) {
-    resetArm = false;
-    if (k == '5') { factoryReset(); return; }
-    drawPinDots(); // wipe the strip prompt, back to normal entry
-    return;
-  }
-  if (k == '*') {
-    if (!pinEntry.length()) {
-      resetArm = true;
-      // small prompt in the top strip (operator: no full-screen flash)
-      gfx->setTextSize(1);
-      gfx->setTextColor(lockFg());
-      gfx->setCursor(252, 2);
-      gfx->print("RESET? 5");
-      return;
-    }
-    pinEntry = "";
-    drawPinDots();
-    return;
-  }
-  if (k == '#') {
-    if (!pinEntry.length()) return;
-    int slot = checkPin(pinEntry);
-    if (slot >= 0) {
-      doUnlock((String("PIN slot ") + slot).c_str());
-    } else {
-      pinFails++;
-      pinEntry = ""; // clear the stale entry immediately
-      // UI first, network after — publishLog on a degraded link must never
-      // delay the operator's feedback.
-      drawFlash("WRONG PIN", C_RED, C_WHITE);
-      tuyaSendAccessResult(1); // DENIED on the MCU bus
-      publishLog("denied", "wrong PIN");
-      delay(1200);
-      if (pinFails >= 5) {
-        lockoutUntil = millis() + 60000UL;
-        publishLog("lockout", "5 wrong PINs — 60s");
-      }
-      screenDirty = true; // redraw keypad with empty PIN dots
-    }
-    return;
-  }
-  // Digit. Entry model is "<4 digits>#" (operator: 4-digit PINs for easy
-  // testing): typing past the max is an invalid entry — clear and start
-  // fresh with the new digit.
-  if (pinEntry.length() >= 4) pinEntry = "";
-  pinEntry += k;
-  drawPinDots();
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Setup / loop
@@ -968,13 +858,19 @@ void handleKey(char k) {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n*** blelock v1 — OZLOCK doorlock emulator (ozkey-08 §10) ***");
-  // Compile stamp — the definitive "is my new sketch on the board?" check.
+  Serial.println("\n*** blecomm v1 — OZLOCK COMM MODULE (MCU = LockSim on UART) ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
 
   // Tuya MCU bus → LockSim Mode B (raw 55 AA frames, wire-tested 2026-07-19)
   Serial1.begin(9600, SERIAL_8N1, TUYA_RX_PIN, TUYA_TX_PIN);
   Serial.println("[TUYA] Serial1 up @ 9600 8N1 GPIO16(TX)/GPIO17(RX)");
+
+  // Transaction buffer (LittleFS, format on first mount)
+  fsUp = LittleFS.begin(true);
+  Serial.printf("[FS] LittleFS %s\n", fsUp ? "mounted" : "FAILED — txlog disabled");
+  txlogCount0 = txlogCountLines("/txlog.0");
+  txlogCount1 = txlogCountLines("/txlog.1");
+  Serial.printf("[FS] txlog %u event(s) buffered\n", (unsigned)txlogTotal());
 
   pinMode(LCD_BL, OUTPUT);
   digitalWrite(LCD_BL, HIGH);
@@ -984,11 +880,7 @@ void setup() {
 
   touchInit();
 
-  WiFi.mode(WIFI_STA); // needed so the factory MAC is readable pre-join
-  // Join-failure diagnostics: the disconnect reason tells apart the cases the
-  // screen can't (201 NO_AP_FOUND = SSID invisible/5GHz-only; 15 4WAY
-  // handshake timeout / 2 AUTH_EXPIRE = wrong password; 210 NO_AP_FOUND_W_
-  // COMPATIBLE_SECURITY = WPA3-only AP).
+  WiFi.mode(WIFI_STA);
   WiFi.onEvent(
       [](WiFiEvent_t e, WiFiEventInfo_t info) {
         Serial.printf("[WiFi] disconnected, reason=%d\n",
@@ -1004,8 +896,6 @@ void setup() {
   buildTopics();
 
   if (provisioned) {
-    // RECONNECT path: straight to network from NVS, no BLE (CONTRACT: stops
-    // advertising once provisioned; factory reset re-opens)
     state = enrolled ? ST_OPERATIONAL : ST_JOINING;
     joinLine1 = "WiFi: joining " + cfgSsid + "...";
     joinLine2 = "Server: " + cfgBrokerHost + ":" + String(cfgBrokerPort);
@@ -1021,21 +911,21 @@ void setup() {
 }
 
 void loop() {
-  tuyaWirePump(); // LockSim → lock frames off the MCU bus
+  tuyaWirePump(); // MCU (LockSim) → module frames off the wire
 
-  // ── WiFi progress (JOINING ladder + NTP once up) ──────────────────────────
+  // ── WiFi progress ─────────────────────────────────────────────────────────
   static wl_status_t lastWifi = WL_IDLE_STATUS;
   wl_status_t ws = WiFi.status();
   if (ws != lastWifi) {
     lastWifi = ws;
     Serial.printf("[WiFi] status=%d\n", (int)ws);
     if (ws == WL_CONNECTED) {
-      configTime(0, 0, "pool.ntp.org"); // validity windows + log ts
+      configTime(0, 0, "pool.ntp.org");
       if (state == ST_JOINING) {
         notifyStatus("WIFI_OK");
         joinLine1 = "WiFi: OK - IP " + WiFi.localIP().toString();
-        screenDirty = true;
       }
+      screenDirty = true; // dashboard NET indicator
       Serial.printf("[WiFi] up, IP %s\n", WiFi.localIP().toString().c_str());
     }
   }
@@ -1045,7 +935,6 @@ void loop() {
     notifyStatus("WIFI_FAIL");
     joinLine1 = "WiFi FAILED (wrong password?)";
     screenDirty = true;
-    // stay re-provisionable: if BLE never started this boot, start it
     if (bleServer == nullptr) startBle();
   }
 
@@ -1057,7 +946,7 @@ void loop() {
   }
   if (isLocalMode() && mqtt.connected() && !enrolled &&
       millis() - lastUnpairedAnnounce > 20000) {
-    publishUnpairedAnnounce(); // keep the discovery cache warm (TTL 120s)
+    publishUnpairedAnnounce();
   }
 
   // ── heartbeat ─────────────────────────────────────────────────────────────
@@ -1066,81 +955,30 @@ void loop() {
     publishHeartbeat();
   }
 
-  // ── auto-relock ───────────────────────────────────────────────────────────
-  if (lockStatus == "UNLOCKED" && millis() - unlockAt >= UNLOCK_MS) {
-    lockStatus = "LOCKED";
-    publishLog("relocked", "auto 5s");
+  // ── door-status mirror auto-relock (matches LockSim's 5s) ────────────────
+  if (doorStatus == "UNLOCKED" && millis() - doorUnlockAt >= DOOR_UNLOCK_MS) {
+    doorStatus = "LOCKED";
     screenDirty = true;
   }
 
-  // ── lockout expiry ────────────────────────────────────────────────────────
-  if (lockoutUntil && millis() >= lockoutUntil) {
-    lockoutUntil = 0;
-    pinFails = 0;
-    screenDirty = true;
-  }
-
-  // ── keypad idle timeout (operator): entry abandoned half-way — no key for
-  // 5s — clears itself (and cancels a pending RESET? prompt) so the next
-  // guest starts fresh.
-  if (state == ST_OPERATIONAL && lastKeyAt && millis() - lastKeyAt > 5000) {
-    lastKeyAt = 0;
-    if (resetArm) {
-      resetArm = false;
-      screenDirty = true; // flash owns the screen — full redraw
-    }
-    if (pinEntry.length()) {
-      pinEntry = "";
-      drawPinDots();
-    }
-  }
-
-  // ── touch (OPERATIONAL keypad + '#' long-press factory reset) ────────────
+  // ── touch: factory reset only ('*' zone arms, '5' zone fires) ────────────
   {
-    int tx, ty; bool held = false;
-    bool newTouch = touchRead(tx, ty, held);
-    // Live indicator: while the finger is down, show which key the lock
-    // currently sees (top strip) — the reading converges over ~100ms, so
-    // the operator can watch it settle before releasing.
-    static char candShown = 0;
-    if (state == ST_OPERATIONAL && !resetArm) {
-      char cand = (held && tapSamples > 0) ? keyAt(lastTapX, lastTapY) : 0;
-      if (cand != candShown) {
-        candShown = cand;
-        gfx->fillRect(220, 0, 24, KP_Y, lockBg());
-        if (cand) {
-          gfx->setTextSize(1);
-          gfx->setTextColor(lockFg());
-          gfx->setCursor(228, 2);
-          gfx->print(cand);
-        }
-      }
-    }
-    if (newTouch) {
+    int tx, ty;
+    if (touchRead(tx, ty)) {
       char k = keyAt(tx, ty);
       Serial.printf("[TOUCH] %d,%d -> key '%c'\n", tx, ty, k ? k : '-');
-      if (state == ST_OPERATIONAL) {
-        if (k) {
-          if (!resetArm) highlightKey(k); // white flash = what registered
-          handleKey(k);
-        }
-      } else if (k) {
-        // Same single reset method on every screen: '*' then '5' (the
-        // keypad zones apply even where keys aren't drawn — hint printed
-        // on the ADVERTISING/CONNECTING screens). Arms silently.
-        if (resetArm) {
-          resetArm = false;
-          if (k == '5') factoryReset();
-        } else if (k == '*') {
-          resetArm = true;
-          Serial.println("[RESET] armed — tap 5 to wipe");
-        }
+      if (resetArm) {
+        resetArm = false;
+        if (k == '5') factoryReset();
+        Serial.println("[RESET] disarmed");
+      } else if (k == '*') {
+        resetArm = true;
+        Serial.println("[RESET] armed — tap 5 to wipe");
       }
     }
-    if (hlKey && millis() > hlUntil) unhighlightKey();
   }
 
-  // ── periodic monitor line (operator: attach serial anytime, see state) ────
+  // ── periodic monitor + dashboard refresh (MCU-link age ticks) ────────────
   static unsigned long lastMon = 0;
   if (millis() - lastMon > 10000) {
     lastMon = millis();
@@ -1150,20 +988,21 @@ void loop() {
     String modeInfo = cfgMode;
     if (isLocalMode())
       modeInfo += cfgRoomNo.length() ? (" room=" + cfgRoomNo) : " (no room)";
-    Serial.printf("[MON] %s mode=%s wifi=%s ip=%s mqtt=%s lock=%s heap=%u\n",
+    Serial.printf("[MON] %s mode=%s wifi=%s ip=%s mqtt=%s mcu=%s tx=%u rx=%u heap=%u\n",
                   st, modeInfo.c_str(),
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
                   WiFi.localIP().toString().c_str(),
-                  mqtt.connected() ? "up" : "down", lockStatus.c_str(),
+                  mqtt.connected() ? "up" : "down",
+                  mcuLinkUp() ? "up" : "DOWN",
+                  (unsigned)mcuTxFrames, (unsigned)mcuRxFrames,
                   (unsigned)ESP.getFreeHeap());
+    if (state == ST_OPERATIONAL) screenDirty = true; // age/link refresh
   }
 
   // ── screen ────────────────────────────────────────────────────────────────
   if (screenDirty) {
     screenDirty = false;
-    if (lockoutUntil && millis() < lockoutUntil) {
-      drawFlash("LOCKED 60s", C_RED, C_WHITE);
-    } else if (state == ST_ADVERTISING) drawAdvertising();
+    if (state == ST_ADVERTISING) drawAdvertising();
     else if (state == ST_JOINING) drawJoining();
     else drawOperational();
   }
