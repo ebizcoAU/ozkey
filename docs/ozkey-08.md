@@ -106,6 +106,20 @@ The commissioning app presents SIX options (one lock, one firmware):
 - **Guest-facing unlock is instant in EVERY option** (auth is local on the
   lock MCU, network-free) — the tiers differ only in REMOTE latency. App copy
   should state this so option 4 doesn't read as a "slow lock".
+- **"App only sees the lock on wake" — resolved as DEVICE-SHADOW UX
+  (operator concern, 2026-07-20):** the app never talks to the lock directly
+  in ANY option — it reads the SERVER's shadow, and the shadow is accurate
+  because every state change originates at an awake lock and is pushed as it
+  happens. A sleeping lock costs exactly two things: the live "online" dot,
+  and unsolicited downlink (≤10 min when nobody is at the door). UI: show
+  "🔒 Locked · synced X min ago" + pending-command badge ("applies ≤10 min,
+  or instantly on touch") — the standard commercial battery-lock pattern.
+  Outs: at-the-door app unlock can go **BLE-direct** (instant, no network —
+  radio already there from commissioning); truly-remote-instant buyers = the
+  bridge tier (option 3) / hotel TWT — that IS the upsell. **App work item
+  P7:** BANOI lock UI needs shadow-state treatment (drop live-presence badge,
+  add synced-ago + pending badges); servers need nothing (ozlockserv DB is
+  the shadow).
 - Options 3/4 are the same OZLOCK app — present as a speed/price toggle
   ("have an OZBRIDGE?"), not separate products.
 
@@ -194,6 +208,205 @@ credential values, so no stock MCU would ever emit it. Large-directory
 with its own keypad/RFID/fingerprint sensors that commands the lock via the
 standard remote-unlock DP — the commercial reader/controller model — not to
 the doorlock's comm module. Code reverted from blecomm + LockSim same day.
+
+### 0.2 Module power & wake topology — persistent power + SRDY/MRDY (operator decisions 2026-07-20)
+
+> Supersedes any earlier framing of "T2W = power-on-by-MCU". Where §0.0.1's
+> option rows say "10-min + Touch2Wake", read them through this section: the
+> cadence is MODULE-owned, the touch is an accelerator (§0.3).
+
+**Tuya ships two Wi-Fi lock architectures**, and the difference decides the
+whole product:
+
+1. **Power-shutdown** ([Wi-Fi Lock Hardware Design], WBRU): *"In standby
+   mode, the Wi-Fi power supply must be completely shut down."* Module dead
+   between events; MCU wakes it to exchange data. **No downlink while
+   asleep → the field horror story**: guest waits 5–10 min for a PIN that
+   never syncs, calls support, support regenerates into the same undelivered
+   queue, cycle repeats. Common to hotel/motel/PMS deployments — exactly the
+   segment that issues time-critical remote credentials forty times a day.
+   Rail-gating also **forecloses TWT physically** (TWT = a held association;
+   a rail-gated module can't hold one). Gated vs TWT are mutually exclusive
+   topologies, not points on a dial.
+2. **Keep-alive** ([Wake-Up Logic of Keep-Alive Smart Lock]): module on
+   **dedicated, persistent 3.3V/GND rails**, holds its Wi-Fi association in
+   low-power keep-alive, and wakes/is-woken over two IO lines. The BLE lock
+   guide (TYBN1, I/O 11 / I/O 14) is the same pattern.
+
+**DECISION — our comm module is keep-alive topology, always:** a separate
+battery line feeds the module through its **own regulator** (low-Iq buck —
+Tuya's own doc names SGM2040-class LDO or DC-DC; regulator Iq must sit well
+below the ~130–200µA TWT sleep floor; bulk capacitance for ~300–400mA Wi-Fi
+TX bursts; common ground with the MCU UART; no back-feed into the MCU's
+module-rail net). Second, independent reason: a stock lock MCU's rail was
+never sized to source ESP32 TX peaks. The four signal lines are then exactly
+Tuya's: **TXD, RXD, SRDY, MRDY** — power is never signalled.
+
+**Wake-line contract** (Tuya keep-alive semantics, adopted verbatim):
+
+| Line | Dir | blecomm GPIO | Active | Meaning |
+|---|---|---|---|---|
+| SRDY | MCU → module | **GPIO7** (LP pin — deep-sleep-wake capable) | low | "module, wake" / held low = MCU awake |
+| MRDY | module → MCU | **GPIO8** (⚠ C6 strapping pin — must be high/floating at reset; MRDY idles high so semantics align, but a stock MCU pull-down on this line would block boot → remap when real lock hardware arrives) | low | "MCU, wake" / held low = module awake or has downlink |
+
+Handshake = answer-before-transmit: initiator pulls its line low, **waits for
+the other line to answer low, then transmits UART**; after 10 s of serial
+idle the module releases MRDY, MCU (if idle) releases SRDY, both may sleep.
+No bytes ever hit a sleeping UART — the handshake is the flow control (this
+obsoletes any wake-preamble hack). GPIO1–4 are reserved (SPI/SD).
+
+**Drop-in mapping (one firmware, pin-role set at commissioning):** a stock
+keep-alive MCU speaks MRDY/SRDY natively → true drop-in. A stock
+power-shutdown lock only has an EN/power line → our battery-fed module
+senses that line as an SRDY-equivalent wake input and ignores its
+power-gating intent.
+
+**Radio policy is the only per-tier variance** (module self-manages, per
+deployment): TWT 30–60 s where the site has ax APs (hotel upgrade) · DTIM
+keep-alive · timed light-sleep + fast rejoin (any router). ⚠ AP inactivity
+timers (often 5 min) can deauth a station sleeping longer — install
+checklist: AP idle timeout ≥ wake interval, or accept the (fast-connect-
+cheap) rejoin.
+
+**Bench stand-in (CP2102 exposes TX/RX only):** NVS flag `wake_sim`
+(default ON): SRDY treated as permanently asserted (module never blocks a
+transmit, does not light-sleep); MRDY is still driven genuinely (probe-able,
+logged in `[MON]`). Flip the flag off when real wake wiring exists — honest
+handshake + sleep engage with zero code change. Optional bench sleep demo
+fallback: RX-start-bit GPIO wake + LockSim 0x00 preamble.
+
+[Wi-Fi Lock Hardware Design]: https://developer.tuya.com/en/docs/iot/hardware-design-guidance?id=K9pestuito11n
+[Wake-Up Logic of Keep-Alive Smart Lock]: https://developer.tuya.com/en/docs/iot/wifi-keepalive-door-lock-wakeup-logic?id=Kada52p7tfr5b
+
+### 0.3 Credential delivery model — the SLA (operator decisions 2026-07-20)
+
+A stock MCU is **reactive**: nothing obliges it to assert SRDY during keypad
+entry — it wakes the module to *report*, i.e. after the failure. Honest
+stock-hardware sequence for a not-yet-synced PIN:
+
+```
+new PIN typed → local table miss → DENIED
+→ MCU wakes module (report failed transaction)
+→ module connects → pushes log → heartbeat pulls pending → DP21 stored
+→ retry works (if the guest is still there; if not → support call → cycle)
+```
+
+**The three delivery paths, ranked by guarantee:**
+
+| Path | Nature | Guarantee level |
+|---|---|---|
+| Module's own proactive wake (interval knob) | independent of MCU and humans | **THE guarantee** — a PIN issued at booking lands within one interval, before the guest reaches the door |
+| Failed-attempt sync (sequence above) | reactive, stock-MCU-native | **the safety net** — self-healing IF the retry happens; requires (a) heartbeat-on-connect flush [verified bench behavior] and (b) guest copy: *"if the code fails, wait a few seconds and try once more"* — never "call support" |
+| Touch-parallel wake / scramble-digit mask | only on MCU firmware that asserts SRDY on keypad activity | **accelerator, never assumed** |
+
+The proactive cadence is the product, not housekeeping — it is why the
+module needed independent power (§0.2). Revocation (checkout, bond revoke
+§0.4) rides the same SLA; a departed guest's own entry attempt still
+triggers the safety-net sync that defeats it.
+
+- **Wake-interval knob (USER-SETTABLE, operator 2026-07-20):** reuse
+  `heartbeat_s` (no new field). App-visible per-lock setting in minutes:
+  **range 1–10 min, step 1** (revised same day from an earlier 1–30).
+  **Defaults per mode: hotel/PMS 1–2 min · residential 10 min (= range
+  max).** It is explicitly the battery↔latency trade, so it belongs in the
+  user's hands; app copy states both sides ("mã mới đến khoá trong ≤N phút ·
+  N nhỏ hơn = tốn pin hơn").
+- **Supersede, don't accumulate** (ozkeyserv/ozlockserv work item): a new
+  PIN issued for a booking/room that already has one pending REPLACES the
+  pending grant and queues a revoke for any previously-synced one. Slots are
+  finite (≤16 in blecomm; similar on real locks); the support cycle must not
+  deliver a stack of DP21s.
+- **Scramble PIN (anti-peeping, Tuya-style `<junk><PIN><junk>#`):** adopt.
+  Matching = any contiguous substring of the entry against stored PINs —
+  implemented in the **MCU** (LockSim `submitPin`), never the comm module
+  (strict-DP split, §0.1). Rules: wrong-attempt lockout counts **per entry,
+  not per substring** (an L-digit entry contains ~L−k+1 candidate substrings
+  → ~L× brute-force speedup if counted naively); max entry length ~20.
+  Second job: the junk prefix masks wake latency — by the time the real PIN
+  passes the matcher, the failed-attempt/touch sync has often already
+  delivered it.
+
+### 0.4 Multi-user — N-bond members over BLE (operator decisions 2026-07-20)
+
+The second-person problem: the door key lives in the first person's app.
+**Tuya's answer is accounts**: cloud account + join the "Home" + explicit
+Administrator role (their plain "shared device" path for locks is
+view-only — a support-page genre of its own), and BLE-direct is
+one-phone-at-a-time (their fix: buy a gateway). **Ours is the XF-42 §14.2
+N-bond keyring, account-less**: the lock stores a **bond set**
+`{pubkey, role, label}`; **bond #0 = the primary appID written at first
+commissioning = the lock's root of trust**; members are unlock-only. Role is
+**per-(app, lock)**: one app identity (one keypair) can be Chủ khoá on its
+own doors and Thành viên on someone else's — same key, different rows in
+different locks' bond tables.
+
+**Grant ceremony (4 decisions CONFIRMED by operator 2026-07-20):**
+
+```
+PRIMARY (anywhere): Thành viên khoá → "Thêm thành viên" → name + role
+  → biometric prompt → app builds INVITE, shows as QR:
+    { lock device_id, member label+role, nonce, expiry ~10 min,
+      SIGNATURE by primary key }          ← public info only, no secrets
+2ND PHONE: same app, own self-generated keypair →
+  "Thêm cửa bằng mã QR" → scan → at the door within expiry →
+  tap any key → BLE window → encrypted session → presents
+    { its own pubkey + the invite }
+LOCK (fully offline): verify invite sig against bond #0 → nonce unused +
+  unexpired → add bond {pubkey, role:member, label} → confirm
+NEXT SYNC: log "bond_added" → OZLOCK's door→apps map builds passively
+```
+
+1. **Holder-at-door is enough** — primary need not be present; sending the
+   QR remotely (within expiry) is allowed: physical-key semantics. ✔
+2. **Single-use nonce = the hard guarantee** (NVS replay cache); the ~10-min
+   expiry is best-effort (lock clock may drift). ✔
+3. **Biometric gate (OS `local_auth` prompt — Face/fingerprint/passcode; we
+   never see biometric data) required to CREATE an invite and to UNLOCK.**
+   Private keys stored auth-gated in Keychain/Keystore. ✔
+4. **Exactly one admin in v1 (bond #0).** Second-admin (spouse), admin
+   transfer, label sync = v2. ✔
+
+**Member unlock ladder** (no server, no primary, no internet in the loop):
+
+```
+tap any key → MCU wakes → SRDY → module wakes → BLE advertising (~60 s)
+app connects → lock sends fresh nonce → biometric prompt →
+app answers with sealed unlock command (ozkey-06 envelope, counter fresh) →
+lock: pubkey in bond set? role ok? envelope valid? →
+DP1 remote-unlock frame → MCU fires motor → event logged → pushed at next sync
+```
+
+Decisions attached:
+
+- **Advertising = touch-window only in v1** (~60 s after any touch): zero
+  idle power, zero idle RF beacon (no wardriving enumeration), BLE attack
+  surface exists only with physical presence. Always-on low-duty
+  (+20–40µA, requires RPA rotation) = a later app toggle enabling proximity
+  auto-unlock — an upsell, not a v1 promise. Proximity may *initiate*,
+  never *authorize* (XF-42).
+- **Labels live ON THE LOCK** (bond record carries the name): the lock is
+  the authoritative member registry; phones cache; **OZLOCK sees pubkeys and
+  events only** (names+doors+times in one server DB is a surveillance
+  dataset we don't build). The door→apps mapping OZLOCK lacked builds
+  passively from bond_added/bond_revoked log events — no new server write
+  path, blind-registry preserved. Optional: **encrypted keyring backup
+  blob** on OZLOCK (sealed by the primary key, server-opaque) — the XF-42
+  export/import seam, materialized.
+- **Owner-reset wipes ALL bonds** (a reset lock trusts nobody; re-invite is
+  minutes; sold-house semantics). **Bond cap declared: 16**, surfaced in UI
+  ("14/16 thành viên").
+- **BANOI UI** (FTPOS-side — to be filed as its own XFtposDecisions entry):
+  Khoá cửa list mixes roles with badges (Chủ khoá / Thành viên); "Thành viên
+  khoá" tab exists only on admin doors (UI mirrors lock-side enforcement —
+  the lock refuses admin verbs from member bonds regardless); member-door
+  row is thin (unlock + own history + "rời khỏi cửa này"); member states use
+  the §0.0.0 shadow-badge language (active / pending-invite /
+  revoked-pending-sync). New dep: `local_auth` (+ the existing
+  flutter_blue_plus).
+- **Stolen-phone analysis:** locked phone → nothing; snatched-unlocked →
+  unlock and invite-creation each demand a fresh biometric; a photographed
+  QR is dead after first redemption (nonce) or ~10 min (expiry); sniffed
+  BLE replays fail (fresh nonce + envelope counter).
 
 ---
 

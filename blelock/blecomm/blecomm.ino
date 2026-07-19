@@ -18,6 +18,11 @@
  * board flashed blelock↔blecomm keeps its enrollment.
  * Factory reset: same invisible '*' then '5' touch zones, every screen.
  * Screen = comm dashboard (no keypad): mode/WiFi/broker/MCU-link + counters.
+ *
+ * Power/wake model (ozkey-08 §0.2/§0.3): persistent power (keep-alive
+ * topology), SRDY/MRDY wake handshake on GPIO7/8, module-owned proactive
+ * pull timer (heartbeat_s, 1-10 min). Bench: NVS wake_sim=true (CP2102 has
+ * no wake wires) = SRDY assumed asserted, no sleep; MRDY still driven.
  */
 
 #include <Arduino_GFX_Library.h>
@@ -32,6 +37,8 @@
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <time.h>
+#include "driver/gpio.h"
+#include "esp_sleep.h"
 
 // ── Hardware pins (HARDWARE.md, operator-verified) ──────────────────────────
 #define LCD_DC 15
@@ -49,6 +56,14 @@
 // Tuya MCU bus → LockSim Mode B (wire-verified 2026-07-19)
 #define TUYA_TX_PIN 16  // -> CP2102 RXD
 #define TUYA_RX_PIN 17  // <- CP2102 TXD
+
+// §0.2 wake lines (Tuya keep-alive contract): active low, answer-before-
+// transmit, 10 s serial-idle release. GPIO1-4 reserved (SPI/SD). SRDY on an
+// LP pin (deep-sleep-wake capable). GPIO8 is a C6 strapping pin — MRDY
+// idles HIGH so boot is unaffected; remap on real lock hw if its MCU pulls
+// this line low at reset.
+#define SRDY_PIN 7  // MCU → module: "module, wake" / held low = MCU awake
+#define MRDY_PIN 8  // module → MCU: "MCU, wake" / held low = module awake
 
 // ── BGR-corrected palette (panel is BGR) ────────────────────────────────────
 #define C_BLACK 0x0000
@@ -105,6 +120,36 @@ String topicCommand, topicEnroll, topicHeartbeat, topicLog, topicPairConfirm;
 bool screenDirty = true;
 String joinLine1 = "", joinLine2 = "";
 bool touchWasDown = false;
+
+// ── §0.2/§0.3 power & wake state (persistent-power keep-alive) ──────────────
+// wake_sim=true (bench default; CP2102 exposes TX/RX only): SRDY assumed
+// asserted, module never sleeps; MRDY still driven genuinely (probe-able).
+// wake_sim=false: honest handshake + light sleep — wake on SRDY low or the
+// heartbeat_s proactive-pull timer. Toggle: MQTT {op:"wake_sim","on":bool}.
+bool wakeSim = true;                  // NVS "wksim"
+bool mrdyAsserted = false;
+unsigned long lastWireActivityAt = 0; // any Serial1 byte, either direction
+unsigned long lastActivityAt = 0;     // frames / MQTT rx / touch / connects
+uint32_t sleepWakeCount = 0;
+#define MRDY_IDLE_RELEASE_MS 10000UL  // Tuya: release after 10 s serial idle
+#define SRDY_WAIT_TIMEOUT_MS 1500UL   // answer-before-transmit guard
+#define SLEEP_IDLE_MS 30000UL         // nap after 30 s with nothing to do
+
+bool srdyAsserted() { return wakeSim || digitalRead(SRDY_PIN) == LOW; }
+
+void mrdySet(bool assertLow) {
+  if (mrdyAsserted == assertLow) return;
+  mrdyAsserted = assertLow;
+  digitalWrite(MRDY_PIN, assertLow ? LOW : HIGH);
+  Serial.printf("[WAKE] MRDY %s\n",
+                assertLow ? "LOW (awake/has data)" : "HIGH (idle release)");
+}
+
+// §0.3: heartbeat_s doubles as the proactive-pull interval — user range is
+// 1-10 min (60-600 s); clamp whatever provisioning/ack delivers.
+uint32_t clampHeartbeatS(uint32_t s) {
+  return s < 60 ? 60 : (s > 600 ? 600 : s);
+}
 
 // ── MCU bus health (drives the dashboard) ───────────────────────────────────
 uint32_t mcuTxFrames = 0;         // frames forwarded server → MCU
@@ -358,10 +403,11 @@ void loadConfig() {
   cfgServerPort = prefs.getUShort("sport", 4200);
   cfgSiteId = prefs.getString("site", "lab");
   cfgName = prefs.getString("name", "");
-  cfgHeartbeatS = prefs.getUInt("hb", 60);
+  cfgHeartbeatS = clampHeartbeatS(prefs.getUInt("hb", 60));
   cfgMode = prefs.getString("mode", "ozkey-cloud");
   cfgRoomNo = prefs.getString("room", "");
   cfgMacToken = prefs.getString("mtoken", "");
+  wakeSim = prefs.getBool("wksim", true);
   prefs.end();
 }
 
@@ -381,6 +427,7 @@ void saveConfig() {
   prefs.putString("mode", cfgMode);
   prefs.putString("room", cfgRoomNo);
   prefs.putString("mtoken", cfgMacToken);
+  prefs.putBool("wksim", wakeSim);
   prefs.end();
 }
 
@@ -401,7 +448,18 @@ void factoryReset() {
 // LockSim's extractFrames() scans for the contiguous 0x55 0xAA header.
 // ─────────────────────────────────────────────────────────────────────────────
 void tuyaWireSend(const uint8_t *f, size_t n) {
+  // §0.2 module-initiated send: raise MRDY, wait for the MCU's answering
+  // SRDY (wake_sim: assumed answered), then transmit — no bytes ever hit a
+  // sleeping UART.
+  mrdySet(true);
+  if (!srdyAsserted()) {
+    unsigned long t0 = millis();
+    while (!srdyAsserted() && millis() - t0 < SRDY_WAIT_TIMEOUT_MS) delay(5);
+    if (!srdyAsserted())
+      Serial.println("[WAKE] SRDY no answer in 1.5s — transmitting anyway");
+  }
   Serial1.write(f, n);
+  lastWireActivityAt = millis();
   mcuTxFrames++;
   String hex; hex.reserve(n * 3);
   for (size_t i = 0; i < n; i++) {
@@ -438,6 +496,7 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
 
   mcuRxFrames++;
   lastMcuFrameAt = millis();
+  lastActivityAt = millis();
   lastMcuSummary = describeDpid(f, n);
   Serial.printf("[TUYA<-] %s (%u bytes)\n", lastMcuSummary.c_str(), (unsigned)n);
   screenDirty = true;
@@ -471,6 +530,8 @@ void tuyaWirePump() {
   static size_t bn = 0;
   while (Serial1.available()) {
     uint8_t b = Serial1.read();
+    lastWireActivityAt = millis();
+    mrdySet(true); // MCU is talking → answer its SRDY per the §0.2 handshake
     if (bn == 0 && b != 0x55) continue;
     if (bn == 1 && b != 0xAA) { bn = 0; if (b == 0x55) bn = 1; continue; }
     if (bn < sizeof(buf)) buf[bn++] = b; else { bn = 0; continue; }
@@ -539,6 +600,7 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   String body; body.reserve(length);
   for (unsigned int i = 0; i < length; i++) body += (char)payload[i];
   Serial.printf("[MQTT<-] %s %s\n", topic, body.c_str());
+  lastActivityAt = millis();
 
   JsonDocument doc;
   if (deserializeJson(doc, body) != DeserializationError::Ok) return;
@@ -547,6 +609,15 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   if (op && (strcmp(op, "factory_reset") == 0 || strcmp(op, "unpair") == 0)) {
     Serial.println("[MQTT<-] factory_reset (unpaired by app/server)");
     factoryReset();
+    return;
+  }
+  if (op && strcmp(op, "wake_sim") == 0) { // §0.2 bench toggle, NVS-persisted
+    wakeSim = doc["on"] | true;
+    prefs.begin("blelock", false);
+    prefs.putBool("wksim", wakeSim);
+    prefs.end();
+    Serial.printf("[WAKE] wake_sim %s (server toggle)\n", wakeSim ? "ON" : "OFF");
+    screenDirty = true;
     return;
   }
   if (op && strcmp(op, "provision_assign") == 0) {
@@ -573,7 +644,8 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     enrolled = true;
     const char *label = doc["label"] | "";
     if (!cfgName.length() && strlen(label)) cfgName = label;
-    if (doc["heartbeat_s"].is<uint32_t>()) cfgHeartbeatS = doc["heartbeat_s"].as<uint32_t>();
+    if (doc["heartbeat_s"].is<uint32_t>())
+      cfgHeartbeatS = clampHeartbeatS(doc["heartbeat_s"].as<uint32_t>());
     prefs.begin("blelock", false);
     prefs.putString("buser", doc["broker_username"] | "");
     prefs.putString("bsecret", doc["broker_secret"] | "");
@@ -632,6 +704,7 @@ void ensureMqtt() {
   mqtt.setBufferSize(1024);
   mqtt.setCallback(onMqttMessage);
   if (mqtt.connect(deviceId.c_str())) {
+    lastActivityAt = millis();
     mqtt.subscribe(topicCommand.c_str(), 1);
     if (isLocalMode() && !enrolled) mqtt.subscribe(topicPairConfirm.c_str(), 1);
     Serial.println("[MQTT] connected + subscribed command topic");
@@ -677,7 +750,7 @@ void applyProvision(JsonDocument &doc) {
   cfgServerPort = doc["server_port"] | 4200;
   cfgSiteId = (const char *)(doc["site_id"] | "lab");
   cfgName = (const char *)(doc["name"] | "");
-  cfgHeartbeatS = doc["heartbeat_s"] | 60;
+  cfgHeartbeatS = clampHeartbeatS(doc["heartbeat_s"] | 60);
   if (!cfgSsid.length() || !cfgBrokerHost.length()) { notifyStatus("ENROLL_FAIL"); return; }
 
   cfgMode = mode;
@@ -807,6 +880,7 @@ bool touchRead(int &tx, int &ty) {
   uint8_t count = buf[2];
   bool down = (count > 0 && count <= 5);
   if (down) {
+    lastActivityAt = millis();
     if (touchWasDown) {
       int rawX = ((buf[3] & 0x0F) << 8) | buf[4];
       int rawY = ((buf[5] & 0x0F) << 8) | buf[6];
@@ -853,6 +927,42 @@ char keyAt(int tx, int ty) {
 bool resetArm = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// §0.2/§0.3 keep-alive nap (wake_sim=false only). Persistent power — this is
+// light sleep, not rail-off: association state is in RAM, the module owns
+// its cadence. Wake sources: SRDY low (MCU wants us) · heartbeat_s timer
+// (the §0.3 proactive pull — THE credential-delivery guarantee) · screen
+// touch (operator door-knock; also wakes a board before flashing).
+// ─────────────────────────────────────────────────────────────────────────────
+void enterKeepAliveSleep() {
+  Serial.printf("[PWR] idle %lus — light sleep (wake: SRDY / %us timer / touch)\n",
+                SLEEP_IDLE_MS / 1000, cfgHeartbeatS);
+  Serial.flush(); // USB serial goes quiet during the nap — expected
+  mqtt.disconnect();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  digitalWrite(LCD_BL, LOW); // dark panel = the visible "napping" cue
+
+  gpio_wakeup_enable((gpio_num_t)SRDY_PIN, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)TOUCH_INT, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_sleep_enable_timer_wakeup((uint64_t)cfgHeartbeatS * 1000000ULL);
+  esp_light_sleep_start();
+
+  sleepWakeCount++;
+  bool timerWake = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+  digitalWrite(LCD_BL, HIGH);
+  lastActivityAt = millis();
+  screenDirty = true;
+  Serial.printf("[PWR] wake #%u by %s — rejoin + heartbeat pull\n",
+                (unsigned)sleepWakeCount,
+                timerWake ? "timer (proactive pull)" : "GPIO (SRDY/touch)");
+  if (!timerWake) mrdySet(true); // answer the MCU's SRDY immediately
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
+  lastMqttAttempt = 0; // dial the broker on the next loop pass
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Setup / loop
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
@@ -864,6 +974,11 @@ void setup() {
   // Tuya MCU bus → LockSim Mode B (raw 55 AA frames, wire-tested 2026-07-19)
   Serial1.begin(9600, SERIAL_8N1, TUYA_RX_PIN, TUYA_TX_PIN);
   Serial.println("[TUYA] Serial1 up @ 9600 8N1 GPIO16(TX)/GPIO17(RX)");
+
+  // §0.2 wake lines — MRDY idles HIGH (also satisfies the GPIO8 strap)
+  pinMode(SRDY_PIN, INPUT_PULLUP);
+  pinMode(MRDY_PIN, OUTPUT);
+  digitalWrite(MRDY_PIN, HIGH);
 
   // Transaction buffer (LittleFS, format on first mount)
   fsUp = LittleFS.begin(true);
@@ -907,6 +1022,10 @@ void setup() {
     state = ST_ADVERTISING;
     startBle();
   }
+  Serial.printf("[WAKE] wake_sim=%s hb=%us (SRDY=GPIO%d MRDY=GPIO%d)\n",
+                wakeSim ? "ON (bench: SRDY assumed, no sleep)" : "OFF (honest)",
+                cfgHeartbeatS, SRDY_PIN, MRDY_PIN);
+  lastActivityAt = millis();
   screenDirty = true;
 }
 
@@ -961,6 +1080,10 @@ void loop() {
     screenDirty = true;
   }
 
+  // ── §0.2 MRDY release after 10s serial idle ──────────────────────────────
+  if (mrdyAsserted && millis() - lastWireActivityAt > MRDY_IDLE_RELEASE_MS)
+    mrdySet(false);
+
   // ── touch: factory reset only ('*' zone arms, '5' zone fires) ────────────
   {
     int tx, ty;
@@ -988,13 +1111,18 @@ void loop() {
     String modeInfo = cfgMode;
     if (isLocalMode())
       modeInfo += cfgRoomNo.length() ? (" room=" + cfgRoomNo) : " (no room)";
-    Serial.printf("[MON] %s mode=%s wifi=%s ip=%s mqtt=%s mcu=%s tx=%u rx=%u heap=%u\n",
+    Serial.printf("[MON] %s mode=%s wifi=%s ip=%s mqtt=%s mcu=%s tx=%u rx=%u "
+                  "wake=%s mrdy=%s srdy=%s hb=%us naps=%u heap=%u\n",
                   st, modeInfo.c_str(),
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
                   WiFi.localIP().toString().c_str(),
                   mqtt.connected() ? "up" : "down",
                   mcuLinkUp() ? "up" : "DOWN",
                   (unsigned)mcuTxFrames, (unsigned)mcuRxFrames,
+                  wakeSim ? "sim" : "real",
+                  mrdyAsserted ? "LOW" : "high",
+                  digitalRead(SRDY_PIN) == LOW ? "LOW" : "high",
+                  cfgHeartbeatS, (unsigned)sleepWakeCount,
                   (unsigned)ESP.getFreeHeap());
     if (state == ST_OPERATIONAL) screenDirty = true; // age/link refresh
   }
@@ -1005,6 +1133,14 @@ void loop() {
     if (state == ST_ADVERTISING) drawAdvertising();
     else if (state == ST_JOINING) drawJoining();
     else drawOperational();
+  }
+
+  // ── §0.2/§0.3 keep-alive nap (honest mode only; bench wake_sim skips) ────
+  if (!wakeSim && state == ST_OPERATIONAL && enrolled && bleServer == nullptr &&
+      !bleClientConnected && !resetArm && doorStatus == "LOCKED" &&
+      !touchWasDown && !mrdyAsserted &&
+      millis() - lastActivityAt > SLEEP_IDLE_MS) {
+    enterKeepAliveSleep();
   }
 
   delay(15);
