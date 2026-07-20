@@ -63,8 +63,53 @@ Validation rules = `ozkey_commissioner/lib/src/provision_payload.dart`
 Failure: notify `WIFI_FAIL`/`BROKER_FAIL`, stay connectable, accept a
 re-written provision (re-provisionable, never one-shot — §7.5).
 
+## Operational / member profile — XF-46 (v1 DRAFT 2026-07-20, FtposPM proposal)
+
+> The N-bond multi-user contract (ozkey-08 §0.4 / ftpos XFtposDecisions-46).
+> App-side (BANOI) is built against this section; firmware (blelock/blecomm)
+> pending — ozkey-team to confirm UUIDs, wire shapes, and the invite-MAC
+> realization below, then this becomes canonical.
+
+**Advertising (operational):** touch-window only — an enrolled lock
+advertises `OZLOCK` + the service UUID for **~60 s after any keypad/screen
+touch**, never while idle (power + no trackable beacon; ozkey-08 §0.4).
+Production adds BLE RPA rotation; bench keeps the plain name.
+
+**`info` gains `"pub"`:** the lock's X25519 ceremony public key (lowercase
+hex, 64 chars). Needed by the member ceremony (and the future v2 sealed
+commissioning) to derive the pairing secret. Lock keypair minted at first
+boot, NVS-persisted, survives re-provision, wiped on factory reset.
+
+**New characteristics** (same service `4f5a4b31-0001-…`):
+
+| Characteristic | UUID (…0005/6/7) | Props | Payload |
+|---|---|---|---|
+| `challenge` | `…0005` | read | 16 random bytes, fresh per read; valid for this connection, ~30 s |
+| `control` | `…0006` | write | `utf8(app_id_hex, 64 chars)` ‖ `OzkeyEnvelope` (app→lock, per-bond counter). Envelope **plaintext = challenge(16 B) ‖ DPID frame**. Lock: look up bond by app_id → open envelope (counter > bond floor) → verify challenge == last-issued → execute frame (DP 1 remote-unlock in v1; role-gate admin verbs to bond #0) |
+| `member_enroll` | `…0007` | write | plaintext JSON `{"app_id":"<member X25519 pubkey hex>","invite":"OZINV1:…"}` — chunked like `provision` (buffer resets on `{`, parse on JSON-complete). No bond exists yet, so this is unsealed; the INVITE is the authenticator |
+
+**Member-enroll lock-side algorithm:** decode invite (`OZINV1:` +
+base64url JSON, fields v/d/i/r/l/n/e/m) → recompute MAC:
+`mac_key = HKDF-SHA256(ikm = bond#0 pairing secret, salt = utf8(device_id ‖
+issuer_app_id_hex), info = "ozkey/invite-v1")`;
+`mac = HMAC-SHA256(mac_key, utf8("1|device_id|issuer|role|label|nonce|expires"))`
+(byte-exact vectors: ftpos `packages/ozkey_commissioner/test/
+member_invite_test.dart` + `tool/gen_invite_vector.dart`) → nonce unused
+(replay cache, suggest 32-entry LRU in NVS; nonce = the HARD guarantee) →
+expiry best-effort (clock drift tolerated) → capacity ≤16 bonds → add bond
+`{pubkey, role, label}` → pairing secret = X25519(lock_priv, member_pub) →
+notify. Lock reports `bond_added` / `bond_revoked` on its log topic at next
+sync (OZLOCK builds the door→apps map passively).
+
+**New `status` wire strings:** `MEMBER_OK`, `MEMBER_FAIL`, `MEMBER_FULL`,
+`MEMBER_REPLAY`, `MEMBER_EXPIRED` (enroll) · `UNLOCK_OK`, `UNLOCK_DENIED`
+(control). These are OUTSIDE the commissioning ladder — apps consume them on
+a raw-status stream, `OzkeyStatus.parse` ignores them.
+
 ## Deferred (v2)
 
 - Factory-pubkey trust anchor (QR on screen) + X25519 session → sealed payload
 - Matter-takeover semantics (this emulator boots straight into OZKEY mode)
 - Admin-PIN keypad menu / battery-compartment factory reset (§7.5 device-side)
+- Member profile: RPA advertising rotation · second admin / bond #0 transfer
+  · member self-remove verb ("rời khỏi cửa này" currently local-only)
