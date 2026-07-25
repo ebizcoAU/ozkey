@@ -13,6 +13,11 @@ core's OpenThread wrapper exposes commit-a-dataset as a typed call, but only
 exposes joiner/commissioner via a text CLI console — rougher to build against
 for a first bring-up. Revisit post-v1 once the basic loop is proven).
 
+**Updated 2026-07-25 (PM decision):** Bridge provision payload now includes a
+`mode` field to select Personality A (Matter bridge) or B (MQTT uplink).
+The app shall send this field at provisioning time. Firmware (bridge32.ino)
+shall parse and store it.
+
 ## Device roles
 
 | Device | Radio | Job |
@@ -36,9 +41,31 @@ both ends already agree on the network — no discovery step happens on 802.15.4
 
 | Characteristic | UUID | Props | Payload |
 |---|---|---|---|
-| `provision` | `…0002` | write | `{"device_id":"ozb-…","ssid":"…","password":"…"}` — chunked like the lock's provision char (buffer resets on `{`) |
-| `status` | `…0003` | notify | `BLE_OK`, `WIFI_JOINING`, `WIFI_OK`, `WIFI_FAIL`, `THREAD_FORMING`, `THREAD_OK`, `THREAD_FAIL` |
+| `provision` | `…0002` | write | JSON – see below. Chunked like the lock's provision char (buffer resets on `{`) |
+| `status` | `…0003` | notify | `BLE_OK`, `WIFI_JOINING`, `WIFI_OK`, `WIFI_FAIL`, `THREAD_FORMING`, `THREAD_OK`, `THREAD_FAIL`, `BROKER_JOINING`, `BROKER_OK`, `BROKER_FAIL`, `PAYLOAD_REJECTED` |
 | `info` | `…0004` | read | JSON, see below |
+
+### Provision payload (updated 2026-07-25)
+
+```json
+{
+  "v": 1,
+  "mode": "mqtt-uplink",              // REQUIRED – "mqtt-uplink" or "matter-bridge"
+  "device_id": "b-98a316a7e638",      // echo of info.device_id
+  "ssid": "HomeWifi",
+  "password": "wifi-secret",
+  "broker_host": "10.1.1.21",         // Required for "mqtt-uplink"
+  "broker_tcp_port": 1883,            // Required for "mqtt-uplink"
+  "site_id": "lab"                    // Required for "mqtt-uplink" – used in MQTT topics
+}
+```
+
+Mode values:
+
+- `"mqtt-uplink"` – bridge connects to Wi-Fi, MQTT broker; subscribes to `ozkey/<site>/locks/<bridge>/command`.
+- `"matter-bridge"` – bridge starts Matter-over-Wi-Fi stack (stubbed in v0; only stores the mode).
+
+If `mode` is missing or invalid, bridge rejects provision with `ERR_PAYLOAD` and notifies `PAYLOAD_REJECTED`.
 
 `info` payload:
 
@@ -48,6 +75,7 @@ both ends already agree on the network — no discovery step happens on 802.15.4
   "mac": "AA:BB:...",
   "fw": "bridge32-0.1",
   "transport": "bridge",
+  "mode": "mqtt-uplink",              // stored personality
   "thread_role": "leader",
   "network_name": "OZ-a1b2",
   "ext_pan_id": "<16 hex chars>",
@@ -101,9 +129,9 @@ pattern as XF-46's MEMBER_*/UNLOCK_* additions in `CONTRACT.md`): `THREAD_OK`,
    (from step 2) into threadcomm's provision characteristic.
 4. threadcomm commits the dataset, attaches to the Thread mesh.
    -> notify THREAD_OK (or THREAD_FAIL on timeout).
-5. (Not yet built) threadcomm relays Tuya frames to bridge32 over Thread;
-   bridge32 forwards to MQTT. This is the next increment — see "Not in this
-   increment" below.
+5. threadcomm relays Tuya frames to bridge32 over Thread; bridge32 forwards
+   to MQTT (this is the next increment — building the Thread-side frame
+   transport and MQTT uplink).
 ```
 
 ## Not in this increment
@@ -111,8 +139,6 @@ pattern as XF-46's MEMBER_*/UNLOCK_* additions in `CONTRACT.md`): `THREAD_OK`,
 Both sketches compile and prove the BLE-provision → radio-join loop only.
 Deliberately deferred, so this lands small and provable:
 
-- **MQTT uplink on bridge32.** No broker connection yet — Wi-Fi + Thread
-  bring-up only.
 - **Tuya UART relay on threadcomm.** No MCU wire, no credential frames. The
   lock-MCU relay logic that exists in `blecomm/` moves here once the Thread
   transport itself is proven.
