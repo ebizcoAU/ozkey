@@ -1,0 +1,342 @@
+PRODUCT SPECIFICATION
+Smart Lock Base Units – Full Product Range
+Australian Compliance-Ready Mechanical Chassis
+===============================================================================
+
+DOCUMENT CONTROL
+
+Document ID : EBIZCO-SPEC-002
+Version : 2.0
+Date : July 2026
+Issued By : EBIZCO Australia Pty Ltd
+Distribution : Suppliers / OEM Partners
+
+===============================================================================
+
+EXECUTIVE SUMMARY
+
+EBIZCO Australia is seeking a manufacturing partner to supply MULTIPLE
+smart lock mechanical base unit types for retrofit with our proprietary
+ESP32-C6 communication module. All lock types will share a COMMON
+electronic interface and be managed under a UNIFIED software platform.
+
+WHAT WE SUPPLY:
+
+ESP32-C6 daughterboard (custom PCB)
+
+Full firmware stack
+
+Unified mobile app and cloud server platform
+
+WHAT WE REQUIRE FROM SUPPLIER:
+
+Complete mechanical chassis, handles, mortise/cylinder mechanisms
+
+Factory host MCU, motor (where applicable), keypad, fingerprint sensor
+
+NO wireless module (Tuya/TTLock) — socket must be left EMPTY
+
+===============================================================================
+
+PRODUCT CATALOGUE REQUIRED
+
+We require FIVE (5) lock types to offer a complete commercial solution:
+
+No. Lock Type Application
+
+1 Timber Door Lock Standard residential/commercial wooden
+doors
+
+2 Glass Door Lock Glass doors, shopfronts, office
+(Push & Slide) partitions
+
+3 Rim Lock Surface-mounted on doors (retrofit,
+thin doors)
+
+4 Deadbolt Secondary security lock (standalone or
+with latch)
+
+5 Padlock Gates, storage units, lockers
+
+NOTE: All electronic lock types (1-4) must integrate with our host MCU
+interface. Padlock may be mechanical-only or electronic depending on
+supplier capability.
+
+===============================================================================
+
+SCOPE OF SUPPLY (PER LOCK TYPE)
+
+Component Timber Glass Rim Dead Padlock
+
+Lock body / chassis ✅ ✅ ✅ ✅ ✅
+Handle / lever ✅ ✅ ✅ ❌ ❌
+(inside/outside)
+Mortise / cylinder ✅ ✅ ✅ ✅ ✅
+mechanism
+Motorised drive ✅ ✅ ✅ ✅ Optional
+Capacitive keypad ✅ ✅ ✅ ✅ Optional
+Fingerprint sensor ✅ ✅ ✅ ✅ Optional
+Host MCU (factory) ✅ ✅ ✅ ✅ Optional
+Wireless module ❌ ❌ ❌ ❌ ❌
+(Tuya/TTLock)
+
+CRITICAL: All electronic lock types must expose plaintext UART (TX/RX)
+for our daughterboard. Wireless module socket must be left UNPOPULATED.
+
+===============================================================================
+
+MATERIAL REQUIREMENTS BY TIER
+
+RESIDENTIAL TIER (Standalone Houses, Townhouses)
+
+Component Material
+
+Lock body / chassis Aluminium alloy or Zinc alloy
+Latch tongue / bolt Zinc alloy or Aluminium
+Internal drive gears Zinc alloy or Aluminium
+
+COMMERCIAL TIER (Apartments, Hotels, Offices, Strata)
+
+Component Material
+
+Lock body / chassis Grade 304 Stainless Steel
+Latch tongue / bolt Grade 304 Stainless Steel
+Internal drive gears Grade 304 Stainless Steel
+
+===============================================================================
+
+MANDATORY COMPLIANCE REQUIREMENTS
+
+RULE 1: INSTANT EMERGENCY EXIT (NCC D2.21 / AS1905.1)
+
+Applies to: Timber, Glass, Rim Locks (where internal handle is present)
+
+Requirement Specification
+
+Inside handle operation Single downward push
+Deadbolt override Automatic — no separate snib
+Latch & deadbolt Retract simultaneously
+BANNED Separate thumb-turn or intermediate step
+
+===============================================================================
+
+RULE 2: DISABLED-FRIENDLY HANDLES (AS1428.1)
+
+Applies to: Timber, Glass, Rim Locks (where handles are present)
+
+Requirement Specification
+
+Handle design Continuous D-style curved return
+Clearance gap 35-45mm between handle and door face
+BANNED Straight levers, round knobs
+
+===============================================================================
+
+RULE 3: FIRE SURVIVAL (AS1530.4) — COMMERCIAL TIER ONLY
+
+Applies to: All lock types installed on fire-rated doors
+
+Requirement Specification
+
+Latch tongue / bolt Grade 304 or 316 Stainless Steel
+Internal drive gears Grade 304 or 316 Stainless Steel
+BANNED Zinc alloy, aluminium alloy internals
+Fire test documentation Supplier to provide AS1530.4 test report
+
+===============================================================================
+6. TECHNICAL REQUIREMENTS (ELECTRONIC LOCKS)
+===============================================================================
+
+6.1 ELECTRONIC INTERFACE (COMMON ACROSS ALL TYPES)
+---------------------------------------------------
++----------------------------------------+----------------------------------------+
+| Requirement                            | Specification                          |
++----------------------------------------+----------------------------------------+
+| Host MCU                               | Factory-standard microcontroller        |
+| Communication                          | Plaintext UART (TX/RX)                  |
+| Protocol                               | Standard Tuya MCU Serial Protocol       |
+|                                        | (0x55 0xAA headers, 8-bit checksum)     |
+| Wireless module                        | Socket left EMPTY                       |
+| Connector                              | 4-pin JST-PH compatible                 |
+|                                        | (VBAT_IN, GND, TX, RX)                  |
++----------------------------------------+----------------------------------------+
+
+IMPORTANT POWER NOTE (VCC):
+The 4-pin JST connector shall carry RAW BATTERY VOLTAGE
+(typically 4.5V - 6.5V for 4x AA batteries, 3.6V minimum)
+on the "VCC" pin, NOT the host MCU's regulated 3.3V output.
+
+REASON: Our daughterboard ESP32-C6 consumes up to 350-400mA
+during Wi-Fi 6 / Thread TX bursts. The host MCU's 3.3V rail
+is typically current-limited (<100mA) and will cause brownouts.
+
+Our daughterboard includes a dedicated, ultra-low-Iq (<10µA)
+LDO regulator that handles the peak current from the raw battery
+input. This ensures both the host MCU and our module have
+stable, independent power supplies.
+
+The signal lines (TX, RX, SRDY, MRDY) remain at 3.3V logic
+levels compatible with the host MCU.
+
+===============================================================================
+
+6.2 POWER SUPPLY INTERFACE (SUPPLIER MUST ROUTE)
+------------------------------------------------
+
+The factory PCB MUST route the following connections to the
+4-pin JST-PH header (or equivalent footprint) where our
+daughterboard plugs in:
+
++----------+----------+---------+----------------------------------------+
+| Pin      | Signal   | Voltage | Requirement                            |
++----------+----------+---------+----------------------------------------+
+| 1        | VBAT_IN  | 3.6V-6.5V| RAW battery voltage. Trace width >=   |
+|          |          | (DC)    | 25 mil to support 500mA peak current. |
+|          |          |         | Bypass capacitors (>= 10uF) optional  |
+|          |          |         | on this line.                          |
+| 2        | GND      | 0V      | Common ground. Trace width >= 25 mil. |
+| 3        | TX       | 3.3V    | Module -> MCU (full-duplex).           |
+|          |          |         | Connect to host MCU UART RX pin.       |
+| 4        | RX       | 3.3V    | MCU -> Module (full-duplex).           |
+|          |          |         | Connect to host MCU UART TX pin.       |
++----------+----------+---------+----------------------------------------+
+
+Optional (Keep-Alive Handshake, per Tuya standard):
+
++----------+----------+---------+----------------------------------------+
+| Signal   | Direction| GPIO    | Description                            |
++----------+----------+---------+----------------------------------------+
+| SRDY     | MCU->Mod | GPIO3   | MCU wakes module (active low)          |
+| MRDY     | Mod->MCU | GPIO20  | Module wakes MCU / has data (active lo)|
++----------+----------+---------+----------------------------------------+
+
+===============================================================================
+
+6.3 POWER CONSUMPTION GUIDELINES (FOR FACTORY PCB DESIGN)
+--------------------------------------------------------
+
++----------------------------------------+----------------------------------------+
+| Component                              | Peak Current (Typical)                  |
++----------------------------------------+----------------------------------------+
+| Host MCU + Keypad + Fingerprint        | 30-50mA @ 3.3V                         |
+| Motor (unlocking burst)                | 200-300mA @ 6V (sourced separately)     |
+| Daughterboard ESP32-C6 (Wi-Fi TX)      | 350-400mA @ 3.6V (after LDO)            |
++----------------------------------------+----------------------------------------+
+
+CRITICAL DESIGN RULE:
+The host MCU's 3.3V rail MUST NOT be used to power our daughterboard.
+The daughterboard receives its power DIRECTLY from the raw battery
+input (VBAT_IN) on the JST connector. This prevents brownouts
+during simultaneous operations (e.g., motor + Wi-Fi TX).
+
+===============================================================================
+
+6.4 MECHANICAL INTERFACE (PER TYPE)
+-----------------------------------
++----------------------------------------+----------------------------------------+
+| Lock Type                              | Key Mechanical Specifications           |
++----------------------------------------+----------------------------------------+
+| Timber Door Lock                       | Tubular latch: 60mm or 70mm backset    |
+|                                        | Door thickness: 35-45mm                |
+| Glass Door Lock                        | Push & slide mechanism                 |
+| (Push & Slide)                         | Compatible with 8-12mm glass           |
+| Rim Lock                               | Surface-mounted                        |
+|                                        | Standard Australian backset            |
+| Deadbolt                               | Single or double-cylinder              |
+|                                        | 60mm or 70mm backset                   |
+| Padlock                                | Shackle diameter and clearance         |
+|                                        | as per Australian standard             |
+|                                        | Electronic optional                    |
++----------------------------------------+----------------------------------------+
+
+
+===============================================================================
+
+PRICING & VOLUMES
+
+Parameter Value
+
+Initial order (combined) 1,000 units (mix of types)
+Target price (Residential / $12-20 USD per unit
+Aluminium) (stripped, no wireless module)
+
+Target price (Commercial / $35-50 USD per unit
+304 Stainless) (stripped, no wireless module)
+
+Inco terms FOB or EXW (please confirm)
+
+NOTE: Prices to be quoted per lock type. We will confirm volume mix
+upon sample validation.
+
+===============================================================================
+
+SAMPLING & VALIDATION
+
+Item Requirement
+
+Sample quantity 2-3 units PER LOCK TYPE
+Sample delivery Airmail / Express
+Validation Full compliance testing in Australia
+Supplier documentation Provide datasheet, photos, test
+reports for each type
+
+===============================================================================
+
+SUPPLIER RESPONSE REQUIRED
+
+Please confirm the following for EACH lock type you can supply:
+
+Item Supplier Response
+
+Which lock types can you
+supply? (Timber / Glass /
+Rim / Deadbolt / Padlock)
+
+Model name / chassis name
+per type
+
+Photos (exterior, internal
+cavity, mechanism)
+
+Inside handle video
+(latch + deadbolt
+retraction) – for door locks
+
+Side-profile photo with
+ruler showing handle
+clearance gap
+
+Material type (Aluminium /
+Zinc / Stainless) per type
+
+Stripped price (no Tuya
+module) – per type /
+1,000 total mix
+
+AS1530.4 fire test report
+availability
+
+Lead time for samples
+
+Lead time for bulk order
+(1,000 total)
+
+===============================================================================
+
+CONTACT
+
+Vince Phan
+Systems Architect | Director
+EBIZCO Australia Pty Ltd
+📧 [email]
+📞 [phone]
+
+===============================================================================
+
+This document outlines our minimum requirements across the full product
+range. Full PRS and engineering specifications will be shared upon
+supplier confirmation.
+
+===============================================================================
+END OF DOCUMENT
+===============================================================================

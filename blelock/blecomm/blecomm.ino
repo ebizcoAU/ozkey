@@ -39,6 +39,7 @@
 #include <time.h>
 #include "driver/gpio.h"
 #include "esp_sleep.h"
+#include "ozcrypto.h" // member-ceremony crypto (XF-46 §7.1) + boot self-test
 
 // ── Hardware pins (HARDWARE.md, operator-verified) ──────────────────────────
 #define LCD_DC 15
@@ -823,6 +824,7 @@ void startBle() {
   doc["mac"] = macStr;
   doc["fw"] = FW_VERSION;
   doc["name"] = cfgName;
+  doc["pub"] = ozLockPubHex(); // X25519 ceremony pubkey (XF-46 §7.1)
   String info; serializeJson(doc, info);
   chrInfo->setValue(info.c_str());
 
@@ -1009,6 +1011,11 @@ void setup() {
 
   loadConfig();
   buildTopics();
+
+  // Ceremony identity (RF is up → TRNG seeded) + boot known-answer self-test.
+  ozLockKeyInit();
+  Serial.printf("[CRYPTO] info.pub=%s\n", ozLockPubHex().c_str());
+  ozCryptoSelfTest();
 
   if (provisioned) {
     state = enrolled ? ST_OPERATIONAL : ST_JOINING;

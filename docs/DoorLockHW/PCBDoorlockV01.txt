@@ -1,0 +1,351 @@
+===============================================================================
+     ENGINEERING SPECIFICATION DOCUMENT
+     Custom ESP32-C6-MINI-1-N8 Baseboard
+     For Doorlock MCU Integration (Tuya Keep-Alive)
+===============================================================================
+     Document Version: 2.0
+     Date: 2026-07-25
+     Prepared By: Sovereign Edge / OZKEY Engineering
+     Distribution: PCB Manufacturing Suppliers
+===============================================================================
+
+1.  OVERVIEW
+    --------
+    This document defines the technical requirements for a custom PCB
+    baseboard that hosts an ESP32-C6-MINI-1-N8 module and interfaces
+    with a standard Tuya-compatible doorlock MCU via a 4-wire UART
+    interface (Keep-Alive topology).
+
+    1.1  Design Philosophy
+         -----------------
+         +---------------------------+------------------------------------+
+         | Requirement               | Rationale                          |
+         +---------------------------+------------------------------------+
+         | Keep-Alive topology       | Module always powered via          |
+         |                           | dedicated LDO, not gated by MCU    |
+         +---------------------------+------------------------------------+
+         | Separate battery input    | Doorlock MCU cannot supply ESP32's |
+         |                           | 500mA peak current                 |
+         +---------------------------+------------------------------------+
+         | XIAO footprint            | Drop-in compatibility with         |
+         | (21 x 17.5 mm)            | standard XIAO ecosystem            |
+         +---------------------------+------------------------------------+
+         | Tuya serial protocol      | 115200-8-N-1, 0x55AA frame header, |
+         |                           | full-duplex                        |
+         +---------------------------+------------------------------------+
+
+    1.2  Key References
+         ----------------
+         - ESP32-C6-MINI-1 & ESP32-C6-MINI-1U Datasheet v1.5 (Espressif)
+         - ESP32-C6 Hardware Design Guidelines (Espressif)
+         - Tuya MCU Integration Protocol (Zigbee/Wi-Fi Lock) (Tuya)
+         - XIAO ESP32-C6 Pinout & Footprint (Seeed Studio)
+
+2.  CORE MODULE: ESP32-C6-MINI-1-N8
+    --------------------------------
+    2.1  Module Specifications
+         +---------------------------+------------------------------------+
+         | Parameter                 | Value                              |
+         +---------------------------+------------------------------------+
+         | Module                    | ESP32-C6-MINI-1-N8                 |
+         | SoC                       | ESP32-C6FH8 (RISC-V single-core)   |
+         | Max Frequency             | 160 MHz                            |
+         | Flash                     | 8 MB (in-package)                  |
+         | SRAM                      | 512 KB HP + 16 KB LP               |
+         | Wireless                  | Wi-Fi 6, BLE 5.3, Zigbee, Thread   |
+         | Antenna                   | On-board PCB antenna               |
+         | GPIOs                     | 22                                 |
+         | Module Size               | 13.2 x 16.6 x 2.4 mm               |
+         | Operating Voltage         | 3.0 V - 3.6 V                      |
+         | XIAO Footprint            | 21 x 17.5 mm, 14 castellated pads  |
+         | Mounting                  | Single-sided SMD                   |
+         +---------------------------+------------------------------------+
+
+    2.2  XIAO Footprint Pin Assignment (Counter-clockwise from USB)
+         The baseboard MUST route the following signals:
+         +------+-------+---------+------------------------------------+
+         | Pin  | Label | GPIO    | Function on Baseboard              |
+         +------+-------+---------+------------------------------------+
+         | 1    | D0    | GPIO0   | Boot button / Strapping            |
+         | 2    | D1    | GPIO1   | ADC (optional)                     |
+         | 3    | D2    | GPIO2   | ADC (optional)                     |
+         | 4    | D3    | GPIO3   | SRDY (MCU->Module, active low)     |
+         | 5    | D4    | GPIO22  | I2C SDA (optional)                 |
+         | 6    | D5    | GPIO23  | I2C SCL (optional)                 |
+         | 7    | D6    | GPIO16  | TXD (Module->MCU)                  |
+         | 8    | D7    | GPIO7   | RXD (MCU->Module)                  |
+         | 9    | D8    | GPIO17  | SPI SCK (optional, strapping pin)  |
+         | 10   | D9    | GPIO19  | SPI MISO (optional)                |
+         | 11   | D10   | GPIO20  | MRDY (Module->MCU, active low)     |
+         | 12   | 5V    | --      | USB 5V (not used)                  |
+         | 13   | 3V3   | --      | 3.3V power input                   |
+         | 14   | GND   | --      | Ground                             |
+         +------+-------+---------+------------------------------------+
+
+         STAPPING PIN SAFETY:
+         GPIO8 (D8) must be high/floating at reset. MRDY is assigned to
+         GPIO20 (non-strapping) for this reason.
+
+3.  POWER SUPPLY SECTION
+    --------------------
+    3.1  Power Requirements (Per Espressif Guidelines)
+         +---------------------------+------------------------------------+
+         | Parameter                 | Value                              |
+         +---------------------------+------------------------------------+
+         | Supply Voltage            | 3.0 V - 3.6 V (3.3 V nominal)      |
+         | Max Output Current        | >= 500 mA                          |
+         | Bulk Capacitance at Entry | >= 10 uF                           |
+         | Decoupling Capacitance    | 0.1 uF near VDDPST1, VDDPST2       |
+         | Analog Power (VDDA3P3)    | 10 uF capacitor on power trace     |
+         +---------------------------+------------------------------------+
+
+    3.2  Power Supply Topology (MUST INCLUDE)
+         Battery Input (3.6V-5.5V)
+             |
+             +-- J1: 2-pin JST connector
+             |
+             +-- D1: Schottky diode (SS12 or equiv)
+             |    Reverse polarity protection
+             |
+             +-- D2: TVS diode (SMBJ5.0A or equiv)
+             |    ESD protection (5V bi-directional)
+             |
+             +-- C1: 10-47 uF bulk input capacitor
+             |
+             +-- U2: LDO Regulator (SGM2040 or equiv)
+             |    * VIN <- Battery
+             |    * VOUT <- 3.3V
+             |    * GND <- GND
+             |    * Iq < 10 uA (critical for battery life)
+             |    * Output: 3.3V, 500mA
+             |
+             +-- C2: 10-22 uF bulk output capacitor
+             |
+             +-- C3, C4: 0.1 uF decoupling capacitors
+             |    Place near U1 VDDPST1, VDDPST2
+             |
+             +-- 3.3V Rail -> U1: VDDPST1, VDDPST2, VDDA3P3
+
+    3.3  LDO Selection Criteria
+         +---------------------------+------------------------------------+
+         | Parameter                 | Requirement                        |
+         +---------------------------+------------------------------------+
+         | Quiescent Current (Iq)    | < 10 uA                            |
+         | Output Voltage            | 3.3 V (+/- 2%)                     |
+         | Output Current            | >= 500 mA                          |
+         | Dropout Voltage           | < 200 mV at 500 mA                 |
+         | Package                   | SOT-23-5 or DFN (small footprint)  |
+         | Recommended Parts         | SGM2040, RT9080, or equivalent     |
+         +---------------------------+------------------------------------+
+
+4.  MCU INTERFACE (4-Wire Tuya Keep-Alive)
+    --------------------------------------
+    4.1  Signal Definition
+         +----------+-----------+---------+--------+------------------------+
+         | Signal   | Direction | GPIO    | Active | Description            |
+         +----------+-----------+---------+--------+------------------------+
+         | TXD      | Mod->MCU  | GPIO16  | --     | Serial transmit        |
+         | RXD      | MCU->Mod  | GPIO7   | --     | Serial receive         |
+         | SRDY     | MCU->Mod  | GPIO3   | Low    | MCU wakes module       |
+         | MRDY     | Mod->MCU  | GPIO20  | Low    | Module wakes MCU / has |
+         |          |           |         |        | data                   |
+         +----------+-----------+---------+--------+------------------------+
+
+    4.2  Serial Protocol (Per Tuya Standard)
+         +---------------------------+------------------------------------+
+         | Parameter                 | Value                              |
+         +---------------------------+------------------------------------+
+         | Baud Rate                 | 115200                             |
+         | Data Bits                 | 8                                  |
+         | Parity                    | None                               |
+         | Stop Bits                 | 1                                  |
+         | Flow Control              | None (HW handshake via SRDY/MRDY)  |
+         | Frame Header              | 0x55AA                             |
+         | Idle State                | TXD/RXD high                       |
+         | Start Bit                 | Low                                |
+         | Stop Bit                  | High                               |
+         +---------------------------+------------------------------------+
+
+    4.3  Wake Handshake Protocol
+         +---------------------------+------------------------------------+
+         | Rule                      | Value                              |
+         +---------------------------+------------------------------------+
+         | SRDY/MRDY active          | Pulled LOW                         |
+         | Wake pulse duration       | >= 10 ms                           |
+         | UART response timeout     | 500 ms                             |
+         | Wake frame response       | 20 ms                              |
+         | Retry count               | 3 attempts                         |
+         +---------------------------+------------------------------------+
+
+         Handshake flow:
+         1. Initiator pulls SRDY/MRDY low
+         2. Waits for response line to go low
+         3. Transmits UART data
+         4. After 10 seconds idle, releases line
+         5. Both may enter sleep
+
+         CRITICAL: Never send bytes to a sleeping UART. The SRDY/MRDY
+         handshake is the flow control mechanism.
+
+    4.4  Pull-Up Resistors
+         +----------+---------+-------------------+------------------------+
+         | Signal   | Ref     | Value             | Purpose                |
+         +----------+---------+-------------------+------------------------+
+         | SRDY     | R4      | 10kOhm to 3.3V    | Clean logic levels     |
+         | MRDY     | R5      | 10kOhm to 3.3V    | Clean logic levels     |
+         +----------+---------+-------------------+------------------------+
+
+5.  STRAPPING RESISTORS (Boot Safety)
+    ---------------------------------
+    Per Espressif guidelines, the following strapping pins require
+    specific pull-up/down resistors:
+    +----------+---------+-------------------+------------------------+
+    | Pin      | Ref     | Value             | Purpose                |
+    +----------+---------+-------------------+------------------------+
+    | EN       | R1      | 10kOhm to 3.3V    | Enable chip at boot    |
+    | GPIO0    | R2      | 10kOhm to 3.3V    | Boot mode selection    |
+    | GPIO8    | R3      | 10kOhm to 3.3V    | Boot safety (high at   |
+    |          |         |                   | reset)                 |
+    +----------+---------+-------------------+------------------------+
+
+    GPIO8 is a strapping pin - it must be high/floating at reset.
+    MRDY is assigned to GPIO20 specifically to avoid this constraint.
+
+6.  PROGRAMMING & CONTROL INTERFACE
+    -------------------------------
+    6.1  Programming Header (J3)
+         4-pin header (2.54mm pitch) for firmware flashing:
+         +----------+-------------------+------------------------+
+         | Pin      | Signal            | Notes                  |
+         +----------+-------------------+------------------------+
+         | 1        | 3.3V              | Power for programmer   |
+         | 2        | TXD (GPIO16)      | Module->Programmer     |
+         | 3        | RXD (GPIO7)       | Programmer->Module     |
+         | 4        | GND               | Common ground          |
+         +----------+-------------------+------------------------+
+
+    6.2  Control Buttons
+         +----------+---------+----------------------------------------+
+         | Ref      | GPIO    | Function                               |
+         +----------+---------+----------------------------------------+
+         | SW1      | GPIO9   | Reset button (momentary tact to GND)  |
+         |          |         | Factory reset / manual reset           |
+         | SW2      | GPIO0   | Boot button (momentary tact to GND)   |
+         |          |         | Enter download mode                    |
+         +----------+---------+----------------------------------------+
+
+7.  TEST POINTS (For Manufacturing)
+    --------------------------------
+    Minimum required test points:
+    +----------+-------------------+------------------------------------+
+    | Ref      | Signal            | Purpose                            |
+    +----------+-------------------+------------------------------------+
+    | TP1      | 3.3V              | Verify power supply                |
+    | TP2      | GND               | Reference ground                   |
+    | TP3      | EN                | Check enable pin state             |
+    | TP4      | TXD               | Debug UART output                  |
+    +----------+-------------------+------------------------------------+
+
+8.  PCB LAYOUT GUIDELINES (Per Espressif)
+    --------------------------------------
+    8.1  Layer Stack
+         +-------------+-------------------+----------------------------+
+         | Layer       | Function          | Requirement                |
+         +-------------+-------------------+----------------------------+
+         | Layer 1     | Signal +          | Route signals, place       |
+         | (Top)       | Components        | components                 |
+         | Layer 2     | Solid ground      | No signal traces, solid    |
+         |             | plane             | ground plane               |
+         | Layer 3     | Power + ground    | Route 3.3V, maintain       |
+         |             | pour              | ground under RF            |
+         | Layer 4     | Signal (minimal)  | No components, minimal     |
+         | (Bottom)    |                   | traces                     |
+         +-------------+-------------------+----------------------------+
+
+    8.2  Power Routing
+         +---------------------------+------------------------------------+
+         | Parameter                 | Requirement                        |
+         +---------------------------+------------------------------------+
+         | Main power trace width    | >= 25 mil                          |
+         | VDDA3P3 branch trace      | >= 20 mil                          |
+         | Other branch traces       | >= 10 mil                          |
+         | Power vias at layer change| >= 2 vias                          |
+         | Bulk cap at power entry   | >= 10 uF                           |
+         +---------------------------+------------------------------------+
+
+    8.3  Component Placement
+         - ESD protection (D2): Place near power entry port
+         - Bulk capacitor (C1): Place before power trace branches
+         - Decoupling caps (C3, C4): Place near VDDPST1, VDDPST2
+         - VDDA3P3 10 uF cap: Place on power trace near pin
+
+    8.4  XIAO Footprint
+         - Size: 21 x 17.5 mm
+         - Pads: 14 castellated edge pads
+         - Mounting: Single-sided SMD
+
+9.  BILL OF MATERIALS (BOM)
+    ------------------------
+    +--------+-----------------------------+-------------------+-----+----------------------------+
+    | Ref    | Component                   | Value             | Qty | Notes                      |
+    +--------+-----------------------------+-------------------+-----+----------------------------+
+    | U1     | ESP32-C6-MINI-1-N8          | 8MB flash, PCB    | 1   | Core module                |
+    |        | module                      | antenna           |     |                            |
+    | U2     | LDO regulator               | SGM2040 or equiv, | 1   | External power             |
+    |        |                             | 3.3V, 500mA,      |     |                            |
+    |        |                             | Iq<10uA           |     |                            |
+    | D1     | Schottky diode              | SS12 or equiv,    | 1   | Reverse polarity           |
+    |        |                             | 1A, 20V           |     | protection                 |
+    | D2     | TVS diode                   | SMBJ5.0A or equiv,| 1   | ESD protection             |
+    |        |                             | 5V bi-directional |     |                            |
+    | C1     | Bulk input capacitor         | 10-47uF, 6.3V,    | 1   | LDO input                  |
+    |        |                             | X5R/X7R           |     |                            |
+    | C2     | Bulk output capacitor        | 10-22uF, 6.3V,    | 1   | LDO output                 |
+    |        |                             | X5R/X7R           |     |                            |
+    | C3,C4  | Decoupling capacitors        | 0.1uF, 6.3V, X7R  | 2   | Near U1 VDDPST1/2          |
+    | R1     | EN pull-up resistor          | 10kOhm, 1%        | 1   | Enable chip                |
+    | R2     | Strapping resistor           | 10kOhm, 1%        | 1   | GPIO0 pull-up              |
+    | R3     | Strapping resistor           | 10kOhm, 1%        | 1   | GPIO8 pull-up              |
+    | R4     | SRDY pull-up resistor        | 10kOhm, 1%        | 1   | Handshake line             |
+    | R5     | MRDY pull-up resistor        | 10kOhm, 1%        | 1   | Handshake line             |
+    | J1     | Battery connector            | 2-pin JST PH      | 1   | Battery input              |
+    | J2     | MCU interface                | 4-pin header      | 1   | TXD,RXD,SRDY,MRDY          |
+    |        |                             | (2.54mm)          |     |                            |
+    | J3     | Programming header           | 4-pin header      | 1   | UART0 flashing             |
+    |        |                             | (2.54mm)          |     |                            |
+    | SW1    | Reset button                 | Tactile switch    | 1   | GPIO9 to GND               |
+    | SW2    | Boot button                  | Tactile switch    | 1   | GPIO0 to GND               |
+    | TP1-4  | Test points                  | SMD test point    | 4   | 3.3V, GND, EN, TXD         |
+    +--------+-----------------------------+-------------------+-----+----------------------------+
+
+10. SUPPLIER QUESTIONS (To Be Answered in Quotation)
+    -------------------------------------------------
+    1. Baseboard dimensions: Can you manufacture to 21 x 17.5 mm XIAO
+       footprint? What is MOQ?
+
+    2. Castellated pads: Are the 14 edge pads plated half-holes for SMD
+       soldering?
+
+    3. PCB stack: Can you provide 4-layer PCB with 1 oz copper and ENIG
+       finish at quoted price?
+
+    4. Lead time: Prototype (10-50 units) vs. production (1,000+ units)?
+
+    5. Component sourcing: Can you source the ESP32-C6-MINI-1-N8 and LDO,
+       or should we provide?
+
+    6. Testing: What testing (flying probe, ICT, functional) is included?
+
+11. REVISION HISTORY
+    ----------------
+    +----------+------------+-------------------+----------------------------+
+    | Version  | Date       | Author            | Changes                    |
+    +----------+------------+-------------------+----------------------------+
+    | 1.0      | 2026-07-20 | OZKEY Eng         | Initial draft              |
+    | 2.0      | 2026-07-25 | OZKEY Eng         | Added Espressif/Tuya refs, |
+    |          |            |                   | corrected BOM              |
+    +----------+------------+-------------------+----------------------------+
+
+===============================================================================
+END OF DOCUMENT
+===============================================================================
