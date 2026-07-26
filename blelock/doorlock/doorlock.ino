@@ -1,28 +1,64 @@
 /*
- * blecomm — OZLOCK Wi-Fi COMM MODULE v0 (blelock fork, 2026-07-19)
+ * doorlock — unified OZLOCK COMM MODULE (forked from blecomm.ino, 2026-07-26)
  * Board : Waveshare ESP32-C6 Touch-LCD 1.47" (pin map: blelock/HARDWARE.md)
  *
- * ROLE SPLIT (real Tuya architecture): this sketch is PURELY the comm module
- * (a TYWE3S equivalent). ALL lock duty — keypad, RFID, fingerprint, battery,
- * credential storage/validation, motor — lives on the MCU = LockSim Mode B,
- * connected over the Tuya 55 AA bus (Serial1 GPIO16/17 @9600 8N1 → CP2102).
+ * UNIFICATION (docs/ozkey-10.md, operator directive 2026-07-26): ONE
+ * firmware image for both transports blecomm.ino (Wi-Fi) and threadcomm.ino
+ * (Thread) used to split across. Selected per-device by the BLE provision
+ * payload's shape at commissioning time — never by which sketch was
+ * flashed:
+ *   - `ssid` present        -> Wi-Fi transport (blecomm's original path,
+ *                              unchanged below)
+ *   - `network_key` present -> Thread transport (ported from threadcomm.ino:
+ *                              join the dataset an already-provisioned
+ *                              bridge32 hands over BLE, then receive DPID
+ *                              command frames over the F4 UDP relay proven
+ *                              2026-07-25/26)
+ * `mode` (ozkey-cloud|ozkey-local) is orthogonal to transport — it still
+ * selects WHO the lock talks to; transport only selects HOW.
  *
- *   server → module : MQTT payload_hex → RAW frame forwarded to MCU (never
+ * KNOWN GAP, DELIBERATE (ozkey-10.md §5/§7): the Thread path's UPLINK
+ * (heartbeat/log -> bridge32 -> MQTT -> server) is NOT built — bridge32's
+ * own UDP socket is send-only today, and there is no addressing scheme yet
+ * for a lock to reach the bridge from a Thread mesh with no discovery
+ * mechanism. This pass proves Thread-join + DOWNLINK (bridge -> lock DPID
+ * frames, e.g. remote unlock) and measures flash footprint on N8. A
+ * Thread-transport lock therefore has no real "enrolled/paired" concept
+ * yet; it goes operational (keypad/DPID/PIN storage all work) the moment
+ * Thread attaches, since there is nothing yet for it to enroll WITH.
+ *
+ * ROLE SPLIT (real Tuya architecture, unchanged from blecomm): this sketch
+ * is PURELY the comm module (a TYWE3S equivalent). ALL lock duty — keypad,
+ * RFID, fingerprint, battery, credential storage/validation, motor — lives
+ * on the MCU = LockSim Mode B, connected over the Tuya 55 AA bus (Serial1
+ * GPIO16/17 @9600 8N1 → CP2102).
+ *
+ *   server → module : command frame (via MQTT or Thread UDP, transport-
+ *                     dependent) → RAW frame forwarded to MCU (never
  *                     executed locally — the MCU owns credentials)
  *   MCU → module    : 55 AA frames translated up: ACCESS_RESULT (DP 8) →
  *                     granted/denied/expired door logs; other DPs → dp_report
  *
- * Provisioning/network spine is blelock-identical: BLE "OZLOCK" advertise →
- * BANOI/MAOI ProvisionPayload → WiFi → MQTT → enroll (cloud) or
- * unpaired-announce + provision_assign (hotel). Same NVS namespace, so a
- * board flashed blelock↔blecomm keeps its enrollment.
- * Factory reset: same invisible '*' then '5' touch zones, every screen.
- * Screen = comm dashboard (no keypad): mode/WiFi/broker/MCU-link + counters.
+ * Provisioning/network spine is blelock-identical for the Wi-Fi path: BLE
+ * "OZLOCK" advertise → BANOI/MAOI ProvisionPayload → WiFi → MQTT → enroll
+ * (cloud) or unpaired-announce + provision_assign (hotel). Same NVS
+ * namespace, so a board flashed blelock↔blecomm↔doorlock keeps its
+ * enrollment (transport field is additive, defaults to "wifi" for existing
+ * rows).
+ * Factory reset: same invisible '*' then '5' touch zones, every screen —
+ * now also erases the persisted Thread dataset via otInstanceFactoryReset()
+ * when the active transport is Thread (a plain NVS wipe alone would leave
+ * the device rejoining the same old mesh on reboot).
+ * Screen = comm dashboard (no keypad): mode/transport/broker/MCU-link +
+ * counters.
  *
  * Power/wake model (ozkey-08 §0.2/§0.3): persistent power (keep-alive
  * topology), SRDY/MRDY wake handshake on GPIO7/8, module-owned proactive
- * pull timer (heartbeat_s, 1-10 min). Bench: NVS wake_sim=true (CP2102 has
- * no wake wires) = SRDY assumed asserted, no sleep; MRDY still driven.
+ * pull timer (heartbeat_s, 1-10 min) — Wi-Fi transport only for now. Bench:
+ * NVS wake_sim=true (CP2102 has no wake wires) = SRDY assumed asserted, no
+ * sleep; MRDY still driven. Thread SED polling as a wake source (ozkey-10
+ * §7 Q1) is an open decision, not yet wired — Thread-transport locks simply
+ * never enter the keep-alive nap in this pass (see the loop() gate).
  */
 
 #include <Arduino_GFX_Library.h>
@@ -40,6 +76,8 @@
 #include "driver/gpio.h"
 #include "esp_sleep.h"
 #include "ozcrypto.h" // member-ceremony crypto (XF-46 §7.1) + boot self-test
+#include <OThread.h>     // Thread transport (ported from threadcomm.ino)
+#include <OThreadUDP.h>  // F4 UDP relay (bridge32/threadcomm proven, 2026-07-25/26)
 
 // ── Hardware pins (HARDWARE.md, operator-verified) ──────────────────────────
 #define LCD_DC 15
@@ -85,7 +123,8 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 #define CHR_PROVISION "4f5a4b31-0002-4c4f-434b-000000000001"
 #define CHR_STATUS "4f5a4b31-0003-4c4f-434b-000000000001"
 #define CHR_INFO "4f5a4b31-0004-4c4f-434b-000000000001"
-#define FW_VERSION "blecomm-1.0"
+#define FW_VERSION "doorlock-1.0"
+#define FW_DISPLAY_VERSION "v1.0" // shown on-screen next to the OZLOCK logo
 
 // ── State machine ───────────────────────────────────────────────────────────
 enum CommState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
@@ -101,6 +140,30 @@ String cfgMode = "ozkey-cloud", cfgRoomNo, cfgMacToken;
 bool isLocalMode() { return cfgMode == "ozkey-local"; }
 
 String deviceId, macStr;
+
+// ── Transport (2026-07-26, ozkey-10 unification) ────────────────────────────
+// "wifi" (blecomm's original path) or "thread" (ported from threadcomm.ino).
+// Selected once, at provisioning, by payload shape — see applyProvision().
+String cfgTransport = "wifi"; // NVS "xport"
+bool isThread() { return cfgTransport == "thread"; }
+
+OpenThread thread;
+DataSet otDataset;
+bool threadFormed = false;
+unsigned long threadJoinStart = 0;
+#define THREAD_JOIN_TIMEOUT_MS 30000UL
+
+// F4 UDP relay, receive half (ported from threadcomm.ino, bench-proven
+// 2026-07-25/26). DOWNLINK ONLY in this pass — see the header comment for
+// why uplink isn't built yet. Group/port MUST match bridge32.ino exactly.
+const uint8_t OZ_THREAD_GROUP_BYTES[16] = {0xff, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x4f, 0x5a};
+const IPAddress OZ_THREAD_GROUP(IPv6, OZ_THREAD_GROUP_BYTES);
+const uint16_t OZ_THREAD_UDP_PORT = 5052;
+#define OZ_UDP_RX_BUF 512
+OThreadUDP threadUdp;
+bool threadUdpReady = false;
+unsigned long threadUdpLastAttempt = 0;
+#define THREAD_UDP_RETRY_MS 3000UL
 
 // BLE
 BLEServer *bleServer = nullptr;
@@ -276,16 +339,18 @@ void drawAdvertising() {
   gfx->setTextColor(C_AMBER);
   gfx->setTextSize(1);
   gfx->setCursor(15, 12);
-  gfx->println("OZLOCK COMM MODULE (blecomm)");
+  gfx->println("OZLOCK COMM MODULE (doorlock)");
   gfx->setCursor(15, 28);
   gfx->print("BLE: ");
   gfx->print(bleClientConnected ? "APP CONNECTED" : "ADVERTISING...");
   gfx->setTextSize(3);
   gfx->setTextColor(C_WHITE);
   gfx->setCursor(52, 70);
-  gfx->println("OZCOMM");
+  gfx->println("OZLOCK");
   gfx->setTextSize(1);
   gfx->setTextColor(C_GREY);
+  gfx->setCursor(172, 88); // small version badge beside the logo
+  gfx->println(FW_DISPLAY_VERSION);
   gfx->setCursor(15, 120);
   gfx->print("device_id: ");
   gfx->println(deviceId);
@@ -305,7 +370,7 @@ void drawJoining() {
   gfx->setTextColor(C_BLUE);
   gfx->setTextSize(1);
   gfx->setCursor(15, 12);
-  gfx->println("OZCOMM - CONNECTING");
+  gfx->println("OZLOCK - CONNECTING");
   gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE);
   gfx->setCursor(15, 36);
@@ -328,7 +393,13 @@ void drawJoining() {
 // plus door name, IP, network status. Border colour = health summary:
 // GREEN = net + MCU link up · AMBER = one leg down · RED = both down.
 void drawOperational() {
-  bool netUp = (WiFi.status() == WL_CONNECTED) && mqtt.connected();
+  // Transport-aware (2026-07-26): Wi-Fi's "connected" is WL_CONNECTED+MQTT;
+  // Thread's is just having attached (threadFormed) — this pass has no
+  // uplink, so there's no MQTT-equivalent "server reachable" signal for
+  // Thread yet (ozkey-10 §5). Showing plain WiFi state for a Thread board
+  // would just be wrong, not merely incomplete.
+  bool netUp = isThread() ? threadFormed
+                          : ((WiFi.status() == WL_CONNECTED) && mqtt.connected());
   bool mcuUp = mcuLinkUp();
   bool open = doorStatus == "UNLOCKED";
   uint16_t border = (netUp && mcuUp) ? C_GREEN : (netUp || mcuUp) ? C_AMBER : C_RED;
@@ -340,8 +411,8 @@ void drawOperational() {
   gfx->setTextSize(1);
   gfx->setTextColor(border);
   gfx->setCursor(15, 8);
-  gfx->print("OZCOMM ");
-  gfx->print(isLocalMode() ? "(hotel)" : "(ozlock)");
+  gfx->print("OZLOCK ");
+  gfx->print(isThread() ? "(thread)" : isLocalMode() ? "(hotel)" : "(wifi)");
   if (isLocalMode() && cfgRoomNo.length()) { // room lives in the header now
     gfx->print(" P.");
     gfx->print(cfgRoomNo);
@@ -370,15 +441,19 @@ void drawOperational() {
   int y = 72;
   gfx->setCursor(15, y);
   gfx->setTextColor(C_WHITE);
-  gfx->print("Net: ");
+  gfx->print(isThread() ? "Thread: " : "Net: ");
   gfx->setTextColor(netUp ? C_GREEN : C_RED);
-  gfx->print(netUp ? "ONLINE" : "OFFLINE");
+  gfx->print(netUp ? (isThread() ? "JOINED" : "ONLINE") : (isThread() ? "DOWN" : "OFFLINE"));
   gfx->setTextColor(C_WHITE);
-  gfx->print(mqtt.connected() ? " MQTT OK" : " MQTT --");
+  if (!isThread()) gfx->print(mqtt.connected() ? " MQTT OK" : " MQTT --");
   y += 24;
   gfx->setCursor(15, y);
-  gfx->print("IP : ");
-  gfx->print(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("---"));
+  if (isThread()) {
+    gfx->print("Uplink: not built yet"); // ozkey-10 §5 — honest, not silent
+  } else {
+    gfx->print("IP : ");
+    gfx->print(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("---"));
+  }
   y += 24;
   gfx->setCursor(15, y);
   gfx->print("Log: ");
@@ -415,6 +490,12 @@ void loadConfig() {
   cfgRoomNo = prefs.getString("room", "");
   cfgMacToken = prefs.getString("mtoken", "");
   wakeSim = prefs.getBool("wksim", true);
+  cfgTransport = prefs.getString("xport", "wifi"); // additive field — old
+                                                    // rows with no "xport"
+                                                    // key correctly default
+                                                    // to "wifi" (unchanged
+                                                    // behavior for existing
+                                                    // blecomm-provisioned boards)
   prefs.end();
 }
 
@@ -435,12 +516,26 @@ void saveConfig() {
   prefs.putString("room", cfgRoomNo);
   prefs.putString("mtoken", cfgMacToken);
   prefs.putBool("wksim", wakeSim);
+  prefs.putString("xport", cfgTransport);
   prefs.end();
 }
 
 void factoryReset() {
   Serial.println("[RESET] factory reset — wiping NVS + txlog");
   prefs.begin("blelock", false); prefs.clear(); prefs.end();
+  // Thread's persisted dataset lives in OpenThread's own NVS storage, not
+  // our "blelock" namespace above — a plain NVS wipe alone would leave a
+  // Thread-transport board rejoining the same old mesh on reboot. Same fix
+  // as threadcomm.ino (2026-07-26): otInstanceFactoryReset() erases it
+  // properly (lock-guarded; esp_openthread_lock.h is transitively available
+  // via <OThread.h>).
+  if (isThread()) {
+    otInstance *inst = thread.getInstance();
+    if (inst != nullptr && esp_openthread_lock_acquire(portMAX_DELAY)) {
+      otInstanceFactoryReset(inst); // erases OT persistent info + platform reset
+      esp_openthread_lock_release(); // unreachable if the reset already fired
+    }
+  }
   if (fsUp) {
     LittleFS.remove("/txlog.0");
     LittleFS.remove("/txlog.1");
@@ -448,6 +543,34 @@ void factoryReset() {
   drawFlash("RESET", C_AMBER, C_BLACK);
   delay(800);
   ESP.restart();
+}
+
+// Hardware escape hatch (2026-07-26, added alongside the touch gesture
+// above): touch depends on the CST816-class controller/I2C wiring working
+// at all — if that's ever flaky or dead on a given unit, the '*'-then-'5'
+// ceremony is unreachable. BOOT-hold is independent of touch entirely, same
+// mechanism as bridge32.ino/threadcomm.ino.
+#ifndef USER_BUTTON
+#define USER_BUTTON BOOT_PIN
+#endif
+#define FACTORY_RESET_HOLD_MS 5000UL
+unsigned long buttonHeldSince = 0;
+bool buttonWasDown = false;
+
+void checkFactoryResetButton() {
+  bool down = digitalRead(USER_BUTTON) == LOW;
+  if (down && !buttonWasDown) {
+    buttonHeldSince = millis();
+  } else if (down && buttonWasDown) {
+    unsigned long held = millis() - buttonHeldSince;
+    if (held >= FACTORY_RESET_HOLD_MS) {
+      Serial.println("[RESET] BOOT held 5s — factory reset");
+      factoryReset(); // does not return
+    } else if (held > 800 && (held / 500) % 2 == 0) {
+      Serial.printf("[RESET] holding BOOT... %lus/5s\n", held / 1000);
+    }
+  }
+  buttonWasDown = down;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -603,6 +726,73 @@ void publishUnpairedAnnounce() {
   Serial.println("[PAIR->] unpaired announce (waiting for room assign)");
 }
 
+// Shared by both transports (2026-07-26 unification): a command frame is a
+// command frame regardless of whether it arrived via MQTT payload_hex
+// (Wi-Fi) or the F4 Thread UDP relay's "payload" field — parse the hex,
+// forward to the MCU, mirror a remote-unlock locally. Spaced or bare hex
+// both accepted (OZKEYSERV publishes spaced; bridge32's F4 envelope is bare).
+void forwardHexToMcu(const String &hex) {
+  static uint8_t frame[256];
+  size_t fn = 0;
+  int hi = -1;
+  for (size_t i = 0; i < hex.length() && fn < sizeof(frame); i++) {
+    char c = hex[i];
+    if (c == ' ' || c == ':') continue;
+    int v = hexNibble(c);
+    if (v < 0) { Serial.println("[TUYA] bad hex in command frame"); return; }
+    if (hi < 0) {
+      hi = v;
+    } else {
+      frame[fn++] = (hi << 4) | v;
+      hi = -1;
+    }
+  }
+  if (fn < 4) return;
+  Serial.printf("[FWD] server cmd -> MCU: %s\n", describeDpid(frame, fn).c_str());
+  tuyaWireSend(frame, fn);
+  // remote unlock (DP 1 BOOL 01): LockSim unlocks on receipt — mirror it
+  if (fn >= 11 && frame[3] == 0x06 && frame[6] == 1 && frame[7] == 0x01 &&
+      frame[10] == 0x01)
+    markDoorUnlocked();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F4 UDP relay, receive half (ported from threadcomm.ino, bench-proven
+// 2026-07-25/26). Every lock on the mesh gets every datagram from bridge32
+// and filters by its own device_id in "target" — same v0 addressing
+// simplification threadcomm.ino used (no discovery mechanism exists yet,
+// ozkey-10 §7 Q3).
+// ─────────────────────────────────────────────────────────────────────────────
+void threadUdpBegin() {
+  if (threadUdpReady) return;
+  threadUdpLastAttempt = millis();
+  threadUdpReady = threadUdp.beginMulticast(OZ_THREAD_GROUP, OZ_THREAD_UDP_PORT) != 0;
+  Serial.printf("[UDP] multicast socket %s on [%s]:%u\n", threadUdpReady ? "open" : "FAILED",
+                OZ_THREAD_GROUP.toString().c_str(), OZ_THREAD_UDP_PORT);
+}
+
+void pollThreadUdp() {
+  if (!threadUdpReady) return;
+  int n = threadUdp.parsePacket();
+  if (n <= 0) return;
+
+  char buf[OZ_UDP_RX_BUF];
+  int got = threadUdp.read(buf, (n < (int)sizeof(buf) - 1) ? n : (int)sizeof(buf) - 1);
+  buf[got] = '\0';
+
+  JsonDocument doc;
+  if (deserializeJson(doc, buf) != DeserializationError::Ok) {
+    Serial.println("[UDP] payload not valid JSON, dropped");
+    return;
+  }
+  String target = (const char *)(doc["target"] | "");
+  String payloadHex = (const char *)(doc["payload"] | "");
+  if (target != deviceId) return; // not for us
+  Serial.printf("[UDP] << target=%s payload=%s\n", target.c_str(), payloadHex.c_str());
+  lastActivityAt = millis();
+  forwardHexToMcu(payloadHex);
+}
+
 void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   String body; body.reserve(length);
   for (unsigned int i = 0; i < length; i++) body += (char)payload[i];
@@ -671,33 +861,9 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     return;
   }
   // Command envelope {action, grant_id, payload_hex}: PURE FORWARD to the
-  // MCU — the comm module never executes credentials. (OZLOCK publishes
-  // SPACED hex; parse pairs skipping whitespace, then re-emit RAW bytes.)
+  // MCU — the comm module never executes credentials.
   const char *hex = doc["payload_hex"] | (const char *)nullptr;
-  if (hex) {
-    static uint8_t frame[256];
-    size_t fn = 0;
-    int hi = -1;
-    for (const char *p = hex; *p && fn < sizeof(frame); p++) {
-      if (*p == ' ' || *p == ':') continue;
-      int v = hexNibble(*p);
-      if (v < 0) { Serial.println("[TUYA] bad hex in payload_hex"); return; }
-      if (hi < 0) {
-        hi = v;
-      } else {
-        frame[fn++] = (hi << 4) | v;
-        hi = -1;
-      }
-    }
-    if (fn >= 4) {
-      Serial.printf("[FWD] server cmd -> MCU: %s\n", describeDpid(frame, fn).c_str());
-      tuyaWireSend(frame, fn);
-      // remote unlock (DP 1 BOOL 01): LockSim unlocks on receipt — mirror it
-      if (fn >= 11 && frame[3] == 0x06 && frame[6] == 1 && frame[7] == 0x01 &&
-          frame[10] == 0x01)
-        markDoorUnlocked();
-    }
-  }
+  if (hex) forwardHexToMcu(String(hex));
 }
 
 void ensureMqtt() {
@@ -738,19 +904,43 @@ void ensureMqtt() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Provisioning (BLE write → JOINING) — blelock-identical
+// Thread dataset hex parsing (ported verbatim from threadcomm.ino)
+// ─────────────────────────────────────────────────────────────────────────────
+bool hexToBytes(const String &hex, uint8_t *out, size_t expectLen) {
+  if ((size_t)hex.length() != expectLen * 2) return false;
+  for (size_t i = 0; i < expectLen; i++) {
+    int h = hexNibble(hex[i * 2]), l = hexNibble(hex[i * 2 + 1]);
+    if (h < 0 || l < 0) return false;
+    out[i] = (uint8_t)((h << 4) | l);
+  }
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Provisioning (BLE write → JOINING). Transport-agnostic prefix (mode,
+// device_id, and the common broker/site/name/heartbeat fields) shared by
+// both paths; branches on payload shape at the bottom (ozkey-10 §4).
 // ─────────────────────────────────────────────────────────────────────────────
 void applyProvision(JsonDocument &doc) {
-  String mode = doc["mode"] | "";
-  if (mode != "ozkey-cloud" && mode != "ozkey-local") { notifyStatus("ENROLL_FAIL"); return; }
   String pid = doc["device_id"] | "";
   if (pid.length() && pid != deviceId) {
     Serial.printf("[PROV] device_id mismatch (%s != %s)\n", pid.c_str(), deviceId.c_str());
     notifyStatus("ENROLL_FAIL");
     return;
   }
-  cfgSsid = (const char *)(doc["ssid"] | "");
-  cfgPass = (const char *)(doc["password"] | "");
+
+  // BUG FIX (2026-07-26, live bench): `mode` used to be required as the
+  // very first check, unconditionally. But the app's Thread-dataset
+  // payload (ThreadDataset.encodeLockProvision(), unchanged since it was
+  // built for the old threadcomm.ino-only binary) never included `mode` at
+  // all — threadcomm.ino's own applyProvision() never checked for it. So
+  // every real Thread provisioning attempt was rejected with ENROLL_FAIL
+  // before this function even looked at whether it was a Thread payload.
+  // `mode` is only actually CONSUMED by the Wi-Fi path today (no
+  // broker/uplink exists for Thread yet — ozkey-10 §5), so it's now
+  // validated strictly there and soft-defaulted here.
+  String mode = doc["mode"] | "";
+
   cfgBrokerHost = (const char *)(doc["broker_host"] | "");
   cfgBrokerPort = doc["broker_tcp_port"] | 1883;
   cfgServerIp = (const char *)(doc["server_ip"] | "");
@@ -758,9 +948,80 @@ void applyProvision(JsonDocument &doc) {
   cfgSiteId = (const char *)(doc["site_id"] | "lab");
   cfgName = (const char *)(doc["name"] | "");
   cfgHeartbeatS = clampHeartbeatS(doc["heartbeat_s"] | 60);
+
+  // Transport discriminator (ozkey-10 §4): same rule threadcomm.ino already
+  // used as a separate binary — network_key present -> Thread dataset;
+  // ssid present -> Wi-Fi credentials. Checked as strings (not just
+  // truthiness) so an empty/missing field doesn't accidentally match.
+  bool hasNetworkKey = doc["network_key"].is<const char *>() &&
+                       String((const char *)doc["network_key"]).length();
+  bool hasSsid = doc["ssid"].is<const char *>() &&
+                 String((const char *)doc["ssid"]).length();
+
+  if (hasNetworkKey) {
+    // ── Thread transport (ported from threadcomm.ino) ─────────────────────
+    // mode isn't sent by today's Thread-dataset payload and isn't consumed
+    // by anything in this transport yet — default rather than reject.
+    if (mode != "ozkey-cloud" && mode != "ozkey-local") mode = "ozkey-cloud";
+    String tName = (const char *)(doc["network_name"] | "");
+    String extPanHex = (const char *)(doc["ext_pan_id"] | "");
+    String keyHex = (const char *)(doc["network_key"] | "");
+    String panHex = (const char *)(doc["pan_id"] | "");
+    int channel = doc["channel"] | 0;
+
+    uint8_t extPanId[8], networkKey[16];
+    if (!tName.length() || channel < 11 || channel > 26 ||
+        !hexToBytes(extPanHex, extPanId, 8) || !hexToBytes(keyHex, networkKey, 16) ||
+        panHex.length() != 4) {
+      Serial.println("[PROV] malformed Thread dataset payload");
+      notifyStatus("ENROLL_FAIL");
+      return;
+    }
+    uint16_t panId = (uint16_t)strtoul(panHex.c_str(), nullptr, 16);
+
+    otDataset.initNew();
+    otDataset.setNetworkName(tName.c_str());
+    otDataset.setExtendedPanId(extPanId);
+    otDataset.setNetworkKey(networkKey);
+    otDataset.setChannel((uint8_t)channel);
+    otDataset.setPanId(panId);
+    thread.commitDataSet(otDataset);
+
+    cfgMode = mode;
+    cfgTransport = "thread";
+    cfgRoomNo = "";
+    cfgMacToken = "";
+    provisioned = true;
+    enrolled = false; // no enrollment concept over Thread yet — see header comment
+    saveConfig();
+    buildTopics();
+    Serial.printf("[PROV] mode=%s site=%s transport=thread name=%s ch=%d\n",
+                  cfgMode.c_str(), cfgSiteId.c_str(), tName.c_str(), channel);
+
+    threadJoinStart = millis();
+    state = ST_JOINING;
+    joinLine1 = "Thread: joining " + tName + "...";
+    joinLine2 = "(no uplink yet — ozkey-10 gap)";
+    screenDirty = true;
+    notifyStatus("THREAD_JOINING");
+    OpenThread::begin(false);
+    thread.start();
+    thread.networkInterfaceUp();
+    return;
+  }
+
+  if (!hasSsid) { notifyStatus("ENROLL_FAIL"); return; } // neither shape present
+
+  // ── Wi-Fi transport (blecomm's original path, unchanged) ─────────────────
+  // mode IS strictly required here — this is the only path that actually
+  // uses it (isLocalMode() gates MQTT enrollment vs hotel-announce below).
+  if (mode != "ozkey-cloud" && mode != "ozkey-local") { notifyStatus("ENROLL_FAIL"); return; }
+  cfgSsid = (const char *)(doc["ssid"] | "");
+  cfgPass = (const char *)(doc["password"] | "");
   if (!cfgSsid.length() || !cfgBrokerHost.length()) { notifyStatus("ENROLL_FAIL"); return; }
 
   cfgMode = mode;
+  cfgTransport = "wifi";
   cfgRoomNo = "";
   cfgMacToken = "";
   provisioned = true;
@@ -849,6 +1110,18 @@ void startBle() {
   doc["fw"] = FW_VERSION;
   doc["name"] = cfgName;
   doc["pub"] = ozLockPubHex(); // X25519 ceremony pubkey (XF-46 §7.1)
+  // BUG FIX (2026-07-26, caught during app-impact review): blecomm.ino never
+  // reported "transport" since it was always Wi-Fi; threadcomm.ino hard-
+  // coded "thread" since it was always Thread. The unified binary can be
+  // EITHER depending on cfgTransport, and the app's existing auto-detect
+  // (info.transport=='thread' -> Thread courier flow) depends on this field
+  // existing — omitting it would silently make every unified lock look
+  // like a Wi-Fi lock to the app, always. NOTE: for a never-provisioned
+  // board this still reads "wifi" (the NVS default) — see the app-side
+  // discussion this same field surfaced (fresh-commissioning transport
+  // choice can't be auto-detected the way it could when two separate
+  // firmwares existed).
+  doc["transport"] = cfgTransport;
   String info; serializeJson(doc, info);
   chrInfo->setValue(info.c_str());
 
@@ -994,7 +1267,7 @@ void enterKeepAliveSleep() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n*** blecomm v1 — OZLOCK COMM MODULE (MCU = LockSim on UART) ***");
+  Serial.println("\n*** doorlock v0 — unified OZLOCK COMM MODULE (MCU = LockSim on UART) ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
 
   // Tuya MCU bus → LockSim Mode B (raw 55 AA frames, wire-tested 2026-07-19)
@@ -1020,6 +1293,7 @@ void setup() {
   gfx->fillScreen(C_BLACK);
 
   touchInit();
+  pinMode(USER_BUTTON, INPUT_PULLUP); // hold 5s -> factory reset, touch-independent
 
   WiFi.mode(WIFI_STA);
   WiFi.onEvent(
@@ -1041,7 +1315,23 @@ void setup() {
   Serial.printf("[CRYPTO] info.pub=%s\n", ozLockPubHex().c_str());
   ozCryptoSelfTest();
 
-  if (provisioned) {
+  if (provisioned && isThread()) {
+    // Thread resume (ported from threadcomm.ino): relies entirely on
+    // OpenThread's own NVS-backed dataset (never stored in our "blelock"
+    // prefs), same as threadcomm.ino always did.
+    state = ST_JOINING;
+    joinLine1 = "Thread: joining...";
+    joinLine2 = "(no uplink yet — ozkey-10 gap)";
+    OpenThread::begin(false);
+    if (thread.hasActiveDataset()) {
+      Serial.println("[THREAD] resuming persisted dataset");
+    } else {
+      Serial.println("[THREAD] no persisted dataset on resume — re-provision needed");
+    }
+    thread.start();
+    thread.networkInterfaceUp();
+    threadJoinStart = millis();
+  } else if (provisioned) {
     state = enrolled ? ST_OPERATIONAL : ST_JOINING;
     joinLine1 = "WiFi: joining " + cfgSsid + "...";
     joinLine2 = "Server: " + cfgBrokerHost + ":" + String(cfgBrokerPort);
@@ -1061,12 +1351,13 @@ void setup() {
 }
 
 void loop() {
+  checkFactoryResetButton();
   tuyaWirePump(); // MCU (LockSim) → module frames off the wire
 
-  // ── WiFi progress ─────────────────────────────────────────────────────────
+  // ── WiFi progress (Wi-Fi transport only) ─────────────────────────────────
   static wl_status_t lastWifi = WL_IDLE_STATUS;
   wl_status_t ws = WiFi.status();
-  if (ws != lastWifi) {
+  if (!isThread() && ws != lastWifi) {
     lastWifi = ws;
     Serial.printf("[WiFi] status=%d\n", (int)ws);
     if (ws == WL_CONNECTED) {
@@ -1083,7 +1374,7 @@ void loop() {
       Serial.printf("[WiFi] up, IP %s\n", WiFi.localIP().toString().c_str());
     }
   }
-  if (state == ST_JOINING && ws != WL_CONNECTED && provisioned &&
+  if (!isThread() && state == ST_JOINING && ws != WL_CONNECTED && provisioned &&
       wifiJoinStart && millis() - wifiJoinStart > 25000) {
     wifiJoinStart = 0;
     WiFi.disconnect(true); // stop the driver's own retry loop — a bad
@@ -1095,21 +1386,52 @@ void loop() {
     if (bleServer == nullptr) startBle();
   }
 
-  // ── MQTT + enroll retry / unpaired announce ──────────────────────────────
-  if (provisioned) ensureMqtt();
-  if (!isLocalMode() && state == ST_JOINING && mqtt.connected() && !enrolled &&
-      lastEnrollSent && millis() - lastEnrollSent > 8000 && enrollAttempts < 5) {
-    publishEnroll();
+  // ── Thread progress (Thread transport only, ported from threadcomm.ino) ──
+  if (isThread() && state == ST_JOINING) {
+    ot_device_role_t role = OpenThread::otGetDeviceRole();
+    if (role == OT_ROLE_CHILD || role == OT_ROLE_ROUTER || role == OT_ROLE_LEADER) {
+      Serial.printf("[THREAD] attached as %s\n", OpenThread::otGetStringDeviceRole());
+      threadFormed = true;
+      notifyStatus("THREAD_OK");
+      joinLine1 = "Thread: OK";
+      // No enrollment concept over Thread yet (uplink not built — ozkey-10
+      // §5); go operational so keypad/DPID/PIN-storage work regardless.
+      enrolled = true;
+      saveConfig();
+      state = ST_OPERATIONAL;
+      screenDirty = true;
+      threadUdpBegin();
+    } else if (millis() - threadJoinStart > THREAD_JOIN_TIMEOUT_MS) {
+      Serial.println("[THREAD] attach timeout");
+      notifyStatus("THREAD_FAIL");
+      joinLine1 = "Thread FAILED";
+      screenDirty = true;
+      if (bleServer == nullptr) startBle();
+    }
   }
-  if (isLocalMode() && mqtt.connected() && !enrolled &&
-      millis() - lastUnpairedAnnounce > 20000) {
-    publishUnpairedAnnounce();
+  if (isThread() && state == ST_OPERATIONAL && !threadUdpReady &&
+      millis() - threadUdpLastAttempt > THREAD_UDP_RETRY_MS) {
+    threadUdpBegin();
   }
+  if (isThread()) pollThreadUdp();
 
-  // ── heartbeat ─────────────────────────────────────────────────────────────
-  if (mqtt.connected() && millis() - lastHeartbeat > cfgHeartbeatS * 1000UL) {
-    lastHeartbeat = millis();
-    publishHeartbeat();
+  // ── MQTT + enroll retry / unpaired announce (Wi-Fi transport only) ───────
+  if (!isThread()) {
+    if (provisioned) ensureMqtt();
+    if (!isLocalMode() && state == ST_JOINING && mqtt.connected() && !enrolled &&
+        lastEnrollSent && millis() - lastEnrollSent > 8000 && enrollAttempts < 5) {
+      publishEnroll();
+    }
+    if (isLocalMode() && mqtt.connected() && !enrolled &&
+        millis() - lastUnpairedAnnounce > 20000) {
+      publishUnpairedAnnounce();
+    }
+
+    // ── heartbeat (Wi-Fi/MQTT only — Thread has no uplink yet, ozkey-10 §5) ─
+    if (mqtt.connected() && millis() - lastHeartbeat > cfgHeartbeatS * 1000UL) {
+      lastHeartbeat = millis();
+      publishHeartbeat();
+    }
   }
 
   // ── door-status mirror auto-relock (matches LockSim's 5s) ────────────────
@@ -1149,12 +1471,15 @@ void loop() {
     String modeInfo = cfgMode;
     if (isLocalMode())
       modeInfo += cfgRoomNo.length() ? (" room=" + cfgRoomNo) : " (no room)";
-    Serial.printf("[MON] %s mode=%s wifi=%s ip=%s mqtt=%s mcu=%s tx=%u rx=%u "
-                  "wake=%s mrdy=%s srdy=%s hb=%us naps=%u heap=%u\n",
-                  st, modeInfo.c_str(),
+    Serial.printf("[MON] %s xport=%s mode=%s wifi=%s ip=%s mqtt=%s thread=%s "
+                  "udp=%s mcu=%s tx=%u rx=%u wake=%s mrdy=%s srdy=%s hb=%us "
+                  "naps=%u heap=%u\n",
+                  st, cfgTransport.c_str(), modeInfo.c_str(),
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
                   WiFi.localIP().toString().c_str(),
                   mqtt.connected() ? "up" : "down",
+                  threadFormed ? "up" : "down",
+                  threadUdpReady ? "up" : "down",
                   mcuLinkUp() ? "up" : "DOWN",
                   (unsigned)mcuTxFrames, (unsigned)mcuRxFrames,
                   wakeSim ? "sim" : "real",
@@ -1173,10 +1498,13 @@ void loop() {
     else drawOperational();
   }
 
-  // ── §0.2/§0.3 keep-alive nap (honest mode only; bench wake_sim skips) ────
-  if (!wakeSim && state == ST_OPERATIONAL && enrolled && bleServer == nullptr &&
-      !bleClientConnected && !resetArm && doorStatus == "LOCKED" &&
-      !touchWasDown && !mrdyAsserted &&
+  // ── §0.2/§0.3 keep-alive nap (Wi-Fi transport, honest mode only; bench
+  // wake_sim skips). Thread SED polling as a wake source is still an open
+  // decision (ozkey-10 §7 Q1) — Thread-transport locks never nap in this
+  // pass rather than guess at an interaction that hasn't been decided.
+  if (!isThread() && !wakeSim && state == ST_OPERATIONAL && enrolled &&
+      bleServer == nullptr && !bleClientConnected && !resetArm &&
+      doorStatus == "LOCKED" && !touchWasDown && !mrdyAsserted &&
       millis() - lastActivityAt > SLEEP_IDLE_MS) {
     enterKeepAliveSleep();
   }

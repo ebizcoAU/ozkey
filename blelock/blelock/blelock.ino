@@ -156,7 +156,13 @@ void notifyStatus(const char *wire) {
   Serial.printf("[STATUS] %s\n", wire);
   if (chrStatus != nullptr) {
     chrStatus->setValue((uint8_t *)wire, strlen(wire));
-    if (bleClientConnected) chrStatus->notify();
+    if (bleClientConnected) {
+      chrStatus->notify();
+      // Same fix as bridge32.ino (2026-07-26): a fast-resolving status
+      // ladder can overwrite an unsent notify before the phone's BLE stack
+      // transmits it, so the app misses a state entirely. Give it room.
+      delay(150);
+    }
   }
 }
 
@@ -734,15 +740,29 @@ void applyProvision(JsonDocument &doc) {
                 isLocalMode() ? "HOTEL (announce+await room)"
                               : "OZLOCK (enroll)");
 
+  // RACE FIX round 2 (2026-07-26, bridge32 bench finding): wifiJoinStart
+  // must be fresh BEFORE state flips to ST_JOINING — loop() (main task) can
+  // be scheduled between any two statements here (BLE callback task) and
+  // would otherwise see the new state with the OLD wifiJoinStart (from a
+  // join minutes ago), making millis()-wifiJoinStart instantly exceed the
+  // timeout and fire a false "join timeout" before WiFi.begin() even ran.
+  wifiJoinStart = millis();
   state = ST_JOINING;
   joinLine1 = "WiFi: joining " + cfgSsid + "...";
   joinLine2 = "Server: " + cfgBrokerHost + ":" + String(cfgBrokerPort);
   screenDirty = true;
   notifyStatus("WIFI_JOINING");
+  // Tell the broker we're leaving BEFORE yanking Wi-Fi, so a re-provision
+  // doesn't leave a zombie session for the broker to reap on its own
+  // keepalive timeout (live-bench finding, 2026-07-26, bridge32).
+  if (mqtt.connected()) mqtt.disconnect();
+  WiFi.disconnect(true); // clean slate — a re-provision may land mid a prior
+                          // attempt; also forces a real status edge so the
+                          // ws!=lastWifi detector below actually re-fires
+                          // instead of silently staying WL_CONNECTED
   Serial.printf("[WiFi] begin ssid='%s' passlen=%u\n", cfgSsid.c_str(),
                 cfgPass.length());
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-  wifiJoinStart = millis();
 }
 
 class ProvisionCB : public BLECharacteristicCallbacks {
@@ -768,7 +788,11 @@ class ServerCB : public BLEServerCallbacks {
   void onDisconnect(BLEServer *) override {
     bleClientConnected = false;
     screenDirty = true;
-    if (state == ST_ADVERTISING) { delay(300); BLEDevice::startAdvertising(); }
+    // BUG FIX (2026-07-26, bridge32 bench finding): restart unconditionally
+    // — gating on state==ST_ADVERTISING meant any client connecting after
+    // provisioning permanently stopped advertising on disconnect.
+    delay(300);
+    BLEDevice::startAdvertising();
   }
 };
 
@@ -1031,7 +1055,11 @@ void loop() {
     Serial.printf("[WiFi] status=%d\n", (int)ws);
     if (ws == WL_CONNECTED) {
       configTime(0, 0, "pool.ntp.org"); // validity windows + log ts
-      if (state == ST_JOINING) {
+      // RACE GUARD: only treat this as OUR join succeeding if we're actually
+      // associated to the SSID we just asked for — a re-provision landing
+      // while a prior association was still settling could otherwise report
+      // success against stale connectivity (bridge32 bench bug, 2026-07-26).
+      if (state == ST_JOINING && WiFi.SSID() == cfgSsid) {
         notifyStatus("WIFI_OK");
         joinLine1 = "WiFi: OK - IP " + WiFi.localIP().toString();
         screenDirty = true;
@@ -1042,6 +1070,9 @@ void loop() {
   if (state == ST_JOINING && ws != WL_CONNECTED && provisioned &&
       wifiJoinStart && millis() - wifiJoinStart > 25000) {
     wifiJoinStart = 0;
+    WiFi.disconnect(true); // stop the driver's own retry loop — a bad
+                            // SSID/password must not keep hammering the
+                            // radio in the background indefinitely
     notifyStatus("WIFI_FAIL");
     joinLine1 = "WiFi FAILED (wrong password?)";
     screenDirty = true;

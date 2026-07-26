@@ -62,7 +62,7 @@ Read: write reg `0x00`, request **7 bytes** (CST816 register map):
 - [ ] **BLE advertise WHILE Wi-Fi associates** — C6 has ONE radio (time-sliced
       coex). This is the §7.5 closed-loop requirement (status notify over BLE
       during WIFI_JOINING) and the #1 real-silicon risk — test early.
-- [ ] MQTT TCP connect to lab Mosquitto `10.1.1.21:1883` (hardware path is TCP,
+- [ ] MQTT TCP connect to lab Mosquitto `10.1.1.20:1883` (hardware path is TCP,
       not the browser's :9001 websocket)
 - [ ] NVS write/read (persists room/site/device_id across reboot)
 

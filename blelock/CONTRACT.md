@@ -36,8 +36,8 @@ image).
   "v": 1,
   "mode": "ozkey-local",
   "ssid": "…", "password": "…",
-  "broker_host": "10.1.1.21", "broker_tcp_port": 1883,
-  "server_ip": "10.1.1.21", "server_port": 3200,
+  "broker_host": "10.1.1.20", "broker_tcp_port": 1883,
+  "server_ip": "10.1.1.20", "server_port": 3200,
   "device_id": "ozk-<machex>",
   "site_id": "hotel",
   "heartbeat_s": 60

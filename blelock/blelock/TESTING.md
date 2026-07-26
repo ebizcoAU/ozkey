@@ -31,7 +31,7 @@ Prereqs: Mosquitto (`*:1883`) + ozlockserv `:4200` running (`node --watch`).
 1. **Register the pairing first** (BANOI's job in B4; curl for the bench —
    device_id from the lock's screen):
 ```sh
-curl -s -X POST http://10.1.1.21:4200/ozlock/api/pairings \
+curl -s -X POST http://10.1.1.20:4200/ozlock/api/pairings \
   -H 'Content-Type: application/json' \
   -d '{"app_id":"bench-curl","device_id":"ozk-<machex>","label":"Cua truoc"}'
 ```
@@ -39,7 +39,7 @@ curl -s -X POST http://10.1.1.21:4200/ozlock/api/pairings \
    your phone caps write length, send it in chunks — any chunk starting `{`
    restarts the buffer):
 ```json
-{"v":1,"mode":"ozkey-cloud","ssid":"<SSID>","password":"<PASS>","broker_host":"10.1.1.21","broker_tcp_port":1883,"server_ip":"10.1.1.21","server_port":4200,"device_id":"ozk-<machex>","site_id":"lab","name":"Cua truoc","heartbeat_s":60}
+{"v":1,"mode":"ozkey-cloud","ssid":"<SSID>","password":"<PASS>","broker_host":"10.1.1.20","broker_tcp_port":1883,"server_ip":"10.1.1.20","server_port":4200,"device_id":"ozk-<machex>","site_id":"lab","name":"Cua truoc","heartbeat_s":60}
 ```
 3. Watch status notifies: `WIFI_JOINING → WIFI_OK → BROKER_JOINING → BROKER_OK → ENROLLED`;
    screen shows **name + IP** during joining, then flips to the **keypad**.
@@ -50,7 +50,7 @@ curl -s -X POST http://10.1.1.21:4200/ozlock/api/pairings \
 
 1. Issue a PIN (what BANOI's Cấp mã calls):
 ```sh
-curl -s -X POST http://10.1.1.21:4200/ozlock/api/locks/ozk-<machex>/grants \
+curl -s -X POST http://10.1.1.20:4200/ozlock/api/locks/ozk-<machex>/grants \
   -H 'Content-Type: application/json' \
   -d '{"user_name":"Bench Guest","type":"pin","raw_value":"2468","slot_number":1}'
 ```

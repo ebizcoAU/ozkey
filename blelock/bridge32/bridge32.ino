@@ -21,6 +21,7 @@
  */
 
 #include <WiFi.h>
+#include <PubSubClient.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
@@ -28,6 +29,30 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <OThread.h>
+#include <OThreadUDP.h>
+#include <Arduino_GFX_Library.h>
+
+// ── LCD (GEEK 1.14" ST7789, 135x240) — pins/offsets bench-confirmed in
+// blelock/GeekDisplayTest/ (2026-07-24/25); bridge32 was headless-only
+// before this. See ozkey-09 gap #9: this is a bench aid, not yet a
+// decided production feature. ────────────────────────────────────────────
+#define LCD_SCK 1
+#define LCD_DIN 2
+#define LCD_DC 3
+#define LCD_RST 4
+#define LCD_CS 5
+#define LCD_BL 6
+#define LCD_PANEL_W 135
+#define LCD_PANEL_H 240
+#define LCD_OFFSET_X 45
+#define LCD_OFFSET_Y 48
+Arduino_DataBus *lcdBus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_DIN);
+Arduino_GFX *gfx = new Arduino_ST7789(lcdBus, LCD_RST, 1 /* rotation: landscape 240x135 */, false /* IPS */,
+                                       LCD_PANEL_W, LCD_PANEL_H, LCD_OFFSET_X, LCD_OFFSET_Y, LCD_OFFSET_X, LCD_OFFSET_Y);
+String lastStatus = "BOOT";
+#define LCD_C_BLACK 0x0000
+#define LCD_C_WHITE 0xFFFF
+#define LCD_C_GREEN 0x07E0
 
 // ── GATT contract (blelock/CONTRACT-BRIDGE.md) ──────────────────────────────
 #define BLE_NAME "OZBRIDGE"
@@ -47,14 +72,57 @@ BridgeState state = ST_ADVERTISING;
 
 Preferences prefs; // namespace "bridge32"
 String cfgSsid, cfgPass;
+String cfgMode, cfgBrokerHost, cfgSiteId; // F1: parsed from provision JSON
+uint16_t cfgBrokerPort = 0;
 bool wifiProvisioned = false;
 String deviceId, macStr;
 unsigned long wifiJoinStart = 0;
 #define WIFI_JOIN_TIMEOUT_MS 20000UL
 
+// Local hardware escape hatch (2026-07-26): hold BOOT for 5s to factory
+// reset even with no app/BLE reachable at all — the orphan case (bridge
+// still running its old config, nothing left to trigger a remote reset
+// from) needs a way out that doesn't depend on radio range or app state.
+#ifndef USER_BUTTON
+#define USER_BUTTON BOOT_PIN
+#endif
+#define FACTORY_RESET_HOLD_MS 5000UL
+unsigned long buttonHeldSince = 0;
+bool buttonWasDown = false;
+
+void checkFactoryResetButton() {
+  bool down = digitalRead(USER_BUTTON) == LOW;
+  if (down && !buttonWasDown) {
+    buttonHeldSince = millis();
+  } else if (down && buttonWasDown) {
+    unsigned long held = millis() - buttonHeldSince;
+    if (held >= FACTORY_RESET_HOLD_MS) {
+      Serial.println("[RESET] BOOT held 5s — factory reset");
+      gfx->fillScreen(LCD_C_BLACK);
+      gfx->setTextColor(LCD_C_WHITE);
+      gfx->setTextSize(2);
+      gfx->setCursor(4, 40);
+      gfx->println("FACTORY RESET");
+      factoryReset(); // wipes NVS + ESP.restart(); does not return
+    } else if (held > 800 && (held / 500) % 2 == 0) {
+      // cheap ~500ms-granularity progress blink, no extra timer needed
+      Serial.printf("[RESET] holding BOOT... %lus/5s\n", held / 1000);
+    }
+  }
+  buttonWasDown = down;
+}
+
 OpenThread thread;
 DataSet otDataset;
 bool threadFormed = false;
+
+// F2: MQTT client — declared here (not down in the F2 section below) so
+// refreshInfo()'s broker_connected check compiles; C++ needs the
+// declaration before any use in the same translation unit, and Arduino's
+// auto-prototype generation only covers functions, not globals (compile
+// error caught 2026-07-26: "'mqttClient' was not declared in this scope").
+WiFiClient wifiNetClient;
+PubSubClient mqttClient(wifiNetClient);
 
 // BLE
 BLEServer *bleServer = nullptr;
@@ -70,6 +138,10 @@ void loadConfig() {
   wifiProvisioned = prefs.getBool("prov", false);
   cfgSsid = prefs.getString("ssid", "");
   cfgPass = prefs.getString("pass", "");
+  cfgMode = prefs.getString("mode", "");
+  cfgBrokerHost = prefs.getString("bhost", "");
+  cfgBrokerPort = prefs.getUShort("bport", 0);
+  cfgSiteId = prefs.getString("site", "");
   prefs.end();
 }
 
@@ -78,6 +150,10 @@ void saveConfig() {
   prefs.putBool("prov", wifiProvisioned);
   prefs.putString("ssid", cfgSsid);
   prefs.putString("pass", cfgPass);
+  prefs.putString("mode", cfgMode);
+  prefs.putString("bhost", cfgBrokerHost);
+  prefs.putUShort("bport", cfgBrokerPort);
+  prefs.putString("site", cfgSiteId);
   prefs.end();
 }
 
@@ -88,13 +164,61 @@ void factoryReset() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Status ladder (notify BANOI over BLE + serial log)
+// LCD status (bench aid — see the header comment near the pin defines)
+// ─────────────────────────────────────────────────────────────────────────────
+void drawStatus() {
+  gfx->fillScreen(LCD_C_BLACK);
+  gfx->setTextWrap(false);
+  gfx->setTextColor(LCD_C_WHITE);
+  gfx->setTextSize(2);
+  gfx->setCursor(4, 9);
+  gfx->println("OZBRIDGE");
+  gfx->setTextSize(2); // bumped from 1 (2026-07-26: too small to read on
+                        // real hardware) — everything except the title
+                        // above was already size 2; title stays unchanged
+  gfx->setCursor(4, 28);
+  gfx->println(deviceId);
+  gfx->setTextColor(LCD_C_GREEN);
+  gfx->setCursor(4, 46);
+  gfx->println(lastStatus);
+  gfx->setTextColor(LCD_C_WHITE);
+  gfx->setCursor(4, 64);
+  if (WiFi.status() == WL_CONNECTED) {
+    gfx->print("IP ");
+    gfx->println(WiFi.localIP().toString());
+  }
+  gfx->setCursor(4, 82);
+  if (cfgMode.length()) {
+    gfx->print("mode ");
+    gfx->println(cfgMode);
+  }
+  gfx->setCursor(4, 100);
+  if (cfgSiteId.length()) {
+    gfx->print("site ");
+    gfx->println(cfgSiteId);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Status ladder (notify BANOI over BLE + serial log + LCD)
 // ─────────────────────────────────────────────────────────────────────────────
 void notifyStatus(const char *wire) {
   Serial.printf("[STATUS] %s\n", wire);
+  lastStatus = wire;
+  drawStatus();
   if (chrStatus != nullptr) {
     chrStatus->setValue((uint8_t *)wire, strlen(wire));
-    if (bleClientConnected) chrStatus->notify();
+    if (bleClientConnected) {
+      chrStatus->notify();
+      // App-observed bug, 2026-07-26: a fast-resolving ladder (WIFI_OK ->
+      // THREAD_OK -> BROKER_OK completed in ~325ms on the bench) can fire
+      // notifies faster than the phone's BLE stack transmits them, so a
+      // later one silently overwrites an earlier one before it's sent —
+      // BANOI's commissioning sheet missed BROKER_OK entirely and showed
+      // "failed to join" even though the bridge had already succeeded.
+      // Give each notify room to actually land before the next one fires.
+      delay(150);
+    }
   }
 }
 
@@ -133,19 +257,158 @@ void refreshInfo() {
   doc["mac"] = macStr;
   doc["fw"] = FW_VERSION;
   doc["transport"] = "bridge";
+  doc["mode"] = cfgMode; // F1: stored personality ("mqtt-uplink" | "matter-bridge")
   doc["thread_role"] = thread ? OpenThread::otGetStringDeviceRole() : "disabled";
+
+  // Per-stage breakdown (live, read on demand — 2026-07-26): the app was
+  // relying solely on the fast BLE notify ladder to know progress, and a
+  // missed notify left it thinking the bridge failed even when it hadn't.
+  // These booleans are live checks, not cached — reading `info` at any time
+  // (a plain GATT read, no notify timing involved) tells the app exactly
+  // which stage is actually done right now.
+  doc["wifi_connected"] = (WiFi.status() == WL_CONNECTED);
+  doc["thread_formed"] = threadFormed;
+  doc["broker_connected"] = mqttClient.connected();
+  doc["last_status"] = lastStatus;
+
   if (threadFormed) {
+    // CRASH FIX (2026-07-26, live bench): thread.getExtendedPanId()/getNetworkKey()
+    // return nullptr if OpenThread's internal lock isn't ready yet (esp_openthread_
+    // lock_acquire can fail right after thread.start(), before the OT task has fully
+    // spun up) — bytesToHex() then dereferenced that null pointer and crashed
+    // (Guru Meditation, Load access fault) on the very first real Wi-Fi-join ->
+    // Thread-form run. DataSet's own getters below are plain struct-field reads,
+    // no lock involved, never null — worst case briefly-empty fields, never a crash.
     const DataSet &ds = thread.getCurrentDataSet();
-    (void)ds; // fields pulled via the typed getters below, not the raw struct
-    doc["network_name"] = thread.getNetworkName();
-    doc["ext_pan_id"] = bytesToHex(thread.getExtendedPanId(), 8);
-    doc["network_key"] = bytesToHex(thread.getNetworkKey(), 16);
-    doc["channel"] = thread.getChannel();
-    char panHex[5]; snprintf(panHex, sizeof(panHex), "%04x", thread.getPanId());
+    doc["network_name"] = ds.getNetworkName();
+    doc["ext_pan_id"] = bytesToHex(ds.getExtendedPanId(), 8);
+    doc["network_key"] = bytesToHex(ds.getNetworkKey(), 16);
+    doc["channel"] = ds.getChannel();
+    char panHex[5]; snprintf(panHex, sizeof(panHex), "%04x", ds.getPanId());
     doc["pan_id"] = panHex;
   }
   String out; serializeJson(doc, out);
   chrInfo->setValue(out.c_str());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F2: MQTT uplink (mode=mqtt-uplink only). Topic per the PM-adopted
+// server-side-bridge-aggregation routing design (2026-07-25): ozlockserv
+// resolves a Thread lock's bridge_id and publishes to this bridge's own
+// topic instead of the lock's device-scoped one; the payload carries the
+// target lock's device_id so this bridge can demux over Thread (F4).
+// S4 (ozlockserv schema/routing) is a separate, server-side task — this
+// bridge already subscribes to the correct final topic, so no further
+// firmware change is needed once S4 ships.
+// ─────────────────────────────────────────────────────────────────────────────
+String mqttCommandTopic;
+unsigned long mqttLastAttempt = 0;
+#define MQTT_RETRY_MS 5000UL
+
+void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
+  String body;
+  body.reserve(len);
+  for (unsigned int i = 0; i < len; i++) body += (char)payload[i];
+  Serial.printf("[MQTT] << %s : %s\n", topic, body.c_str());
+
+  // F4: distill to {target, payload} for the Thread hop. Accepts either the
+  // lean v0 shape (a bench `mosquitto_pub` test) or the richer ozlockserv
+  // queue envelope (device_id/payload_hex) — S4 pins the exact server-side
+  // shape; both are handled defensively until then.
+  JsonDocument doc;
+  if (deserializeJson(doc, body) != DeserializationError::Ok) {
+    Serial.println("[MQTT] payload not valid JSON, dropped");
+    return;
+  }
+  String target = (const char *)(doc["target"] | "");
+  if (!target.length()) target = (const char *)(doc["device_id"] | "");
+  String payloadHex = (const char *)(doc["payload"] | "");
+  if (!payloadHex.length()) payloadHex = (const char *)(doc["payload_hex"] | "");
+  forwardOverThread(target, payloadHex);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F4: Thread-side frame transport, bridge -> lock. Neither device discovers
+// the other over the air (CONTRACT-BRIDGE.md) and the bridge has no
+// point-to-point route to a specific lock's Mesh-Local address yet, so v0
+// uses a realm-local multicast group: every threadcomm lock on the mesh
+// listens and filters by its own device_id in "target". Group/port MUST
+// match threadcomm.ino exactly. Port avoids CoAP (5683/5684) and Thread
+// TMF CoAP (61631); last two group bytes are the "OZ" motif.
+// ─────────────────────────────────────────────────────────────────────────────
+const uint8_t OZ_THREAD_GROUP_BYTES[16] = {0xff, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x4f, 0x5a};
+const IPAddress OZ_THREAD_GROUP(IPv6, OZ_THREAD_GROUP_BYTES);
+const uint16_t OZ_THREAD_UDP_PORT = 5052;
+
+OThreadUDP threadUdp;
+bool threadUdpReady = false;
+unsigned long threadUdpLastAttempt = 0;
+#define THREAD_UDP_RETRY_MS 3000UL
+
+// threadUdpBegin() can fail right after THREAD_OK — same family as the
+// bytesToHex crash: OpenThread's internal lock isn't always ready the
+// instant Thread forms (live-bench finding, 2026-07-26: "[UDP] socket
+// FAILED" reproduced on a fresh boot's first formation). It fails
+// gracefully here (unlike the null-deref case), so the fix is a retry, not
+// a null-check — called once at THREAD_OK and then re-polled from loop()
+// until it succeeds.
+void threadUdpBegin() {
+  if (threadUdpReady) return;
+  threadUdpLastAttempt = millis();
+  threadUdpReady = threadUdp.begin(OZ_THREAD_UDP_PORT) != 0; // sender: plain unicast bind
+  Serial.printf("[UDP] socket %s on port %u\n", threadUdpReady ? "open" : "FAILED",
+                OZ_THREAD_UDP_PORT);
+}
+
+void forwardOverThread(const String &target, const String &payloadHex) {
+  if (!target.length() || !payloadHex.length()) {
+    Serial.println("[UDP] drop — command missing target/payload");
+    return;
+  }
+  if (!threadUdpReady) {
+    Serial.println("[UDP] drop — socket not open");
+    return;
+  }
+  JsonDocument doc;
+  doc["target"] = target;
+  doc["payload"] = payloadHex;
+  String out;
+  serializeJson(doc, out);
+
+  if (!threadUdp.beginPacket(OZ_THREAD_GROUP, OZ_THREAD_UDP_PORT)) {
+    Serial.println("[UDP] beginPacket failed");
+    return;
+  }
+  threadUdp.write((const uint8_t *)out.c_str(), out.length());
+  if (!threadUdp.endPacket()) {
+    Serial.println("[UDP] endPacket failed");
+    return;
+  }
+  Serial.printf("[UDP] >> %s\n", out.c_str());
+}
+
+void mqttConnect() {
+  if (mqttClient.connected()) return;
+  Serial.printf("[MQTT] connecting to %s:%u as %s\n", cfgBrokerHost.c_str(), cfgBrokerPort,
+                deviceId.c_str());
+  notifyStatus("BROKER_JOINING");
+  if (mqttClient.connect(deviceId.c_str())) {
+    Serial.println("[MQTT] connected");
+    notifyStatus("BROKER_OK");
+    mqttClient.subscribe(mqttCommandTopic.c_str());
+    Serial.printf("[MQTT] subscribed %s\n", mqttCommandTopic.c_str());
+  } else {
+    Serial.printf("[MQTT] connect failed, rc=%d\n", mqttClient.state());
+    notifyStatus("BROKER_FAIL");
+  }
+  mqttLastAttempt = millis();
+}
+
+void mqttBegin() {
+  mqttCommandTopic = "ozkey/" + cfgSiteId + "/bridges/" + deviceId + "/command";
+  mqttClient.setServer(cfgBrokerHost.c_str(), cfgBrokerPort);
+  mqttClient.setCallback(mqttMessageReceived);
+  mqttConnect();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,30 +449,108 @@ void formThreadNetwork() {
   state = ST_OPERATIONAL;
   notifyStatus("THREAD_OK");
   refreshInfo();
+  threadUdpBegin(); // F4 — open regardless of personality; only mqtt-uplink sends on it for now
+
+  // Personality dispatch — Thread network formation is common to both;
+  // only the post-THREAD_OK behavior differs (blelock/CONTRACT-BRIDGE.md).
+  if (cfgMode == "matter-bridge") {
+    // F5: Personality A stub — no functional Matter-over-Wi-Fi stack yet.
+    Serial.println("[MODE] matter-bridge — Matter bridge mode not yet implemented");
+  } else if (cfgMode == "mqtt-uplink") {
+    mqttBegin(); // F2
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provisioning (BLE write -> Wi-Fi join -> Thread form)
 // ─────────────────────────────────────────────────────────────────────────────
+// F1: mode is the personality selector (blelock/CONTRACT-BRIDGE.md
+// "Provision payload"). Validated before anything else is applied, so a
+// bad payload never touches the Wi-Fi/NVS state left by a prior good one.
+bool validModePayload(JsonDocument &doc, String &modeOut, String &hostOut,
+                       uint16_t &portOut, String &siteOut) {
+  modeOut = (const char *)(doc["mode"] | "");
+  if (modeOut != "mqtt-uplink" && modeOut != "matter-bridge") return false;
+
+  hostOut = (const char *)(doc["broker_host"] | "");
+  portOut = (uint16_t)(doc["broker_tcp_port"] | 0);
+  siteOut = (const char *)(doc["site_id"] | "");
+  if (modeOut == "mqtt-uplink" &&
+      (!hostOut.length() || portOut == 0 || !siteOut.length())) {
+    return false; // broker_host/broker_tcp_port/site_id are REQUIRED for mqtt-uplink
+  }
+  return true;
+}
+
 void applyProvision(JsonDocument &doc) {
+  // Reset sentinel (2026-07-26): reuses this same write characteristic —
+  // same pattern threadcomm uses to tell a Thread dataset from Wi-Fi creds
+  // by field presence, just a dedicated key here since "reset" can't be
+  // confused with any real provision field. Needed so removing a bridge in
+  // BANOI can actually tell the physical device to let go, instead of
+  // leaving a fully-configured orphan still running with stale credentials
+  // (bridge32.ino had a factoryReset() with no caller anywhere before this).
+  if (doc["reset"] | false) {
+    String pid = doc["device_id"] | "";
+    if (pid.length() && pid != deviceId) {
+      Serial.printf("[PROV] reset requested for wrong device_id (%s != %s), ignoring\n",
+                    pid.c_str(), deviceId.c_str());
+      return;
+    }
+    Serial.println("[PROV] factory reset requested over BLE");
+    factoryReset(); // wipes NVS + ESP.restart(); does not return
+    return;
+  }
+
   String pid = doc["device_id"] | "";
   if (pid.length() && pid != deviceId) {
     Serial.printf("[PROV] device_id mismatch (%s != %s)\n", pid.c_str(), deviceId.c_str());
     notifyStatus("WIFI_FAIL");
     return;
   }
+
+  String mode, brokerHost, siteId;
+  uint16_t brokerPort;
+  if (!validModePayload(doc, mode, brokerHost, brokerPort, siteId)) {
+    Serial.printf("[PROV] rejected — mode missing/invalid or broker fields incomplete "
+                  "(mode='%s')\n", mode.c_str());
+    notifyStatus("PAYLOAD_REJECTED");
+    return;
+  }
+
   cfgSsid = (const char *)(doc["ssid"] | "");
   cfgPass = (const char *)(doc["password"] | "");
   if (!cfgSsid.length()) { notifyStatus("WIFI_FAIL"); return; }
 
+  cfgMode = mode;
+  cfgBrokerHost = brokerHost;
+  cfgBrokerPort = brokerPort;
+  cfgSiteId = siteId;
   wifiProvisioned = true;
   saveConfig();
 
+  Serial.printf("[PROV] mode=%s site=%s broker=%s:%u\n", cfgMode.c_str(), cfgSiteId.c_str(),
+                cfgBrokerHost.c_str(), cfgBrokerPort);
+
+  // RACE FIX (2026-07-26, live bench, round 2): wifiJoinStart must be fresh
+  // BEFORE state flips to ST_WIFI_JOINING — loop() (main task) can be
+  // scheduled between any two statements here (BLE callback task) and would
+  // otherwise see the new state with the OLD wifiJoinStart (from a join
+  // minutes ago), making millis()-wifiJoinStart instantly exceed the
+  // timeout and fire a false "[WiFi] join timeout" before WiFi.begin() even
+  // ran. Set wifiJoinStart first so it's already fresh the moment state
+  // becomes observable.
+  wifiJoinStart = millis();
   state = ST_WIFI_JOINING;
   notifyStatus("WIFI_JOINING");
+  // Tell the broker we're leaving BEFORE yanking Wi-Fi, so a re-provision
+  // doesn't leave a zombie session for the broker to reap on its own
+  // keepalive timeout (live-bench finding, 2026-07-26: showed up in the
+  // Mosquitto log as "disconnected: exceeded timeout" well after the fact).
+  if (mqttClient.connected()) mqttClient.disconnect();
+  WiFi.disconnect(true); // clean slate — a re-provision may land mid a prior attempt
   Serial.printf("[WiFi] begin ssid='%s' passlen=%u\n", cfgSsid.c_str(), cfgPass.length());
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-  wifiJoinStart = millis();
 }
 
 class ProvisionCB : public BLECharacteristicCallbacks {
@@ -226,6 +567,13 @@ class ProvisionCB : public BLECharacteristicCallbacks {
   }
 };
 
+// Regenerates `info` at read-time so it always reflects live Wi-Fi/Thread/
+// broker state, not whatever refreshInfo() last happened to push (2026-07-26
+// app-sync fix). A plain GATT read has no notify-timing risk.
+class InfoCB : public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic *) override { refreshInfo(); }
+};
+
 class ServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer *) override {
     bleClientConnected = true;
@@ -233,7 +581,14 @@ class ServerCB : public BLEServerCallbacks {
   }
   void onDisconnect(BLEServer *) override {
     bleClientConnected = false;
-    if (state == ST_ADVERTISING) { delay(300); BLEDevice::startAdvertising(); }
+    // BUG FIX (2026-07-26, live bench): this used to only restart
+    // advertising while state==ST_ADVERTISING. Once provisioned/operational,
+    // ANY client connecting and disconnecting (a status check, our own
+    // reset-scan code, a second BANOI session) permanently stopped
+    // advertising until the next reboot — "keep BLE up even post-provision"
+    // (this file's own header comment) requires restarting unconditionally.
+    delay(300);
+    BLEDevice::startAdvertising();
   }
 };
 
@@ -252,6 +607,7 @@ void startBle() {
   chrStatus->setValue("BLE_OK");
 
   chrInfo = svc->createCharacteristic(CHR_INFO, BLECharacteristic::PROPERTY_READ);
+  chrInfo->setCallbacks(new InfoCB());
   refreshInfo();
 
   svc->start();
@@ -271,6 +627,13 @@ void setup() {
   Serial.println("\n*** bridge32 v0 — OZBRIDGE Thread border router bootstrap ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
 
+  pinMode(LCD_BL, OUTPUT);
+  digitalWrite(LCD_BL, HIGH);
+  gfx->begin();
+  drawStatus(); // deviceId isn't set yet — redrawn again once it is, below
+
+  pinMode(USER_BUTTON, INPUT_PULLUP); // hold 5s -> factory reset, any state
+
   WiFi.mode(WIFI_STA);
   WiFi.onEvent(
       [](WiFiEvent_t e, WiFiEventInfo_t info) {
@@ -282,6 +645,7 @@ void setup() {
   String machex = macStr; machex.replace(":", ""); machex.toLowerCase();
   deviceId = "ozb-" + machex;
   Serial.printf("[ID] device_id=%s mac=%s\n", deviceId.c_str(), macStr.c_str());
+  drawStatus();
 
   loadConfig();
 
@@ -298,16 +662,30 @@ void setup() {
 }
 
 void loop() {
+  checkFactoryResetButton();
+
   static bool wasWifiConnected = false;
   bool wifiConnected = WiFi.status() == WL_CONNECTED;
 
   if (state == ST_WIFI_JOINING) {
-    if (wifiConnected) {
+    // RACE FIX (2026-07-26, live bench): applyProvision() runs on the BLE
+    // callback task and this loop() runs on the main task, with no
+    // synchronization between them. A re-provision (already-connected bridge
+    // gets a fresh SSID/password over BLE) could have this check see
+    // WiFi.status()==WL_CONNECTED left over from the PRIOR join, racing ahead
+    // of the BLE task's own new WiFi.begin() call — state left ST_WIFI_JOINING
+    // before the real new join outcome was known, so the join's actual
+    // success/failure was silently dropped ("update never took"). Requiring
+    // the SSID match closes the window regardless of exact task scheduling.
+    if (wifiConnected && WiFi.SSID() == cfgSsid) {
       Serial.printf("[WiFi] joined, IP=%s\n", WiFi.localIP().toString().c_str());
       notifyStatus("WIFI_OK");
       formThreadNetwork(); // -> ST_OPERATIONAL on success
     } else if (millis() - wifiJoinStart > WIFI_JOIN_TIMEOUT_MS) {
       Serial.println("[WiFi] join timeout");
+      WiFi.disconnect(true); // stop the driver's own retry loop — a bad SSID/password
+                              // must not keep hammering the radio in the background
+                              // (coex-stresses BLE, was implicated in a reset loop)
       notifyStatus("WIFI_FAIL");
       state = ST_ADVERTISING; // stay connectable, accept a re-write (never one-shot)
     }
@@ -317,6 +695,19 @@ void loop() {
     Serial.println("[WiFi] link dropped — Thread mesh keeps running independently");
   }
   wasWifiConnected = wifiConnected;
+
+  if (state == ST_OPERATIONAL && cfgMode == "mqtt-uplink" && wifiConnected) {
+    if (mqttClient.connected()) {
+      mqttClient.loop();
+    } else if (millis() - mqttLastAttempt > MQTT_RETRY_MS) {
+      mqttConnect();
+    }
+  }
+
+  if (state == ST_OPERATIONAL && !threadUdpReady &&
+      millis() - threadUdpLastAttempt > THREAD_UDP_RETRY_MS) {
+    threadUdpBegin();
+  }
 
   delay(50);
 }

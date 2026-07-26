@@ -26,6 +26,23 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <OThread.h>
+#include <OThreadUDP.h>
+#include <Arduino_GFX_Library.h>
+
+// ── LCD (Waveshare ESP32-C6 Touch LCD 1.47", ST7789 172x320) — pins/offsets
+// verified in blelock/HARDWARE.md. threadcomm was headless-only before
+// this; touch is intentionally not initialized here (no keypad in F1-F6
+// scope). ────────────────────────────────────────────────────────────────
+#define LCD_DC 15
+#define LCD_CS 14
+#define LCD_SCK 1
+#define LCD_DIN 2
+#define LCD_RST 22
+#define LCD_BL 23
+Arduino_DataBus *lcdBus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_DIN);
+Arduino_GFX *gfx = new Arduino_ST7789(lcdBus, LCD_RST, 0, true, 172, 320, 34, 0, 34, 0);
+String lastStatus = "BOOT";
+String lastUdpLine = "";
 
 // ── GATT contract — SAME service/characteristics as blecomm (CONTRACT.md);
 //    this is still "OZLOCK" to the app, just a different transport ─────────
@@ -49,6 +66,48 @@ unsigned long threadJoinStart = 0;
 OpenThread thread;
 DataSet otDataset;
 
+// Local hardware escape hatch (2026-07-26, same as bridge32.ino): hold BOOT
+// for 5s to factory reset with no app/BLE reachable at all. Unlike
+// bridge32's own NVS-only reset, threadcomm's actual "provisioned state" is
+// the Thread dataset itself (our own "threadcomm" Preferences namespace is
+// otherwise unused — the dataset lives in OpenThread's own NVS storage), so
+// this must erase that via the native otInstanceFactoryReset(), not just
+// our prefs. That call needs the OpenThread lock, which the Arduino
+// wrapper doesn't expose a public helper for, but esp_openthread_lock.h's
+// acquire/release functions are already transitively available via
+// <OThread.h>.
+#ifndef USER_BUTTON
+#define USER_BUTTON BOOT_PIN
+#endif
+#define FACTORY_RESET_HOLD_MS 5000UL
+unsigned long buttonHeldSince = 0;
+bool buttonWasDown = false;
+
+void factoryReset() {
+  Serial.println("[RESET] factory reset — erasing Thread dataset + NVS");
+  prefs.begin("threadcomm", false); prefs.clear(); prefs.end();
+  otInstance *inst = thread.getInstance();
+  if (inst != nullptr && esp_openthread_lock_acquire(portMAX_DELAY)) {
+    otInstanceFactoryReset(inst); // erases OT persistent info + platform reset
+    esp_openthread_lock_release(); // unreachable if the reset already fired; harmless otherwise
+  }
+  ESP.restart(); // fallback in case the OT platform reset above didn't fire
+                  // (e.g. instance not ready) — still clears our own prefs
+}
+
+// F4: Thread-side frame transport, bridge -> lock (realm-local multicast —
+// see the matching comment + rationale in blelock/bridge32/bridge32.ino).
+// Group/port MUST match bridge32.ino exactly.
+const uint8_t OZ_THREAD_GROUP_BYTES[16] = {0xff, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x4f, 0x5a};
+const IPAddress OZ_THREAD_GROUP(IPv6, OZ_THREAD_GROUP_BYTES);
+const uint16_t OZ_THREAD_UDP_PORT = 5052;
+#define OZ_UDP_RX_BUF 512
+
+OThreadUDP threadUdp;
+bool threadUdpReady = false;
+unsigned long threadUdpLastAttempt = 0;
+#define THREAD_UDP_RETRY_MS 3000UL
+
 // BLE
 BLEServer *bleServer = nullptr;
 BLECharacteristic *chrStatus = nullptr, *chrInfo = nullptr;
@@ -56,13 +115,70 @@ volatile bool bleClientConnected = false;
 String provBuf;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LCD status (bench aid — see the header comment near the pin defines)
+// ─────────────────────────────────────────────────────────────────────────────
+#define LCD_C_BLACK 0x0000
+#define LCD_C_WHITE 0xFFFF
+#define LCD_C_GREEN 0x07E0
+#define LCD_C_CYAN 0x07FF
+
+void drawStatus() {
+  gfx->fillScreen(LCD_C_BLACK);
+  gfx->setTextWrap(false);
+  gfx->setTextColor(LCD_C_WHITE);
+  gfx->setTextSize(2);
+  gfx->setCursor(4, 4);
+  gfx->println("OZLOCK");
+  gfx->setTextSize(1);
+  gfx->setCursor(4, 26);
+  gfx->println("(transport=thread)");
+  gfx->setCursor(4, 40);
+  gfx->println(deviceId);
+  gfx->setTextColor(LCD_C_GREEN);
+  gfx->setCursor(4, 58);
+  gfx->println(lastStatus);
+  gfx->setTextColor(LCD_C_CYAN);
+  gfx->setCursor(4, 76);
+  gfx->println(lastUdpLine);
+}
+
+void checkFactoryResetButton() {
+  bool down = digitalRead(USER_BUTTON) == LOW;
+  if (down && !buttonWasDown) {
+    buttonHeldSince = millis();
+  } else if (down && buttonWasDown) {
+    unsigned long held = millis() - buttonHeldSince;
+    if (held >= FACTORY_RESET_HOLD_MS) {
+      Serial.println("[RESET] BOOT held 5s — factory reset");
+      gfx->fillScreen(LCD_C_BLACK);
+      gfx->setTextColor(LCD_C_WHITE);
+      gfx->setTextSize(2);
+      gfx->setCursor(4, 40);
+      gfx->println("FACTORY RESET");
+      factoryReset(); // does not return
+    } else if (held > 800 && (held / 500) % 2 == 0) {
+      Serial.printf("[RESET] holding BOOT... %lus/5s\n", held / 1000);
+    }
+  }
+  buttonWasDown = down;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Status ladder
 // ─────────────────────────────────────────────────────────────────────────────
 void notifyStatus(const char *wire) {
   Serial.printf("[STATUS] %s\n", wire);
+  lastStatus = wire;
+  drawStatus();
   if (chrStatus != nullptr) {
     chrStatus->setValue((uint8_t *)wire, strlen(wire));
-    if (bleClientConnected) chrStatus->notify();
+    if (bleClientConnected) {
+      chrStatus->notify();
+      // Same fix as bridge32.ino (2026-07-26): a fast-resolving status
+      // ladder can overwrite an unsent notify before the phone's BLE stack
+      // transmits it, so the app misses a state entirely. Give it room.
+      delay(150);
+    }
   }
 }
 
@@ -96,6 +212,52 @@ void refreshInfo() {
   doc["thread_role"] = thread ? OpenThread::otGetStringDeviceRole() : "disabled";
   String out; serializeJson(doc, out);
   chrInfo->setValue(out.c_str());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F4: Thread-side frame transport, receive half. threadUdpBegin() opens a
+// multicast listen socket once Thread is attached; parsePacket() is polled
+// from loop(). Every lock on the mesh gets every datagram and filters by
+// its own device_id in "target" (no per-lock addressing yet — v0 scope).
+//
+// Can fail right after THREAD_OK — same family as the bridge32 bytesToHex
+// crash: OpenThread's internal lock isn't always ready the instant Thread
+// attaches (live-bench finding, 2026-07-26, reproduced on bridge32's own
+// threadUdpBegin()). Fails gracefully here, so the fix is a retry from
+// loop(), not a null-check.
+// ─────────────────────────────────────────────────────────────────────────────
+void threadUdpBegin() {
+  if (threadUdpReady) return;
+  threadUdpLastAttempt = millis();
+  threadUdpReady = threadUdp.beginMulticast(OZ_THREAD_GROUP, OZ_THREAD_UDP_PORT) != 0;
+  Serial.printf("[UDP] multicast socket %s on [%s]:%u\n", threadUdpReady ? "open" : "FAILED",
+                OZ_THREAD_GROUP.toString().c_str(), OZ_THREAD_UDP_PORT);
+}
+
+void pollThreadUdp() {
+  if (!threadUdpReady) return;
+  int n = threadUdp.parsePacket();
+  if (n <= 0) return;
+
+  char buf[OZ_UDP_RX_BUF];
+  int got = threadUdp.read(buf, (n < (int)sizeof(buf) - 1) ? n : (int)sizeof(buf) - 1);
+  buf[got] = '\0';
+
+  JsonDocument doc;
+  if (deserializeJson(doc, buf) != DeserializationError::Ok) {
+    Serial.println("[UDP] payload not valid JSON, dropped");
+    return;
+  }
+  String target = (const char *)(doc["target"] | "");
+  String payloadHex = (const char *)(doc["payload"] | "");
+  if (target != deviceId) {
+    Serial.printf("[UDP] ignoring datagram for %s (not us)\n", target.c_str());
+    return;
+  }
+  Serial.printf("[UDP] << target=%s payload=%s\n", target.c_str(), payloadHex.c_str());
+  // F4 scope ends here — handing payloadHex to the Tuya UART relay is a later increment.
+  lastUdpLine = "RX: " + payloadHex;
+  drawStatus();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -165,7 +327,11 @@ class ServerCB : public BLEServerCallbacks {
   }
   void onDisconnect(BLEServer *) override {
     bleClientConnected = false;
-    if (state == ST_ADVERTISING) { delay(300); BLEDevice::startAdvertising(); }
+    // BUG FIX (2026-07-26, bridge32 bench finding): restart unconditionally
+    // — gating on state==ST_ADVERTISING meant any client connecting after
+    // provisioning permanently stopped advertising on disconnect.
+    delay(300);
+    BLEDevice::startAdvertising();
   }
 };
 
@@ -203,6 +369,14 @@ void setup() {
   Serial.println("\n*** threadcomm v0 — OZLOCK Thread comm module ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
 
+  pinMode(LCD_BL, OUTPUT);
+  digitalWrite(LCD_BL, HIGH);
+  gfx->begin();
+  gfx->setRotation(5); // landscape, matches blelock/HARDWARE.md's touch transform
+  drawStatus();         // deviceId isn't set yet — redrawn again once it is, below
+
+  pinMode(USER_BUTTON, INPUT_PULLUP); // hold 5s -> factory reset, any state
+
   // Factory base MAC read directly (esp_read_mac) — this sketch never starts
   // the Wi-Fi driver, so WiFi.macAddress() can't be relied on for an ID here.
   uint8_t mac[6];
@@ -216,6 +390,7 @@ void setup() {
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   deviceId = "ozk-" + String(machexBuf);
   Serial.printf("[ID] device_id=%s mac=%s\n", deviceId.c_str(), macStr.c_str());
+  drawStatus();
 
   OpenThread::begin(false); // don't auto-start; wait for a committed dataset
 
@@ -232,6 +407,8 @@ void setup() {
 }
 
 void loop() {
+  checkFactoryResetButton();
+
   static ot_device_role_t lastRole = OT_ROLE_DISABLED;
 
   if (state == ST_THREAD_JOINING) {
@@ -241,6 +418,7 @@ void loop() {
       state = ST_OPERATIONAL;
       notifyStatus("THREAD_OK");
       refreshInfo();
+      threadUdpBegin();
     } else if (millis() - threadJoinStart > THREAD_JOIN_TIMEOUT_MS) {
       Serial.println("[THREAD] attach timeout");
       notifyStatus("THREAD_FAIL");
@@ -254,6 +432,8 @@ void loop() {
     lastRole = role;
     refreshInfo();
   }
+
+  pollThreadUdp();
 
   delay(50);
 }

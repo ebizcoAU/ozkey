@@ -5,7 +5,7 @@
  *  Role     : Market-A personal cloud, per ozkey-05: MQTT rendezvous + mini
  *             directory that holds doorlock <-> owner-account pairing.
  *  Port     : 4200  (REST base /ozlockserv/api)
- *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.21:1883 (lab stand-in for EMQX)
+ *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.20:1883 (lab stand-in for EMQX)
  *  Database : MySQL (localhost / ozlock)
  *
  *  Responsibilities (ozkey-04 §6, ozkey-05 §6)
@@ -59,9 +59,9 @@ const CONFIG = {
     connectionLimit: 10,
     queueLimit: 0,
   },
-  MQTT_URL: 'mqtt://10.1.1.21:1883',
+  MQTT_URL: 'mqtt://10.1.1.20:1883',
   BROKER: {
-    host: '10.1.1.21',
+    host: '10.1.1.20',
     tcp_port: 1883,
     ws_port: 9001,
     ws_path: '/mqtt',

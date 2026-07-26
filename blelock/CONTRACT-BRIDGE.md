@@ -54,7 +54,7 @@ both ends already agree on the network — no discovery step happens on 802.15.4
   "device_id": "b-98a316a7e638",      // echo of info.device_id
   "ssid": "HomeWifi",
   "password": "wifi-secret",
-  "broker_host": "10.1.1.21",         // Required for "mqtt-uplink"
+  "broker_host": "10.1.1.20",         // Required for "mqtt-uplink"
   "broker_tcp_port": 1883,            // Required for "mqtt-uplink"
   "site_id": "lab"                    // Required for "mqtt-uplink" – used in MQTT topics
 }

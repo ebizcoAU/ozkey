@@ -4,7 +4,7 @@
  *  ---------------------------------------------------------------------------
  *  Role     : API Gateway + Rule Engine + MySQL Manager
  *  Port     : 4000
- *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.21:1883
+ *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.20:1883
  *  Database : MySQL (localhost / ozkey)
  *
  *  Responsibilities
@@ -51,7 +51,7 @@ const CONFIG = {
     connectionLimit: 10,
     queueLimit: 0,
   },
-  MQTT_URL: 'mqtt://10.1.1.21:1883',
+  MQTT_URL: 'mqtt://10.1.1.20:1883',
   // This deployment's site (tenant) prefix on the device-scoped topic root.
   // Distinct from ozlockserv's 'lab' — multiple servers share the broker and
   // each must own its own site (ozkey-07 §10 / ozkey-04 §9).
