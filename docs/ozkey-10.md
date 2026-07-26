@@ -22,6 +22,66 @@
 
 ---
 
+> **THREAD COMMISSIONING WORKING END-TO-END 2026-07-27 (live-hardware
+> verified).** bridge32 forms a Thread network and the doorlock joins it —
+> the two open bugs blocking this since 2026-07-26 are both fixed, plus a
+> handful of others found chasing them down. All in `blelock/bridge32/
+> bridge32.ino` and `blelock/doorlock/doorlock.ino` unless noted:
+>
+> - **bridge32's `esp_event_loop_create_default()` call inside OpenThread's
+>   worker task always failed** once WiFi had already created the default
+>   event loop (arduino-esp32's own Network stack tolerates
+>   `ESP_ERR_INVALID_STATE` there; the bundled `OThread.cpp`'s worker task
+>   does not) — `OpenThread::begin()` silently never actually initialized.
+>   Fixed by calling `OpenThread::begin(false)` once, very early in
+>   `setup()`, before WiFi touches anything, so OpenThread claims the event
+>   loop first.
+> - **`thread.start()` (`otThreadSetEnabled`) was called before
+>   `thread.networkInterfaceUp()` (`otIp6SetEnabled`)** in both files —
+>   backwards from what `openthread/thread.h` documents
+>   (`OT_ERROR_INVALID_STATE` = "network interface was not up"). Attach
+>   never happened as a result, regardless of dataset freshness. Order
+>   swapped in all three call sites (bridge32's `formThreadNetwork()`,
+>   doorlock's `applyProvision()` Thread branch, doorlock's `setup()` resume
+>   path).
+> - **bridge32's `factoryReset()` never actually cleared the Thread
+>   dataset** — it only wiped the app's own "bridge32" Preferences
+>   namespace; OpenThread persists its dataset in a separate NVS namespace
+>   it owns. Fixed with `otInstanceFactoryReset(thread.getInstance())`.
+> - **bridge32 declared `THREAD_OK` and published its dataset on `info`
+>   immediately after `start()`/`networkInterfaceUp()`**, before OpenThread
+>   had actually attached — a real race (not just "briefly empty fields" as
+>   an earlier comment assumed) that could publish an all-zero dataset. The
+>   app caches whatever it reads there and never re-syncs, so this silently
+>   poisoned a doorlock provision once (`ch=0`, all-zero
+>   `ext_pan_id`/`network_key` — confirmed live via a diagnostic log added
+>   to doorlock's `applyProvision()`). Fixed by polling
+>   `otGetDeviceRole()` for actual attachment (20s bound — single-node
+>   Leader formation took ~7s on the bench) before declaring success, and
+>   sending the already-documented-but-never-sent `THREAD_FAIL` on timeout
+>   instead of proceeding anyway.
+> - **`esp_coex_wifi_i154_enable()` was never called** — bridge32 is the
+>   only sketch running WiFi and 802.15.4 concurrently on the C6's shared
+>   radio. Added at boot; turned out not to be the actual blocker (the
+>   event-loop bug was), but is correct/required regardless and stays in.
+> - App-side (`ftpos/lib/screens/banoi_doorlock.dart`, `_writeThreadDataset`):
+>   the status listener only reacted to `threadOk`/`threadFail`, silently
+>   hanging on "joining" for any other terminal status (e.g. `ENROLL_FAIL`
+>   from the zero-dataset bug above). Now checks `OzkeyStatus.isTerminalError`.
+> - bridge32 also got a bench-aid LCD status screen (`blelock/GeekDisplayTest/`
+>   pin map, `gfx->invertDisplay(true)` needed for this panel — see
+>   `blelock/bridge32/bridge32.ino`'s `drawStatus()`), `bridge32-1.0`.
+>
+> **Remaining/not done here:** F4's Thread-side frame relay is still
+> bridge→lock only (no receive path, per `CONTRACT-BRIDGE.md` "not in this
+> increment" — bridge32's LCD wake-on-traffic accordingly has no Thread-side
+> trigger yet, only BLE/MQTT). The actual `blecomm.ino`+`threadcomm.ino`
+> unification into one binary (this doc's original scope, §2 above) has not
+> started — today's fixes are in the pre-unification bridge32/threadcomm
+> proof-of-concept sketches, not the unified firmware yet.
+
+---
+
 ## 1. The five configurations
 
 Restates ozkey-08 §0 / §0.0.0's canonical taxonomy, reframed as exactly what

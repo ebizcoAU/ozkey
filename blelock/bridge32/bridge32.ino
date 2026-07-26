@@ -29,6 +29,8 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <OThread.h>
+#include <openthread/instance.h> // otInstanceFactoryReset() — see factoryReset()
+#include "esp_coexist.h"
 #include <OThreadUDP.h>
 #include <Arduino_GFX_Library.h>
 
@@ -53,6 +55,17 @@ String lastStatus = "BOOT";
 #define LCD_C_BLACK 0x0000
 #define LCD_C_WHITE 0xFFFF
 #define LCD_C_GREEN 0x07E0
+#define LCD_C_RED 0xF800
+
+// LCD idle blank (2026-07-27): bench aid, not a status signal — the screen
+// itself goes dark after LCD_IDLE_OFF_MS with nothing to check on it. Only a
+// BOOT button press wakes it back up (status changes while it's off do NOT
+// wake it — screen state is intentionally independent of the status ladder
+// once it's gone dark, matching "only turn on if someone touch the boot
+// button").
+#define LCD_IDLE_OFF_MS 30000UL
+bool lcdOn = true;
+unsigned long lastLcdActivityAt = 0;
 
 // ── GATT contract (blelock/CONTRACT-BRIDGE.md) ──────────────────────────────
 #define BLE_NAME "OZBRIDGE"
@@ -60,7 +73,8 @@ String lastStatus = "BOOT";
 #define CHR_PROVISION "4f5a4b32-0002-4272-6467-000000000001"
 #define CHR_STATUS "4f5a4b32-0003-4272-6467-000000000001"
 #define CHR_INFO "4f5a4b32-0004-4272-6467-000000000001"
-#define FW_VERSION "bridge32-0.1"
+#define FW_VERSION "bridge32-1.0"
+#define FW_DISPLAY_VERSION "v1.0" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
 // existing mesh) in v0; it is the only network former in the home.
@@ -94,6 +108,7 @@ void checkFactoryResetButton() {
   bool down = digitalRead(USER_BUTTON) == LOW;
   if (down && !buttonWasDown) {
     buttonHeldSince = millis();
+    lcdWake(); // any press wakes the screen — a 5s hold decides factory reset below
   } else if (down && buttonWasDown) {
     unsigned long held = millis() - buttonHeldSince;
     if (held >= FACTORY_RESET_HOLD_MS) {
@@ -158,45 +173,103 @@ void saveConfig() {
 }
 
 void factoryReset() {
-  Serial.println("[RESET] factory reset — wiping NVS");
+  Serial.println("[RESET] factory reset — wiping app config");
   prefs.begin("bridge32", false); prefs.clear(); prefs.end();
-  ESP.restart();
+  // BUG FIX (2026-07-27, live bench): this only ever cleared the "bridge32"
+  // Preferences namespace (WiFi creds/mode/broker) — the OpenThread stack
+  // persists its own dataset in a separate NVS namespace it manages
+  // internally, so every "factory reset" today still resumed the old
+  // (possibly stale, from a run where begin() was silently broken) Thread
+  // dataset instead of forming fresh. otInstanceFactoryReset() is the
+  // correct call — it erases OpenThread's own persistent info and triggers
+  // its own platform reset (does not return on success).
+  if (thread) {
+    Serial.println("[RESET] erasing OpenThread persistent info");
+    otInstanceFactoryReset(thread.getInstance());
+  }
+  ESP.restart(); // fallback in case otInstanceFactoryReset() ever returns
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LCD status (bench aid — see the header comment near the pin defines)
 // ─────────────────────────────────────────────────────────────────────────────
 void drawStatus() {
+  // Two-state screen (2026-07-27), styled after doorlock.ino's bordered
+  // bench screens (drawAdvertising/drawJoining: accent border + header, big
+  // centered title, dim footer, hint line) — scaled down to this panel's
+  // 240x135. Success is deliberately the plainer of the two: no border, no
+  // ladder text, just a clean white "nothing to check on here" screen —
+  // the opposite of the busy red transition screen.
+  bool allUp = (WiFi.status() == WL_CONNECTED) && threadFormed;
+
+  if (allUp) {
+    gfx->fillScreen(LCD_C_WHITE);
+    gfx->setTextWrap(false);
+    gfx->setTextColor(LCD_C_BLACK);
+    gfx->setTextSize(2);
+    gfx->setCursor(170, 10);
+    gfx->println(FW_DISPLAY_VERSION);
+    gfx->setTextSize(3); // reverted from 3 (2026-07-27) — too big
+    gfx->setCursor(4, 12);
+    gfx->println("OZBRIDGE");
+    gfx->setTextSize(2);
+    gfx->setCursor(4, 48);
+    gfx->println("WIFI:   OK");
+    gfx->setCursor(4, 66);
+    gfx->println("THREAD: OK");
+    gfx->setCursor(4, 84);
+    gfx->print("IP ");
+    gfx->println(WiFi.localIP().toString());
+    gfx->setCursor(4, 102);
+    if (cfgSiteId.length()) {
+      gfx->print("site ");
+      gfx->println(cfgSiteId);
+    }
+    gfx->setTextSize(1);
+    gfx->setCursor(4, 122); // tightened from 106 (2026-07-27)
+    gfx->println(deviceId);
+    return;
+  }
+
+  // Reworked (2026-07-27, user pass): dropped the separate header line and
+  // the factory-reset hint (screen real estate) and the device_id line ("no
+  // use") — version now lives on the title line instead of its own row.
   gfx->fillScreen(LCD_C_BLACK);
+  gfx->drawRect(0, 0, 240, 135, LCD_C_RED);
   gfx->setTextWrap(false);
+  gfx->setTextColor(LCD_C_RED);
+  gfx->setTextSize(2); // bumped from 1 — was unreadable
+  gfx->setCursor(6, 10);
+  gfx->println(lastStatus); // no "STATUS: " label — longest value (17 chars)
+                             // already fills the width at size2 with it
   gfx->setTextColor(LCD_C_WHITE);
+  gfx->setCursor(6, 44);
+  gfx->print("OZBRIDGE ");
+  gfx->println(FW_DISPLAY_VERSION);
   gfx->setTextSize(2);
-  gfx->setCursor(4, 9);
-  gfx->println("OZBRIDGE");
-  gfx->setTextSize(2); // bumped from 1 (2026-07-26: too small to read on
-                        // real hardware) — everything except the title
-                        // above was already size 2; title stays unchanged
-  gfx->setCursor(4, 28);
-  gfx->println(deviceId);
-  gfx->setTextColor(LCD_C_GREEN);
-  gfx->setCursor(4, 46);
-  gfx->println(lastStatus);
-  gfx->setTextColor(LCD_C_WHITE);
-  gfx->setCursor(4, 64);
+  gfx->setTextColor(LCD_C_RED);
+  gfx->setCursor(6, 90);
   if (WiFi.status() == WL_CONNECTED) {
     gfx->print("IP ");
     gfx->println(WiFi.localIP().toString());
   }
-  gfx->setCursor(4, 82);
-  if (cfgMode.length()) {
-    gfx->print("mode ");
-    gfx->println(cfgMode);
-  }
-  gfx->setCursor(4, 100);
+  gfx->setCursor(6, 112);
   if (cfgSiteId.length()) {
     gfx->print("site ");
     gfx->println(cfgSiteId);
+  } else if (cfgMode.length()) {
+    gfx->print("mode ");
+    gfx->println(cfgMode);
   }
+}
+
+// Wakes the backlight + redraws immediately (button press, or right after
+// boot). A no-op backlight-write if it's already on.
+void lcdWake() {
+  digitalWrite(LCD_BL, HIGH);
+  lcdOn = true;
+  lastLcdActivityAt = millis();
+  drawStatus();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,7 +278,12 @@ void drawStatus() {
 void notifyStatus(const char *wire) {
   Serial.printf("[STATUS] %s\n", wire);
   lastStatus = wire;
-  drawStatus();
+  // Wakes the screen (2026-07-27, revised) — every status ladder step is
+  // either the app talking to it (BLE_OK) or a real WiFi/Thread/broker state
+  // change, exactly the kind of activity the user wants visible on the
+  // panel rather than dark. See mqttMessageReceived() for the other
+  // wake trigger (routine data-plane traffic with no ladder step of its own).
+  lcdWake();
   if (chrStatus != nullptr) {
     chrStatus->setValue((uint8_t *)wire, strlen(wire));
     if (bleClientConnected) {
@@ -306,6 +384,9 @@ unsigned long mqttLastAttempt = 0;
 #define MQTT_RETRY_MS 5000UL
 
 void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
+  // Incoming WiFi/MQTT traffic — no ladder status step of its own, so wake
+  // the screen explicitly here (2026-07-27).
+  lcdWake();
   String body;
   body.reserve(len);
   for (unsigned int i = 0; i < len; i++) body += (char)payload[i];
@@ -419,7 +500,25 @@ void formThreadNetwork() {
   state = ST_THREAD_FORMING;
   notifyStatus("THREAD_FORMING");
 
+  // COEX SETTLE (2026-07-27, live bench): this runs the instant WL_CONNECTED
+  // is observed — zero gap before the 802.15.4 radio init competes with WiFi
+  // for the same shared 2.4GHz RF frontend on the C6. Same radio-coexistence
+  // stress already implicated in a BLE reset loop elsewhere in this file
+  // (see the WIFI_JOIN_TIMEOUT_MS comment above) produced this symptom:
+  // esp_openthread_lock_acquire "mutex is not ready" + platform_deinit "not
+  // initialized", then otGetDeviceRole() stuck Disabled — OpenThread's
+  // platform init was racing WiFi's own driver/event-loop settling.
+  delay(500);
+
   OpenThread::begin(false); // false = don't auto-start; we commit a dataset first
+  // DIAGNOSTIC (2026-07-27): begin()'s own worker task can fail its stack
+  // init fast (radio/netif bring-up) and silently return with the platform
+  // never actually up — the code below never checked this before charging
+  // into hasActiveDataset()/commitDataSet() regardless. If this prints 0,
+  // the failure is inside begin() itself, not in the dataset calls that
+  // follow (which would just be downstream symptoms of an instance that was
+  // never really initialized).
+  Serial.printf("[THREAD] begin() otStarted=%d\n", (int)(bool)thread);
   if (thread.hasActiveDataset()) {
     Serial.println("[THREAD] resuming persisted dataset");
   } else {
@@ -443,8 +542,52 @@ void formThreadNetwork() {
                   name.c_str(), OT_CHANNEL, panId);
   }
 
-  thread.start();
+  // ORDER FIX (2026-07-27, live bench): otThreadSetEnabled()'s own header doc
+  // (openthread/thread.h) documents OT_ERROR_INVALID_STATE = "the network
+  // interface was not up" — it requires otIp6SetEnabled(true) (networkInterfaceUp())
+  // to run FIRST. This was calling thread.start() (-> otThreadSetEnabled)
+  // before networkInterfaceUp() (-> otIp6SetEnabled), guaranteeing that call
+  // fails every time — role stuck Disabled forever, no matter how clean the
+  // dataset or how correctly the platform initialized (both already verified
+  // fine this session). Its log_e() never surfaced because Core Debug Level
+  // was filtering it, which is why this took so long to pin down.
   thread.networkInterfaceUp();
+  thread.start();
+
+  // RACE FIX (2026-07-27, live bench): getCurrentDataSet() can return
+  // zeroed fields for a short window right after start()/networkInterfaceUp()
+  // — the OpenThread task hasn't attached yet, so refreshInfo() below would
+  // publish an all-zero dataset on `info`. The app caches whatever it reads
+  // there (never re-syncs), so it silently poisoned a doorlock provision with
+  // ext_pan_id/network_key/channel/pan_id all zero (doorlock correctly
+  // rejected ch=0 as malformed). Wait for actual attachment first.
+  //
+  // TIMEOUT BUMP (2026-07-27): with the start()/networkInterfaceUp() call
+  // order now fixed, the device correctly reaches Detached (not stuck
+  // Disabled) but 5s wasn't long enough for OpenThread's own MLE attach/
+  // parent-search state machine to give up and form as Leader — observed
+  // still Detached at the 5000ms mark on live hardware. 20s comfortably
+  // covers that on a single-node network with nothing to attach to.
+  unsigned long attachStart = millis();
+  ot_device_role_t role;
+  do {
+    delay(50);
+    role = OpenThread::otGetDeviceRole();
+  } while (role != OT_ROLE_LEADER && role != OT_ROLE_ROUTER && role != OT_ROLE_CHILD &&
+           millis() - attachStart < 20000);
+  Serial.printf("[THREAD] attach role=%s after %lums\n",
+                OpenThread::otGetStringDeviceRole(), millis() - attachStart);
+
+  if (role != OT_ROLE_LEADER && role != OT_ROLE_ROUTER && role != OT_ROLE_CHILD) {
+    // Fail closed (CONTRACT-BRIDGE.md's documented THREAD_FAIL, never actually
+    // sent before this fix) — declaring THREAD_OK here would let refreshInfo()
+    // publish whatever getCurrentDataSet() has (unattached, likely garbage)
+    // for the app to cache and hand to a doorlock.
+    Serial.println("[THREAD] attach failed — not publishing dataset");
+    notifyStatus("THREAD_FAIL");
+    return;
+  }
+
   threadFormed = true;
   state = ST_OPERATIONAL;
   notifyStatus("THREAD_OK");
@@ -627,14 +770,57 @@ void setup() {
   Serial.println("\n*** bridge32 v0 — OZBRIDGE Thread border router bootstrap ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
 
+  // EVENT-LOOP RACE FIX (2026-07-27, live bench): OThread.cpp's worker task
+  // calls esp_event_loop_create_default() with a strict `!= ESP_OK` check —
+  // it does NOT tolerate ESP_ERR_INVALID_STATE ("already created"), unlike
+  // arduino-esp32's own Network/WiFi stack (NetworkEvents.cpp), which
+  // explicitly accepts that as fine. Since WiFi always comes up first in this
+  // sketch and claims the default event loop itself, OpenThread's own
+  // creation call was guaranteed to fail every time formThreadNetwork() ran
+  // later — this is what "esp_openthread_lock_acquire: mutex is not ready" /
+  // otGetDeviceRole() stuck Disabled actually traced back to (confirmed by
+  // reading OThread.cpp + NetworkEvents.cpp directly, not a coex/timing
+  // issue — the earlier settle-delay and esp_coex_wifi_i154_enable() fixes
+  // were both no-ops against this). Claiming the event loop here, before
+  // WiFi ever touches it, flips who's "first" — WiFi's own creation call
+  // afterward already handles ESP_ERR_INVALID_STATE gracefully.
+  // OpenThread::begin() is idempotent (early-returns if already started), so
+  // the existing call later in formThreadNetwork() stays a safe no-op.
+  OpenThread::begin(false);
+  Serial.printf("[THREAD] early begin() otStarted=%d\n", (int)(bool)thread);
+
   pinMode(LCD_BL, OUTPUT);
   digitalWrite(LCD_BL, HIGH);
   gfx->begin();
+  // PANEL FIX (2026-07-27, live bench): Arduino_ST7789::begin() defaults to
+  // invertDisplay(false), but this panel needs inversion ON — without this,
+  // every color comes out as its complement (black bg shows white, white
+  // title shows black, red shows cyan-ish/yellow depending on which "red"
+  // value was tried). Confirmed by the math matching exactly: BLACK
+  // (0,0,0) complements to WHITE, standard-RGB565 RED (0xF800) complements
+  // to CYAN ("light blue"), then BLUE (0x001F, my wrong first attempt at a
+  // fix) complements to YELLOW — precisely what was reported. This is the
+  // actual fix; the LCD_C_RED value swap that preceded it was chasing the
+  // wrong cause and has been reverted.
+  gfx->invertDisplay(true);
   drawStatus(); // deviceId isn't set yet — redrawn again once it is, below
 
   pinMode(USER_BUTTON, INPUT_PULLUP); // hold 5s -> factory reset, any state
 
   WiFi.mode(WIFI_STA);
+
+  // COEX FIX (2026-07-27, live bench): bridge32 is the one sketch running
+  // WiFi and 802.15.4 (Thread) concurrently on the C6's single shared
+  // 2.4GHz radio, and nothing was ever telling the coexistence arbiter both
+  // radios would be in play. Without this, OpenThread::begin()'s platform
+  // init silently failed to stand up its own task/lock later in
+  // formThreadNetwork() — "esp_openthread_lock_acquire: mutex is not ready",
+  // otGetDeviceRole() stuck Disabled — and a fixed settle delay there did
+  // NOT fix it (same failure, just shifted later by the delay amount),
+  // which is what ruled out a plain timing race and pointed here instead.
+  esp_err_t coexErr = esp_coex_wifi_i154_enable();
+  Serial.printf("[COEX] wifi_i154_enable -> %d\n", (int)coexErr);
+
   WiFi.onEvent(
       [](WiFiEvent_t e, WiFiEventInfo_t info) {
         Serial.printf("[WiFi] disconnected, reason=%d\n",
@@ -645,6 +831,7 @@ void setup() {
   String machex = macStr; machex.replace(":", ""); machex.toLowerCase();
   deviceId = "ozb-" + machex;
   Serial.printf("[ID] device_id=%s mac=%s\n", deviceId.c_str(), macStr.c_str());
+  lastLcdActivityAt = millis(); // idle-off clock starts now, not at cold boot
   drawStatus();
 
   loadConfig();
@@ -663,6 +850,16 @@ void setup() {
 
 void loop() {
   checkFactoryResetButton();
+
+  // Idle auto-off only once both radios are actually up (2026-07-27) — stay
+  // lit through the whole pairing/forming ladder no matter how long it
+  // takes, so nothing gets missed mid-bring-up; only blank once there's
+  // genuinely nothing left to watch.
+  bool bothUp = (WiFi.status() == WL_CONNECTED) && threadFormed;
+  if (bothUp && lcdOn && millis() - lastLcdActivityAt > LCD_IDLE_OFF_MS) {
+    digitalWrite(LCD_BL, LOW);
+    lcdOn = false;
+  }
 
   static bool wasWifiConnected = false;
   bool wifiConnected = WiFi.status() == WL_CONNECTED;

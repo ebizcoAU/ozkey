@@ -347,10 +347,11 @@ void drawAdvertising() {
   gfx->setTextColor(C_WHITE);
   gfx->setCursor(52, 70);
   gfx->println("OZLOCK");
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_GREY);
-  gfx->setCursor(172, 88); // small version badge beside the logo
+  gfx->setTextSize(2); // bumped from 1 (2026-07-27) — too small to read
+  gfx->setTextColor(C_WHITE);
+  gfx->setCursor(172, 86); // version badge beside the logo
   gfx->println(FW_DISPLAY_VERSION);
+  gfx->setTextSize(1);
   gfx->setCursor(15, 120);
   gfx->print("device_id: ");
   gfx->println(deviceId);
@@ -970,6 +971,10 @@ void applyProvision(JsonDocument &doc) {
     int channel = doc["channel"] | 0;
 
     uint8_t extPanId[8], networkKey[16];
+    Serial.printf("[PROV] thread fields: name='%s'(%u) ext_pan='%s'(%u) key_len=%u ch=%d pan='%s'(%u)\n",
+                  tName.c_str(), (unsigned)tName.length(), extPanHex.c_str(),
+                  (unsigned)extPanHex.length(), (unsigned)keyHex.length(), channel,
+                  panHex.c_str(), (unsigned)panHex.length());
     if (!tName.length() || channel < 11 || channel > 26 ||
         !hexToBytes(extPanHex, extPanId, 8) || !hexToBytes(keyHex, networkKey, 16) ||
         panHex.length() != 4) {
@@ -1005,8 +1010,12 @@ void applyProvision(JsonDocument &doc) {
     screenDirty = true;
     notifyStatus("THREAD_JOINING");
     OpenThread::begin(false);
-    thread.start();
+    // ORDER FIX (2026-07-27, live bench bridge32 finding): otThreadSetEnabled()
+    // (thread.start()) requires otIp6SetEnabled() (networkInterfaceUp()) to
+    // already be up — OT_ERROR_INVALID_STATE otherwise (openthread/thread.h).
+    // Calling start() first guarantees attach never happens.
     thread.networkInterfaceUp();
+    thread.start();
     return;
   }
 
@@ -1328,8 +1337,10 @@ void setup() {
     } else {
       Serial.println("[THREAD] no persisted dataset on resume — re-provision needed");
     }
-    thread.start();
+    // ORDER FIX (2026-07-27): see the applyProvision() Thread branch —
+    // networkInterfaceUp() must run before start(), not after.
     thread.networkInterfaceUp();
+    thread.start();
     threadJoinStart = millis();
   } else if (provisioned) {
     state = enrolled ? ST_OPERATIONAL : ST_JOINING;
