@@ -90,7 +90,7 @@ one firmware image must be told to do at commissioning:
 | # | Configuration | Transport | Server | RBAC | Firmware today |
 |---|---|---|---|---|---|
 | 1 | **Matter** | Thread → ecosystem's own border router (Apple TV/Alexa/Nest) | none of ours | none | **not started** — separate protocol stack (esp-matter), out of scope here (§6) |
-| 2a | **OZLOCK-HOME, premium** | Thread → bridge32 → MQTT → ozlockserv | ozlockserv (free relay) | none (app+lock only) | proven in `threadcomm.ino`, not merged |
+| 2a | **OZLOCK-HOME, premium** | Thread → bridge32 → MQTT → ozlockserv | ozlockserv (free relay) | none (app+lock only) | **proven live end-to-end 2026-07-27** on the actual unified `doorlock.ino` binary (not just the old standalone `threadcomm.ino` proof-of-concept) — see the status note above |
 | 2b | **OZLOCK-HOME, economy** | Wi-Fi direct → MQTT → ozlockserv | ozlockserv (free relay) | none | proven in `blecomm.ino` (`mode=ozkey-cloud`) |
 | 3 | **OZKEY** (hotel/motel/campus/mining camp) | Wi-Fi direct → MQTT → ozkeyserv | on-prem or cloud, **3-level RBAC**, AI-generated site/room map | org → operator → tenant | proven in `blecomm.ino` (`mode=ozkey-local`) |
 | 4 | **OZPMS** (property management) | Wi-Fi direct → MQTT → ozkeyserv-family, cloud | cloud, **3-level RBAC**, Google Maps-assisted | platform → property manager → tenant | **no firmware difference from #3** — ozkey-07 §14 already settled this: "same wire contract as Mode 3 — the lock only ever knows `broker_host:port`, so hotel-on-LAN vs PMS-in-cloud is a deployment choice, not a firmware or protocol fork" |

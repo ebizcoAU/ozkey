@@ -78,6 +78,12 @@
 #include "ozcrypto.h" // member-ceremony crypto (XF-46 §7.1) + boot self-test
 #include <OThread.h>     // Thread transport (ported from threadcomm.ino)
 #include <OThreadUDP.h>  // F4 UDP relay (bridge32/threadcomm proven, 2026-07-25/26)
+// Receive half runs on lwIP, not OpenThread's internal UDP — see the root-cause
+// note above threadUdpBegin() (esp_openthread_netif_glue pushes inbound Thread
+// packets into lwIP, so otUdp* sockets never see them).
+#include <lwip/sockets.h>
+#include <errno.h>
+#include <fcntl.h>
 
 // ── Hardware pins (HARDWARE.md, operator-verified) ──────────────────────────
 #define LCD_DC 15
@@ -764,22 +770,161 @@ void forwardHexToMcu(const String &hex) {
 // simplification threadcomm.ino used (no discovery mechanism exists yet,
 // ozkey-10 §7 Q3).
 // ─────────────────────────────────────────────────────────────────────────────
+// ── RAW OpenThread UDP receive (2026-07-28) ─────────────────────────────────
+// Replaces OThreadUDP for the receive half. OThreadUDP::begin() binds with
+//     otUdpBind(inst, &sock, &sa, OT_NETIF_THREAD_INTERNAL)
+// and on arduino-esp32 3.3.11 no inbound multicast ever matched that socket.
+// Bench-proven 2026-07-28: bridge32 transmitted the SAME datagram to both
+// ff03::4f5a and ff03::1 (realm-local all-nodes, which every Thread node joins
+// automatically) while this board was a confirmed attached Child — live role
+// from otGetStringDeviceRole(), not the latched threadFormed flag — with the
+// socket reporting open and subscribed. parsePacket() never returned a single
+// packet. Attach, subscribe and transmit were all verified working; only
+// receive was dead, which points squarely at the netif filter.
+// OT_NETIF_UNSPECIFIED (= 0) disables netif filtering altogether, which is what
+// a Thread-only node actually wants. Note this OpenThread has FOUR netif values
+// (UNSPECIFIED / THREAD_HOST / THREAD_INTERNAL / BACKBONE) where older versions
+// had three, so the identifier numbering shifted under the wrapper.
+// ROOT CAUSE (2026-07-28, found by reading the installed core): OThread.cpp
+// :255/:271 creates an esp_netif for OpenThread and attaches
+// esp_openthread_netif_glue. With CONFIG_ESP_NETIF_TCPIP_LWIP=y, inbound
+// Thread packets are pushed UP into lwIP by that glue and are NEVER delivered
+// to OpenThread's own otUdp* socket list. So OThreadUDP's whole receive half —
+// and our raw otUdpOpen port of it — can never fire on ESP32, whichever netif
+// identifier is bound. Sending is unaffected, because otUdpSend goes DOWN
+// through OpenThread to the radio; that is why bridge32 worked throughout.
+// Bench-proven 2026-07-28: node a confirmed attached Child, both ff03::4f5a
+// and ff03::1 joined at stack level, socket bound with netif filtering off —
+// and NOTHING arrived, not even a unicast datagram to this node's own
+// mesh-local EID. Unicast failing is what ruled out every addressing and
+// link-mode theory and pointed at the stack boundary.
+// Fix: listen where the packets actually land — a normal lwIP AF_INET6 socket.
+static int ozRxFd = -1;
+
 void threadUdpBegin() {
   if (threadUdpReady) return;
   threadUdpLastAttempt = millis();
-  threadUdpReady = threadUdp.beginMulticast(OZ_THREAD_GROUP, OZ_THREAD_UDP_PORT) != 0;
-  Serial.printf("[UDP] multicast socket %s on [%s]:%u\n", threadUdpReady ? "open" : "FAILED",
-                OZ_THREAD_GROUP.toString().c_str(), OZ_THREAD_UDP_PORT);
+
+  otInstance *inst = thread.getInstance();
+  if (inst == nullptr) {
+    Serial.println("[UDP] no OpenThread instance yet — will retry");
+    return;
+  }
+  // Same lock discipline as factoryReset() above; bounded wait so a busy OT
+  // task costs us a retry rather than blocking loop() forever.
+  if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) {
+    Serial.println("[UDP] OpenThread lock busy — will retry");
+    return;
+  }
+  bool ok = false;
+  do {
+    otError e = OT_ERROR_NONE;
+    otIp6Address grp;
+    memcpy(grp.mFields.m8, OZ_THREAD_GROUP_BYTES, 16);
+    e = otIp6SubscribeMulticastAddress(inst, &grp);
+    if (e != OT_ERROR_NONE && e != OT_ERROR_ALREADY) {
+      // Non-fatal: ff03::1 still reaches us, so the relay can be re-pointed
+      // at all-nodes if our custom group turns out to be the problem.
+      Serial.printf("[UDP] subscribe ff03::4f5a failed: %d (continuing)\n", (int)e);
+    }
+
+    // GROUND TRUTH (2026-07-28): is this node actually rx-on-when-idle?
+    // A SLEEPY child attaches, joins multicast groups and binds a socket
+    // exactly like an rx-on one — but it only ever polls its parent for
+    // UNICAST and never hears the link-layer broadcast that carries
+    // realm-local multicast. That fits every symptom we have, and it is the
+    // one property never read back (rx-on was ASSUMED from
+    // CONFIG_OPENTHREAD_FTD=y, never verified). Raw C calls only in here —
+    // the OThread wrapper methods take this same lock and would deadlock.
+    otLinkModeConfig lm = otThreadGetLinkMode(inst);
+    Serial.printf("[THREAD] linkmode rx_on=%d ftd=%d netdata=%d\n",
+                  (int)lm.mRxOnWhenIdle, (int)lm.mDeviceType, (int)lm.mNetworkData);
+    if (!lm.mRxOnWhenIdle) {
+      lm.mRxOnWhenIdle = true;
+      otError le = otThreadSetLinkMode(inst, lm);
+      Serial.printf("[THREAD] was SLEEPY — forced rx-on-when-idle -> %d\n", (int)le);
+    }
+    ok = true;
+  } while (false);
+  esp_openthread_lock_release();
+
+  // ── the actual listener: lwIP AF_INET6 datagram socket ────────────────────
+  if (ok) {
+    ozRxFd = lwip_socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (ozRxFd < 0) {
+      Serial.printf("[UDP] lwip socket() failed errno=%d\n", errno);
+      ok = false;
+    }
+  }
+  if (ok) {
+    int on = 1;
+    lwip_setsockopt(ozRxFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    struct sockaddr_in6 sa6;
+    memset(&sa6, 0, sizeof(sa6));
+    sa6.sin6_family = AF_INET6;
+    sa6.sin6_port = htons(OZ_THREAD_UDP_PORT);
+    // in6addr_any: accept unicast to any of our addresses AND any joined group
+    if (lwip_bind(ozRxFd, (struct sockaddr *)&sa6, sizeof(sa6)) != 0) {
+      Serial.printf("[UDP] lwip bind() failed errno=%d\n", errno);
+      lwip_close(ozRxFd);
+      ozRxFd = -1;
+      ok = false;
+    }
+  }
+  if (ok) {
+    // Non-blocking so pollThreadUdp() never stalls loop().
+    int fl = lwip_fcntl(ozRxFd, F_GETFL, 0);
+    lwip_fcntl(ozRxFd, F_SETFL, fl | O_NONBLOCK);
+
+    // Join the group at the lwIP layer too. OpenThread's own subscription
+    // (above) makes the stack accept the frame off the radio; this makes lwIP
+    // deliver it to THIS socket. Interface 0 = default/any, which is correct
+    // here since Thread is the only IPv6 netif on a Thread-transport lock.
+    struct ipv6_mreq mreq;
+    memset(&mreq, 0, sizeof(mreq));
+    memcpy(&mreq.ipv6mr_multiaddr, OZ_THREAD_GROUP_BYTES, 16);
+    mreq.ipv6mr_interface = 0;
+    if (lwip_setsockopt(ozRxFd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq, sizeof(mreq)) != 0) {
+      // Non-fatal: unicast still works, and that alone proves the stack theory.
+      Serial.printf("[UDP] lwip IPV6_JOIN_GROUP failed errno=%d (unicast still live)\n", errno);
+    }
+  }
+
+  threadUdpReady = ok;
+  Serial.printf("[UDP] lwip socket %s fd=%d on port %u (group ff03::4f5a)\n",
+                ok ? "open" : "FAILED", ozRxFd, OZ_THREAD_UDP_PORT);
+
+  // GROUND TRUTH (2026-07-28): subscribe returning OT_ERROR_NONE is NOT proof
+  // the group is live on the interface, and every hypothesis so far died on an
+  // assumption we never actually read back. Dump what the IPv6 stack really
+  // holds. Expect ff03::4f5a here, plus the auto-joined ff02::1 / ff03::1 /
+  // ff03::fc — if ff03::4f5a is absent the subscription silently failed; if
+  // ff03::1 is absent too, this node is not receiving realm-local multicast at
+  // all and the fault is below UDP entirely.
+  for (const auto &a : thread.getAllMulticastAddresses()) {
+    Serial.printf("[UDP] mcast joined: %s\n", a.toString().c_str());
+  }
+  for (const auto &a : thread.getAllUnicastAddresses()) {
+    Serial.printf("[UDP] unicast addr : %s\n", a.toString().c_str());
+  }
 }
 
 void pollThreadUdp() {
-  if (!threadUdpReady) return;
-  int n = threadUdp.parsePacket();
-  if (n <= 0) return;
+  if (!threadUdpReady || ozRxFd < 0) return;
 
   char buf[OZ_UDP_RX_BUF];
-  int got = threadUdp.read(buf, (n < (int)sizeof(buf) - 1) ? n : (int)sizeof(buf) - 1);
-  buf[got] = '\0';
+  struct sockaddr_in6 src;
+  socklen_t srcLen = sizeof(src);
+  int n = lwip_recvfrom(ozRxFd, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&src, &srcLen);
+  if (n <= 0) return; // EWOULDBLOCK on an idle socket
+  buf[n] = '\0';
+
+  // DIAGNOSTIC (2026-07-28 bench): log EVERY datagram before any filtering.
+  // The target filter below used to return silently, which made "no packet
+  // ever arrived" and "packet arrived but wasn't addressed to us" look
+  // identical on the serial console — the single blind spot that stalled the
+  // first end-to-end relay test (ozkey-11 §4.1).
+  Serial.printf("[UDP] rx %d bytes: %s\n", n, buf);
 
   JsonDocument doc;
   if (deserializeJson(doc, buf) != DeserializationError::Ok) {
@@ -788,7 +933,10 @@ void pollThreadUdp() {
   }
   String target = (const char *)(doc["target"] | "");
   String payloadHex = (const char *)(doc["payload"] | "");
-  if (target != deviceId) return; // not for us
+  if (target != deviceId) { // not for us
+    Serial.printf("[UDP] not for us (target='%s' me='%s')\n", target.c_str(), deviceId.c_str());
+    return;
+  }
   Serial.printf("[UDP] << target=%s payload=%s\n", target.c_str(), payloadHex.c_str());
   lastActivityAt = millis();
   forwardHexToMcu(payloadHex);
@@ -1304,6 +1452,21 @@ void setup() {
   touchInit();
   pinMode(USER_BUTTON, INPUT_PULLUP); // hold 5s -> factory reset, touch-independent
 
+  // ROOT-CAUSE FIX (2026-07-28) — the ozkey-10 §1 fix, which had only ever
+  // been applied to bridge32.ino (its line ~789), never here.
+  // esp_event_loop_create_default() inside OpenThread::begin()'s worker task
+  // FAILS once WiFi already owns the default event loop: arduino-esp32
+  // tolerates ESP_ERR_INVALID_STATE, the bundled OThread.cpp does not. Both
+  // later begin() calls (applyProvision + the Thread-resume branch below) run
+  // AFTER WiFi.mode(WIFI_STA), so OpenThread came up in a half-initialised
+  // state — which is why the resume path logged "OpenThread platform not
+  // initialized", why hasActiveDataset() returned a FALSE NEGATIVE against a
+  // dataset still present in NVS, and why attach retried in a tight loop.
+  // begin() is idempotent (early-returns once started), so calling it here
+  // is safe for the Wi-Fi-transport case too.
+  OpenThread::begin(false);
+  Serial.printf("[THREAD] early begin() otStarted=%d\n", (int)(bool)thread);
+
   WiFi.mode(WIFI_STA);
   WiFi.onEvent(
       [](WiFiEvent_t e, WiFiEventInfo_t info) {
@@ -1489,7 +1652,13 @@ void loop() {
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
                   WiFi.localIP().toString().c_str(),
                   mqtt.connected() ? "up" : "down",
-                  threadFormed ? "up" : "down",
+                  // LIVE role, not the latched threadFormed flag (2026-07-28).
+                  // threadFormed is set once on first attach and never cleared,
+                  // so it reported "up" even while actually detached — which
+                  // masked a bridge reboot during the relay bench test and made
+                  // a void run look like a genuine receive failure.
+                  isThread() ? OpenThread::otGetStringDeviceRole()
+                             : (threadFormed ? "up" : "down"),
                   threadUdpReady ? "up" : "down",
                   mcuLinkUp() ? "up" : "DOWN",
                   (unsigned)mcuTxFrames, (unsigned)mcuRxFrames,

@@ -47,7 +47,8 @@ function detectLanIp() {
  * Configuration
  * ------------------------------------------------------------------------- */
 const CONFIG = {
-  HTTP_PORT: 4200,
+  // Override to spin a verification instance beside the watcher-run :4200 one.
+  HTTP_PORT: Number(process.env.OZLOCK_HTTP_PORT) || 4200,
   SERVER_IP: process.env.OZLOCK_SERVER_IP || detectLanIp(),
   SITE_ID: 'lab', // single-tenant lab deployment (ozkey-05 §1.3)
   DB: {
@@ -74,6 +75,10 @@ const CONFIG = {
   SUB_HEARTBEAT: 'ozkey/lab/locks/+/heartbeat',
   SUB_LOG: 'ozkey/lab/locks/+/log',
   topicCommand: (site, deviceId) => `ozkey/${site}/locks/${deviceId}/command`,
+  // A Thread lock has no MQTT client of its own — bridge32 is its gateway and
+  // subscribes to its OWN topic (blelock/bridge32/bridge32.ino:489), then
+  // demuxes onto the mesh by `target`. ozkey-11 §3.
+  topicBridgeCommand: (site, bridgeId) => `ozkey/${site}/bridges/${bridgeId}/command`,
   ENROLL_TOKEN_TTL_MS: 10 * 60 * 1000, // ozkey-05 §7.5
   DEFAULT_HEARTBEAT_S: 60,
 };
@@ -258,6 +263,7 @@ async function initDatabase() {
       id VARCHAR(64) PRIMARY KEY,
       site_id VARCHAR(50),
       app_id VARCHAR(80) NULL,
+      bridge_id VARCHAR(64) NULL,
       mac VARCHAR(17),
       label VARCHAR(255) DEFAULT 'New Doorlock',
       fw VARCHAR(50) NULL,
@@ -279,6 +285,18 @@ async function initDatabase() {
     [CONFIG.DB.database]
   );
   if (!hasAppId) await pool.query('ALTER TABLE locks ADD COLUMN app_id VARCHAR(80) NULL AFTER site_id');
+
+  // bridge_id = the bridge32 gateway a Thread lock is reached through (ozkey-11
+  // §3). NULL = the lock is its own MQTT client (direct Wi-Fi, modes 2b/3/4).
+  // Only the app learns this — it read the bridge's Thread dataset over BLE at
+  // commissioning — so it must tell us at /pairings or the lock is unreachable.
+  const [[{ hasBridgeId }]] = await pool.query(
+    `SELECT COUNT(*) AS hasBridgeId FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'bridge_id'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasBridgeId)
+    await pool.query('ALTER TABLE locks ADD COLUMN bridge_id VARCHAR(64) NULL AFTER app_id');
 
   const [[{ hasTokenAppId }]] = await pool.query(
     `SELECT COUNT(*) AS hasTokenAppId FROM information_schema.columns
@@ -397,6 +415,12 @@ async function flushQueueForDevice(siteId, deviceId) {
   );
   if (queued.length === 0) return 0;
 
+  // Transport routing (ozkey-11 §3). A bridged (Thread) lock never subscribes
+  // to MQTT itself, so publishing to its device-scoped topic reaches nobody —
+  // the command must go to its BRIDGE's topic, naming the lock in `target`.
+  const [[lockRow]] = await pool.query('SELECT bridge_id FROM locks WHERE id = ?', [deviceId]);
+  const bridgeId = lockRow && lockRow.bridge_id ? lockRow.bridge_id : null;
+
   let sent = 0;
   for (const job of queued) {
     // ozkey-05 §6.3: commands must never fire stale.
@@ -406,7 +430,9 @@ async function flushQueueForDevice(siteId, deviceId) {
       continue;
     }
 
-    const commandTopic = CONFIG.topicCommand(siteId, deviceId);
+    const commandTopic = bridgeId
+      ? CONFIG.topicBridgeCommand(siteId, bridgeId)
+      : CONFIG.topicCommand(siteId, deviceId);
     const envelope = {
       msg_id: `ozl-${job.id}-${Date.now()}`,
       device_id: deviceId,
@@ -416,6 +442,13 @@ async function flushQueueForDevice(siteId, deviceId) {
       issued_at: new Date().toISOString(),
       source: 'ozlockserv',
     };
+    // bridge32 demuxes on {target, payload} (CONTRACT-BRIDGE / ozkey-11 §3). It
+    // does fall back to device_id/payload_hex, but name the contract keys
+    // explicitly rather than lean on the fallback.
+    if (bridgeId) {
+      envelope.target = deviceId;
+      envelope.payload = job.payload_hex;
+    }
 
     const ok = mqttPublish(commandTopic, envelope);
     if (!ok) break;
@@ -429,7 +462,11 @@ async function flushQueueForDevice(siteId, deviceId) {
       ]);
     }
     sent++;
-    logEvent('sync', `${deviceId} wake -> burst ${job.action_type} #${job.id} down ${commandTopic}`);
+    logEvent(
+      'sync',
+      `${deviceId} wake -> burst ${job.action_type} #${job.id} down ${commandTopic}` +
+        (bridgeId ? ` (via bridge ${bridgeId})` : '')
+    );
   }
   return sent;
 }
@@ -635,7 +672,7 @@ function buildProvisionPayload(appId, deviceId) {
  * unguessability + the (future) e2e envelope are the security, not a server
  * credential. Returns {status:number}|null via `err` for the caller to map.
  */
-async function registerPairing(appId, deviceId, label) {
+async function registerPairing(appId, deviceId, label, bridgeId) {
   const [[existing]] = await pool.query('SELECT app_id, status FROM locks WHERE id = ?', [
     deviceId,
   ]);
@@ -647,15 +684,19 @@ async function registerPairing(appId, deviceId, label) {
   // Fresh registration lands as 'registered' (awaiting the lock's first
   // contact); an already-enrolled lock keeps its status on re-register.
   await pool.query(
-    `INSERT INTO locks (id, site_id, app_id, label, status, heartbeat_s)
-       VALUES (?, ?, ?, ?, 'registered', ?)
+    `INSERT INTO locks (id, site_id, app_id, bridge_id, label, status, heartbeat_s)
+       VALUES (?, ?, ?, ?, ?, 'registered', ?)
      ON DUPLICATE KEY UPDATE app_id = VALUES(app_id),
+       bridge_id = COALESCE(VALUES(bridge_id), bridge_id),
        label = COALESCE(VALUES(label), label)`,
-    [deviceId, CONFIG.SITE_ID, appId, label || 'New Doorlock', CONFIG.DEFAULT_HEARTBEAT_S]
+    [deviceId, CONFIG.SITE_ID, appId, bridgeId || null, label || 'New Doorlock', CONFIG.DEFAULT_HEARTBEAT_S]
   );
   logEvent(
     'pair',
-    `Pairing registered: app ${appId || '(anon)'} ⇄ device ${deviceId} — awaiting doorlock contact`
+    `Pairing registered: app ${appId || '(anon)'} ⇄ device ${deviceId}` +
+      (bridgeId
+        ? ` via bridge ${bridgeId} (Thread — no self-enroll, see ozkey-11 §3)`
+        : ' — awaiting doorlock contact')
   );
   await recordAudit(appId, deviceId, 'pair', `registered pairing (label "${label || 'New Doorlock'}")`);
 }
@@ -664,19 +705,23 @@ async function registerPairing(appId, deviceId, label) {
 api.post('/pairings', async (req, res) => {
   if (!guardDb(res)) return;
   try {
-    const { app_id, device_id, label } = req.body || {};
+    const { app_id, device_id, label, bridge_id } = req.body || {};
     const appId = app_id ? String(app_id).slice(0, 80) : null;
     const deviceId = device_id ? String(device_id).slice(0, 64) : null;
+    // Optional: present only for a Thread lock reached through a bridge32
+    // gateway (ozkey-11 §3). Absent = direct Wi-Fi lock, routed as before.
+    const bridgeId = bridge_id ? String(bridge_id).slice(0, 64) : null;
     if (!appId || !deviceId) {
       return res
         .status(400)
         .json({ ok: false, error: 'app_id and device_id are required (the app grants both)' });
     }
-    await registerPairing(appId, deviceId, label);
+    await registerPairing(appId, deviceId, label, bridgeId);
     res.json({
       ok: true,
       device_id: deviceId,
       app_id: appId,
+      bridge_id: bridgeId,
       provision_payload: buildProvisionPayload(appId, deviceId),
     });
   } catch (err) {
@@ -688,14 +733,16 @@ api.get('/pairings/status', async (req, res) => {
   if (!guardDb(res)) return;
   try {
     const deviceId = String(req.query.device_id || '');
-    const [[row]] = await pool.query('SELECT id, app_id, status, mac FROM locks WHERE id = ?', [
-      deviceId,
-    ]);
+    const [[row]] = await pool.query(
+      'SELECT id, app_id, bridge_id, status, mac FROM locks WHERE id = ?',
+      [deviceId]
+    );
     if (!row) return res.status(404).json({ ok: false, error: 'no such pairing' });
     res.json({
       ok: true,
       device_id: row.id,
       app_id: row.app_id,
+      bridge_id: row.bridge_id,
       // 'registered' = awaiting lock; 'enrolled' = lock made first contact.
       status: row.status,
       mac: row.mac,
@@ -1086,7 +1133,13 @@ api.post('/locks/:id/unlock', async (req, res) => {
     const deviceId = req.params.id;
     const [[lock]] = await pool.query('SELECT * FROM locks WHERE id = ?', [deviceId]);
     if (!lock) return res.status(404).json({ ok: false, error: `Lock ${deviceId} not found` });
-    if (lock.status !== 'enrolled') {
+    // A bridged (Thread) lock has no MQTT uplink of its own, so handleEnroll can
+    // never run for it and its status cannot advance past 'registered' — that is
+    // the ozkey-10 uplink gap, not a half-finished pairing. Commands still reach
+    // it, because the BRIDGE is the MQTT client. Direct locks keep the stricter
+    // 'enrolled' bar, which for them still means "the lock has spoken to us".
+    const reachable = lock.status === 'enrolled' || (lock.bridge_id && lock.status === 'registered');
+    if (!reachable) {
       return res
         .status(409)
         .json({ ok: false, error: `Lock ${deviceId} is not enrolled yet (status: ${lock.status})` });

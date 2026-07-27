@@ -421,6 +421,19 @@ const uint8_t OZ_THREAD_GROUP_BYTES[16] = {0xff, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0
 const IPAddress OZ_THREAD_GROUP(IPv6, OZ_THREAD_GROUP_BYTES);
 const uint16_t OZ_THREAD_UDP_PORT = 5052;
 
+// DIAGNOSTIC (2026-07-28, temporary — remove once the answer is known).
+// ff03::1 = realm-local ALL-NODES, which every Thread node subscribes to
+// automatically, with no explicit subscription needed. The doorlock's socket
+// is bound to IN6ADDR_ANY:5052, so it accepts a datagram sent to EITHER group
+// without any doorlock-side change. Sending to both isolates the last two
+// hypotheses for why the relay goes unheard:
+//   • ff03::1 arrives, ff03::4f5a does not -> our custom group is not being
+//     registered with the parent / not subscribed effectively.
+//   • neither arrives -> realm-local multicast is not reaching a Child at all
+//     (link-mode / MPL forwarding), independent of which group we use.
+const uint8_t OZ_ALLNODES_BYTES[16] = {0xff, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01};
+const IPAddress OZ_REALM_ALLNODES(IPv6, OZ_ALLNODES_BYTES);
+
 OThreadUDP threadUdp;
 bool threadUdpReady = false;
 unsigned long threadUdpLastAttempt = 0;
@@ -441,6 +454,34 @@ void threadUdpBegin() {
                 OZ_THREAD_UDP_PORT);
 }
 
+// One multicast send, logged per destination group so the bench can tell which
+// group a datagram actually went out on.
+static bool sendToThreadGroup(const IPAddress &group, const String &target,
+                              const String &payloadHex, const char *label) {
+  // "via" tags which multicast group carried this datagram. The doorlock reads
+  // only "target"/"payload" and ArduinoJson ignores unknown keys, so this is
+  // inert to the relay — but the doorlock's rx diagnostic dumps the whole
+  // buffer, making it obvious which group actually got through.
+  JsonDocument doc;
+  doc["target"] = target;
+  doc["payload"] = payloadHex;
+  doc["via"] = label;
+  String out;
+  serializeJson(doc, out);
+
+  if (!threadUdp.beginPacket(group, OZ_THREAD_UDP_PORT)) {
+    Serial.printf("[UDP] beginPacket failed (%s)\n", label);
+    return false;
+  }
+  threadUdp.write((const uint8_t *)out.c_str(), out.length());
+  if (!threadUdp.endPacket()) {
+    Serial.printf("[UDP] endPacket failed (%s)\n", label);
+    return false;
+  }
+  Serial.printf("[UDP] >> [%s] %s\n", label, out.c_str());
+  return true;
+}
+
 void forwardOverThread(const String &target, const String &payloadHex) {
   if (!target.length() || !payloadHex.length()) {
     Serial.println("[UDP] drop — command missing target/payload");
@@ -450,22 +491,29 @@ void forwardOverThread(const String &target, const String &payloadHex) {
     Serial.println("[UDP] drop — socket not open");
     return;
   }
-  JsonDocument doc;
-  doc["target"] = target;
-  doc["payload"] = payloadHex;
-  String out;
-  serializeJson(doc, out);
+  sendToThreadGroup(OZ_THREAD_GROUP, target, payloadHex, "ff03::4f5a");
+  // DIAGNOSTIC (2026-07-28, temporary): same datagram to realm-local
+  // all-nodes — see the OZ_REALM_ALLNODES note above.
+  sendToThreadGroup(OZ_REALM_ALLNODES, target, payloadHex, "ff03::1");
 
-  if (!threadUdp.beginPacket(OZ_THREAD_GROUP, OZ_THREAD_UDP_PORT)) {
-    Serial.println("[UDP] beginPacket failed");
-    return;
+  // DIAGNOSTIC (2026-07-28, temporary — REMOVE, hard-codes one bench lock).
+  // Unicast control test. The doorlock's mesh-local EID, read from its own
+  // boot dump. Its stack confirms it has joined BOTH ff03::4f5a and ff03::1,
+  // it is an attached Child of this bridge (RLOC16 0x7401), and its socket is
+  // bound with no netif filter — yet neither multicast is ever delivered.
+  // This separates the last two possibilities:
+  //   • unicast ARRIVES, multicast does not -> multicast delivery to a Child
+  //     is broken; the relay needs a lock->address map (which ozkey-11 §3
+  //     ruled unnecessary, but that assumed multicast worked).
+  //   • unicast ALSO fails -> UDP receive is broken end-to-end regardless of
+  //     addressing, and the next step is the OpenThread CLI (`ot ping`) to
+  //     test below our code entirely.
+  IPAddress benchLock;
+  if (benchLock.fromString("fd30:4e72:549c:3c5b:5630:8734:5090:340b")) {
+    sendToThreadGroup(benchLock, target, payloadHex, "unicast-ML-EID");
+  } else {
+    Serial.println("[UDP] bench unicast address failed to parse");
   }
-  threadUdp.write((const uint8_t *)out.c_str(), out.length());
-  if (!threadUdp.endPacket()) {
-    Serial.println("[UDP] endPacket failed");
-    return;
-  }
-  Serial.printf("[UDP] >> %s\n", out.c_str());
 }
 
 void mqttConnect() {
