@@ -102,6 +102,45 @@ So the real firmware gap is narrower than "5 modes" suggests:
 
 **The actual unification work is: teach `blecomm.ino` to also speak Thread**, selected by the same payload-shape discriminator `threadcomm.ino` already uses (`network_key` present → Thread dataset; `ssid` present → Wi-Fi credentials) — not a new top-level "mode" value.
 
+## 1a. Operator connectivity + response-tier addendum (2026-07-29)
+
+The operator restated the delivery paths on 2026-07-29. §1's taxonomy already covers
+all of them; two details it did **not** yet capture are recorded here (plus one vertical
+name), so they aren't lost.
+
+**Response-time tiers (OZLOCK-HOME / BANOI) — operator-stated figures:**
+
+| Config | Path | Response |
+|---|---|---|
+| **2a premium** | Doorlock → Thread → **bridge32** → MQTT → ozlockserv → BANOI | **2–5 s** — always-on bridge holds a persistent link |
+| **2b economy** | Doorlock → **Wi-Fi direct** → MQTT → ozlockserv → BANOI | **~10 min** — lock sleeps on battery, wakes periodically |
+
+The economy latency is the same knob as the **§7 Q2** sleep/wake open question — Wi-Fi's
+join/rejoin cost is why an unmained lock can't hold a persistent link; the mechanism
+(battery poll cadence) is operator-implied, not yet pinned to a number, so treat the
+"~10 min" as the target SLA, not a settled poll interval.
+
+**Matter (#1) — old vs new ecosystem devices.** The operator splits row #1 by hub
+capability:
+- **Old** Apple TV / Echo / Alexa / Nest (no native Thread border router): Doorlock →
+  **Bridge** → Matter → hub.
+- **New** devices (native Matter / Thread border router): Doorlock → **Matter** directly,
+  no bridge.
+
+This is ecosystem-compatibility context only — Matter firmware stays **out of scope this
+pass (§6)**; noted so the "premium needs a bridge, and so do old Matter hubs" distinction
+survives. (Open: whether that Matter-side bridge is `bridge32` or an ecosystem hub — a
+Matter-workstream detail, not this unification's.)
+
+**Verticals (#3 OZKEY):** operator's list is hotel / motel / **university** / campus /
+mining — "university" stated explicitly alongside "campus."
+
+**App mapping:** 2a/2b → **BANOI**; #3 (OZKEY, local server) → **MAOI**; #4 (OZPMS, cloud
+server) → **OZPMS app** — OZPMS being a MAOI-like front end with its **own MQTT and its
+own Nexus-equivalent backend**, customer-self-hosted on their own VPS/cloud under their
+own brand (deployment-only fork of #3 from the *firmware's* view, per §1 / ozkey-07 §14;
+a fully separate stack from the *product's* view).
+
 ## 2. Base sketch decision (operator, 2026-07-26)
 
 **Start from `blecomm.ino`, not `threadcomm.ino`.** It already has the mature
