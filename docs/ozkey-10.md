@@ -89,7 +89,7 @@ one firmware image must be told to do at commissioning:
 
 | # | Configuration | Transport | Server | RBAC | Firmware today |
 |---|---|---|---|---|---|
-| 1 | **Matter** | Thread → ecosystem's own border router (Apple TV/Alexa/Nest) | none of ours | none | **not started** — separate protocol stack (esp-matter), out of scope here (§6) |
+| 1 | **Matter** | Thread → ecosystem's own border router (Apple TV/Alexa/Nest) | none of ours | none | **SUPERSEDED 2026-07-29 — no longer a LOCK mode at all.** Operator decision: native Matter on the lock is dropped; Matter runs on **bridge32** (`cfgMode="matter-bridge"`) and the lock stays a plain Thread device. Frees 2.64 MB + the DAC partition + the RAM pressure on a battery device, and settles the BOM at N8-with-OTA. Full rationale and measured flash budget: **ozkey-11 §2–§4**. |
 | 2a | **OZLOCK-HOME, premium** | Thread → bridge32 → MQTT → ozlockserv | ozlockserv (free relay) | none (app+lock only) | **proven live end-to-end 2026-07-27** on the actual unified `doorlock.ino` binary (not just the old standalone `threadcomm.ino` proof-of-concept) — see the status note above |
 | 2b | **OZLOCK-HOME, economy** | Wi-Fi direct → MQTT → ozlockserv | ozlockserv (free relay) | none | proven in `blecomm.ino` (`mode=ozkey-cloud`) |
 | 3 | **OZKEY** (hotel/motel/campus/mining camp) | Wi-Fi direct → MQTT → ozkeyserv | on-prem or cloud, **3-level RBAC**, AI-generated site/room map | org → operator → tenant | proven in `blecomm.ino` (`mode=ozkey-local`) |

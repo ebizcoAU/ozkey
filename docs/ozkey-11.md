@@ -1,5 +1,130 @@
 # OZKEY-11 — OZLOCK-HOME Remote-Unlock Access Model + Hosted-Broker Auth
 
+> **APP→LOCK REMOTE UNLOCK WORKING 2026-07-29 + MATTER MOVED TO THE BRIDGE
+> (operator decision) + BOM SETTLED: N8 FOR THE LOCK.**
+> Supersedes the mode table in **ozkey-10 §0** — Mode 1 (Matter) is no longer a
+> lock firmware mode at all. Read this note and the 2026-07-27 one below it.
+>
+> ## 1. The full chain works, driven by the app
+>
+> `BANOI → ozlockserv → MQTT → bridge32 → Thread multicast → doorlock → MCU`,
+> confirmed on real hardware with a server-generated `msg_id` (i.e. a genuine
+> app-originated command, not a hand-made test publish), ending in the real
+> frame on the Tuya bus: `[TUYA->] 55 AA 00 06 00 05 01 01 00 01 01 0E`.
+> Observed latency ≈ **1 s**, comfortably inside the 2–5 s premium claim.
+>
+> **THE BUG THAT BLOCKED IT ALL NIGHT — PubSubClient's 256-byte ceiling.**
+> `MQTT_MAX_PACKET_SIZE` defaults to **256** and PubSubClient **silently
+> discards any larger inbound packet** — no error, no callback, no log line.
+> ozlockserv's full command envelope (`msg_id`/`device_id`/`action`/`grant_id`/
+> `payload_hex`/`issued_at`/`source`/`target`/`payload`) is ~280 bytes of JSON
+> plus a ~45-byte topic, so **every command from the server was binned by every
+> bridge**, while short hand-typed `{target,payload}` bench publishes (~130
+> bytes total) always got through. That asymmetry is exactly why the transport
+> looked perfect in testing and the app never worked once. The failure mode is
+> vicious: server reports `delivery:"delivered"`, `mosquitto_sub` shows the
+> message on the broker, and the bridge logs nothing at all.
+> Fixed both ends: bridge32 calls `mqttClient.setBufferSize(1024)` (headroom for
+> the ozkey-06 sealed envelope, which will be larger again), and ozlockserv now
+> sends bridge topics a minimal `{msg_id, target, payload}` — the other fields
+> never cross the Thread hop, since bridge32 rebuilds its datagram from
+> `target`/`payload` alone. Small wire is the belt to that braces: a
+> stock-configured or older bridge still works.
+>
+> ## 2. The six paths (supersedes ozkey-10 §0)
+>
+> | # | Path | Where Matter runs | Firmware status |
+> |---|---|---|---|
+> | 1 | Lock → **Bridge** → Matter → AppleTV/Google/Echo | **bridge** | `cfgMode="matter-bridge"` field exists, unbuilt |
+> | 2 | Lock → Matter → ecosystems (native) | lock | **DROPPED — see §3** |
+> | 3 | Lock → Bridge → MQTT → BANOI (PREMIUM, ~1–5 s) | — | ✅ **proven 2026-07-29** |
+> | 4 | Lock → WiFi → MQTT → BANOI (ECO, 2–10 min) | — | firmware done |
+> | 5 | Lock → WiFi → MQTT → OZKEY local → MAOI | — | firmware done |
+> | 6 | Lock → WiFi → MQTT → OZPMS cloud | — | **same binary as 5** (ozkey-07 §14) |
+>
+> After dropping #2 the lock has just **two transports** (Thread-via-bridge, or
+> WiFi-direct) and one broker-host config field. Both already exist and are
+> proven — there is no new transport mode left to build.
+>
+> ## 3. OPERATOR DECISION — native Matter on the lock is dropped
+>
+> Anyone wanting Matter buys the bridge. Rationale:
+> - A Matter **Bridge** exposes devices *to* a controller; it is not a
+>   controller. So path #1 still requires the customer to own an Apple TV /
+>   HomePod / Nest Hub / Echo — a $150–300 AUD box most households do not have.
+>   **Smart TVs generally do not qualify**: AirPlay or Google TV does not make a
+>   set a Matter controller *and* Thread Border Router (a few high-end Samsung
+>   sets ship a SmartThings hub with Thread; that is the exception).
+> - Therefore Matter never grows the addressable market — it serves the slice
+>   who already bought into an ecosystem, which skews affluent and suits a
+>   premium SKU. In Vietnam hub penetration is very low, making it close to
+>   irrelevant there; Australia is better but far from universal.
+> - What *does* remove the requirement is path #3 — our own bridge, which needs
+>   no third-party hardware and IS the hub.
+> - Matter's real value is therefore **channel and credibility** ("Works with
+>   Apple Home", retail listings, tenders that specify it) — not user-facing
+>   reach. Build it **bridged** when there is a commercial reason.
+>
+> Dropping native Matter deletes, from the lock: a 2.64 MB stack, the DAC/factory
+> partition, the RAM pressure, certification burden on a battery device, and
+> multi-tens-of-minutes Matter OTA per lock over Thread.
+>
+> ## 4. Flash budget — MEASURED, and the partition correction
+>
+> All figures built for `esp32c6`, `CDCOnBoot=cdc`:
+>
+> | Build | Flash | % of slot |
+> |---|---|---|
+> | `blecomm` (WiFi + BLE + MQTT + Tuya) | 1,580,668 | 47% |
+> | `doorlock` (adds OpenThread + LCD + crypto + LittleFS) | 2,060,142 | 61% |
+> | `MatterMinimum` (bare stack, no app logic) | **2,644,204** | **79%** |
+> | `MatterOnOffLight` (realistic device) | 2,649,368 | 79% |
+>
+> Two things this settles. **Matter's cost is almost entirely fixed** —
+> Minimum→OnOffLight is only +5 KB, so application logic is noise beside the
+> stack. And the whole Thread stack + LCD + crypto + FS cost only **+479 KB**
+> over `blecomm`.
+>
+> **PARTITION CORRECTION (this tripped us up twice).** `default_8MB` is
+> **already dual-OTA**:
+> ```
+> app0  0x10000  0x330000   ← 3.19 MB
+> app1  0x340000 0x330000   ← 3.19 MB
+> spiffs 0x670000 0x180000  ← 1.5 MB
+> ```
+> So the "Maximum is 3342336 bytes" in every build result **is** the OTA slot
+> size — OTA costs nothing extra. (The "OTA halves it to ~1.5 MB" figure is a
+> **4 MB** board's `default.csv`, 1.25 MB per slot.) Also note **BLE DFU does
+> not avoid the OTA partition**: the running app cannot be overwritten in place,
+> so `esp_ota_*` always writes to the inactive slot regardless of transport.
+> Only esptool-over-USB avoids it, and that means visiting every door.
+>
+> **BOM: N8 for the lock, WITH OTA.** ~2.06 MB in a 3.19 MB slot ≈ **1.1 MB
+> headroom**. (Had native Matter stayed, it would have been ~2.9–3.05 MB — a
+> 5–10% margin, with RAM tighter still: Matter alone takes 140 KB of 328 KB.)
+> The bridge stays the 16 MB GEEK module, which is where Matter belongs anyway:
+> mains-powered, WiFi-speed OTA, certified once per home.
+>
+> ## 5. Commercial validation — ECO latency is fine, missed wakes are not
+>
+> Operator, on ~500 Airbnb properties in Perth: a 10–15 min PIN-sync delay is
+> perfectly acceptable — booking to check-in leaves ample time, and
+> `pending_queue` + flush-on-heartbeat already implements exactly this.
+> Credential jobs correctly persist (only `unlock` rows carry a 60 s expiry).
+>
+> **But ECO cannot do remote unlock** — a 2–10 min wake cadence makes "open my
+> door" unusable on demand. ECO's honest story is: **unlock is BLE at the door;
+> the WiFi link carries key management and audit.** The app copy must say so or
+> ECO customers will think the lock is broken. This is precisely what makes the
+> ~$50 bridge worth buying, and premium's proposition is "remote unlock actually
+> works".
+>
+> **Open gap for Mode 3/4 at fleet scale:** the risk is not latency, it is a
+> **missed wake** — a lock that sleeps through its heartbeat leaves a guest at
+> the door at 11pm with no PIN. Grants survive in the queue, but delivery
+> **confirmation** needs surfacing to the property manager rather than just
+> "queued". Cheaper to design now than to retrofit across 500 doors.
+
 > **BRIDGE ROUTING BUILT 2026-07-27 (lab-verified) + SEQUENCING DECISION.**
 > §4's step ordering below is **superseded** by the five-step sequence in this
 > note — read this first.
