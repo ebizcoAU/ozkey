@@ -442,15 +442,22 @@ async function flushQueueForDevice(siteId, deviceId) {
       issued_at: new Date().toISOString(),
       source: 'ozlockserv',
     };
-    // bridge32 demuxes on {target, payload} (CONTRACT-BRIDGE / ozkey-11 §3). It
-    // does fall back to device_id/payload_hex, but name the contract keys
-    // explicitly rather than lean on the fallback.
-    if (bridgeId) {
-      envelope.target = deviceId;
-      envelope.payload = job.payload_hex;
-    }
+    // bridge32 demuxes on {target, payload} (CONTRACT-BRIDGE / ozkey-11 §3).
+    // Send it a MINIMAL envelope: the bridge reads only these two fields and
+    // rebuilds its own datagram from them, so msg_id/action/grant_id/issued_at/
+    // source never cross the Thread hop and are pure overhead on a constrained
+    // link. Keeping them nearly broke the product: PubSubClient's default
+    // MQTT_MAX_PACKET_SIZE is 256 bytes and silently discards anything larger,
+    // so the ~280-byte full envelope was dropped by every bridge without a
+    // trace while short hand-made test publishes sailed through (found live
+    // 2026-07-29). bridge32 now also calls setBufferSize(1024), but keeping the
+    // wire small is the belt to that braces — a stock-configured bridge, or one
+    // on an older build, still works.
+    const publishBody = bridgeId
+      ? { msg_id: envelope.msg_id, target: deviceId, payload: job.payload_hex }
+      : envelope;
 
-    const ok = mqttPublish(commandTopic, envelope);
+    const ok = mqttPublish(commandTopic, publishBody);
     if (!ok) break;
 
     await pool.query("UPDATE pending_queue SET status = 'sent' WHERE id = ?", [job.id]);

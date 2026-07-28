@@ -29,7 +29,9 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <OThread.h>
-#include <openthread/instance.h> // otInstanceFactoryReset() — see factoryReset()
+#include <openthread/instance.h>   // otInstanceFactoryReset() — see factoryReset()
+#include <openthread/thread_ftd.h> // otChildInfo / otThreadGetChildInfoByIndex
+                                   // (FTD-only API) — see logThreadChildren()
 #include "esp_coexist.h"
 #include <OThreadUDP.h>
 #include <Arduino_GFX_Library.h>
@@ -63,7 +65,17 @@ String lastStatus = "BOOT";
 // wake it — screen state is intentionally independent of the status ladder
 // once it's gone dark, matching "only turn on if someone touch the boot
 // button").
-#define LCD_IDLE_OFF_MS 30000UL
+#define LCD_IDLE_OFF_MS 60000UL // 30s -> 60s (operator request 2026-07-28)
+
+// RX activity flash (2026-07-28, operator request): when a command arrives over
+// MQTT, briefly swap the two footer lines (site / device_id) for a "received"
+// banner, then restore them. Makes relay traffic visible on the panel itself —
+// which matters because this board's USB-CDC serial has been unreliable to
+// capture, while the LCD has been trustworthy all along.
+#define LCD_RX_FLASH_MS 5000UL
+unsigned long lcdRxFlashUntil = 0;
+bool lcdRxFlashActive = false; // so loop() can redraw once when it lapses
+String lcdRxMsg;
 bool lcdOn = true;
 unsigned long lastLcdActivityAt = 0;
 
@@ -129,6 +141,22 @@ void checkFactoryResetButton() {
 
 OpenThread thread;
 DataSet otDataset;
+
+// ── Thread dataset RESTORE (2026-07-28, operator request) ───────────────────
+// Until now bridge32 could only ever SELF-FORM: on a factory reset (or on a
+// replacement unit) it invented a random ext-PAN-ID + network key, which meant
+// every doorlock already provisioned onto the OLD mesh was orphaned and had to
+// be re-paired over BLE at each door. Bit us live 2026-07-28 after a bridge
+// delete from the app.
+// The app already holds everything needed — it reads this bridge's dataset off
+// the `info` characteristic (network_name / ext_pan_id / network_key / channel
+// / pan_id) and stores it to provision locks in the first place. So it can now
+// hand the SAME dataset back, and every existing lock rejoins on its own with
+// no trip to the door. Field names deliberately match what refreshInfo()
+// publishes, so it is a straight round-trip.
+bool haveRestoreDataset = false;
+String rdNetworkName, rdExtPanHex, rdNetworkKeyHex, rdPanIdHex;
+uint16_t rdChannel = 0;
 bool threadFormed = false;
 
 // F2: MQTT client — declared here (not down in the F2 section below) so
@@ -220,14 +248,29 @@ void drawStatus() {
     gfx->setCursor(4, 84);
     gfx->print("IP ");
     gfx->println(WiFi.localIP().toString());
-    gfx->setCursor(4, 102);
-    if (cfgSiteId.length()) {
-      gfx->print("site ");
-      gfx->println(cfgSiteId);
+    // Footer: normally site + device_id; briefly the RX banner instead.
+    // device_id bumped size1 -> size2 (2026-07-28, operator: unreadable on this
+    // 240x135 panel). At size2 the full "ozb-98a316a7e638" is 16 chars * 12px =
+    // 192px, so it still fits the 240px width — the "ozb-" prefix is kept
+    // because it is what appears verbatim in the MQTT topic you type at the
+    // bench. The site line drops to size1 instead: "lab" is short, static, and
+    // the least useful thing on the screen.
+    if (lcdRxFlashActive && millis() < lcdRxFlashUntil) {
+      gfx->setCursor(4, 100);
+      gfx->println("<< CMD RX");
+      gfx->setCursor(4, 118);
+      gfx->println(lcdRxMsg);
+    } else {
+      gfx->setTextSize(1);
+      gfx->setCursor(4, 100);
+      if (cfgSiteId.length()) {
+        gfx->print("site ");
+        gfx->println(cfgSiteId);
+      }
+      gfx->setTextSize(2);
+      gfx->setCursor(4, 114);
+      gfx->println(deviceId);
     }
-    gfx->setTextSize(1);
-    gfx->setCursor(4, 122); // tightened from 106 (2026-07-27)
-    gfx->println(deviceId);
     return;
   }
 
@@ -405,6 +448,14 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   if (!target.length()) target = (const char *)(doc["device_id"] | "");
   String payloadHex = (const char *)(doc["payload"] | "");
   if (!payloadHex.length()) payloadHex = (const char *)(doc["payload_hex"] | "");
+
+  // Show it on the panel for LCD_RX_FLASH_MS, then the footer restores itself
+  // (loop() redraws once when lcdRxFlashUntil lapses).
+  lcdRxMsg = target.length() ? target : String("(no target)");
+  lcdRxFlashUntil = millis() + LCD_RX_FLASH_MS;
+  lcdRxFlashActive = true;
+  lcdWake(); // redraws immediately with the banner
+
   forwardOverThread(target, payloadHex);
 }
 
@@ -482,6 +533,40 @@ static bool sendToThreadGroup(const IPAddress &group, const String &target,
   return true;
 }
 
+// DIAGNOSTIC (2026-07-28, temporary): who is actually attached to THIS mesh?
+// The doorlock's own LCD/MON "JOINED" comes from a latched flag that is never
+// cleared, so it keeps claiming JOINED after the bridge re-forms the network
+// and orphans it. The bridge's child table is ground truth: if the lock is not
+// listed here, it is on a different (dead) Thread network and no amount of
+// relaying will reach it — it needs re-pairing against the CURRENT dataset.
+static void logThreadChildren() {
+  otInstance *inst = thread.getInstance();
+  if (inst == nullptr) {
+    Serial.println("[MESH] no OT instance");
+    return;
+  }
+  // LOCK DISCIPLINE (2026-07-28): this runs on the MQTT callback task, NOT the
+  // OpenThread task. Calling ot* APIs from a foreign task without holding
+  // esp_openthread's lock can corrupt/crash the stack — exactly the class of
+  // fault this file already documents for getExtendedPanId()/getNetworkKey().
+  // Bounded wait so a busy OT task costs us one skipped diagnostic, never a
+  // blocked relay: forwarding the command matters more than logging.
+  if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(200))) {
+    Serial.println("[MESH] lock busy — skipped child dump");
+    return;
+  }
+  int n = 0;
+  otChildInfo ci;
+  for (uint16_t i = 0; i < 64; i++) {
+    if (otThreadGetChildInfoByIndex(inst, i, &ci) != OT_ERROR_NONE) continue;
+    n++;
+    Serial.printf("[MESH] child %d: rloc16=0x%04x rssi=%d timeout=%lus\n", n,
+                  ci.mRloc16, (int)ci.mAverageRssi, (unsigned long)ci.mTimeout);
+  }
+  esp_openthread_lock_release();
+  Serial.printf("[MESH] children attached: %d (0 = the lock is NOT on this mesh)\n", n);
+}
+
 void forwardOverThread(const String &target, const String &payloadHex) {
   if (!target.length() || !payloadHex.length()) {
     Serial.println("[UDP] drop — command missing target/payload");
@@ -491,6 +576,7 @@ void forwardOverThread(const String &target, const String &payloadHex) {
     Serial.println("[UDP] drop — socket not open");
     return;
   }
+  logThreadChildren(); // DIAGNOSTIC (temporary) — is the lock even on this mesh?
   sendToThreadGroup(OZ_THREAD_GROUP, target, payloadHex, "ff03::4f5a");
   // DIAGNOSTIC (2026-07-28, temporary): same datagram to realm-local
   // all-nodes — see the OZ_REALM_ALLNODES note above.
@@ -537,6 +623,17 @@ void mqttBegin() {
   mqttCommandTopic = "ozkey/" + cfgSiteId + "/bridges/" + deviceId + "/command";
   mqttClient.setServer(cfgBrokerHost.c_str(), cfgBrokerPort);
   mqttClient.setCallback(mqttMessageReceived);
+  // ROOT CAUSE of "the app can't open the door" (found 2026-07-29).
+  // PubSubClient defaults to MQTT_MAX_PACKET_SIZE = 256 bytes and DISCARDS any
+  // larger inbound packet silently — no error, no callback, nothing in the log.
+  // ozlockserv's real command envelope (msg_id/device_id/action/grant_id/
+  // payload_hex/issued_at/source/target/payload) is ~280 bytes of JSON plus a
+  // ~45-byte topic, so every command from the SERVER was dropped here, while
+  // hand-rolled `{target,payload}` test publishes (~130 bytes total) always got
+  // through. That is exactly why bench tests passed and the app never worked.
+  // 1024 leaves headroom for the ozkey-06 sealed envelope, which will be
+  // larger again (ver+counter+nonce+ciphertext+tag, hex-encoded).
+  mqttClient.setBufferSize(1024);
   mqttConnect();
 }
 
@@ -567,7 +664,24 @@ void formThreadNetwork() {
   // follow (which would just be downstream symptoms of an instance that was
   // never really initialized).
   Serial.printf("[THREAD] begin() otStarted=%d\n", (int)(bool)thread);
-  if (thread.hasActiveDataset()) {
+
+  // RESTORE wins over both resume and self-form: the whole point is to put a
+  // reset/replacement bridge back onto the household's EXISTING mesh so the
+  // locks rejoin themselves.
+  uint8_t rExtPan[8], rKey[16], rPan[2];
+  if (haveRestoreDataset && hexToBytes(rdExtPanHex, rExtPan, 8) &&
+      hexToBytes(rdNetworkKeyHex, rKey, 16) && hexToBytes(rdPanIdHex, rPan, 2)) {
+    otDataset.initNew();
+    otDataset.setNetworkName(rdNetworkName.c_str());
+    otDataset.setExtendedPanId(rExtPan);
+    otDataset.setNetworkKey(rKey);
+    otDataset.setChannel(rdChannel);
+    otDataset.setPanId((uint16_t)((rPan[0] << 8) | rPan[1]));
+    thread.commitDataSet(otDataset);
+    Serial.printf("[THREAD] RESTORED dataset from app: name=%s channel=%u panId=0x%s\n",
+                  rdNetworkName.c_str(), rdChannel, rdPanIdHex.c_str());
+    haveRestoreDataset = false; // one-shot; NVS holds it from here
+  } else if (thread.hasActiveDataset()) {
     Serial.println("[THREAD] resuming persisted dataset");
   } else {
     Serial.println("[THREAD] no persisted dataset — forming a new network");
@@ -719,6 +833,32 @@ void applyProvision(JsonDocument &doc) {
   cfgSiteId = siteId;
   wifiProvisioned = true;
   saveConfig();
+
+  // Optional Thread dataset to RESTORE (see haveRestoreDataset above). All five
+  // fields must be present and well-formed or we ignore the lot and fall back
+  // to resume/self-form — a half-applied dataset would strand the bridge on a
+  // network nothing else is on, which is worse than forming a fresh one.
+  {
+    String nn = (const char *)(doc["network_name"] | "");
+    String ep = (const char *)(doc["ext_pan_id"] | "");
+    String nk = (const char *)(doc["network_key"] | "");
+    String pi = (const char *)(doc["pan_id"] | "");
+    uint16_t ch = (uint16_t)(doc["channel"] | 0);
+    if (nn.length() && ep.length() == 16 && nk.length() == 32 &&
+        pi.length() == 4 && ch >= 11 && ch <= 26) {
+      rdNetworkName = nn;
+      rdExtPanHex = ep;
+      rdNetworkKeyHex = nk;
+      rdPanIdHex = pi;
+      rdChannel = ch;
+      haveRestoreDataset = true;
+      Serial.printf("[PROV] Thread dataset supplied — will RESTORE mesh %s "
+                    "(ch=%u panId=0x%s) instead of forming a new one\n",
+                    nn.c_str(), ch, pi.c_str());
+    } else if (nn.length() || ep.length() || nk.length() || pi.length()) {
+      Serial.println("[PROV] partial/invalid Thread dataset in payload — ignored");
+    }
+  }
 
   Serial.printf("[PROV] mode=%s site=%s broker=%s:%u\n", cfgMode.c_str(), cfgSiteId.c_str(),
                 cfgBrokerHost.c_str(), cfgBrokerPort);
@@ -907,6 +1047,12 @@ void loop() {
   if (bothUp && lcdOn && millis() - lastLcdActivityAt > LCD_IDLE_OFF_MS) {
     digitalWrite(LCD_BL, LOW);
     lcdOn = false;
+  }
+
+  // RX banner lapsed -> redraw once to put site/device_id back.
+  if (lcdRxFlashActive && millis() >= lcdRxFlashUntil) {
+    lcdRxFlashActive = false;
+    if (lcdOn) drawStatus();
   }
 
   static bool wasWifiConnected = false;
