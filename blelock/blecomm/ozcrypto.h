@@ -21,6 +21,7 @@
 #include "esp_random.h"
 #define MBEDTLS_ALLOW_PRIVATE_ACCESS // ecp_point X/Y/Z are private in mbedTLS 3.x
 #include "mbedtls/ecp.h"
+#include "mbedtls/gcm.h"
 #include "mbedtls/hkdf.h"
 #include "mbedtls/md.h"
 
@@ -186,6 +187,145 @@ static void ozFromHex(const char *hex, uint8_t *out, size_t n) {
   for (size_t i = 0; i < n; i++) out[i] = (nib(hex[2 * i]) << 4) | nib(hex[2 * i + 1]);
 }
 
+// ── ozkey-06 AES-256-GCM envelope ─────────────────────────────────────────────
+//
+// Frozen wire format (ozkey-06 §1, XF-42 §14.3; reference implementation is
+// ftpos packages/ozkey_commissioner/lib/src/envelope.dart — that file is
+// authoritative, this is the lock-side mirror):
+//
+//   envelope = ver(1B=0x02) ‖ counter(8B BE) ‖ nonce(12B) ‖ ciphertext ‖ tag(16B)
+//   nonce    = prefix(4B random) ‖ counter(8B BE)
+//   AAD      = ver(1B) ‖ counter(8B BE) ‖ utf8(device_id)
+//   key      = HKDF-SHA256(ikm  = pairing_secret,
+//                          salt = utf8(device_id) ‖ utf8(app_id),
+//                          info = "ozkey/app->lock" | "ozkey/lock->app")
+//
+// The counter appears TWICE by design — once in the header (for AAD and
+// anti-replay) and once as the nonce tail. Do not "optimise" one away; the wire
+// format is frozen and byte-verified against the Dart side.
+//
+// Anti-replay is NOT done here. ozEnvOpen() returns the verified counter and the
+// caller compares it against that bond's stored counter_floor (XF-47 §2.5).
+
+#define OZ_ENV_VER 0x02
+#define OZ_ENV_HDR 21 // 1 ver + 8 counter + 12 nonce
+#define OZ_ENV_TAG 16
+#define OZ_ENV_MIN (OZ_ENV_HDR + OZ_ENV_TAG)
+#define OZ_ENV_AAD_MAX 96 // 1 + 8 + device_id (device ids are ≤ 64 chars)
+
+static void ozPutU64BE(uint64_t v, uint8_t out[8]) {
+  for (int i = 7; i >= 0; i--) {
+    out[i] = (uint8_t)(v & 0xFF);
+    v >>= 8;
+  }
+}
+
+static uint64_t ozGetU64BE(const uint8_t in[8]) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; i++) v = (v << 8) | in[i];
+  return v;
+}
+
+// Per-direction AEAD key. appToLock=true derives the key the LOCK uses to OPEN
+// app traffic; false derives the key the lock uses to SEAL its own uplink.
+static bool ozEnvKey(const uint8_t *pairingSecret, size_t psLen,
+                     const String &deviceId, const String &appId,
+                     bool appToLock, uint8_t outKey[32]) {
+  String salt = deviceId + appId;
+  const char *info = appToLock ? "ozkey/app->lock" : "ozkey/lock->app";
+  return ozHkdfSha256(pairingSecret, psLen, (const uint8_t *)salt.c_str(),
+                      salt.length(), (const uint8_t *)info, strlen(info),
+                      outKey, 32);
+}
+
+static size_t ozEnvAad(const String &deviceId, uint64_t counter,
+                       uint8_t out[OZ_ENV_AAD_MAX]) {
+  size_t dLen = deviceId.length();
+  if (1 + 8 + dLen > OZ_ENV_AAD_MAX) return 0;
+  out[0] = OZ_ENV_VER;
+  ozPutU64BE(counter, out + 1);
+  memcpy(out + 9, deviceId.c_str(), dLen);
+  return 9 + dLen;
+}
+
+// Seal [pt] as a lock→app envelope. Returns envelope length, or -1 on failure.
+// noncePrefix may be NULL for production (random); pass 4 bytes for test vectors.
+static int ozEnvSeal(const uint8_t key[32], const String &deviceId,
+                     uint64_t counter, const uint8_t *pt, size_t ptLen,
+                     uint8_t *out, size_t outCap,
+                     const uint8_t *noncePrefix) {
+  if (outCap < OZ_ENV_HDR + ptLen + OZ_ENV_TAG) return -1;
+
+  uint8_t nonce[12];
+  if (noncePrefix) {
+    memcpy(nonce, noncePrefix, 4);
+  } else if (ozRng(nullptr, nonce, 4) != 0) {
+    return -1;
+  }
+  ozPutU64BE(counter, nonce + 4);
+
+  uint8_t aad[OZ_ENV_AAD_MAX];
+  size_t aadLen = ozEnvAad(deviceId, counter, aad);
+  if (!aadLen) return -1;
+
+  out[0] = OZ_ENV_VER;
+  ozPutU64BE(counter, out + 1);
+  memcpy(out + 9, nonce, 12);
+
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  int rc = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256);
+  if (rc == 0) {
+    rc = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, ptLen, nonce, 12,
+                                   aad, aadLen, pt, out + OZ_ENV_HDR,
+                                   OZ_ENV_TAG, out + OZ_ENV_HDR + ptLen);
+  }
+  mbedtls_gcm_free(&gcm);
+  if (rc != 0) return -1;
+  return (int)(OZ_ENV_HDR + ptLen + OZ_ENV_TAG);
+}
+
+// Open an app→lock envelope. Returns plaintext length, or -1 on any failure
+// (malformed, wrong version, bad tag). Writes the verified counter to
+// *counterOut for the caller's anti-replay check.
+//
+// A tag failure and a malformed envelope are deliberately indistinguishable to
+// the caller — there is nothing useful to tell an attacker apart.
+static int ozEnvOpen(const uint8_t key[32], const String &deviceId,
+                     const uint8_t *env, size_t envLen, uint8_t *out,
+                     size_t outCap, uint64_t *counterOut) {
+  if (envLen < OZ_ENV_MIN || env[0] != OZ_ENV_VER) return -1;
+
+  size_t ctLen = envLen - OZ_ENV_HDR - OZ_ENV_TAG;
+  if (ctLen > outCap) return -1;
+
+  uint64_t counter = ozGetU64BE(env + 1);
+  const uint8_t *nonce = env + 9;
+
+  // The nonce tail must equal the header counter. A well-formed sealer always
+  // makes them equal; a mismatch is semantically ambiguous, so reject rather
+  // than pick one. (GCM alone would not catch this — both are authenticated.)
+  if (ozGetU64BE(nonce + 4) != counter) return -1;
+
+  uint8_t aad[OZ_ENV_AAD_MAX];
+  size_t aadLen = ozEnvAad(deviceId, counter, aad);
+  if (!aadLen) return -1;
+
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  int rc = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256);
+  if (rc == 0) {
+    rc = mbedtls_gcm_auth_decrypt(&gcm, ctLen, nonce, 12, aad, aadLen,
+                                  env + OZ_ENV_HDR + ctLen, OZ_ENV_TAG,
+                                  env + OZ_ENV_HDR, out);
+  }
+  mbedtls_gcm_free(&gcm);
+  if (rc != 0) return -1;
+
+  if (counterOut) *counterOut = counter;
+  return (int)ctLen;
+}
+
 // Returns true iff every vector matches. Logs each leg over serial.
 static bool ozCryptoSelfTest() {
   bool ok = true;
@@ -222,6 +362,80 @@ static bool ozCryptoSelfTest() {
                             "Ba Ngoai", nonce, 1789000000u, mac) &&
         ozHexEq(mac, 32, "e7780baea8feef5674c0ffecd1b83f35dfd9198db50cea6d0735c7a43d268aac");
     Serial.printf("[CRYPTO] selftest invite-mac %s\n", pass ? "PASS" : "FAIL");
+    ok &= pass;
+  }
+
+  // ozkey-06 §5 frozen envelope vectors. Fixed inputs, shared by legs 4–8.
+  uint8_t ps[32];
+  for (int i = 0; i < 32; i++) ps[i] = i; // 000102…1F
+  const String devId = "ozl-00112233445566778899aabbccddeeff";
+  const String appId = "app_00112233445566778899aabb";
+  uint8_t kA2L[32], kL2A[32];
+  bool haveKeys = ozEnvKey(ps, 32, devId, appId, true, kA2L) &&
+                  ozEnvKey(ps, 32, devId, appId, false, kL2A);
+
+  // 4) HKDF key derivation, both directions — ozkey-06 §5 header.
+  {
+    bool pass = haveKeys &&
+        ozHexEq(kA2L, 32, "919e05d8dab046bd5f2721ffe7fae0fa039a2f0399024964f2c8fdac9c9e5ac8") &&
+        ozHexEq(kL2A, 32, "ad1daf444b95706ae9d97286498b79ba372c1f04c8abb17b12c937c58b62e4d0");
+    Serial.printf("[CRYPTO] selftest env-hkdf-keys %s\n", pass ? "PASS" : "FAIL");
+    ok &= pass;
+  }
+
+  // 5) app→lock open — ozkey-06 §5.1. Must yield SAMPLE_ADD_TEMP_PIN_FRAME.
+  {
+    uint8_t env[64], pt[64];
+    ozFromHex("020000000000000001aabbccdd00000000000000019e129265ad2537f37a1485e72b"
+              "d9f36cb304876c8f777b1a12925a7e0f57788c84df29dd08a68a74e44458", env, 64);
+    uint64_t ctr = 0;
+    int n = haveKeys ? ozEnvOpen(kA2L, devId, env, 64, pt, sizeof(pt), &ctr) : -1;
+    bool pass = n == 27 && ctr == 1 &&
+        ozHexEq(pt, 27, "55aa0006001415000010000e3438323931356955b9006b36ec7f0c");
+    Serial.printf("[CRYPTO] selftest env-open-5.1 %s (len=%d ctr=%llu)\n",
+                  pass ? "PASS" : "FAIL", n, (unsigned long long)ctr);
+    ok &= pass;
+  }
+
+  // 6) Seal must reproduce §5.1 byte-exactly given the vector's nonce prefix.
+  {
+    uint8_t prefix[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    uint8_t pt[27], env[64];
+    ozFromHex("55aa0006001415000010000e3438323931356955b9006b36ec7f0c", pt, 27);
+    int n = haveKeys ? ozEnvSeal(kA2L, devId, 1, pt, 27, env, sizeof(env), prefix) : -1;
+    bool pass = n == 64 &&
+        ozHexEq(env, 64, "020000000000000001aabbccdd00000000000000019e129265ad2537f37a1485e72b"
+                         "d9f36cb304876c8f777b1a12925a7e0f57788c84df29dd08a68a74e44458");
+    Serial.printf("[CRYPTO] selftest env-seal-5.1 %s (len=%d)\n", pass ? "PASS" : "FAIL", n);
+    ok &= pass;
+  }
+
+  // 7) lock→app open — ozkey-06 §5.2, the door-event log JSON (72 B plaintext).
+  {
+    uint8_t env[109], pt[80];
+    ozFromHex("020000000000000007112233440000000000000007f87fd3dcaadc2dedeba91e5784"
+              "be64b327bad1f9da838c4bb88e8c9e45392590bb3528448e101b7bcd8f1579fd5ae0a"
+              "ab97129e20c7d100353a61e0dd8864a3951ecf9bc5926601c4ffbe431aad97cf046b7"
+              "1f01928b2418", env, 109);
+    uint64_t ctr = 0;
+    int n = haveKeys ? ozEnvOpen(kL2A, devId, env, 109, pt, sizeof(pt), &ctr) : -1;
+    bool pass = n == 72 && ctr == 7 &&
+        memcmp(pt, "{\"result\":\"granted\",\"detail\":\"REMOTE UNLOCK COMMAND\","
+                   "\"ts\":1767225600000}", 72) == 0;
+    Serial.printf("[CRYPTO] selftest env-open-5.2 %s (len=%d ctr=%llu)\n",
+                  pass ? "PASS" : "FAIL", n, (unsigned long long)ctr);
+    ok &= pass;
+  }
+
+  // 8) Tamper — flip one ciphertext byte, GCM tag must reject.
+  {
+    uint8_t env[64], pt[64];
+    ozFromHex("020000000000000001aabbccdd00000000000000019e129265ad2537f37a1485e72b"
+              "d9f36cb304876c8f777b1a12925a7e0f57788c84df29dd08a68a74e44458", env, 64);
+    env[OZ_ENV_HDR] ^= 0x01;
+    bool pass = !haveKeys ? false
+                          : ozEnvOpen(kA2L, devId, env, 64, pt, sizeof(pt), nullptr) < 0;
+    Serial.printf("[CRYPTO] selftest env-tamper-reject %s\n", pass ? "PASS" : "FAIL");
     ok &= pass;
   }
 

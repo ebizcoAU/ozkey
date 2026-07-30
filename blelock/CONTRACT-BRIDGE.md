@@ -112,9 +112,79 @@ than `ssid`:
   "ext_pan_id": "<16 hex chars>",
   "network_key": "<32 hex chars>",
   "channel": 15,
-  "pan_id": "<4 hex chars>"
+  "pan_id": "<4 hex chars>",
+  "app_id": "<64 hex chars — optional>"
 }
 ```
+
+**[XF-47 §11.5] `app_id` is REQUIRED for a Thread lock to ever hold a bond.**
+Bond #0 is created from `provision.app_id` (`CONTRACT.md` §"[XF-47] Bond #0
+establishment"). That field originally existed only on the **Wi-Fi**
+`ProvisionPayload`, so as first specified a Thread lock could never obtain bond
+#0 — and therefore no `member_enroll`, no sealed unlock, and no DPID 101/102.
+The entire XF-46 member model would have been Wi-Fi-only, on the platform's
+primary topology. Caught by ftpos in XF-47 §11.5; shipped app-side in F2c.
+
+Same key, same meaning, same 64-hex-char member/admin X25519 pubkey as the Wi-Fi
+payload. Optional and additive — firmware that ignores it records the lock as
+unbonded, and the app falls back to `thread-joined`.
+
+### [XF-47] Bridge ownership guard
+
+> **Touching an unowned bridge requires physical presence. Touching an owned bridge
+> requires a matching `app_id`.**
+
+```
+bridge provision:
+  no owner (app_id present OR absent) → REQUIRES claim window open
+                                        open   → apply; if app_id present, claim it
+                                        closed → BRIDGE_CLAIM_REQUIRED
+  owner == incoming app_id            → idempotent, no window needed
+  owner != incoming app_id            → BRIDGE_DENIED, change nothing
+  owner exists, app_id ABSENT         → BRIDGE_DENIED, change nothing
+```
+
+**Refusal is atomic in every branch** — a rejected provision must not apply the
+broker or Wi-Fi fields either, or an attacker who cannot steal the bridge can still
+repoint it.
+
+**Claim window:** a short **BOOT** press opens a ~60 s window. A 5 s hold is already
+factory reset (`bridge32.ino:108-139`), so the short press is free. Re-provisioning
+an already-owned bridge by its owner needs no button, keeping the normal
+change-my-Wi-Fi path intact. `owner_app_id` is cleared only by factory reset.
+
+**Why physical presence is required at all:** `bridge32.ino:916-922` keeps BLE
+advertising up permanently after provisioning (deliberate, so the app can always
+reconnect). Unlike the lock's ~60 s touch window, **a bridge's provisioning window
+never closes** — so without the button gate an unowned bridge is reconfigurable by
+anyone in BLE range, at any time, with no wait.
+
+Two bypasses were found and closed during XF-47 review, both worth recording
+because each made the guard optional at the attacker's discretion:
+
+1. **Omit `app_id` on an owned bridge** — dodged the guard entirely. Closed by the
+   `owner exists, app_id ABSENT → BRIDGE_DENIED` clause.
+2. **Omit `app_id` on an unowned-but-deployed bridge** — could not claim it, but
+   could repoint `broker_host` and move a live mesh's uplink to attacker
+   infrastructure, with no physical access. Closed by requiring the claim window for
+   *all* unowned-bridge provisions regardless of whether `app_id` is present.
+
+**`BRIDGE_CLAIM_REQUIRED` must be distinct from `BRIDGE_DENIED`.** An unowned bridge
+answering `BRIDGE_DENIED` tells the user it has an owner, which is false and
+undiagnosable — the same reason `BOND_DENIED` exists rather than reusing
+`PAYLOAD_REJECTED`. Both strings are terminal, both settle at progress 2.5/6.
+
+**SCHEDULED FOR REMOVAL after M4:** the `app_id`-absent-and-unowned branch exists
+only for ozkey bench tooling that provisions bridges by raw JSON. BANOI sends
+`app_id` unconditionally and is the only production producer, so this branch has no
+legitimate caller once the bench tooling is updated. It is a temporary
+accommodation, not an accepted variant.
+
+**Firmware MUST read `app_id` once, before the `hasNetworkKey` branch**
+(`doorlock.ino:~1102`), not separately inside each transport arm. Two reads in
+two branches is the same divergence hazard as `ozcrypto.h` existing in two copies
+or `hexToBytes` existing twice app-side — both of which produced real bugs in this
+project. One read, one meaning, both transports.
 
 New `status` wire strings (outside the existing WIFI_*/BROKER_* ladder, same
 pattern as XF-46's MEMBER_*/UNLOCK_* additions in `CONTRACT.md`): `THREAD_OK`,
