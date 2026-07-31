@@ -1,12 +1,30 @@
 /*
  * ============================================================================
- *  OZLOCKSERV — OZLOCK Rendezvous Directory (lab deployment)
+ *  OZPMSSERV — OZPMS Property-Management Server (lab deployment)
  *  ---------------------------------------------------------------------------
- *  Role     : Market-A personal cloud, per ozkey-05: MQTT rendezvous + mini
- *             directory that holds doorlock <-> owner-account pairing.
- *  Port     : 4200  (REST base /ozlockserv/api)
+ *  Role     : The OPERATOR'S OWN server. Forked from ozlockserv 2026-07-31 by
+ *             operator decision ("OZLOCKSERV IS OZPMS SERVER") to resolve the
+ *             XF-48 §9.4 conflict between the v3 whitepaper §4.1 data inventory
+ *             and the XF-47 §8(b) log work.
+ *
+ *             THE SPLIT, and why it is a fork rather than a flag:
+ *               - OZLOCKSERV is the HOSTED RELAY we run for other people. It is
+ *                 blind: it holds no door events at all (§4.1 — "not which lock
+ *                 opened, when, or by whom"). `lock_logs` was REMOVED there.
+ *               - OZPMSSERV is run BY the property operator, ON their own
+ *                 infrastructure, over THEIR OWN doors. Holding that data is not
+ *                 a sovereignty breach — it is the point of a PMS, and it is the
+ *                 same rule XF-47 Ask 7 already set for `grants.raw_value`.
+ *             A runtime flag would have put both behaviours in one binary we
+ *             also host; the guarantee is only credible if the hosted build
+ *             cannot log door events at all.
+ *
+ *             So the XF-47 §8(b) work (seq / recorded_at / sync_batch /
+ *             window_from / window_to, drop lock_ts) targets THIS server.
+ *  Port     : 4400  (REST base /ozpmsserv/api)   [OZPMS_HTTP_PORT]
+ *  Site     : 'pms' — must differ from ozlockserv's 'lab' (see CONFIG.SITE_ID)
  *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.20:1883 (lab stand-in for EMQX)
- *  Database : MySQL (localhost / ozlock)
+ *  Database : MySQL (localhost / ozpms)
  *
  *  Responsibilities (ozkey-04 §6, ozkey-05 §6)
  *    1. Mint single-use enrollment tokens (BANOI "Add Doorlock" begins here)
@@ -14,25 +32,12 @@
  *       credentials, ack on the command topic
  *    3. Issue/revoke user keys as Tuya 55 AA DPID frames, queue them, flush
  *       on the lock's wake (ozkey/<site>/locks/<id>/heartbeat)
- *
- *  NOT a responsibility, deliberately — DOOR EVENTS ARE NEVER INGESTED.
- *    Removed 2026-07-31 (operator decision, XF-48 §9.4). This server is the
- *    HOSTED RELAY: it is run by us, for other people, over their doors. The
- *    Sovereign Edge whitepaper v3 §4.1 data inventory says we hold connection
- *    metadata (7 d) and security events (90 d) and "explicitly not which lock
- *    opened, when, or by whom" — and `lock_logs` was exactly that. It is gone:
- *    no table, no `log` subscription, no ingest, no query endpoint.
- *
- *    Same rule XF-47 Ask 7 set for `grants.raw_value`. Door events live on
- *    OZPMSSERV / OZKEYSERV — the OPERATOR'S OWN servers, over their own doors,
- *    which is not a sovereignty breach. The XF-47 §8(b) log work (seq /
- *    recorded_at / sync_batch / window_from / window_to) targets those, not this.
- *
- *    DO NOT REINSTATE as a flag or a shorter retention. The guarantee is only
- *    credible because the hosted build cannot do it at all.
+ *    4. Ingest door access transactions (ozkey/<site>/locks/<id>/log)
  *
  *  Lab simplifications (flagged, ozkey-05 §10 migration steps 3-5 pending):
- *    - single seeded owner + site ('lab'); REST is unauthenticated
+ *    - single seeded owner + site ('pms'); REST is unauthenticated. NOTE: real
+ *      OZPMS is multi-tenant (2000 locks / 10 PMs / GM / admin) — that is the
+ *      first thing this fork must grow, and it is why it is a separate server.
  *    - broker credentials are minted + stored + acked for contract shape, but
  *      the lab Mosquitto does not enforce them
  *    - device_id is derived from the MAC (real hardware: keypair, ozkey-04 §3)
@@ -48,7 +53,7 @@ const mqtt = require('mqtt');
 const os = require('os');
 const crypto = require('crypto');
 
-/** First non-internal IPv4 of this host. Override with OZLOCK_SERVER_IP. */
+/** First non-internal IPv4 of this host. Override with OZPMS_SERVER_IP. */
 function detectLanIp() {
   for (const ifaces of Object.values(os.networkInterfaces())) {
     for (const iface of ifaces || []) {
@@ -62,15 +67,22 @@ function detectLanIp() {
  * Configuration
  * ------------------------------------------------------------------------- */
 const CONFIG = {
-  // Override to spin a verification instance beside the watcher-run :4200 one.
-  HTTP_PORT: Number(process.env.OZLOCK_HTTP_PORT) || 4200,
-  SERVER_IP: process.env.OZLOCK_SERVER_IP || detectLanIp(),
-  SITE_ID: 'lab', // single-tenant lab deployment (ozkey-05 §1.3)
+  // Override to spin a verification instance beside the watcher-run :4400 one.
+  HTTP_PORT: Number(process.env.OZPMS_HTTP_PORT) || 4400,
+  SERVER_IP: process.env.OZPMS_SERVER_IP || detectLanIp(),
+  // MUST NOT be 'lab'. Topics are site-pinned so several servers can share one
+  // broker, but two servers on the SAME site both consume every heartbeat and
+  // both flush the queue — the lock would receive each command twice. OZLOCKSERV
+  // owns 'lab'; OZKEYSERV owns 'hotel'; this server owns 'pms'.
+  SITE_ID: 'pms',
   DB: {
     host: 'localhost',
     user: 'root',
     password: 'Cableman',
-    database: 'ozlock',
+    // Separate schema from ozlockserv's 'ozlock'. Nothing is migrated by this
+    // server: it bootstraps its own tables on first boot (CREATE TABLE IF NOT
+    // EXISTS), so the existing lab data is left exactly where it is.
+    database: 'ozpms',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
@@ -86,11 +98,9 @@ const CONFIG = {
   // Site-pinned (NOT wildcard) so multiple servers can share one broker —
   // OZKEYSERV (site 'hotel', ozkey-07) publishes device-scoped on the same
   // ozkey/<site>/... root; each server must only consume its own site.
-  SUB_ENROLL: 'ozkey/lab/locks/+/enroll',
-  SUB_HEARTBEAT: 'ozkey/lab/locks/+/heartbeat',
-  // SUB_LOG removed 2026-07-31 — see the header. We do not subscribe to
-  // `ozkey/<site>/locks/+/log` at all, so door events are never delivered to
-  // this process. Locks may still publish there; nothing here consumes it.
+  SUB_ENROLL: 'ozkey/pms/locks/+/enroll',
+  SUB_HEARTBEAT: 'ozkey/pms/locks/+/heartbeat',
+  SUB_LOG: 'ozkey/pms/locks/+/log',
   topicCommand: (site, deviceId) => `ozkey/${site}/locks/${deviceId}/command`,
   // A Thread lock has no MQTT client of its own — bridge32 is its gateway and
   // subscribes to its OWN topic (blelock/bridge32/bridge32.ino:489), then
@@ -329,13 +339,12 @@ async function initDatabase() {
     ) ENGINE=InnoDB`);
 
   // MUST run AFTER the CREATE above. Ordered the other way round originally,
-  // which worked only because this deployment already had the table: on a FRESH
-  // schema the information_schema probe returns 0 (no table, so no column) and
-  // the ALTER then fails with "Table 'x.enroll_tokens' doesn't exist" — an init
-  // loop that never converges, so a brand-new install could never boot. Found
-  // 2026-07-31 bootstrapping ozpms from this same code. The `locks` probe above
-  // is safe only because `locks` is created earlier; keep every migration below
-  // the CREATE it depends on.
+  // which worked only because every existing deployment already had the table:
+  // on a FRESH schema the information_schema probe returns 0 (no table, so no
+  // column), and the ALTER then fails with "Table 'x.enroll_tokens' doesn't
+  // exist" — an init loop that never converges. Found 2026-07-31 bootstrapping
+  // the ozpms database. The `locks` probe above is safe only because `locks` is
+  // created earlier; keep every migration below the CREATE it depends on.
   const [[{ hasTokenAppId }]] = await pool.query(
     `SELECT COUNT(*) AS hasTokenAppId FROM information_schema.columns
       WHERE table_schema = ? AND table_name = 'enroll_tokens' AND column_name = 'app_id'`,
@@ -373,17 +382,21 @@ async function initDatabase() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB`);
 
-  // `lock_logs` is NOT created here — removed 2026-07-31, see the file header.
-  // Any rows an older build left in this schema are deliberately NOT dropped by
-  // code: destroying an operator's existing data is their decision, not a
-  // side effect of a deploy. Drop it by hand when you are satisfied it is
-  // migrated:  DROP TABLE lock_logs;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lock_logs (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      device_id VARCHAR(64),
+      site_id VARCHAR(50),
+      mac VARCHAR(17),
+      result VARCHAR(20),
+      detail VARCHAR(255),
+      lock_ts VARCHAR(50),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB`);
 
   // App-attributed control-plane audit trail: every action an app performs
   // through OZLOCK (register pairing, grant/revoke a key, remote unlock,
-  // settings). This is "what an app did", NOT "what a door did" — it is the
-  // §4.1 "security events" class and is RETAINED here on purpose: without it
-  // an abuse report is uninvestigable. Kept deliberately when `lock_logs` went.
+  // settings). Distinct from lock_logs (physical door events at the lock).
   await pool.query(`
     CREATE TABLE IF NOT EXISTS audit_log (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -461,7 +474,7 @@ async function flushQueueForDevice(siteId, deviceId) {
       grant_id: job.grant_id,
       payload_hex: job.payload_hex,
       issued_at: new Date().toISOString(),
-      source: 'ozlockserv',
+      source: 'ozpmsserv',
     };
     // bridge32 demuxes on {target, payload} (CONTRACT-BRIDGE / ozkey-11 §3).
     // Send it a MINIMAL envelope: the bridge reads only these two fields and
@@ -501,7 +514,7 @@ async function flushQueueForDevice(siteId, deviceId) {
 
 function initMqtt() {
   mqttClient = mqtt.connect(CONFIG.MQTT_URL, {
-    clientId: `ozlockserv-${Math.random().toString(16).slice(2, 8)}`,
+    clientId: `ozpmsserv-${Math.random().toString(16).slice(2, 8)}`,
     reconnectPeriod: 5000,
     connectTimeout: 10_000,
   });
@@ -509,15 +522,14 @@ function initMqtt() {
   mqttClient.on('connect', () => {
     logEvent('info', `MQTT online — broker ${CONFIG.MQTT_URL}`);
     mqttClient.subscribe(
-      [CONFIG.SUB_ENROLL, CONFIG.SUB_HEARTBEAT],
+      [CONFIG.SUB_ENROLL, CONFIG.SUB_HEARTBEAT, CONFIG.SUB_LOG],
       { qos: 1 },
       (err) => {
         if (err) logEvent('error', `MQTT subscribe failed: ${err.message}`);
         else
           logEvent(
             'info',
-            `Subscribed: ${CONFIG.SUB_ENROLL} + ${CONFIG.SUB_HEARTBEAT}` +
-              ' (door-event topic deliberately NOT subscribed — see header)'
+            `Subscribed: ${CONFIG.SUB_ENROLL} + ${CONFIG.SUB_HEARTBEAT} + ${CONFIG.SUB_LOG}`
           );
       }
     );
@@ -558,17 +570,22 @@ function initMqtt() {
         return; // quiet heartbeat
       }
 
-      /* -- Door access transactions: NOT HANDLED, deliberately ---------------- *
-       * Removed 2026-07-31 with `lock_logs` (see header). We no longer subscribe
-       * to the `log` topic, so `kind === 'log'` cannot arrive here — but if a
-       * future change re-adds that subscription, note what USED to be here:
-       * besides the INSERT, this branch called
-       *   logEvent('lock', `Door GRANTED — <detail> @ "<label>"`)
-       * which put the door event in the rolling event ring served to the
-       * dashboard terminal AND on stdout. Dropping only the table would have
-       * left the same data in the log stream and looked like a fix. If door
-       * events are ever wanted, they belong on OZPMSSERV/OZKEYSERV — not here.
-       */
+      /* -- Door access transaction ------------------------------------------ */
+      if (kind === 'log') {
+        const mac = normalizeMac(obj.mac) || null;
+        const result = String(obj.result || 'unknown').slice(0, 20);
+        const detail = String(obj.detail || '').slice(0, 255);
+        const lockTs = obj.ts ? new Date(obj.ts).toISOString() : new Date().toISOString();
+        await pool.query(
+          'INSERT INTO lock_logs (device_id, site_id, mac, result, detail, lock_ts) VALUES (?, ?, ?, ?, ?, ?)',
+          [deviceId, siteId, mac, result, detail, lockTs]
+        );
+        const [[lk]] = await pool.query('SELECT label FROM locks WHERE id = ?', [deviceId]);
+        logEvent(
+          'lock',
+          `Door ${result.toUpperCase()} — ${detail || 'no detail'} @ "${lk ? lk.label : deviceId}"`
+        );
+      }
     } catch (err) {
       logEvent('error', `MQTT message handler fault on ${topic}: ${err.message}`);
     }
@@ -642,7 +659,7 @@ app.use(express.json());
 const api = express.Router();
 // Mount under both the process name and the service brand so either base path
 // works (LockSim's health probe / the keyring app may use either).
-app.use('/ozlockserv/api', api);
+app.use('/ozpmsserv/api', api);
 app.use('/ozlock/api', api);
 
 function guardDb(res) {
@@ -657,7 +674,7 @@ function guardDb(res) {
 api.get('/health', (req, res) => {
   res.json({
     ok: true,
-    service: 'ozlockserv',
+    service: 'ozpmsserv',
     site: CONFIG.SITE_ID,
     db: !!pool,
     mqtt: !!(mqttClient && mqttClient.connected),
@@ -922,16 +939,14 @@ api.patch('/locks/:id', async (req, res) => {
 });
 
 /* -- Clear the fleet (start fresh) ------------------------------------------- *
- * No FK cascade from locks → grants/pending_queue (they only carry a device_id
- * column), so wipe the dependents explicitly. DELETE /locks clears every lock
- * for the site; DELETE /locks/:id removes one. Lab/dev convenience.
- *
- * `lock_logs` is intentionally absent — this server no longer creates it, and
- * DELETEing a table that does not exist would throw on a fresh schema.
+ * No FK cascade from locks → grants/pending_queue/lock_logs (they only carry a
+ * device_id column), so wipe the dependents explicitly. DELETE /locks clears
+ * every lock for the site; DELETE /locks/:id removes one. Lab/dev convenience.
  */
 async function purgeLockRows(conn, where, args) {
   await conn.query(`DELETE FROM grants WHERE ${where}`, args);
   await conn.query(`DELETE FROM pending_queue WHERE ${where}`, args);
+  await conn.query(`DELETE FROM lock_logs WHERE ${where}`, args);
   await conn.query(`DELETE FROM audit_log WHERE ${where}`, args);
 }
 
@@ -1277,25 +1292,24 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
   }
 });
 
-/* -- Door transaction log — GONE on the hosted relay -------------------------- *
- * Answers 410, not 404 and not an empty list. BANOI calls this today
- * (`doorlock_service.dart:837-843` merges it into the event feed), so the
- * failure has to be *diagnosable*: an empty `log: []` would render as "this
- * door has never been opened", which is a lie, and a 404 reads as a bad URL.
- * 410 Gone says the resource intentionally no longer exists here.
- */
-api.get('/locks/:id/log', (_req, res) => {
-  res.status(410).json({
-    ok: false,
-    error: 'gone',
-    detail:
-      'Door event history is not held by the hosted relay. This server stores ' +
-      'no record of which lock opened, when, or by whom (Sovereign Edge v3 ' +
-      '§4.1). Door events are available only from an operator-run OZPMSSERV / ' +
-      'OZKEYSERV instance, or on-device.',
-    since: '2026-07-31',
-    ref: 'XF-48 §9.4',
-  });
+/* -- Door transaction log (paginated + optional date range) ------------------- */
+api.get('/locks/:id/log', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const { where, params } = rangeWhere('device_id = ?', [req.params.id], req.query);
+    const { limit, offset } = pageParams(req.query);
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM lock_logs WHERE ${where}`,
+      params
+    );
+    const [rows] = await pool.query(
+      `SELECT * FROM lock_logs WHERE ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+    res.json({ ok: true, log: rows, total, limit, offset });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 /* -- Introspection + terminal feed --------------------------------------------- */
@@ -1334,7 +1348,7 @@ api.post('/sim/heartbeat', async (req, res) => {
  * Boot sequence
  * ------------------------------------------------------------------------- */
 async function boot() {
-  logEvent('info', 'OZLOCKSERV booting — personal-cloud rendezvous directory (lab)');
+  logEvent('info', 'OZPMSSERV booting — operator-owned property-management server (site: pms)');
 
   let attempts = 0;
   for (;;) {
@@ -1351,7 +1365,7 @@ async function boot() {
   initMqtt();
 
   app.listen(CONFIG.HTTP_PORT, () => {
-    logEvent('info', `HTTP directory listening on http://localhost:${CONFIG.HTTP_PORT}/ozlockserv/api`);
+    logEvent('info', `HTTP directory listening on http://localhost:${CONFIG.HTTP_PORT}/ozpmsserv/api`);
   });
 }
 

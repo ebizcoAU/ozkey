@@ -1,31 +1,35 @@
 /*
  * ============================================================================
- *  OZLOCK REGISTRY CONSOLE — the rendezvous server's operator view (Port 4300)
+ *  OZPMS CONSOLE — the property operator's own view (Port 4401)
  *  ---------------------------------------------------------------------------
- *  OZLOCK is the STUN/rendezvous server: it matches apps to doorlocks and
- *  relays. It does NOT grant keys or add doorlocks — those are the BANOI app's
- *  job. This console is READ-ONLY observability over what OZLOCK knows:
- *    • given an app (user id)  → all its doorlocks + its activity log
- *    • given a doorlock (device id) → the bound app + its door-transaction log
- *  ONE record stream, as of 2026-07-31:
+ *  Forked from ozlock/ 2026-07-31 (operator decision, XF-48 §9.4) as the
+ *  front-end for OZPMSSERV (:4400).
+ *
+ *  WHY THIS IS A SEPARATE APP, not a mode of the ozlock console:
+ *    OZLOCKSERV is the hosted relay we run for other people, and it now holds
+ *    NO door events at all (Sovereign Edge v3 §4.1). OZPMSSERV is run BY the
+ *    property operator over THEIR OWN doors, where door history is the point of
+ *    the product. Same rule XF-47 Ask 7 set for `grants.raw_value`.
+ *
+ *  So the DOOR LOG PANEL LIVES HERE and was removed from ozlock/. The two
+ *  record streams, kept distinct:
  *    • Activity log  = control-plane actions an app performed (pair/grant/
- *                      revoke/unlock) — from audit_log. KEPT.
- *    • Door log      = physical access events at the lock. REMOVED — OZLOCKSERV
- *                      holds no door events at all (Sovereign Edge v3 §4.1,
- *                      operator decision XF-48 §9.4). `/locks/:id/log` answers
- *                      410 Gone. The Door Transactions tab now explains the
- *                      absence instead of rendering an empty list, which would
- *                      read as "this door has never been opened".
- *                      Door history lives on OZPMSSERV (:4400, console :4401)
- *                      and OZKEYSERV — the operator's OWN servers.
- *  Against OZLOCKSERV (:4200). Registry admin (prune stale records) is kept;
- *  originating pairings/keys is not.
+ *                      revoke/unlock) — from audit_log
+ *    • Door log      = physical access events at the lock (granted/denied/
+ *                      expired) — from lock_logs. Present on OZPMSSERV ONLY.
+ *
+ *  Registry admin (prune stale records) is kept; originating pairings/keys is
+ *  not — that is still the BANOI app's job.
+ *
+ *  TODO (real OZPMS, per the OZPMS concept): this is still the single-tenant
+ *  lab console. Multi-tenancy — 2000 locks / 10 property managers / GM /
+ *  admin, with per-role scoping — is the first thing this fork must grow.
  * ============================================================================
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-const API = 'http://localhost:4200/ozlockserv/api';
+const API = 'http://localhost:4400/ozpmsserv/api';
 
 /* ---------------------------------------------------------------------------
  * Palette
@@ -98,8 +102,8 @@ const statusColor = (s) =>
 const actionColor = (a) =>
   ({ pair: C.blue, grant: C.violet, revoke: C.red, unlock: C.teal, settings: C.amber }[a] || C.dim);
 
-// resultColor (granted/denied/expired) removed 2026-07-31 with the door log —
-// it coloured door outcomes, which this console no longer receives.
+const resultColor = (r) =>
+  ({ granted: C.green, denied: C.red, expired: C.amber }[r] || C.dim);
 
 const levelColor = (l) =>
   ({ error: C.red, warn: C.amber, pair: C.blue, key: C.violet, sync: C.teal, lock: C.blue }[l] ||
@@ -151,8 +155,11 @@ export default function OzlockConsole() {
   const [actPage, setActPage] = useState(0);
   const [actFrom, setActFrom] = useState('');
   const [actTo, setActTo] = useState('');
-  // Door-log state removed 2026-07-31 (lockLog/logTotal/logPage/logFrom/logTo) —
-  // this server holds no door events. Activity-log state above is unaffected.
+  const [lockLog, setLockLog] = useState([]);
+  const [logTotal, setLogTotal] = useState(0);
+  const [logPage, setLogPage] = useState(0);
+  const [logFrom, setLogFrom] = useState('');
+  const [logTo, setLogTo] = useState('');
 
   // General activity firehose — every message OZLOCK receives, live.
   const [events, setEvents] = useState([]);
@@ -199,10 +206,19 @@ export default function OzlockConsole() {
       .catch(() => {});
   }, [sel, actPage, actFrom, actTo]);
 
-  // Door transactions: NOT FETCHED. OZLOCKSERV holds no door events as of
-  // 2026-07-31 (XF-48 §9.4) and answers 410 on /locks/:id/log. The panel below
-  // explains the absence rather than rendering an empty list, which would read
-  // as "this door has never been opened".
+  // Door transactions — refetch when the lock, its page, or its date range changes.
+  useEffect(() => {
+    if (!sel || sel.kind !== 'lock') return;
+    fetch(`${API}/locks/${encodeURIComponent(sel.id)}/log?${rangeQs(logPage, logFrom, logTo)}`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.ok) {
+          setLockLog(d.log);
+          setLogTotal(d.total);
+        }
+      })
+      .catch(() => {});
+  }, [sel, logPage, logFrom, logTo]);
 
   useEffect(() => {
     let alive = true;
@@ -260,6 +276,11 @@ export default function OzlockConsole() {
     setSel({ kind: 'lock', id });
     setInspectTab('primary');
     setLockDetail(null);
+    setLockLog([]);
+    setLogTotal(0);
+    setLogPage(0);
+    setLogFrom('');
+    setLogTo('');
     loadSelection({ kind: 'lock', id });
   };
 
@@ -391,8 +412,16 @@ export default function OzlockConsole() {
     );
   };
 
-  // exportDoorLogCsv removed 2026-07-31 — there is no door log on this server to
-  // export. See the Door Transactions panel.
+  const exportDoorLogCsv = async () => {
+    const rows = await fetchAllInRange(
+      `${API}/locks/${encodeURIComponent(sel.id)}/log`, logFrom, logTo, 'log'
+    );
+    downloadCsv(
+      `ozlock-doorlog-${sel.id}-${stamp()}.csv`,
+      ['id', 'lock_time_utc', 'received_utc', 'result', 'detail'],
+      rows.map((t) => [t.id, t.lock_ts || '', t.created_at, t.result, t.detail || ''])
+    );
+  };
 
   /* -------------------------------------------------------------------------
    * Render
@@ -680,7 +709,7 @@ export default function OzlockConsole() {
               </div>
               <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
                 {[
-                  ['primary', 'Door Transactions'],
+                  ['primary', `Door Transactions (${logTotal})`],
                   ['secondary', 'Details'],
                 ].map(([id, label]) => (
                   <button
@@ -708,42 +737,22 @@ export default function OzlockConsole() {
               {inspectTab === 'primary' && (
                 <>
                   <div style={{ color: C.dim, fontSize: 10, marginBottom: 6 }}>
-                    not held by this server — by design
+                    physical access events at the lock (granted / denied / expired), newest first
                   </div>
-                  <div style={{ background: '#050B14', border: `1px solid ${C.panelEdge}`, borderRadius: 6, padding: '18px 20px', fontSize: 12, lineHeight: 1.8, height: 500, overflowY: 'auto' }}>
-                    <div style={{ color: C.amber, fontWeight: 700, letterSpacing: 0.6, marginBottom: 10 }}>
-                      NO DOOR EVENT HISTORY ON THE HOSTED RELAY
-                    </div>
-                    <div style={{ color: C.text, marginBottom: 12 }}>
-                      OZLOCKSERV keeps no record of which lock opened, when, or by
-                      whom. There is no <code style={{ color: C.teal }}>lock_logs</code>{' '}
-                      table, no subscription to the door-event topic, and no
-                      ingest path — so there is nothing here to show, and nothing
-                      that could be disclosed or compelled.
-                    </div>
-                    <div style={{ color: C.dim, marginBottom: 12 }}>
-                      This is the Sovereign Edge v3 §4.1 data inventory: connection
-                      metadata (7 days) and security events (90 days) only. Door
-                      events were removed 2026-07-31 per XF-48 §9.4.
-                    </div>
-                    <div style={{ color: C.text, marginBottom: 6, fontWeight: 700 }}>
-                      Where door history does live:
-                    </div>
-                    <div style={{ color: C.dim }}>
-                      • <span style={{ color: C.teal }}>OZPMSSERV</span> — the
-                      property operator&apos;s own server, over their own doors
-                      (console on :4401)
-                      <br />• <span style={{ color: C.teal }}>OZKEYSERV</span> —
-                      the hotel gateway, likewise operator-run
-                      <br />• <span style={{ color: C.teal }}>On the phone</span> —
-                      BANOI&apos;s own local event notes
-                    </div>
-                    <div style={{ color: C.dim, marginTop: 14, fontSize: 11, fontStyle: 'italic' }}>
-                      The control-plane Activity log (what an app did — pair, grant,
-                      revoke, unlock) is a different record and is still kept here:
-                      select an app to view it.
-                    </div>
+                  {renderDateRange(logFrom, logTo, setLogFrom, setLogTo, setLogPage)}
+                  <div style={{ background: '#050B14', border: `1px solid ${C.panelEdge}`, borderRadius: 6, padding: '10px 12px', fontSize: 12, lineHeight: 1.7, height: 464, overflowY: 'auto' }}>
+                    {lockLog.length === 0 && <div style={{ color: C.dim }}>— no door transactions in range —</div>}
+                    {lockLog.map((t) => (
+                      <div key={t.id} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                        <span style={{ color: '#33445C' }}>{fmtTime(t.lock_ts || t.created_at)} </span>
+                        <span style={{ color: resultColor(t.result), fontWeight: 700 }}>
+                          [{String(t.result).toUpperCase().padEnd(7, ' ')}]
+                        </span>{' '}
+                        <span style={{ color: C.termGreen }}>{t.detail || '—'}</span>
+                      </div>
+                    ))}
                   </div>
+                  {renderPager(logPage, logTotal, lockLog.length, setLogPage, C.teal, exportDoorLogCsv)}
                 </>
               )}
 
