@@ -975,8 +975,14 @@ api.patch('/locks/:id', async (req, res) => {
       params.push(power_profile);
     }
     if (heartbeat_s !== undefined) {
+      // Clamp to the SAME 60–600 the firmware enforces (clampHeartbeatS,
+      // doorlock.ino:285). The old Math.max(5, …) had no ceiling, so a PATCH of 5
+      // or 86400 was stored and the row then disagreed with anything the lock would
+      // actually run — the "row says X, device runs Y" class ftpos flagged in
+      // XF-55 §11.2. One authority, one range.
+      const hb = Number(heartbeat_s) || CONFIG.DEFAULT_HEARTBEAT_S;
       sets.push('heartbeat_s = ?');
-      params.push(Math.max(5, Number(heartbeat_s) || CONFIG.DEFAULT_HEARTBEAT_S));
+      params.push(hb < 60 ? 60 : hb > 600 ? 600 : hb);
     }
     if (!sets.length)
       return res.status(400).json({ ok: false, code: 'nothing_to_update', error: 'nothing to update' });
