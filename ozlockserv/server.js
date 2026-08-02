@@ -286,6 +286,11 @@ async function initDatabase() {
       fw VARCHAR(50) NULL,
       status VARCHAR(20) DEFAULT 'enrolled',
       power_profile VARCHAR(20) DEFAULT 'eco',
+      -- XF-48 Ask 1: the lock's OWN statement of what it can do, as a JSON
+      -- array e.g. ["remote_unlock","pin_sync","audit"]. NULL until firmware
+      -- reports it (M3+); until then capability is inferred — see
+      -- effectiveCaps(). Never infer once the device has spoken.
+      caps VARCHAR(255) NULL,
       heartbeat_s INT DEFAULT 60,
       broker_username VARCHAR(64),
       broker_secret VARCHAR(64),
@@ -314,6 +319,15 @@ async function initDatabase() {
   );
   if (!hasBridgeId)
     await pool.query('ALTER TABLE locks ADD COLUMN bridge_id VARCHAR(64) NULL AFTER app_id');
+
+  // XF-48 Ask 1 / ask (E). Additive migration for existing lab rows.
+  const [[{ hasCaps }]] = await pool.query(
+    `SELECT COUNT(*) AS hasCaps FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'caps'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasCaps)
+    await pool.query('ALTER TABLE locks ADD COLUMN caps VARCHAR(255) NULL AFTER power_profile');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS enroll_tokens (
@@ -608,8 +622,18 @@ async function handleEnroll(siteId, topicDeviceId, obj) {
   const label = row.label && row.label !== 'New Doorlock' ? row.label : `Doorlock ${mac.slice(-5)}`;
   const appId = row.app_id || (obj.app_id ? String(obj.app_id).slice(0, 80) : null);
 
+  // bridge_id = NULL here is deliberate (2026-08-03). Reaching handleEnroll means
+  // the LOCK ITSELF spoke MQTT — which only a direct Wi-Fi lock can do; a Thread
+  // lock behind a bridge has no uplink and never enrolls. So a self-enroll is proof
+  // the lock is NOT bridged. Found by converting a Thread lock to Wi-Fi (T2-on-WiFi,
+  // ozprov.py): the row kept its old bridge_id, and BOTH the caps inference
+  // (effectiveCaps) and the app's transport routing (XF-55 §9.1) key off bridge_id,
+  // so the now-WiFi lock was still classified Thread-behind-bridge and its unlock was
+  // routed to the bridge topic — which no longer reaches it. A device that transitions
+  // transports must not carry the old transport's binding.
   await pool.query(
     `UPDATE locks SET app_id = ?, mac = ?, label = ?, fw = ?, status = 'enrolled',
+       bridge_id = NULL,
        heartbeat_s = COALESCE(heartbeat_s, ?), broker_username = ?, broker_secret = ?, last_seen_at = NOW()
      WHERE id = ?`,
     [appId, mac, label, obj.fw || null, CONFIG.DEFAULT_HEARTBEAT_S, brokerUsername, brokerSecret, deviceId]
@@ -703,6 +727,10 @@ async function registerPairing(appId, deviceId, label, bridgeId) {
   if (existing && existing.app_id && appId && existing.app_id !== appId) {
     const e = new Error(`device_id already paired to a different app`);
     e.httpStatus = 409;
+    // XF-48 ask (I). NOT `e.code` — mysql2 and Node system errors already use
+    // `.code` (ER_DUP_ENTRY, ECONNREFUSED), so writing there would sometimes
+    // ship a driver's internal code to the app as if it were our contract.
+    e.ozCode = 'device_paired_elsewhere';
     throw e;
   }
   // Fresh registration lands as 'registered' (awaiting the lock's first
@@ -738,7 +766,11 @@ api.post('/pairings', async (req, res) => {
     if (!appId || !deviceId) {
       return res
         .status(400)
-        .json({ ok: false, error: 'app_id and device_id are required (the app grants both)' });
+        .json({
+          ok: false,
+          code: 'missing_fields',
+          error: 'app_id and device_id are required (the app grants both)',
+        });
     }
     await registerPairing(appId, deviceId, label, bridgeId);
     res.json({
@@ -749,7 +781,13 @@ api.post('/pairings', async (req, res) => {
       provision_payload: buildProvisionPayload(appId, deviceId),
     });
   } catch (err) {
-    res.status(err.httpStatus || 500).json({ ok: false, error: err.message });
+    // ozCode is OUR contract; err.httpStatus present means a deliberate throw.
+    // Anything else is an unhandled fault and must not masquerade as a known code.
+    res.status(err.httpStatus || 500).json({
+      ok: false,
+      code: err.ozCode || (err.httpStatus ? 'request_failed' : 'internal_error'),
+      error: err.message,
+    });
   }
 });
 
@@ -761,7 +799,8 @@ api.get('/pairings/status', async (req, res) => {
       'SELECT id, app_id, bridge_id, status, mac FROM locks WHERE id = ?',
       [deviceId]
     );
-    if (!row) return res.status(404).json({ ok: false, error: 'no such pairing' });
+    if (!row)
+      return res.status(404).json({ ok: false, code: 'pairing_not_found', error: 'no such pairing' });
     res.json({
       ok: true,
       device_id: row.id,
@@ -794,7 +833,13 @@ api.post('/enroll/begin', async (req, res) => {
       provision_payload: buildProvisionPayload(appId, deviceId),
     });
   } catch (err) {
-    res.status(err.httpStatus || 500).json({ ok: false, error: err.message });
+    // ozCode is OUR contract; err.httpStatus present means a deliberate throw.
+    // Anything else is an unhandled fault and must not masquerade as a known code.
+    res.status(err.httpStatus || 500).json({
+      ok: false,
+      code: err.ozCode || (err.httpStatus ? 'request_failed' : 'internal_error'),
+      error: err.message,
+    });
   }
 });
 
@@ -802,12 +847,20 @@ api.post('/enroll/begin', async (req, res) => {
 api.get('/locks', async (req, res) => {
   if (!guardDb(res)) return;
   try {
+    // bridge_id + caps, same as GET /locks/:id (2026-08-02). Patching only the
+    // single-lock read was not enough: the app builds its lock LIST from here, so
+    // a lock could report remote_unlock when opened individually and still render
+    // as BLE-only in the list the user actually taps. Both reads must agree.
     const [rows] = await pool.query(
       `SELECT id, site_id, app_id, mac, label, fw, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at
+              last_seen_at, enrolled_at, bridge_id, caps
          FROM locks ORDER BY enrolled_at DESC`
     );
-    res.json({ ok: true, locks: rows });
+    const locks = rows.map((l) => {
+      const { caps, source } = effectiveCaps(l);
+      return { ...l, caps, caps_source: source };
+    });
+    res.json({ ok: true, locks });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -876,14 +929,28 @@ api.get('/apps/:appId/activity', async (req, res) => {
 api.get('/locks/:id', async (req, res) => {
   if (!guardDb(res)) return;
   try {
+    // bridge_id + caps added 2026-08-02. They were being SELECTed nowhere, so the
+    // app had no way to learn a Thread lock is remotely reachable and fell back to
+    // BLE — which a commissioned lock never advertises for. Symptom was "Do not
+    // see doorlock" on a lock the server could have unlocked: effectiveCaps()
+    // already inferred remote_unlock from bridge_id, we simply never published it.
+    // This is XF-48 ask 1 (the capability field) landing on the read path.
     const [[lock]] = await pool.query(
       `SELECT id, app_id, site_id, mac, label, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at
+              last_seen_at, enrolled_at, bridge_id, caps
          FROM locks WHERE id = ?`,
       [req.params.id]
     );
-    if (!lock) return res.status(404).json({ ok: false, error: `Lock ${req.params.id} not found` });
-    res.json({ ok: true, lock });
+    if (!lock)
+      return res
+        .status(404)
+        .json({ ok: false, code: 'lock_not_found', error: `Lock ${req.params.id} not found` });
+    const { caps, source } = effectiveCaps(lock);
+    // caps_source lets the app distinguish "the device told us" from "we inferred
+    // it from a bound bridge" — XF-48 §9.5 wants the device's own report to win
+    // once the state uplink exists, and silently swapping one for the other would
+    // be undiagnosable from the app side.
+    res.json({ ok: true, lock: { ...lock, caps, caps_source: source } });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -901,7 +968,9 @@ api.patch('/locks/:id', async (req, res) => {
     }
     if (power_profile !== undefined) {
       if (!['eco', 'responsive', 'scheduled'].includes(power_profile))
-        return res.status(400).json({ ok: false, error: 'invalid power_profile' });
+        return res
+          .status(400)
+          .json({ ok: false, code: 'invalid_power_profile', error: 'invalid power_profile' });
       sets.push('power_profile = ?');
       params.push(power_profile);
     }
@@ -909,11 +978,14 @@ api.patch('/locks/:id', async (req, res) => {
       sets.push('heartbeat_s = ?');
       params.push(Math.max(5, Number(heartbeat_s) || CONFIG.DEFAULT_HEARTBEAT_S));
     }
-    if (!sets.length) return res.status(400).json({ ok: false, error: 'nothing to update' });
+    if (!sets.length)
+      return res.status(400).json({ ok: false, code: 'nothing_to_update', error: 'nothing to update' });
     params.push(req.params.id);
     const [r] = await pool.query(`UPDATE locks SET ${sets.join(', ')} WHERE id = ?`, params);
     if (r.affectedRows === 0)
-      return res.status(404).json({ ok: false, error: `Lock ${req.params.id} not found` });
+      return res
+        .status(404)
+        .json({ ok: false, code: 'lock_not_found', error: `Lock ${req.params.id} not found` });
     logEvent('info', `Lock ${req.params.id} settings updated (${sets.join(', ')})`);
     res.json({ ok: true, id: req.params.id });
   } catch (err) {
@@ -1026,7 +1098,7 @@ api.delete('/locks/:id', async (req, res) => {
     const [d] = await conn.query('DELETE FROM locks WHERE id = ?', [id]);
     await conn.commit();
     if (d.affectedRows === 0)
-      return res.status(404).json({ ok: false, error: `Lock ${id} not found` });
+      return res.status(404).json({ ok: false, code: 'lock_not_found', error: `Lock ${id} not found` });
     logEvent('info', `Doorlock ${id} removed + factory_reset sent`);
     res.json({ ok: true, id });
   } catch (err) {
@@ -1057,22 +1129,34 @@ api.post('/locks/:id/grants', async (req, res) => {
     } = req.body || {};
 
     if (!user_name || !raw_value) {
-      return res.status(400).json({ ok: false, error: 'user_name and raw_value are required' });
+      return res.status(400).json({
+        ok: false,
+        code: 'missing_fields',
+        error: 'user_name and raw_value are required',
+      });
     }
     if (type === 'fingerprint') {
       return res.status(422).json({
         ok: false,
+        code: 'credential_type_unsupported',
         error: 'fingerprint credentials are on hold — DP codec supports pin/rfid only',
       });
     }
     if (!SUPPORTED_CRED_TYPES.includes(type)) {
       return res
         .status(400)
-        .json({ ok: false, error: `type must be one of: ${SUPPORTED_CRED_TYPES.join(', ')}` });
+        .json({
+          ok: false,
+          code: 'credential_type_unsupported',
+          error: `type must be one of: ${SUPPORTED_CRED_TYPES.join(', ')}`,
+        });
     }
 
     const [[lock]] = await conn.query('SELECT * FROM locks WHERE id = ?', [deviceId]);
-    if (!lock) return res.status(404).json({ ok: false, error: `Lock ${deviceId} not found` });
+    if (!lock)
+      return res
+        .status(404)
+        .json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
 
     const from = date_from || new Date().toISOString();
     const to = date_to || new Date(Date.now() + 24 * 3600 * 1000).toISOString();
@@ -1087,7 +1171,7 @@ api.post('/locks/:id/grants', async (req, res) => {
         dateTo: to,
       });
     } catch (err) {
-      return res.status(400).json({ ok: false, error: err.message });
+      return res.status(400).json({ ok: false, code: 'bad_request', error: err.message });
     }
     const payloadHex = toSpacedHex(frame);
 
@@ -1153,12 +1237,52 @@ api.get('/locks/:id/grants', async (req, res) => {
 });
 
 /* -- Remote unlock (the away-path "Mở cửa", ozkey-05 §6.3) -------------------- */
+/* -- XF-48 ask (E): capability enforcement, server-side ---------------------- *
+ * ftpos raised this and they were right: removing the remote-unlock affordance
+ * from BANOI fixes one build of one client. It does not close the path for older
+ * app versions, other clients, or a direct API call — and after their fix the
+ * exposure would be INVISIBLE to them, because the only thing that knew the rule
+ * was the UI they had just changed.
+ *
+ * Authority order, and the order matters:
+ *   1. `locks.caps` — what the LOCK reported about itself (firmware, M3+).
+ *      A device's own statement, per XF-48 Ask 1. Never override it by
+ *      inference; inference is what rots.
+ *   2. Interim rule until caps ships: remote unlock requires a bound bridge.
+ *
+ * Why a bridge is the right proxy: a direct Wi-Fi lock wakes every 2-10 minutes,
+ * and the unlock below carries a 60 s expiry precisely so a command can never
+ * fire stale. So for an ECO lock the command already almost always expired
+ * unheard — the door simply never opened and nothing said why. Enforcement does
+ * not remove a capability; it converts a silent, undiagnosable expiry into a
+ * refusal the app can render.
+ */
+const ENFORCE_CAPS = process.env.OZLOCK_ENFORCE_CAPS !== '0';
+
+function effectiveCaps(lock) {
+  if (lock.caps) {
+    try {
+      const c = JSON.parse(lock.caps);
+      if (Array.isArray(c)) return { caps: c, source: 'device' };
+    } catch (_) {
+      // Malformed device report: fall through to inference rather than trust it.
+    }
+  }
+  return {
+    caps: lock.bridge_id ? ['remote_unlock', 'pin_sync', 'audit'] : ['pin_sync', 'audit'],
+    source: 'inferred',
+  };
+}
+
 api.post('/locks/:id/unlock', async (req, res) => {
   if (!guardDb(res)) return;
   try {
     const deviceId = req.params.id;
     const [[lock]] = await pool.query('SELECT * FROM locks WHERE id = ?', [deviceId]);
-    if (!lock) return res.status(404).json({ ok: false, error: `Lock ${deviceId} not found` });
+    if (!lock)
+      return res
+        .status(404)
+        .json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
     // A bridged (Thread) lock has no MQTT uplink of its own, so handleEnroll can
     // never run for it and its status cannot advance past 'registered' — that is
     // the ozkey-10 uplink gap, not a half-finished pairing. Commands still reach
@@ -1168,7 +1292,36 @@ api.post('/locks/:id/unlock', async (req, res) => {
     if (!reachable) {
       return res
         .status(409)
-        .json({ ok: false, error: `Lock ${deviceId} is not enrolled yet (status: ${lock.status})` });
+        .json({
+          ok: false,
+          code: 'lock_not_enrolled',
+          error: `Lock ${deviceId} is not enrolled yet (status: ${lock.status})`,
+          status_now: lock.status,
+        });
+    }
+
+    // XF-48 ask (E) — capability gate. Checked BEFORE anything is queued, so a
+    // refused unlock leaves no row to expire later and no audit entry implying
+    // it was attempted at the door.
+    const { caps, source } = effectiveCaps(lock);
+    if (ENFORCE_CAPS && !caps.includes('remote_unlock')) {
+      logEvent(
+        'warn',
+        `Remote UNLOCK refused for "${lock.label}" — no remote_unlock capability (${source})`
+      );
+      return res.status(409).json({
+        ok: false,
+        code: 'remote_unlock_unsupported',
+        error: 'remote_unlock_unsupported', // kept: ftpos shipped against error= for this one
+        detail:
+          'This lock cannot be unlocked remotely. Unlock is Bluetooth-at-the-door; ' +
+          'its network link carries key management, PIN sync and audit on a periodic ' +
+          'wake, not live commands. Add an OZKEY bridge to enable remote unlock.',
+        caps,
+        caps_source: source, // 'device' = the lock said so; 'inferred' = no bridge bound
+        device_id: deviceId,
+        ref: 'XF-48 §3',
+      });
     }
 
     // §6.3: a remote unlock MUST NOT fire stale. Queue with a 60 s expiry; the
@@ -1212,9 +1365,17 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
       deviceId,
     ]);
     if (!grant)
-      return res.status(404).json({ ok: false, error: `Grant #${grantId} not found on ${deviceId}` });
+      return res.status(404).json({
+        ok: false,
+        code: 'grant_not_found',
+        error: `Grant #${grantId} not found on ${deviceId}`,
+      });
     if (grant.sync_status === 'revoked')
-      return res.status(409).json({ ok: false, error: `Grant #${grantId} is already revoked` });
+      return res.status(409).json({
+        ok: false,
+        code: 'grant_already_revoked',
+        error: `Grant #${grantId} is already revoked`,
+      });
     const [[dupe]] = await conn.query(
       `SELECT id FROM pending_queue
         WHERE grant_id = ? AND action_type = 'revoke-key' AND status = 'queued'`,
@@ -1223,14 +1384,16 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
     if (dupe)
       return res.status(409).json({
         ok: false,
+        code: 'revoke_already_queued',
         error: `Grant #${grantId} already has revoke queue #${dupe.id} pending`,
+        queue_id: dupe.id,
       });
 
     let frame;
     try {
       frame = buildDeleteFrame({ type: grant.type, slotNumber: grant.slot_number });
     } catch (err) {
-      return res.status(422).json({ ok: false, error: err.message });
+      return res.status(422).json({ ok: false, code: 'unprocessable', error: err.message });
     }
     const payloadHex = toSpacedHex(frame);
 
@@ -1287,6 +1450,7 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
 api.get('/locks/:id/log', (_req, res) => {
   res.status(410).json({
     ok: false,
+    code: 'gone',
     error: 'gone',
     detail:
       'Door event history is not held by the hosted relay. This server stores ' +
@@ -1318,10 +1482,14 @@ api.get('/events', (req, res) => {
 api.post('/sim/heartbeat', async (req, res) => {
   if (!guardDb(res)) return;
   const { device_id } = req.body || {};
-  if (!device_id) return res.status(400).json({ ok: false, error: 'device_id required' });
+  if (!device_id)
+    return res.status(400).json({ ok: false, code: 'missing_fields', error: 'device_id required' });
   try {
     const [[lock]] = await pool.query('SELECT site_id FROM locks WHERE id = ?', [device_id]);
-    if (!lock) return res.status(404).json({ ok: false, error: `Lock ${device_id} not found` });
+    if (!lock)
+      return res
+        .status(404)
+        .json({ ok: false, code: 'lock_not_found', error: `Lock ${device_id} not found` });
     await pool.query('UPDATE locks SET last_seen_at = NOW() WHERE id = ?', [device_id]);
     const sent = await flushQueueForDevice(lock.site_id, String(device_id));
     res.json({ ok: true, device_id, flushed: sent });

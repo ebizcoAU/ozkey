@@ -85,8 +85,28 @@ unsigned long lastLcdActivityAt = 0;
 #define CHR_PROVISION "4f5a4b32-0002-4272-6467-000000000001"
 #define CHR_STATUS "4f5a4b32-0003-4272-6467-000000000001"
 #define CHR_INFO "4f5a4b32-0004-4272-6467-000000000001"
-#define FW_VERSION "bridge32-1.0"
-#define FW_DISPLAY_VERSION "v1.0" // shown on-screen, doorlock.ino's badge convention
+// Version bumped on every flashed change (operator directive 2026-08-02) — it
+// ships on `info.fw`, so the app and servers can tell which contract a device
+// speaks, and a serial capture maps to a known build.
+//   1.0  initial border-router bootstrap, MQTT uplink, Thread dataset restore
+//   1.1  log the formed network's name/ext_pan/channel/pan at THREAD_OK — the
+//        missing half of the "is the lock even on my mesh?" question
+//   1.2  ONE version per build, in one place. The boot banner carried its own
+//        "bridge32 v0 —" directly above `[FW] bridge32-1.x`, so every capture
+//        showed two disagreeing versions; the banner now names the product only
+//        and FW_VERSION is the single source (operator, 2026-08-02).
+//        FW_DISPLAY_VERSION was left at "v1.0" through the 1.1 bump, so the LCD
+//        badge disagreed with `info.fw` and with the serial banner. Bumping
+//        rather than quietly correcting to "v1.1": two different binaries both
+//        answering "bridge32-1.1" is exactly the ambiguity the version rule
+//        exists to prevent, and 1.1 is already flashed and captured.
+//   1.3  [MESH] now reports OUR role/rloc16/partition and, when we are a Child,
+//        our PARENT — replacing "children attached: 0 (0 = the lock is NOT on
+//        this mesh)", which was false and misdirected a full day of debugging.
+//        Bench truth 2026-08-02: bridge and lock shared ext_pan the whole time
+//        with children==0, because the lock was Leader and parented the bridge.
+#define FW_VERSION "bridge32-1.3"
+#define FW_DISPLAY_VERSION "v1.3" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
 // existing mesh) in v0; it is the only network former in the home.
@@ -536,9 +556,21 @@ static bool sendToThreadGroup(const IPAddress &group, const String &target,
 // DIAGNOSTIC (2026-07-28, temporary): who is actually attached to THIS mesh?
 // The doorlock's own LCD/MON "JOINED" comes from a latched flag that is never
 // cleared, so it keeps claiming JOINED after the bridge re-forms the network
-// and orphans it. The bridge's child table is ground truth: if the lock is not
-// listed here, it is on a different (dead) Thread network and no amount of
-// relaying will reach it — it needs re-pairing against the CURRENT dataset.
+// and orphans it.
+//
+// ⚠ CORRECTED 2026-08-02 — this used to print "0 = the lock is NOT on this mesh"
+// and that assertion is FALSE. It cost a full day. The child table only lists
+// devices for which THIS node is the parent; it says nothing about a device that
+// is our parent, our sibling, or a router elsewhere in the partition. Bench
+// proof: bridge and lock were on ext_pan 916e387c9a1bd316 the entire time, and
+// children==0 throughout — because the *lock* was Leader and the bridge attached
+// to IT as a Child (19:42:03, role=Child after 102ms). We wrote a diagnostic
+// that asserted the opposite of the truth and then reasoned from it.
+//
+// So report OUR role and partition first: on this network the interesting
+// question is not "who are my children" but "whose partition am I in, and am I
+// the router I was designed to be". children==0 is only meaningful once role is
+// known to be Leader/Router.
 static void logThreadChildren() {
   otInstance *inst = thread.getInstance();
   if (inst == nullptr) {
@@ -555,6 +587,16 @@ static void logThreadChildren() {
     Serial.println("[MESH] lock busy — skipped child dump");
     return;
   }
+  otDeviceRole role = otThreadGetDeviceRole(inst);
+  uint16_t rloc16 = otThreadGetRloc16(inst);
+  uint32_t partition = otThreadGetPartitionId(inst);
+
+  // If we are a Child, name our PARENT — that is the device the old message
+  // would have reported as "not on this mesh".
+  otRouterInfo parent;
+  bool haveParent = (role == OT_DEVICE_ROLE_CHILD) &&
+                    (otThreadGetParentInfo(inst, &parent) == OT_ERROR_NONE);
+
   int n = 0;
   otChildInfo ci;
   for (uint16_t i = 0; i < 64; i++) {
@@ -564,7 +606,27 @@ static void logThreadChildren() {
                   ci.mRloc16, (int)ci.mAverageRssi, (unsigned long)ci.mTimeout);
   }
   esp_openthread_lock_release();
-  Serial.printf("[MESH] children attached: %d (0 = the lock is NOT on this mesh)\n", n);
+
+  const char *roleName = (role == OT_DEVICE_ROLE_LEADER)   ? "Leader"
+                         : (role == OT_DEVICE_ROLE_ROUTER) ? "Router"
+                         : (role == OT_DEVICE_ROLE_CHILD)  ? "Child"
+                         : (role == OT_DEVICE_ROLE_DETACHED) ? "Detached"
+                                                             : "Disabled";
+  Serial.printf("[MESH] self role=%s rloc16=0x%04x partition=0x%08lx children=%d\n",
+                roleName, rloc16, (unsigned long)partition, n);
+  if (haveParent) {
+    // otRouterInfo carries NO rssi — mAverageRssi is otChildInfo's, which is why
+    // the child line above compiles and this one did not (esp32c6-libs 3.3.11,
+    // openthread/thread.h:140). Link quality in (0-3) is the equivalent here.
+    Serial.printf("[MESH] parent rloc16=0x%04x routerid=%u lqi_in=%u — WE ARE A CHILD. "
+                  "The border router should be Leader/Router; a battery lock should "
+                  "not parent it.\n",
+                  parent.mRloc16, (unsigned)parent.mRouterId,
+                  (unsigned)parent.mLinkQualityIn);
+  } else if (n == 0 && (role == OT_DEVICE_ROLE_LEADER || role == OT_DEVICE_ROLE_ROUTER)) {
+    Serial.println("[MESH] children=0 and we are Leader/Router — no device has us as "
+                   "its parent (it may still be elsewhere in this partition).");
+  }
 }
 
 void forwardOverThread(const String &target, const String &payloadHex) {
@@ -740,6 +802,7 @@ void formThreadNetwork() {
   Serial.printf("[THREAD] attach role=%s after %lums\n",
                 OpenThread::otGetStringDeviceRole(), millis() - attachStart);
 
+
   if (role != OT_ROLE_LEADER && role != OT_ROLE_ROUTER && role != OT_ROLE_CHILD) {
     // Fail closed (CONTRACT-BRIDGE.md's documented THREAD_FAIL, never actually
     // sent before this fix) — declaring THREAD_OK here would let refreshInfo()
@@ -751,6 +814,28 @@ void formThreadNetwork() {
   }
 
   threadFormed = true;
+
+  // DIAGNOSTIC (2026-08-02): print WHICH network this is. One line, and it
+  // settles a question that has now cost hours twice — when a doorlock sits at
+  // Leader on its own partition, the ONLY thing distinguishing "the app handed
+  // it a stale dataset" from "same network, ordinary partition-merge delay" is
+  // comparing ext_pan_id, and neither device printed it. The lock already logs
+  // its side (`[PROV] thread fields: … ext_pan=…`); this is the missing half.
+  // Companion to logThreadChildren(): that says WHO is attached, this says WHAT
+  // network they would be attaching to.
+  //
+  // Placed AFTER the fail-closed check above on purpose — on a failed attach the
+  // dataset is unattached and, per that comment, likely garbage; printing it
+  // would look authoritative and mislead. Uses `const DataSet &` and DataSet's
+  // own getters, which are plain struct reads: the 2026-07-26 crash was
+  // thread.getExtendedPanId() (lock-dependent, can return nullptr), not these.
+  {
+    const DataSet &ds = thread.getCurrentDataSet();
+    Serial.printf("[THREAD] network name='%s' ext_pan=%s ch=%u pan=%04x\n",
+                  ds.getNetworkName(), bytesToHex(ds.getExtendedPanId(), 8).c_str(),
+                  (unsigned)ds.getChannel(), (unsigned)ds.getPanId());
+  }
+
   state = ST_OPERATIONAL;
   notifyStatus("THREAD_OK");
   refreshInfo();
@@ -955,7 +1040,7 @@ void startBle() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n*** bridge32 v0 — OZBRIDGE Thread border router bootstrap ***");
+  Serial.println("\n*** OZBRIDGE Thread border router bootstrap ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
 
   // EVENT-LOOP RACE FIX (2026-07-27, live bench): OThread.cpp's worker task

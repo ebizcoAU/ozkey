@@ -168,6 +168,98 @@ static String ozLockPubHex() {
   return String(h);
 }
 
+// ── M2: bond #0, the owner bond ───────────────────────────────────────────────
+//
+// Defined here rather than beside the self-test because the provisioning path
+// needs it; ozFromHex() lives further down with the vector helpers, hence the
+// forward declaration.
+static void ozFromHex(const char *hex, uint8_t *out, size_t n);
+//
+// CONTRACT.md "Bond #0 bootstrap" (XF-47, canonical). Bond #0 is minted from the
+// `app_id` field ALREADY present in the provision payload — BANOI has sent it
+// since `provision_payload.dart:63` — so commissioning creates the owner bond
+// with zero wire change.
+//
+// Stored in the same "blelock" namespace as the lock keypair. That is
+// deliberate: `factoryReset()` does `prefs.clear()` on this namespace, so a
+// factory reset wipes the bond AND mints a new keypair, and per CONTRACT.md a
+// factory reset is the ONLY way to clear ownership. A re-provision can never
+// overwrite it — see OZ_BOND_DENIED below.
+//
+// counter_floor is persisted from the start even though nothing moves it until
+// M4: a bond whose floor resets to 0 on reboot would re-open every captured
+// frame, and the anti-replay rule (XF-47) leans on the floor surviving.
+
+static const uint8_t OZ_ROLE_ADMIN = 0;
+
+static uint8_t  g_bond0Pub[32];
+static bool     g_bond0Present = false;
+static uint8_t  g_bond0Role    = OZ_ROLE_ADMIN;
+static uint64_t g_bond0Floor   = 0;
+
+enum OzBondVerdict {
+  OZ_BOND_ABSENT,    // no app_id in payload -> legacy path: no bond, NO error
+  OZ_BOND_MALFORMED, // app_id present but not exactly 64 hex chars
+  OZ_BOND_CREATE,    // no bond #0 yet -> mint it when the payload is accepted
+  OZ_BOND_SAME,      // bond #0 exists and matches -> idempotent re-provision
+  OZ_BOND_DENIED     // bond #0 exists and DIFFERS -> refuse, change NOTHING
+};
+
+static void ozBond0Load() {
+  prefs.begin("blelock", true);
+  g_bond0Present = (prefs.getBytesLength("b0pub") == 32);
+  if (g_bond0Present) {
+    prefs.getBytes("b0pub", g_bond0Pub, 32);
+    g_bond0Role  = prefs.getUChar("b0role", OZ_ROLE_ADMIN);
+    g_bond0Floor = prefs.getULong64("b0ctr", 0);
+  }
+  prefs.end();
+}
+
+// Strict: exactly n*2 chars, all hex. ozFromHex() silently maps junk to 0, so an
+// app_id of "zzzz…" would otherwise bond a lock to an all-zero pubkey nobody
+// holds the private half of — unrecoverable without a factory reset.
+static bool ozIsHex(const char *h, size_t nbytes) {
+  if (!h) return false;
+  size_t i = 0;
+  for (; h[i]; i++) {
+    const char c = h[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+      return false;
+  }
+  return i == nbytes * 2;
+}
+
+// Pure decision — writes nothing. The caller must be able to refuse atomically,
+// which means knowing the verdict BEFORE it has mutated any state.
+static OzBondVerdict ozBond0Evaluate(const char *appIdHex, uint8_t outPub[32]) {
+  if (!appIdHex || !*appIdHex) return OZ_BOND_ABSENT;
+  if (!ozIsHex(appIdHex, 32)) return OZ_BOND_MALFORMED;
+  ozFromHex(appIdHex, outPub, 32);
+  if (!g_bond0Present) return OZ_BOND_CREATE;
+  return memcmp(outPub, g_bond0Pub, 32) == 0 ? OZ_BOND_SAME : OZ_BOND_DENIED;
+}
+
+// Called ONLY on the accept path, after the payload is known good.
+static void ozBond0Commit(const uint8_t pub[32]) {
+  memcpy(g_bond0Pub, pub, 32);
+  g_bond0Role  = OZ_ROLE_ADMIN;
+  g_bond0Floor = 0;
+  g_bond0Present = true;
+  prefs.begin("blelock", false);
+  prefs.putBytes("b0pub", g_bond0Pub, 32);
+  prefs.putUChar("b0role", g_bond0Role);
+  prefs.putULong64("b0ctr", g_bond0Floor);
+  prefs.end();
+}
+
+static String ozBond0PubHex() {
+  if (!g_bond0Present) return String("");
+  char h[65];
+  ozHex(g_bond0Pub, 32, h);
+  return String(h);
+}
+
 // ── boot self-test (known-answer vectors) ─────────────────────────────────────
 
 static bool ozHexEq(const uint8_t *b, size_t n, const char *expectHex) {

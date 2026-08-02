@@ -129,8 +129,54 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 #define CHR_PROVISION "4f5a4b31-0002-4c4f-434b-000000000001"
 #define CHR_STATUS "4f5a4b31-0003-4c4f-434b-000000000001"
 #define CHR_INFO "4f5a4b31-0004-4c4f-434b-000000000001"
-#define FW_VERSION "doorlock-1.0"
-#define FW_DISPLAY_VERSION "v1.0" // shown on-screen next to the OZLOCK logo
+// ── Firmware version ────────────────────────────────────────────────────────
+// BUMP THE MINOR ON EVERY FLASHED CHANGE (operator directive 2026-08-02). This
+// is not bookkeeping: FW_VERSION goes out on `info.fw` and is persisted as
+// `locks.fw` server-side, so it is how BANOI and ozlockserv tell which contract
+// a device speaks — and how a serial capture is matched to a known build. The
+// compiler's __DATE__ stamp identifies a binary but nobody can talk about it.
+//
+//   1.0  M1 — AES-GCM envelope in ozcrypto.h, boot self-test vs ozkey-06 §5
+//   1.1  M2 — bond #0 from provision.app_id (BOND_OK / BOND_DENIED, atomic
+//             refusal); LCD bottom row shows Owner instead of the txlog count;
+//             factoryReset() order fix so the txlog wipe and screen flash are
+//             no longer dead code behind otInstanceFactoryReset(); Thread
+//             attach-timeout latch fix (was re-notifying THREAD_FAIL every
+//             loop, flooding a connected app's status ladder)
+//             — superseded by 1.2 before it was ever flashed; no board ran it
+//   1.2  XF-52 (R) — BLE maintenance window: a short BOOT press makes a
+//             COMMISSIONED lock discoverable for 60 s. Deliberately physical;
+//             there is no remote verb for it and there must never be one.
+//             Unblocks M3 member_enroll and XF-52 (S) `Ghép lại`, neither of
+//             which could reach a working lock at all.
+//   1.3  STALE-ROLE FIX — after commitDataSet() the stack briefly still reports
+//             the OLD network's role, so the lock announced THREAD_OK 0 ms after
+//             THREAD_JOINING, went ST_OPERATIONAL, and never re-evaluated —
+//             claiming "Thread: OK" while orphaned on a dead partition. Root
+//             cause of the XF-53 ladder hang, which we had wrongly attributed
+//             to the app catching a fast-but-honest attach.
+//             Also XF-53 (Y): bleClientConnected is now DERIVED from a link
+//             count, not latched false by any teardown, so a stale link closing
+//             while a live one is up can no longer silence the status ladder.
+//             onConnect/onDisconnect now log — they were mute, which is why the
+//             T2 capture could not settle (Y) either way.
+//             Also: boot banner no longer carries a second, stale version.
+//   1.4  LCD told the operator the lock was fine when it was not. "Thread:
+//             JOINED" came from `threadFormed`, set once at first attach and
+//             cleared nowhere, so it stayed green through detachment and through
+//             the lock leading its own orphaned partition. Now reads the LIVE
+//             role and NAMES it — CHILD / ROUTER / LEADER! / DOWN — because the
+//             role is the thing that matters: a doorlock showing LEADER is the
+//             topology inversion, not a healthy lock. The [MON] serial line was
+//             given the live role on 2026-07-28; the display an installer
+//             actually reads was left latched for five weeks.
+//             Same pass, same fault class: an UNPROVISIONED lock showed
+//             "(wifi)" and logged xport=wifi because cfgTransport defaults to
+//             "wifi" (:572) — a default rendered as a decision. It now reads
+//             "(mode: set by app)" / xport=unset until the app actually picks a
+//             transport, which it does by sending network_key or not.
+#define FW_VERSION "doorlock-1.4"
+#define FW_DISPLAY_VERSION "v1.4" // shown on-screen next to the OZLOCK logo
 
 // ── State machine ───────────────────────────────────────────────────────────
 enum CommState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
@@ -156,6 +202,11 @@ bool isThread() { return cfgTransport == "thread"; }
 OpenThread thread;
 DataSet otDataset;
 bool threadFormed = false;
+// Set when a NEW dataset is committed: until the stack reports DETACHED at least
+// once, otGetDeviceRole() may still be returning the role from the network we
+// are leaving. See the STALE-ROLE FIX in loop(). Not set on boot-resume, where
+// the stack starts detached and the role is trustworthy from the first read.
+bool threadAwaitDetach = false;
 unsigned long threadJoinStart = 0;
 #define THREAD_JOIN_TIMEOUT_MS 30000UL
 
@@ -175,6 +226,20 @@ unsigned long threadUdpLastAttempt = 0;
 BLEServer *bleServer = nullptr;
 BLECharacteristic *chrStatus = nullptr, *chrInfo = nullptr;
 volatile bool bleClientConnected = false;
+// XF-53 (Y). bleClientConnected used to be a plain bool that onDisconnect set
+// false unconditionally — so ANY link teardown cleared it, including a stale
+// link's, while a second live link was still up. A re-provision is by definition
+// a second connection to a lock we have connected to before, which is exactly
+// when that happens. Symptom is silent: notifyStatus() then skips notify() and
+// its 150 ms settle, so the app never receives that rung of the ladder and sits
+// on a spinner. Count links instead of latching a bool; the flag is now derived.
+volatile int bleLinkCount = 0;
+// XF-52 (R) maintenance window. Declared HERE, not beside its helpers further
+// down, because drawStatus() reads it — and the IDE auto-prototypes functions
+// but NOT variables, so a later declaration compiles as "not declared in this
+// scope" with a confusing line number.
+unsigned long bleWindowUntil = 0; // 0 = closed; millis deadline while open
+bool bleWindowOpen();
 String provBuf;
 
 // Networking
@@ -405,7 +470,18 @@ void drawOperational() {
   // uplink, so there's no MQTT-equivalent "server reachable" signal for
   // Thread yet (ozkey-10 §5). Showing plain WiFi state for a Thread board
   // would just be wrong, not merely incomplete.
-  bool netUp = isThread() ? threadFormed
+  // ⚠ 2026-08-02 (operator: "LCD shows Thread: JOINED — misleading").
+  // threadFormed is set true ONCE (doorlock.ino:1839) and cleared NOWHERE, so the
+  // LCD kept showing green JOINED while the lock was detached or orphaned. The
+  // [MON] serial line was fixed to read the live role on 2026-07-28 (see :1936)
+  // and the LCD — the thing an installer actually looks at — was left latched.
+  // Read the live role here too. ROUTER/LEADER on a doorlock is not "joined to
+  // the bridge": it means we formed or took over a partition, which is the
+  // topology inversion, so only CHILD counts as properly attached below.
+  ot_device_role_t liveRole = isThread() ? OpenThread::otGetDeviceRole() : OT_ROLE_DISABLED;
+  bool threadAttached = (liveRole == OT_ROLE_CHILD || liveRole == OT_ROLE_ROUTER ||
+                         liveRole == OT_ROLE_LEADER);
+  bool netUp = isThread() ? threadAttached
                           : ((WiFi.status() == WL_CONNECTED) && mqtt.connected());
   bool mcuUp = mcuLinkUp();
   bool open = doorStatus == "UNLOCKED";
@@ -419,14 +495,30 @@ void drawOperational() {
   gfx->setTextColor(border);
   gfx->setCursor(15, 8);
   gfx->print("OZLOCK ");
-  gfx->print(isThread() ? "(thread)" : isLocalMode() ? "(hotel)" : "(wifi)");
+  // An unprovisioned lock has NO transport — cfgTransport merely defaults to
+  // "wifi" (:572). Showing "(wifi)" on a virgin lock renders a default as a
+  // decision, which is how a factory-reset lock looked like a misconfigured one.
+  // The app decides the mode, at provision time, by sending network_key or not.
+  gfx->print(!provisioned            ? "(mode: set by app)"
+             : isThread()            ? "(thread)"
+             : isLocalMode()         ? "(hotel)"
+                                     : "(wifi)");
   if (isLocalMode() && cfgRoomNo.length()) { // room lives in the header now
     gfx->print(" P.");
     gfx->print(cfgRoomNo);
   }
-  gfx->setTextColor(C_DIM);
+  // XF-52 (R): while the maintenance window is open, say so instead of showing
+  // the reset hint. Pressing a button and getting no visible response is how a
+  // user concludes it didn't work and holds it longer — which is the factory
+  // reset. The countdown is the whole point: it tells them how long they have.
   gfx->setCursor(220, 8);
-  gfx->print("reset: * then 5");
+  if (bleWindowOpen()) {
+    gfx->setTextColor(C_GREEN);
+    gfx->printf("BLE open %lus", (bleWindowUntil - millis()) / 1000);
+  } else {
+    gfx->setTextColor(C_DIM);
+    gfx->print("reset: * then 5");
+  }
 
   // DOOR STATUS — compact block (operator 2026-07-19: smaller status fonts,
   // bigger white text lines — size-1 grey was unreadable on this panel)
@@ -450,7 +542,15 @@ void drawOperational() {
   gfx->setTextColor(C_WHITE);
   gfx->print(isThread() ? "Thread: " : "Net: ");
   gfx->setTextColor(netUp ? C_GREEN : C_RED);
-  gfx->print(netUp ? (isThread() ? "JOINED" : "ONLINE") : (isThread() ? "DOWN" : "OFFLINE"));
+  // Name the ROLE, not a boolean. "JOINED" told the operator the lock was
+  // working when it was Leader of its own orphaned partition — and even when
+  // genuinely attached, it implied reachable, which a commissioned Thread lock
+  // is not (no uplink yet, and BLE stops advertising once provisioned).
+  gfx->print(netUp ? (isThread() ? (liveRole == OT_ROLE_CHILD    ? "CHILD"
+                                    : liveRole == OT_ROLE_ROUTER ? "ROUTER"
+                                                                 : "LEADER!")
+                                 : "ONLINE")
+                   : (isThread() ? "DOWN" : "OFFLINE"));
   gfx->setTextColor(C_WHITE);
   if (!isThread()) gfx->print(mqtt.connected() ? " MQTT OK" : " MQTT --");
   y += 24;
@@ -463,9 +563,21 @@ void drawOperational() {
   }
   y += 24;
   gfx->setCursor(15, y);
-  gfx->print("Log: ");
-  gfx->print(txlogTotal());
-  gfx->print(" events");
+  // M2: ownership, not the txlog count. Replaced "Log: N events" 2026-08-01 —
+  // the event count was never actionable at the door, whereas "who owns this
+  // lock" is the single fact an installer needs and cannot otherwise see: it
+  // decides whether a failed provision is a bug or a correctly-refused
+  // BOND_DENIED. First 8 hex of bond #0 is enough to eyeball against the app.
+  gfx->print("Owner: ");
+  if (g_bond0Present) {
+    gfx->setTextColor(C_GREEN);
+    gfx->print(ozBond0PubHex().substring(0, 8));
+  } else {
+    // Amber, not red: unowned is a normal pre-commissioning state, not a fault.
+    gfx->setTextColor(C_AMBER);
+    gfx->print("none");
+  }
+  gfx->setTextColor(C_WHITE);
 }
 
 void drawFlash(const char *msg, uint16_t bg, uint16_t fg) {
@@ -529,7 +641,33 @@ void saveConfig() {
 
 void factoryReset() {
   Serial.println("[RESET] factory reset — wiping NVS + txlog");
+  // M2: prefs.clear() wipes the "blelock" namespace, which holds BOTH the
+  // ceremony keypair (xpriv/xpub) and bond #0 (b0pub/b0role/b0ctr). So a factory
+  // reset is the ONLY way to clear ownership (CONTRACT.md), and it necessarily
+  // mints a NEW identity — info.pub changes. That coupling is deliberate: an
+  // owner who resets a lock must not inherit the previous owner's identity, and
+  // a new owner must not be able to reuse a captured pairing secret.
   prefs.begin("blelock", false); prefs.clear(); prefs.end();
+
+  // ORDER FIX (2026-08-02, bench): everything destructive must happen BEFORE the
+  // OpenThread reset below, because otInstanceFactoryReset() performs a PLATFORM
+  // RESET and never returns. The old order left the txlog wipe, the "RESET"
+  // screen flash and ESP.restart() all downstream of it — dead code on any
+  // Thread-transport lock, which is the primary topology.
+  //
+  // Measured: "[RESET] factory reset" to ESP-ROM banner was 34 ms, against a
+  // coded delay(800) further down. That gap is the proof.
+  //
+  // It mattered because txlog is the DOOR EVENT buffer, and a factory reset is
+  // the ownership transfer (XF-46 §1 sold-house semantics) — so the previous
+  // owner's access history was surviving onto the next owner's lock.
+  if (fsUp) {
+    LittleFS.remove("/txlog.0");
+    LittleFS.remove("/txlog.1");
+    txlogCount0 = txlogCount1 = 0;
+  }
+  drawFlash("RESET", C_AMBER, C_BLACK);
+  delay(800);
   // Thread's persisted dataset lives in OpenThread's own NVS storage, not
   // our "blelock" namespace above — a plain NVS wipe alone would leave a
   // Thread-transport board rejoining the same old mesh on reboot. Same fix
@@ -543,12 +681,10 @@ void factoryReset() {
       esp_openthread_lock_release(); // unreachable if the reset already fired
     }
   }
-  if (fsUp) {
-    LittleFS.remove("/txlog.0");
-    LittleFS.remove("/txlog.1");
-  }
-  drawFlash("RESET", C_AMBER, C_BLACK);
-  delay(800);
+  // Reached only on a Wi-Fi-transport lock: the isThread() branch above has
+  // already reset the platform and never returned. Kept so the Wi-Fi path still
+  // reboots — do NOT put anything else after this line for the same reason the
+  // block above was moved.
   ESP.restart();
 }
 
@@ -564,6 +700,47 @@ void factoryReset() {
 unsigned long buttonHeldSince = 0;
 bool buttonWasDown = false;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// XF-52 (R): the BLE maintenance window.
+//
+// A commissioned lock does NOT advertise — startBle() runs only when
+// unprovisioned or after a network failure. That is deliberate (it is why a
+// deployed lock is invisible to a passer-by, XF-52 §1) but it made two things
+// impossible: re-provisioning your own lock, and M3's member_enroll, which is a
+// BLE write on a working lock.
+//
+// So: a SHORT BOOT press opens a bounded advertising window. Deliberately
+// physical — a remotely-triggerable window would hand back at scale exactly the
+// exposure the closed radio prevents (XF-52 §4), so there is no MQTT/DPID verb
+// for this and there must never be one.
+//
+// The 5 s hold is already factory reset, so short-press is free and unambiguous:
+// press and release = window, press and keep holding = wipe. The countdown
+// prints either way, so a user who overshoots sees it coming.
+#define BLE_WINDOW_MS 60000UL
+#define BUTTON_DEBOUNCE_MS 60UL
+// bleWindowUntil is declared with the other BLE globals near the top — see the
+// note there about drawStatus() needing it before this point.
+
+void startBle(); // defined with the GATT setup, further down
+
+bool bleWindowOpen() { return bleWindowUntil && (long)(millis() - bleWindowUntil) < 0; }
+
+void openBleWindow() {
+  bleWindowUntil = millis() + BLE_WINDOW_MS;
+  if (bleServer == nullptr) startBle(); // first open: build the GATT server
+  else BLEDevice::startAdvertising();   // already built: just go discoverable
+  Serial.printf("[BLE] window OPEN %lus (short BOOT press)\n", BLE_WINDOW_MS / 1000);
+  screenDirty = true;
+}
+
+void closeBleWindow(const char *why) {
+  bleWindowUntil = 0;
+  BLEDevice::stopAdvertising();
+  Serial.printf("[BLE] window closed (%s)\n", why);
+  screenDirty = true;
+}
+
 void checkFactoryResetButton() {
   bool down = digitalRead(USER_BUTTON) == LOW;
   if (down && !buttonWasDown) {
@@ -576,6 +753,11 @@ void checkFactoryResetButton() {
     } else if (held > 800 && (held / 500) % 2 == 0) {
       Serial.printf("[RESET] holding BOOT... %lus/5s\n", held / 1000);
     }
+  } else if (!down && buttonWasDown) {
+    // Released. A short press opens the window; a long one already wiped the
+    // device and never got here.
+    unsigned long held = millis() - buttonHeldSince;
+    if (held >= BUTTON_DEBOUNCE_MS && held < FACTORY_RESET_HOLD_MS) openBleWindow();
   }
   buttonWasDown = down;
 }
@@ -1070,11 +1252,69 @@ bool hexToBytes(const String &hex, uint8_t *out, size_t expectLen) {
 // device_id, and the common broker/site/name/heartbeat fields) shared by
 // both paths; branches on payload shape at the bottom (ozkey-10 §4).
 // ─────────────────────────────────────────────────────────────────────────────
+// M2: emit the bond #0 outcome at the accept point. CONTRACT.md places BOND_OK
+// INSIDE the commissioning ladder — after provision-accepted, before
+// WIFI_JOINING / THREAD_JOINING — so the app sees ownership settle before it
+// starts waiting on a network join that can take a minute.
+//
+// BOND_OK is optional by contract: its absence means pre-bond firmware and the
+// app falls back to `v1-bench`. That is why OZ_BOND_ABSENT emits nothing at all
+// rather than an error — a legacy payload with no app_id is still a valid
+// provision.
+static void bond0Accept(OzBondVerdict v, const uint8_t provPub[32]) {
+  if (v == OZ_BOND_CREATE) {
+    ozBond0Commit(provPub);
+    Serial.printf("[BOND] bond #0 CREATED role=admin floor=0 pub=%s\n",
+                  ozBond0PubHex().c_str());
+    screenDirty = true; // the Owner row just changed from "none" to a pubkey
+    notifyStatus("BOND_OK");
+  } else if (v == OZ_BOND_SAME) {
+    // Idempotent: same owner re-provisioning to move broker/Wi-Fi. Bond and
+    // counter_floor are left exactly as they were — re-minting would reset the
+    // floor to 0 and re-open every captured frame.
+    Serial.println("[BOND] bond #0 unchanged (same app_id) — idempotent re-provision");
+    notifyStatus("BOND_OK");
+  }
+}
+
 void applyProvision(JsonDocument &doc) {
   String pid = doc["device_id"] | "";
   if (pid.length() && pid != deviceId) {
     Serial.printf("[PROV] device_id mismatch (%s != %s)\n", pid.c_str(), deviceId.c_str());
     notifyStatus("ENROLL_FAIL");
+    return;
+  }
+
+  // ── M2: bond #0 verdict — decided HERE, before ANY state is touched ───────
+  //
+  // `app_id` is read ONCE, ABOVE the transport branch. XF-47 §11.5: it used to
+  // exist only on the Wi-Fi ProvisionPayload, so parsing it inside the Wi-Fi arm
+  // would have given Thread locks no bond #0 at all — silently removing the
+  // whole XF-46 member model from the platform's PRIMARY topology, and it would
+  // not have surfaced until M3 bring-up. Same key, same meaning, both arms.
+  uint8_t provPub[32];
+  const char *appIdHex = (const char *)(doc["app_id"] | "");
+  const OzBondVerdict bondVerdict = ozBond0Evaluate(appIdHex, provPub);
+
+  if (bondVerdict == OZ_BOND_MALFORMED) {
+    Serial.println("[BOND] app_id present but not 64 hex chars — payload rejected");
+    notifyStatus("PAYLOAD_REJECTED");
+    return;
+  }
+  if (bondVerdict == OZ_BOND_DENIED) {
+    // ATOMIC REFUSAL — and note WHERE this return sits: above every cfg*
+    // assignment, saveConfig(), WiFi.disconnect(), and the Thread
+    // commitDataSet(). Nothing has been mutated, in RAM or NVS.
+    //
+    // CONTRACT.md: "the refusal is atomic — a rejected re-provision must not
+    // change WiFi/broker either, else an attacker who cannot steal the lock can
+    // still repoint it." Ownership theft was the original vector: info.pub
+    // survives re-provision, so anyone inside the ~60 s touch window could
+    // re-provision a commissioned lock with their own app_id and become bond #0.
+    // Only a factory reset clears bond #0.
+    Serial.printf("[BOND] DENIED — re-provision with a different app_id (owner=%s)\n",
+                  ozBond0PubHex().c_str());
+    notifyStatus("BOND_DENIED");
     return;
   }
 
@@ -1139,6 +1379,9 @@ void applyProvision(JsonDocument &doc) {
     otDataset.setChannel((uint8_t)channel);
     otDataset.setPanId(panId);
     thread.commitDataSet(otDataset);
+    // A new dataset means the role we currently report belongs to the network we
+    // are about to leave — do not believe it until the stack has detached.
+    threadAwaitDetach = true;
 
     cfgMode = mode;
     cfgTransport = "thread";
@@ -1150,6 +1393,8 @@ void applyProvision(JsonDocument &doc) {
     buildTopics();
     Serial.printf("[PROV] mode=%s site=%s transport=thread name=%s ch=%d\n",
                   cfgMode.c_str(), cfgSiteId.c_str(), tName.c_str(), channel);
+
+    bond0Accept(bondVerdict, provPub); // BOND_OK before THREAD_JOINING
 
     threadJoinStart = millis();
     state = ST_JOINING;
@@ -1196,6 +1441,8 @@ void applyProvision(JsonDocument &doc) {
   // would otherwise see the new state with the OLD wifiJoinStart (from a
   // join minutes ago), making millis()-wifiJoinStart instantly exceed the
   // timeout and fire a false "join timeout" before WiFi.begin() even ran.
+  bond0Accept(bondVerdict, provPub); // BOND_OK before WIFI_JOINING
+
   wifiJoinStart = millis();
   state = ST_JOINING;
   joinLine1 = "WiFi: joining " + cfgSsid + "...";
@@ -1231,18 +1478,37 @@ class ProvisionCB : public BLECharacteristicCallbacks {
 
 class ServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer *) override {
-    bleClientConnected = true;
+    bleLinkCount++;
+    bleClientConnected = (bleLinkCount > 0);
+    Serial.printf("[BLE] connect  — links=%d\n", bleLinkCount);
     screenDirty = true;
     notifyStatus("BLE_OK");
   }
   void onDisconnect(BLEServer *) override {
-    bleClientConnected = false;
+    if (bleLinkCount > 0) bleLinkCount--;
+    bleClientConnected = (bleLinkCount > 0);
+    // XF-53 (Y): this event was completely silent until 2026-08-02, which is why
+    // the T2 capture could not answer whether the link dropped — the evidence was
+    // never emitted. If links>0 here, a stale teardown arrived while a live link
+    // was up and the old code would have wrongly declared the app gone.
+    Serial.printf("[BLE] disconnect — links=%d%s\n", bleLinkCount,
+                  bleLinkCount > 0 ? "  (stale link closed, live link retained)" : "");
     screenDirty = true;
-    // BUG FIX (2026-07-26, bridge32 bench finding): restart unconditionally
-    // — gating on state==ST_ADVERTISING meant any client connecting after
-    // provisioning permanently stopped advertising on disconnect.
     delay(300);
-    BLEDevice::startAdvertising();
+    // Restart advertising only where we are SUPPOSED to be discoverable:
+    //   - unprovisioned: the commissioning state, always advertise (this is the
+    //     2026-07-26 bridge32 fix — gating on state==ST_ADVERTISING meant any
+    //     client connecting after provisioning killed advertising for good);
+    //   - inside an open XF-52 (R) window: a dropped link must not end the
+    //     window early, or one flaky connection costs the user their 60 s.
+    // Otherwise stay silent. Restarting unconditionally — which is what this did
+    // until 2026-08-02 — would make one connection turn a bounded window into a
+    // permanent one, quietly undoing the whole point of (R).
+    if (!provisioned || bleWindowOpen()) {
+      BLEDevice::startAdvertising();
+    } else if (bleWindowUntil) {
+      closeBleWindow("expired during session");
+    }
   }
 };
 
@@ -1424,7 +1690,7 @@ void enterKeepAliveSleep() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n*** doorlock v0 — unified OZLOCK COMM MODULE (MCU = LockSim on UART) ***");
+  Serial.println("\n*** OZLOCK COMM MODULE — unified doorlock (MCU = LockSim on UART) ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
 
   // Tuya MCU bus → LockSim Mode B (raw 55 AA frames, wire-tested 2026-07-19)
@@ -1485,6 +1751,13 @@ void setup() {
   // Ceremony identity (RF is up → TRNG seeded) + boot known-answer self-test.
   ozLockKeyInit();
   Serial.printf("[CRYPTO] info.pub=%s\n", ozLockPubHex().c_str());
+  // M2: ownership state, printed every boot. This line is the Ask 6 factory-reset
+  // evidence — after a reset both info.pub AND this must change (pub re-minted,
+  // owner back to "none"), since prefs.clear() wipes the whole "blelock"
+  // namespace that holds the keypair and the bond together.
+  ozBond0Load();
+  Serial.printf("[BOND] bond #0: %s\n",
+                g_bond0Present ? ozBond0PubHex().c_str() : "none (unowned)");
   ozCryptoSelfTest();
 
   if (provisioned && isThread()) {
@@ -1526,6 +1799,14 @@ void setup() {
 
 void loop() {
   checkFactoryResetButton();
+
+  // XF-52 (R): close the window on expiry — but never mid-session. A client
+  // connected at the deadline keeps its link; onDisconnect() closes it then.
+  // Cutting a live commissioning off at 60 s would produce exactly the
+  // dropped-ladder "unknown" state XF-48 §21.3 exists to handle, self-inflicted.
+  if (bleWindowUntil && !bleWindowOpen() && !bleClientConnected) {
+    closeBleWindow("60s elapsed");
+  }
   tuyaWirePump(); // MCU (LockSim) → module frames off the wire
 
   // ── WiFi progress (Wi-Fi transport only) ─────────────────────────────────
@@ -1563,7 +1844,37 @@ void loop() {
   // ── Thread progress (Thread transport only, ported from threadcomm.ino) ──
   if (isThread() && state == ST_JOINING) {
     ot_device_role_t role = OpenThread::otGetDeviceRole();
-    if (role == OT_ROLE_CHILD || role == OT_ROLE_ROUTER || role == OT_ROLE_LEADER) {
+
+    // STALE-ROLE FIX (2026-08-02, live bench). After commitDataSet() the stack
+    // does NOT drop to DETACHED immediately — for a few ms otGetDeviceRole()
+    // still reports the role held on the network we are LEAVING. This block
+    // then saw LEADER, declared THREAD_OK, and set state = ST_OPERATIONAL,
+    // which stops this block running ever again. Observed: THREAD_JOINING,
+    // "attached as Leader" and THREAD_OK all in the SAME millisecond, followed
+    // 7 s later by thread=Detached — i.e. success was announced before the lock
+    // had even left the old network, and the real outcome was never evaluated.
+    //
+    // Two consequences, both nasty because the device looks fine:
+    //   1. The lock reports "Thread: OK" while orphaned on a dead partition —
+    //      exactly the latched-JOINED symptom bridge32's logThreadChildren()
+    //      comment describes from the other side.
+    //   2. THREAD_OK lands 0 ms after THREAD_JOINING, which is what hangs
+    //      BANOI's commissioning ladder (XF-53). We had attributed that to a
+    //      fast-but-honest attach; it was neither.
+    //
+    // So after committing a dataset, require the stack to actually let go —
+    // one observed DETACHED/DISABLED — before any attached role is believed.
+    // Kept OUT of the else-if chain below on purpose: if this were a branch of
+    // it, the attach-timeout arm could never fire while we were waiting for a
+    // detach that (on a wedged stack) might never come — trading a false success
+    // for a silent hang, which is not an improvement.
+    if (threadAwaitDetach && (role == OT_ROLE_DETACHED || role == OT_ROLE_DISABLED)) {
+      threadAwaitDetach = false;
+      Serial.println("[THREAD] left previous network — now joining");
+    }
+
+    if (!threadAwaitDetach &&
+        (role == OT_ROLE_CHILD || role == OT_ROLE_ROUTER || role == OT_ROLE_LEADER)) {
       Serial.printf("[THREAD] attached as %s\n", OpenThread::otGetStringDeviceRole());
       threadFormed = true;
       notifyStatus("THREAD_OK");
@@ -1575,7 +1886,17 @@ void loop() {
       state = ST_OPERATIONAL;
       screenDirty = true;
       threadUdpBegin();
-    } else if (millis() - threadJoinStart > THREAD_JOIN_TIMEOUT_MS) {
+    } else if (threadJoinStart && millis() - threadJoinStart > THREAD_JOIN_TIMEOUT_MS) {
+      // LATCH FIX (2026-08-02, bench): threadJoinStart must be cleared or this
+      // branch re-fires on EVERY loop iteration until the state changes —
+      // observed as ~20 repeats of "[THREAD] attach timeout" in 5 s. The Wi-Fi
+      // equivalent already clears wifiJoinStart (see the WIFI_FAIL branch); this
+      // arm was simply missing it.
+      //
+      // The real cost is not log noise: notifyStatus() pushes a BLE notification,
+      // so a connected BANOI was being flooded with THREAD_FAIL — the app's
+      // status ladder sees one failure repeated indefinitely rather than once.
+      threadJoinStart = 0;
       Serial.println("[THREAD] attach timeout");
       notifyStatus("THREAD_FAIL");
       joinLine1 = "Thread FAILED";
@@ -1648,7 +1969,7 @@ void loop() {
     Serial.printf("[MON] %s xport=%s mode=%s wifi=%s ip=%s mqtt=%s thread=%s "
                   "udp=%s mcu=%s tx=%u rx=%u wake=%s mrdy=%s srdy=%s hb=%us "
                   "naps=%u heap=%u\n",
-                  st, cfgTransport.c_str(), modeInfo.c_str(),
+                  st, provisioned ? cfgTransport.c_str() : "unset", modeInfo.c_str(),
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
                   WiFi.localIP().toString().c_str(),
                   mqtt.connected() ? "up" : "down",
