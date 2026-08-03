@@ -329,6 +329,20 @@ async function initDatabase() {
   if (!hasCaps)
     await pool.query('ALTER TABLE locks ADD COLUMN caps VARCHAR(255) NULL AFTER power_profile');
 
+  // XF-57 (AN), operator directive 2026-08-03. The lock's OWN statement of its
+  // transport, reported on every enroll and heartbeat. Before this the server
+  // never knew — it inferred capability from `bridge_id`, and the app kept a
+  // private copy written at commissioning that nothing corrected, so a lock
+  // converted Thread -> Wi-Fi stayed "Thread" in the app permanently and every
+  // remote unlock was refused. `wifi` | `thread`, NULL until the device reports.
+  const [[{ hasTransport }]] = await pool.query(
+    `SELECT COUNT(*) AS hasTransport FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'transport'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasTransport)
+    await pool.query('ALTER TABLE locks ADD COLUMN transport VARCHAR(16) NULL AFTER power_profile');
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS enroll_tokens (
       token VARCHAR(64) PRIMARY KEY,
@@ -566,7 +580,20 @@ function initMqtt() {
 
       /* -- Wake heartbeat: update presence, flush the queue ----------------- */
       if (kind === 'heartbeat') {
-        await pool.query('UPDATE locks SET last_seen_at = NOW() WHERE id = ?', [deviceId]);
+        // XF-57: the heartbeat is the only message a lock in service sends
+        // unprompted, so it is the only thing that can heal a stale row without
+        // anyone visiting the door. Written on EVERY beat, not just on change —
+        // we have no reliable "changed" signal and a conditional write here would
+        // just be a second thing to get wrong.
+        const id = deviceIdentity(obj);
+        await pool.query(
+          `UPDATE locks
+              SET last_seen_at = NOW(),
+                  transport = COALESCE(?, transport),
+                  caps      = COALESCE(?, caps)
+            WHERE id = ?`,
+          [id.transport, id.caps, deviceId]
+        );
         const sent = await flushQueueForDevice(siteId, deviceId);
         if (sent > 0) return; // flush already logged
         return; // quiet heartbeat
@@ -631,12 +658,18 @@ async function handleEnroll(siteId, topicDeviceId, obj) {
   // so the now-WiFi lock was still classified Thread-behind-bridge and its unlock was
   // routed to the bridge topic — which no longer reaches it. A device that transitions
   // transports must not carry the old transport's binding.
+  // XF-57 (AN): record what the lock says it IS, alongside the binding reset
+  // above. Same COALESCE rule as the heartbeat — a pre-XF-57 firmware omits both
+  // fields and must not blank them.
+  const ident = deviceIdentity(obj);
   await pool.query(
     `UPDATE locks SET app_id = ?, mac = ?, label = ?, fw = ?, status = 'enrolled',
        bridge_id = NULL,
+       transport = COALESCE(?, transport), caps = COALESCE(?, caps),
        heartbeat_s = COALESCE(heartbeat_s, ?), broker_username = ?, broker_secret = ?, last_seen_at = NOW()
      WHERE id = ?`,
-    [appId, mac, label, obj.fw || null, CONFIG.DEFAULT_HEARTBEAT_S, brokerUsername, brokerSecret, deviceId]
+    [appId, mac, label, obj.fw || null, ident.transport, ident.caps,
+     CONFIG.DEFAULT_HEARTBEAT_S, brokerUsername, brokerSecret, deviceId]
   );
 
   // v1 plaintext ack — bench only; production wraps this in the ozkey-04 §8
@@ -853,7 +886,7 @@ api.get('/locks', async (req, res) => {
     // as BLE-only in the list the user actually taps. Both reads must agree.
     const [rows] = await pool.query(
       `SELECT id, site_id, app_id, mac, label, fw, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at, bridge_id, caps
+              last_seen_at, enrolled_at, bridge_id, caps, transport
          FROM locks ORDER BY enrolled_at DESC`
     );
     const locks = rows.map((l) => {
@@ -937,7 +970,7 @@ api.get('/locks/:id', async (req, res) => {
     // This is XF-48 ask 1 (the capability field) landing on the read path.
     const [[lock]] = await pool.query(
       `SELECT id, app_id, site_id, mac, label, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at, bridge_id, caps
+              last_seen_at, enrolled_at, bridge_id, caps, transport
          FROM locks WHERE id = ?`,
       [req.params.id]
     );
@@ -1265,19 +1298,92 @@ api.get('/locks/:id/grants', async (req, res) => {
  */
 const ENFORCE_CAPS = process.env.OZLOCK_ENFORCE_CAPS !== '0';
 
+/**
+ * XF-57 (AN). Pull the lock's self-reported identity out of an enroll/heartbeat
+ * payload, for storage. Returns `{transport, caps}` where each is either a value
+ * to write or NULL meaning "the device did not say" — callers COALESCE, so a
+ * pre-XF-57 firmware (doorlock <= 1.5) never blanks a column it simply omits.
+ *
+ * Validated, not trusted: `transport` must be one of the two we know, and `caps`
+ * must be an array of known strings. A device is authoritative about itself, not
+ * about our schema — and this arrives over an MQTT broker that is anonymous-open
+ * on the bench, so anything unrecognised is dropped rather than stored.
+ */
+const KNOWN_TRANSPORTS = ['wifi', 'thread'];
+const KNOWN_CAPS = ['remote_unlock', 'assisted_unlock', 'pin_sync', 'audit'];
+
+// XF-58. The "visitor at the door" unlock: the owner authorises remotely while on
+// the phone, and the visitor's keypad touch completes it. 60 s — operator's call,
+// and it is safe ONLY because doorlock-1.5 refuses the command without a recent
+// touch. Without that lock-side check the window would be a probability rather
+// than a requirement: a sleeping lock also wakes on its heartbeat timer, so a
+// longer window would make an UNATTENDED open more likely, not less.
+const ASSISTED_UNLOCK_MS = 60_000;
+
+function deviceIdentity(obj) {
+  const t = typeof obj.transport === 'string' ? obj.transport.toLowerCase() : null;
+  const transport = KNOWN_TRANSPORTS.includes(t) ? t : null;
+
+  let caps = null;
+  if (Array.isArray(obj.caps)) {
+    const clean = obj.caps.filter((c) => KNOWN_CAPS.includes(c));
+    // An empty array after filtering is still a real statement ("I can do none
+    // of these"), but an all-junk report is not — treat it as nothing said.
+    if (clean.length === obj.caps.length) caps = JSON.stringify(clean);
+  }
+  return { transport, caps };
+}
+
 function effectiveCaps(lock) {
+  const bridged = !!lock.bridge_id;
+
+  // What we can deduce with no word from the device. Note `assisted_unlock` is
+  // NOT here, and cannot be — see the rule below.
+  const inferred = bridged
+    ? ['remote_unlock', 'pin_sync', 'audit']
+    : ['pin_sync', 'audit'];
+
+  let device = null;
   if (lock.caps) {
     try {
       const c = JSON.parse(lock.caps);
-      if (Array.isArray(c)) return { caps: c, source: 'device' };
+      if (Array.isArray(c)) device = c;
     } catch (_) {
       // Malformed device report: fall through to inference rather than trust it.
     }
   }
-  return {
-    caps: lock.bridge_id ? ['remote_unlock', 'pin_sync', 'audit'] : ['pin_sync', 'audit'],
-    source: 'inferred',
-  };
+  if (!device) return { caps: inferred, source: 'inferred' };
+
+  const caps = [];
+
+  // XF-57 — remote_unlock needs BOTH sides to agree, because each knows half:
+  //   • the device knows its transport — a Wi-Fi lock sleeps and can never do
+  //     remote unlock, whatever the deployment looks like;
+  //   • the server knows whether a bridge is actually bound — a Thread lock is
+  //     only remotely reachable THROUGH one, and the lock cannot tell whether
+  //     its bridge is alive or was removed yesterday.
+  // Trusting the device alone would mirror the bug XF-57 fixed: a Thread lock
+  // whose bridge is gone would keep claiming remote_unlock and every attempt
+  // would queue and expire unheard.
+  if (device.includes('remote_unlock') && bridged) caps.push('remote_unlock');
+
+  // XF-58 — assisted_unlock is DEVICE-ONLY and must NEVER be inferred.
+  //
+  // This is a safety interlock, not a modelling nicety. The whole guarantee of an
+  // assisted unlock — "the door opens only if somebody is standing at it" — is
+  // enforced in FIRMWARE (doorlock-1.5 refuses the command without a recent
+  // keypad touch). A lock running anything older ignores `action` entirely and
+  // forwards the frame straight to the MCU, so granting the capability by
+  // inference would hand an unenforced unlock to exactly the firmware that cannot
+  // enforce it. Only a device new enough to report caps at all is new enough to
+  // honour them, so the report IS the version check.
+  //
+  // General rule worth keeping: a capability whose enforcement lives in firmware
+  // may only ever be device-reported. Never infer one.
+  if (device.includes('assisted_unlock')) caps.push('assisted_unlock');
+
+  for (const cap of ['pin_sync', 'audit']) if (device.includes(cap)) caps.push(cap);
+  return { caps, source: 'device' };
 }
 
 api.post('/locks/:id/unlock', async (req, res) => {
@@ -1310,7 +1416,8 @@ api.post('/locks/:id/unlock', async (req, res) => {
     // refused unlock leaves no row to expire later and no audit entry implying
     // it was attempted at the door.
     const { caps, source } = effectiveCaps(lock);
-    if (ENFORCE_CAPS && !caps.includes('remote_unlock')) {
+    const assisted = !caps.includes('remote_unlock') && caps.includes('assisted_unlock');
+    if (ENFORCE_CAPS && !caps.includes('remote_unlock') && !assisted) {
       logEvent(
         'warn',
         `Remote UNLOCK refused for "${lock.label}" — no remote_unlock capability (${source})`
@@ -1330,17 +1437,31 @@ api.post('/locks/:id/unlock', async (req, res) => {
       });
     }
 
-    // §6.3: a remote unlock MUST NOT fire stale. Queue with a 60 s expiry; the
-    // flush drops it if the lock doesn't wake in time.
+    // §6.3: an unlock MUST NOT fire stale. Queue with an expiry; the flush drops
+    // it if the lock doesn't wake in time.
+    //
+    // XF-58: an ASSISTED unlock additionally carries `action_type =
+    // 'assisted-unlock'`, which doorlock-1.5 refuses unless the keypad was
+    // touched in the last 30 s. The expiry alone would not be enough — it bounds
+    // WHEN the command may run, never WHETHER anybody was at the door, and a
+    // sleeping lock wakes on its heartbeat timer too. The device-side check is
+    // what makes "someone must be there" a requirement instead of a probability.
     const payloadHex = toSpacedHex(buildUnlockFrame());
-    const expiresAt = new Date(Date.now() + 60_000);
+    const actionType = assisted ? 'assisted-unlock' : 'unlock';
+    const windowMs = assisted ? ASSISTED_UNLOCK_MS : 60_000;
+    const expiresAt = new Date(Date.now() + windowMs);
     const [queueResult] = await pool.query(
       `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, payload_hex, status, expires_at)
-       VALUES (?, ?, NULL, 'unlock', ?, 'queued', ?)`,
-      [deviceId, lock.site_id, payloadHex, expiresAt]
+       VALUES (?, ?, NULL, ?, ?, 'queued', ?)`,
+      [deviceId, lock.site_id, actionType, payloadHex, expiresAt]
     );
 
-    logEvent('key', `Remote UNLOCK queued for "${lock.label}" (queue #${queueResult.insertId}, expires 60s)`);
+    logEvent(
+      'key',
+      `${assisted ? 'ASSISTED' : 'Remote'} UNLOCK queued for "${lock.label}" ` +
+        `(queue #${queueResult.insertId}, expires ${windowMs / 1000}s` +
+        `${assisted ? ', needs a keypad touch' : ''})`
+    );
     await recordAudit(lock.app_id, deviceId, 'unlock', `remote unlock "${lock.label}"`);
     const sent = await flushQueueForDevice(lock.site_id, deviceId);
 
@@ -1353,6 +1474,14 @@ api.post('/locks/:id/unlock', async (req, res) => {
       // a real eco lock would report 'queued' until its next wake.
       delivery: sent > 0 ? 'delivered' : 'queued',
       expires_at: expiresAt.toISOString(),
+      // XF-58: everything the app needs to run the countdown, so it never has to
+      // hardcode our window. `mode: 'assisted'` is the app's cue to prompt
+      // "bảo khách chạm vào bàn phím" and show the seconds ticking — on this path
+      // `delivered` means the command is ARMED, not that the door opened, since
+      // the lock will still refuse it if nobody touches.
+      mode: assisted ? 'assisted' : 'remote',
+      window_s: windowMs / 1000,
+      requires_touch: assisted,
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
