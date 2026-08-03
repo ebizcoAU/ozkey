@@ -209,8 +209,19 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //             corrected. A lock converted Thread→Wi-Fi stayed "Thread + bridge"
 //             in the app forever and every "Mở cửa" took a remote path the
 //             server then refused. Now it self-heals within one heartbeat.
-#define FW_VERSION "doorlock-1.5"
-#define FW_DISPLAY_VERSION "v1.5" // shown on-screen next to the OZLOCK logo
+//   1.6  Two bench-legibility fixes, both "the evidence was never emitted":
+//             (a) selftest leg 9 `invite-b64url` FAILED on the first 1.5 flash —
+//             our TEST, not our decoder. Transcribing ftpos's frozen OZINV1 QR
+//             into a wrapped C literal dropped 16 chars out of the middle of the
+//             64-`a` issuer run (324 in source vs 340 real); the decoder returned
+//             242 bytes, exactly right for 323 data chars. Vector is now GENERATED
+//             and chunked programmatically so it cannot drift by hand again.
+//             (b) XF-53 (Y): [STATUS] now says whether it NOTIFIED or only stored
+//             the value. It printed identically either way, so the one hypothesis
+//             (Y) is about — a stale teardown clearing bleClientConnected, so
+//             notify() is skipped — was invisible in our own serial.
+#define FW_VERSION "doorlock-1.6"
+#define FW_DISPLAY_VERSION "v1.6" // shown on-screen next to the OZLOCK logo
 
 // ── State machine ───────────────────────────────────────────────────────────
 enum CommState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
@@ -445,7 +456,21 @@ int hexNibble(char c) {
 // Status ladder (notify BANOI over BLE + serial log)
 // ─────────────────────────────────────────────────────────────────────────────
 void notifyStatus(const char *wire) {
-  Serial.printf("[STATUS] %s\n", wire);
+  // XF-53 (Y): say WHICH of the two things happened. Until now this line printed
+  // identically whether the status was notified or merely stored — so the one
+  // hypothesis (Y) is actually about, "a stale teardown cleared
+  // bleClientConnected and notify() was skipped", was invisible in our own
+  // serial. Same class of gap ftpos just closed on their side by tagging
+  // notify-vs-poll at the call site; this is its mirror image, and without both
+  // halves the T2 re-run cannot be read either way.
+  //
+  // Printed BEFORE setValue/notify deliberately: the 150 ms settle below would
+  // otherwise shift every notified line's timestamp, and the missing-150 ms
+  // question in §7.1 is exactly a timing question. Captures stay comparable with
+  // every one taken before today.
+  const bool live = (chrStatus != nullptr) && bleClientConnected;
+  Serial.printf("[STATUS] %s (%s, links=%d)\n", wire,
+                live ? "notified" : "SET ONLY — no live link", bleLinkCount);
   if (chrStatus != nullptr) {
     chrStatus->setValue((uint8_t *)wire, strlen(wire));
     if (bleClientConnected) {
