@@ -774,11 +774,11 @@ static bool ozCryptoSelfTest() {
   //    they cover the whole enrolment authenticator without a bench phone.
   {
     const char *body =
-        "eyJ2IjoxLCJkIjoib3prLWE0Y2YxMjg3OWRhNyIsImkiOiJhYWFhYWFhYWFhYWFhYWFhYWFh"
-        "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwiciI6Im1lbWJlciIsImwiOiJC"
-        "YSBOZ29haSIsIm4iOiI0MjQyNDI0MjQyNDI0MjQyNDI0MjQyNDI0MjQyNDI0MiIsImUiOjE3"
-        "ODkwMDAwMDAsIm0iOiJlNzc4MGJhZWE4ZmVlZjU2NzRjMGZmZWNkMWI4M2YzNWRmZDkxOThk"
-        "YjUwY2VhNmQwNzM1YzdhNDNkMjY4YWFjIn0=";
+        "eyJ2IjoxLCJkIjoib3prLWE0Y2YxMjg3OWRhNyIsImkiOiJhYWFhYWFhYWFhYWFhYWFh"
+        "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwi"
+        "ciI6Im1lbWJlciIsImwiOiJCYSBOZ29haSIsIm4iOiI0MjQyNDI0MjQyNDI0MjQyNDI0"
+        "MjQyNDI0MjQyNDI0MiIsImUiOjE3ODkwMDAwMDAsIm0iOiJlNzc4MGJhZWE4ZmVlZjU2"
+        "NzRjMGZmZWNkMWI4M2YzNWRmZDkxOThkYjUwY2VhNmQwNzM1YzdhNDNkMjY4YWFjIn0=";
     const char *want =
         "{\"v\":1,\"d\":\"ozk-a4cf12879da7\",\"i\":\"aaaaaaaaaaaaaaaaaaaaaaaa"
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"r\":\"member\",\"l\":\"Ba "
