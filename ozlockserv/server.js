@@ -586,13 +586,23 @@ function initMqtt() {
         // we have no reliable "changed" signal and a conditional write here would
         // just be a second thing to get wrong.
         const id = deviceIdentity(obj);
+        // `fw` too, and it was the same staleness bug as transport — caught on the
+        // bench 2026-08-03 with a lock running 1.6 whose row still read 1.4. The
+        // heartbeat has ALWAYS carried fw; only handleEnroll wrote it, and an
+        // already-enrolled lock never re-enrolls, so the column froze at whatever
+        // version first enrolled and never moved again.
+        // It matters because `locks.fw` is how we and BANOI tell which contract a
+        // device speaks. A frozen value answers that question wrongly and with
+        // total confidence.
+        const fw = typeof obj.fw === 'string' && obj.fw.length <= 50 ? obj.fw : null;
         await pool.query(
           `UPDATE locks
               SET last_seen_at = NOW(),
+                  fw        = COALESCE(?, fw),
                   transport = COALESCE(?, transport),
                   caps      = COALESCE(?, caps)
             WHERE id = ?`,
-          [id.transport, id.caps, deviceId]
+          [fw, id.transport, id.caps, deviceId]
         );
         const sent = await flushQueueForDevice(siteId, deviceId);
         if (sent > 0) return; // flush already logged
