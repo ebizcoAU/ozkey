@@ -26,7 +26,26 @@ image).
 | Characteristic | UUID (…0002/3/4) | Props | Payload |
 |---|---|---|---|
 | `provision` | `…0002` | write | `ProvisionPayload` JSON — v1 plaintext (bench); v2 = `OzkeyEnvelope`-sealed bytes, same characteristic |
-| `status`    | `…0003` | notify | `OzkeyStatus` wire strings: `BLE_OK`, `WIFI_JOINING`, `WIFI_OK`, `BROKER_JOINING`, `BROKER_OK`, `WIFI_FAIL`, `BROKER_FAIL` |
+| `status`    | `…0003` | **read + notify** | `OzkeyStatus` wire strings: `BLE_OK`, `WIFI_JOINING`, `WIFI_OK`, `BROKER_JOINING`, `BROKER_OK`, `WIFI_FAIL`, `BROKER_FAIL` |
+
+> **READ on `…0003` is NORMATIVE, not incidental — XF-53 (Z), 2026-08-03.** It was
+> listed as `notify` only, while all four firmwares have always declared
+> `PROPERTY_READ | PROPERTY_NOTIFY` (`doorlock.ino:1963`, `bridge32.ino:1020`,
+> `threadcomm.ino:347`, `blecomm.ino:840`). The app now **depends** on it: it polls
+> the characteristic every 2 s while a write is outstanding, because
+> `notifyStatus()` calls `setValue()` unconditionally — **so a status whose
+> notification was never transmitted is still readable, and reading is the only way
+> to see it.** That is what closes the XF-53 hang, where a terminal rung arriving
+> 13 ms after its predecessor was lost and commissioning stalled forever.
+>
+> A build that drops READ degrades safely (the read throws, the app detects it and
+> disables polling) but brings the hang back with it. No wire change — this makes an
+> existing property a promise.
+>
+> **Do not rely on the value being reset to `BLE_OK` on connect.** Every firmware
+> happens to do it; none of them promises to, so the app takes its own baseline read
+> before each write and reports only a *change*. Otherwise a poll could read back an
+> hour-old `THREAD_OK` and complete a commissioning that had not started.
 | `info`      | `…0004` | read | JSON `{"device_id":"ozk-…","fw":"blelock-0.1","mac":"AA:BB:…"}` |
 
 ## Provision payload (mode=ozkey-local — the hotel case)
