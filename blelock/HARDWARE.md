@@ -71,3 +71,92 @@ Read: write reg `0x00`, request **7 bytes** (CST816 register map):
 Mirrors LockSim's MQTT wire exactly (announce → provision_assign → heartbeat →
 DPID command frames → log) so ozkeyserv :3200 needs zero changes. Milestones
 F1–F6 in the FTPOS decision log; BLE GATT contract in CONTRACT.md.
+
+---
+
+## Production hardening — decisions that must be made BEFORE the first batch
+
+Recorded 2026-08-04. None of this is needed for the pilot; all of it is a
+**manufacturing-flow** decision, which means it cannot be retrofitted to units
+already built. Same agenda as the RCM work.
+
+### Current state (verified 2026-08-04)
+
+| | Status |
+|---|---|
+| Flash encryption | **off** |
+| Secure boot | **off** |
+| eFuse use | **none beyond the factory MAC** |
+| X25519 private key | **plaintext in NVS** (`xpriv`) |
+| Device identity | `device_id = "ozk-" + eFuse MAC` |
+
+### 1. A burned unique ID adds nothing — we already have one
+
+`device_id` is derived from the factory-burned eFuse MAC. **A MAC identifies, it
+does not authenticate**: it is readable by anyone and spoofable in firmware. No
+burned *identifier* solves a security problem. Only a burned **secret** or a
+**signature** does. Do not spend a manufacturing step on an ID.
+
+### 2. Key at rest — the flash-dump attack
+
+The X25519 private key sits in plaintext NVS. Opening the case and clipping onto
+the flash yields `xpriv`, which clones the lock's identity, derives the pairing
+secret and forges sealed frames. It is **quieter than the crowbar attack the
+threat model already accepts** — no damage, no trace.
+
+Scoped honestly: each lock has its own key, so this compromises one door, and the
+attacker already has physical access. It matters where a lock is *briefly
+handled* and attacked later — installer, cleaner, previous tenant, or
+interception between factory and site.
+
+**Fix: flash encryption** (eFuse-held AES key, hardware XTS on flash reads), not
+an ID. Optionally the HMAC/DS peripheral, which can use an eFuse key that
+hardware reads and software never can.
+
+### 3. Trust anchor — there isn't one today
+
+The app trusts whatever `info.pub` a device advertises. **Nothing distinguishes a
+genuine OZLOCK from a counterfeit or a man-in-the-middle.** Already on the record
+as CONTRACT.md "Deferred (v2) — factory-pubkey trust anchor".
+
+**Fix: a factory signature over the device's public key.** Our CA attests "this
+pubkey belongs to a genuine unit, serial N"; the app verifies before bonding.
+This also gives anti-counterfeit, which starts to matter once suppliers build to
+our spec.
+
+### 4. ⚠ THE TRAP — the factory must never generate the keypair
+
+This is the default way factory provisioning is done: generate, burn, log to a
+database. **It would mean the contract manufacturer holds a copy of every
+customer's private key.** For a product whose entire pitch is "we cannot open
+your door, even if compelled", a supplier holding the keys is fatal — and it is
+the first thing an enterprise security review will look for.
+
+**Required pattern: the key is generated ON DEVICE and never leaves. The factory
+station signs only the PUBLIC half** (a CSR-style flow). Trust anchor and
+anti-counterfeit, with nobody ever holding the private key.
+
+### 5. Costs, stated plainly
+
+- Flash encryption and secure boot are **irreversible per device**, complicate
+  OTA, and make field debugging much harder.
+- The signing station needs a CA key, which then becomes the thing that must be
+  protected. This **moves** the crown jewels; it does not eliminate them.
+
+### 6. RCM / radio compliance — one firmware rule
+
+The production board uses the **ESP32-C6-MINI-1-N8** with antenna tuning "100%
+unchanged" (`docs/DoorLockHW/ESP32C6SEEEDSTUDIO.md:104`), so the DoC can lean on
+Espressif's existing radio test reports. **That inheritance holds only while the
+radio runs inside the tested envelope.**
+
+**RULE: no `setTxPower` / `esp_wifi_set_max_tx_power` / radio-power call in
+shipped firmware without a compliance conversation first.** Verified clean in
+`doorlock.ino` and `bridge32.ino` on 2026-08-04 — both run the SDK default. This
+is the kind of line that gets added innocently to fix a range complaint, and it
+silently invalidates the evidence the Declaration of Conformity rests on.
+
+Note also: RCM is **not** a certificate a module carries. It is a mark the
+Australian supplier applies under their own DoC, backed by test evidence and
+registered with ACMA. No module "has" RCM — not the Seeed dev board, not the
+MINI-1.
