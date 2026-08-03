@@ -129,6 +129,19 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 #define CHR_PROVISION "4f5a4b31-0002-4c4f-434b-000000000001"
 #define CHR_STATUS "4f5a4b31-0003-4c4f-434b-000000000001"
 #define CHR_INFO "4f5a4b31-0004-4c4f-434b-000000000001"
+// M3 (CONTRACT.md "Operational / member profile"). …0006 `control` is M4 and is
+// deliberately NOT created yet — an advertised-but-inert characteristic would
+// let the app's capability probe conclude the lock can authorise an unlock.
+#define CHR_CHALLENGE "4f5a4b31-0005-4c4f-434b-000000000001"
+#define CHR_MEMBER "4f5a4b31-0007-4c4f-434b-000000000001"
+
+// Bluedroid advertising PDU types (esp_ble_adv_type_t). Spelled out here rather
+// than included: BLEAdvertising::setAdvertisementType() takes a bare uint8_t and
+// the BLE library does not re-export Bluedroid's enum, while
+// esp_gap_ble_api.h is not on the sketch include path in core 3.3.11. Values are
+// the Bluetooth Core spec's own PDU type codes and cannot drift.
+#define OZ_ADV_TYPE_IND 0x00      // connectable, scannable, undirected
+#define OZ_ADV_TYPE_SCAN_IND 0x02 // scannable, NON-connectable, undirected
 // ── Firmware version ────────────────────────────────────────────────────────
 // BUMP THE MINOR ON EVERY FLASHED CHANGE (operator directive 2026-08-02). This
 // is not bookkeeping: FW_VERSION goes out on `info.fw` and is persisted as
@@ -175,8 +188,29 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //             "wifi" (:572) — a default rendered as a decision. It now reads
 //             "(mode: set by app)" / xport=unset until the app actually picks a
 //             transport, which it does by sending network_key or not.
-#define FW_VERSION "doorlock-1.4"
-#define FW_DISPLAY_VERSION "v1.4" // shown on-screen next to the OZLOCK logo
+//   1.5  M3 — the member ceremony. `challenge` …0005 (16 fresh bytes per read,
+//             destroyed on disconnect), `member_enroll` …0007, the bond TABLE
+//             (M2's three flat keys migrate into slot 0 of 16), the 64-entry
+//             nonce replay cache, and the advertised busy flag.
+//             Also the M3 PREREQUISITE: a keypad touch now opens the same 60 s
+//             BLE window a short BOOT press does. Without it the ceremony is
+//             unreachable — BOOT is inside the door, the keypad is outside, so
+//             a member standing at a commissioned lock had no way to make it
+//             advertise. Serves WiFi-owner unlock and member unlock too
+//             (XF-55 §13/§14 — one mechanism, four callers).
+//             Also a battery fix M3 would otherwise have made routine: the nap
+//             gate tested `bleServer == nullptr`, and bleServer is never nulled
+//             once built — so the FIRST window a lock ever opened stopped it
+//             sleeping again, permanently. Gated on the window/link instead.
+//             Also XF-57 (AN), operator directive: the lock now REPORTS ITSELF —
+//             `transport` + `caps` on every enroll and heartbeat. It never did,
+//             so ozlockserv inferred capability from a bound bridge and the app
+//             kept a private copy of `transport` from commissioning that nothing
+//             corrected. A lock converted Thread→Wi-Fi stayed "Thread + bridge"
+//             in the app forever and every "Mở cửa" took a remote path the
+//             server then refused. Now it self-heals within one heartbeat.
+#define FW_VERSION "doorlock-1.5"
+#define FW_DISPLAY_VERSION "v1.5" // shown on-screen next to the OZLOCK logo
 
 // ── State machine ───────────────────────────────────────────────────────────
 enum CommState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
@@ -242,6 +276,16 @@ unsigned long bleWindowUntil = 0; // 0 = closed; millis deadline while open
 bool bleWindowOpen();
 String provBuf;
 
+// M3. The challenge is per-CONNECTION, not per-lock: fresh 16 bytes on every
+// read of …0005, wiped on disconnect. M4's `control` compares against it
+// unconditionally (XF-47) — a revoked-then-re-invited bond restarts at
+// counter_floor 0, so captured frames clear the floor and the stale challenge is
+// the only thing left stopping the replay. Kept here rather than inside the
+// callback so onDisconnect can destroy it.
+uint8_t bleChallenge[16];
+bool bleChallengeValid = false;
+String memberBuf; // chunked …0007 JSON, same reassembly rule as provBuf
+
 // Networking
 WiFiClient wifiTcp;
 PubSubClient mqtt(wifiTcp);
@@ -255,6 +299,19 @@ String topicCommand, topicEnroll, topicHeartbeat, topicLog, topicPairConfirm;
 bool screenDirty = true;
 String joinLine1 = "", joinLine2 = "";
 bool touchWasDown = false;
+
+// XF-58: the assisted ("visitor at the door") unlock. The server may queue one,
+// but ONLY the lock can know whether anybody actually touched the keypad — so
+// only the lock can enforce it, and it must, because a queue expiry cannot.
+//
+// Without this check the touch requirement is not a requirement at all, merely
+// a probability: a sleeping lock also wakes on its heartbeat timer, so a queued
+// unlock would be collected untouched roughly (window / heartbeat_s) of the
+// time — ~25% at a 15 s window on a 60 s heartbeat, and ~100% once the window
+// reaches the interval. Lengthening the window to help the visitor would have
+// made an unattended open MORE likely, which is the opposite of the intent.
+unsigned long lastTouchAt = 0; // 0 = never touched since boot
+#define ASSISTED_TOUCH_MAX_MS 30000UL
 
 // ── §0.2/§0.3 power & wake state (persistent-power keep-alive) ──────────────
 // wake_sim=true (bench default; CP2102 exposes TX/RX only): SRDY assumed
@@ -569,9 +626,17 @@ void drawOperational() {
   // decides whether a failed provision is a bug or a correctly-refused
   // BOND_DENIED. First 8 hex of bond #0 is enough to eyeball against the app.
   gfx->print("Owner: ");
-  if (g_bond0Present) {
+  if (ozBond0Present()) {
     gfx->setTextColor(C_GREEN);
     gfx->print(ozBond0PubHex().substring(0, 8));
+    // M3: members, if any. An installer verifying an enrolment has no other way
+    // to see it happened — the member's phone shows its own view, not the
+    // lock's, and the two disagreeing is precisely the failure worth catching.
+    const int members = ozBondCount() - 1;
+    if (members > 0) {
+      gfx->setTextColor(C_WHITE);
+      gfx->printf(" +%d", members);
+    }
   } else {
     // Amber, not red: unowned is a normal pre-commissioning state, not a fault.
     gfx->setTextColor(C_AMBER);
@@ -641,9 +706,10 @@ void saveConfig() {
 
 void factoryReset() {
   Serial.println("[RESET] factory reset — wiping NVS + txlog");
-  // M2: prefs.clear() wipes the "blelock" namespace, which holds BOTH the
-  // ceremony keypair (xpriv/xpub) and bond #0 (b0pub/b0role/b0ctr). So a factory
-  // reset is the ONLY way to clear ownership (CONTRACT.md), and it necessarily
+  // M2: prefs.clear() wipes the "blelock" namespace, which holds the ceremony
+  // keypair (xpriv/xpub), the whole bond table (M3 "bondtab" — owner AND every
+  // member) and the M3 nonce replay cache. So a factory reset is the ONLY way
+  // to clear ownership (CONTRACT.md), and it necessarily
   // mints a NEW identity — info.pub changes. That coupling is deliberate: an
   // owner who resets a lock must not inherit the previous owner's identity, and
   // a new owner must not be able to reuse a captured pairing secret.
@@ -726,11 +792,20 @@ void startBle(); // defined with the GATT setup, further down
 
 bool bleWindowOpen() { return bleWindowUntil && (long)(millis() - bleWindowUntil) < 0; }
 
-void openBleWindow() {
+// No default argument on `gesture`: the IDE auto-prototypes this file, and a
+// generated prototype that repeats a default argument is a hard compile error.
+void openBleWindow(const char *gesture) {
+  const bool wasOpen = bleWindowOpen();
   bleWindowUntil = millis() + BLE_WINDOW_MS;
   if (bleServer == nullptr) startBle(); // first open: build the GATT server
-  else BLEDevice::startAdvertising();   // already built: just go discoverable
-  Serial.printf("[BLE] window OPEN %lus (short BOOT press)\n", BLE_WINDOW_MS / 1000);
+  else if (!bleClientConnected)
+    BLEDevice::startAdvertising(); // already built: just go discoverable
+  // A tap DURING a live connection must not restart advertising — the link is
+  // already up and we are deliberately SCAN_IND while busy (see bleSetBusy).
+  // It still extends the deadline, which is the point: a long enrolment must
+  // not have its window expire underneath it.
+  if (!wasOpen)
+    Serial.printf("[BLE] window OPEN %lus (%s)\n", BLE_WINDOW_MS / 1000, gesture);
   screenDirty = true;
 }
 
@@ -757,7 +832,8 @@ void checkFactoryResetButton() {
     // Released. A short press opens the window; a long one already wiped the
     // device and never got here.
     unsigned long held = millis() - buttonHeldSince;
-    if (held >= BUTTON_DEBOUNCE_MS && held < FACTORY_RESET_HOLD_MS) openBleWindow();
+    if (held >= BUTTON_DEBOUNCE_MS && held < FACTORY_RESET_HOLD_MS)
+      openBleWindow("short BOOT press");
   }
   buttonWasDown = down;
 }
@@ -887,8 +963,48 @@ void publishHeartbeat() {
   doc["device_id"] = deviceId;
   doc["mac"] = macStr;
   doc["fw"] = FW_VERSION;
+  // On EVERY heartbeat, not just enroll. A transport change does not always
+  // re-enroll (a re-provision of an already-enrolled lock does not), and this is
+  // the only message a lock in service sends unprompted — so it is the only
+  // thing that can make a stale server row self-heal within one interval.
+  addIdentity(doc);
   String out; serializeJson(doc, out);
   mqtt.publish(topicHeartbeat.c_str(), out.c_str());
+}
+
+// XF-57 (AN), operator directive 2026-08-03: "the doorlock should inform the app
+// of its changes." Until now the lock never told the server what it WAS — the
+// server inferred capability from whether a bridge was bound, and the app kept
+// its own copy of `transport` written at commissioning that nothing ever
+// corrected. A lock converted from Thread to Wi-Fi therefore stayed "Thread with
+// a bridge" in the app forever, and every "Mở cửa" took a remote path the server
+// then refused. The device is the authority on what it is; it must say so, on
+// every enroll AND every heartbeat, so the fact self-heals however the change
+// was made.
+//
+// `caps` here is what this TRANSPORT can support, not what this deployment can
+// deliver — the lock knows it is on Thread but cannot know its bridge is alive.
+// The server intersects this with its own bridge binding (effectiveCaps), so
+// neither side can over-promise alone.
+static void addIdentity(JsonDocument &doc) {
+  doc["transport"] = cfgTransport;
+  JsonArray caps = doc["caps"].to<JsonArray>();
+  // Wi-Fi/economy locks sleep and wake on the heartbeat interval, so they cannot
+  // promise a live "open now" — unlock there is BLE-at-the-door, by design and
+  // by product tier (XF-48 §3). Thread locks are reached through the bridge in
+  // ~1 s, proven.
+  //
+  // XF-58: what a Wi-Fi lock CAN offer is `assisted_unlock` — the owner
+  // authorises remotely, the visitor's keypad touch completes it, and this
+  // firmware refuses it without a recent touch (see onMqttMessage). Deliberately
+  // a DIFFERENT capability name, not a widened `remote_unlock`: it makes a
+  // weaker promise (someone must be at the door) and an app that could not tell
+  // them apart would offer "unlock remotely" on a lock that only opens when
+  // somebody is standing at it.
+  if (isThread()) caps.add("remote_unlock");
+  else caps.add("assisted_unlock");
+  caps.add("pin_sync");
+  caps.add("audit");
 }
 
 void publishEnroll() {
@@ -896,6 +1012,7 @@ void publishEnroll() {
   doc["device_id"] = deviceId;
   doc["mac"] = macStr;
   doc["fw"] = FW_VERSION;
+  addIdentity(doc);
   if (cfgName.length()) doc["name"] = cfgName;
   String out; serializeJson(doc, out);
   mqtt.publish(topicEnroll.c_str(), out.c_str());
@@ -1194,7 +1311,38 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   // Command envelope {action, grant_id, payload_hex}: PURE FORWARD to the
   // MCU — the comm module never executes credentials.
   const char *hex = doc["payload_hex"] | (const char *)nullptr;
-  if (hex) forwardHexToMcu(String(hex));
+  if (!hex) return;
+
+  // XF-58: `assisted-unlock` is the ONE action the comm module is allowed to
+  // refuse. It is the "visitor standing at the door" unlock — the owner
+  // authorises it remotely while on the phone, and the visitor's touch is what
+  // completes it. The server cannot check that: it has no idea whether anyone
+  // is there, and a queue expiry only bounds WHEN the command may run, never
+  // WHETHER someone was present. The lock is the only party that knows, so the
+  // lock enforces it. Fails closed and silent — a door that does not open is
+  // the correct outcome of "nobody was there".
+  const char *action = doc["action"] | (const char *)nullptr;
+  if (action && strcmp(action, "assisted-unlock") == 0) {
+    const bool touched =
+        lastTouchAt != 0 && (millis() - lastTouchAt) <= ASSISTED_TOUCH_MAX_MS;
+    if (!touched) {
+      Serial.printf("[ASSIST] REFUSED — no keypad touch in the last %lus "
+                    "(last touch %s)\n",
+                    ASSISTED_TOUCH_MAX_MS / 1000,
+                    lastTouchAt ? String((millis() - lastTouchAt) / 1000).c_str()
+                                : "never");
+      txlogAppend("refused", "assisted unlock — nobody at the door");
+      return;
+    }
+    Serial.printf("[ASSIST] touch %lus ago — assisted unlock ALLOWED\n",
+                  (millis() - lastTouchAt) / 1000);
+    // Consume it. Without this one touch would satisfy every assisted unlock
+    // arriving in the next 30 s, and the owner's second press would open the
+    // door for whoever is there by then.
+    lastTouchAt = 0;
+  }
+
+  forwardHexToMcu(String(hex));
 }
 
 void ensureMqtt() {
@@ -1462,6 +1610,243 @@ void applyProvision(JsonDocument &doc) {
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// M3 — member enrolment (CONTRACT.md `member_enroll` …0007)
+//
+// Payload: plaintext JSON `{"app_id":"<member pubkey hex>","invite":"OZINV1:…"}`.
+// Unsealed by design: the member holds no bond yet, so there is no key to seal
+// under. The INVITE is the authenticator — an HMAC only bond #0's pairing
+// secret could have produced, and only this lock can verify.
+//
+// Everything unauthentic collapses to MEMBER_FAIL. That is deliberate: a
+// caller who cannot produce a valid MAC learns only "no", never which field
+// they got wrong, which is the difference between a locked door and an oracle.
+// The three specific outcomes below are all reachable ONLY after the MAC has
+// already verified, so they leak nothing to an attacker.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// UTF-8-safe truncation. A label cut mid-sequence is invalid UTF-8 that the app
+// would later fail to decode out of a bond listing — the bond would be real and
+// unusable, which is worse than a shortened name.
+static void copyLabelUtf8(const char *src, char *dst, size_t cap) {
+  size_t n = strlen(src);
+  if (n > cap - 1) {
+    n = cap - 1;
+    while (n > 0 && (src[n] & 0xC0) == 0x80) n--; // back off continuation bytes
+  }
+  memcpy(dst, src, n);
+  dst[n] = 0;
+}
+
+void handleMemberEnroll(JsonDocument &doc) {
+  const char *appIdHex = doc["app_id"] | "";
+  const char *inviteQr = doc["invite"] | "";
+
+  if (!ozBond0Present()) {
+    // An unowned lock has no issuer to verify against, so no invite can be
+    // authentic. Refuse rather than invent a trust root.
+    Serial.println("[MEMBER] no bond #0 — nothing can authorise a member");
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+  uint8_t memberPub[32];
+  if (!ozIsHex(appIdHex, 32)) {
+    Serial.println("[MEMBER] app_id not 64 hex chars");
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+  ozFromHex(appIdHex, memberPub, 32);
+  // The owner scanning their own invite. Harmless in authority terms — bond #0
+  // already outranks any member — but it would land on slot 0 and rewrite the
+  // OWNER record's label with a member label, and burn a nonce doing it. Name
+  // it instead of quietly half-applying it.
+  if (memcmp(memberPub, g_bonds[0].pub, 32) == 0) {
+    Serial.println("[MEMBER] that is the owner's own key — already bond #0");
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+
+  const char *prefix = "OZINV1:";
+  const size_t plen = strlen(prefix);
+  if (strncmp(inviteQr, prefix, plen) != 0) {
+    Serial.println("[MEMBER] invite is not an OZINV1 string");
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+
+  // static, not stack: this runs on the BLE task, whose stack is modest, and a
+  // long member label pushes the decoded invite past 300 bytes. Safe because
+  // exactly one connection can exist at a time (the SCAN_IND busy rule).
+  static uint8_t body[512];
+  const int bodyLen = ozB64UrlDecode(inviteQr + plen, strlen(inviteQr) - plen,
+                                     body, sizeof(body) - 1);
+  if (bodyLen <= 0) {
+    Serial.println("[MEMBER] invite body is not base64url");
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+  body[bodyLen] = 0;
+
+  JsonDocument inv;
+  if (deserializeJson(inv, (const char *)body) != DeserializationError::Ok) {
+    Serial.println("[MEMBER] invite body is not JSON");
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+
+  const int         ver     = inv["v"] | 0;
+  const String      invDev  = inv["d"] | "";
+  const String      issuer  = inv["i"] | "";
+  const String      roleStr = inv["r"] | "";
+  const String      label   = inv["l"] | "";
+  const String      nonceHx = inv["n"] | "";
+  const uint32_t    expires = inv["e"] | 0u;
+  const String      macHex  = inv["m"] | "";
+
+  if (ver != 1 || nonceHx.length() != 32 || macHex.length() != 64) {
+    Serial.printf("[MEMBER] invite shape rejected (v=%d n=%u m=%u)\n", ver,
+                  nonceHx.length(), macHex.length());
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+  // The invite names the lock it opens. Without this check, an invite minted
+  // for the neighbour's lock by an issuer who owns BOTH would enrol here.
+  if (invDev != deviceId) {
+    Serial.printf("[MEMBER] invite is for '%s', not this lock\n", invDev.c_str());
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+  // The issuer must be OUR bond #0. The MAC would fail anyway (we key it off
+  // our own bond #0 secret regardless of what `i` claims), but checking the
+  // claim explicitly makes the serial log diagnosable instead of a bare MAC
+  // mismatch — the commonest real cause is a phone that lost its keyring.
+  if (issuer != ozBond0PubHex()) {
+    Serial.println("[MEMBER] invite issuer is not this lock's owner");
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+  // v1 has exactly one admin and no bond #0 transfer (CONTRACT.md "Deferred
+  // (v2)"). BANOI never sets role, so refusing costs nothing today — and
+  // accepting would create a second admin with no revoke story behind it.
+  if (roleStr != "member") {
+    Serial.printf("[MEMBER] role '%s' refused — v1 issues members only\n",
+                  roleStr.c_str());
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+
+  uint8_t s0[32];
+  if (!ozBond0Secret(s0)) {
+    Serial.println("[MEMBER] could not derive bond #0 pairing secret");
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+  uint8_t want[32], got[32];
+  const bool macOk =
+      ozInviteMac(s0, 32, invDev, issuer, roleStr, label, nonceHx, expires, want);
+  ozFromHex(macHex.c_str(), got, 32);
+  memset(s0, 0, sizeof(s0));
+  if (!macOk || !ozCtEq(want, got, 32)) {
+    Serial.println("[MEMBER] invite MAC does not verify — refused");
+    notifyStatus("MEMBER_FAIL");
+    return;
+  }
+
+  // `expires` is parse-and-ignore in v1 (XF-47): the lock has no clock, so
+  // enforcing it would be theatre. MEMBER_EXPIRED is reserved and NEVER
+  // emitted. The nonce is the hard guarantee; DPID 102 is the kill switch.
+  Serial.printf("[MEMBER] invite VERIFIED label='%s' expires=%u (not enforced)\n",
+                label.c_str(), (unsigned)expires);
+
+  uint8_t nonce[16];
+  ozFromHex(nonceHx.c_str(), nonce, 16);
+  const OzNonceState ns = ozNonceCheck(nonce, memberPub);
+  const int existing = ozBondFind(memberPub);
+
+  if (ns == OZ_NONCE_REPLAY) {
+    Serial.println("[MEMBER] nonce already burned by a DIFFERENT key — replay");
+    notifyStatus("MEMBER_REPLAY");
+    return;
+  }
+  if (ns == OZ_NONCE_SAME_PUB) {
+    if (existing >= 0) {
+      // The enrolment already happened and our notify was lost. Re-answer OK
+      // and touch NOTHING — especially not counter_floor, which would re-open
+      // every frame this member has already sent.
+      Serial.printf("[MEMBER] idempotent retry — bond %d unchanged\n", existing);
+      notifyStatus("MEMBER_OK");
+      return;
+    }
+    // Burned by THIS key, but the bond is gone: it was revoked after redemption.
+    // Re-admitting here would make a spent invite resurrect a revoked member and
+    // defeat revocation entirely. XF-47's idempotent-retry rule assumes the bond
+    // still exists; this is the branch where it does not.
+    Serial.println("[MEMBER] nonce spent and the bond was revoked — refused");
+    notifyStatus("MEMBER_REPLAY");
+    return;
+  }
+
+  int slot = existing;
+  if (slot < 0) {
+    for (int i = 1; i < OZ_BOND_MAX; i++) { // slot 0 is the owner, never reused
+      if (!g_bonds[i].present) { slot = i; break; }
+    }
+  }
+  if (slot < 0) {
+    Serial.printf("[MEMBER] no free bond slot (%d/%d used)\n", ozBondCount(),
+                  OZ_BOND_MAX);
+    notifyStatus("MEMBER_FULL");
+    return;
+  }
+
+  if (existing >= 0) {
+    // Re-invite of a key that already holds a bond (BANOI's "gửi lại QR" —
+    // doorlock_service.reinviteMember). Refresh the label, KEEP the floor: a
+    // floor reset here would re-open every frame this member ever sent.
+    Serial.printf("[MEMBER] bond %d already exists — refreshing label, floor kept\n",
+                  slot);
+  } else {
+    g_bonds[slot].present = true;
+    g_bonds[slot].role    = OZ_ROLE_MEMBER;
+    g_bonds[slot].floor   = 0;
+    memcpy(g_bonds[slot].pub, memberPub, 32);
+  }
+  copyLabelUtf8(label.c_str(), g_bonds[slot].label, OZ_LABEL_MAX);
+  ozBondsSave();
+  ozNonceBurn(nonce, memberPub); // ONLY on success — XF-47 §"Nonce replay cache"
+
+  Serial.printf("[MEMBER] bond %d ADDED role=member label='%s' pub=%.16s… (%d/%d)\n",
+                slot, g_bonds[slot].label, appIdHex, ozBondCount(), OZ_BOND_MAX);
+  screenDirty = true;
+  notifyStatus("MEMBER_OK");
+}
+
+class MemberCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String chunk = String(c->getValue().c_str());
+    if (!chunk.length()) return;
+    if (chunk[0] == '{') memberBuf = chunk; else memberBuf += chunk;
+    JsonDocument doc;
+    if (deserializeJson(doc, memberBuf) == DeserializationError::Ok) {
+      Serial.printf("[MEMBER] enrol payload complete (%u B)\n", memberBuf.length());
+      memberBuf = "";
+      handleMemberEnroll(doc);
+    }
+  }
+};
+
+// M3 `challenge` …0005 — fresh 16 bytes on EVERY read. Generating in the read
+// callback rather than at connect time is what makes it fresh: two unlocks on
+// one connection must not share a challenge, or the second is replayable.
+class ChallengeCB : public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic *c) override {
+    esp_fill_random(bleChallenge, sizeof(bleChallenge));
+    bleChallengeValid = true;
+    c->setValue(bleChallenge, sizeof(bleChallenge));
+    Serial.println("[CHAL] issued a fresh 16-byte challenge");
+  }
+};
+
 class ProvisionCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
     String chunk = String(c->getValue().c_str());
@@ -1476,12 +1861,56 @@ class ProvisionCB : public BLECharacteristicCallbacks {
   }
 };
 
+// ── M3 busy flag (XF-47 "Single connection, and the busy flag") ──────────────
+//
+// One byte of service data in the SCAN RESPONSE, bit 0 = a connection is up.
+// Scan response, not the ADV packet: ADV is already at 29 of 31 bytes (flags 3
+// + complete-128-bit-UUID-list 18 + name 8), and BANOI's Android `withServices`
+// filter keys off that 0x07 UUID list — displacing it would break discovery
+// before their listener ever ran. Costs an active scan on the app side.
+//
+// While connected we keep advertising but switch to SCAN_IND (scannable,
+// NON-connectable). That is what enforces "max 1 connection, the in-progress
+// one is kept": a second phone can still SEE the lock and read busy=1, but the
+// link layer refuses it, so a half-finished enrolment can never be aborted by
+// someone else connecting. Refusing at the link layer is indistinguishable from
+// out-of-range, which is exactly why the flag has to be observable.
+void bleSetBusy(bool busy) {
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  if (adv == nullptr) return;
+  BLEAdvertisementData scanResp;
+  String sd;
+  sd += (char)(busy ? 0x01 : 0x00);
+  scanResp.setServiceData(BLEUUID(SVC_UUID), sd);
+  // Writes esp_ble_gap_config_scan_rsp_data_raw immediately, so the byte can be
+  // updated mid-advertising without a stop/start cycle.
+  adv->setScanResponseData(scanResp);
+}
+
+// Connectable (normal) vs scannable-only (busy). MUST stop first — Bluedroid
+// ignores an adv-params change while advertising is running, and a silently
+// ignored change here would leave a lock permanently non-connectable.
+void bleSetConnectable(bool connectable) {
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  if (adv == nullptr) return;
+  BLEDevice::stopAdvertising();
+  adv->setAdvertisementType(connectable ? OZ_ADV_TYPE_IND : OZ_ADV_TYPE_SCAN_IND);
+}
+
 class ServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer *) override {
     bleLinkCount++;
     bleClientConnected = (bleLinkCount > 0);
     Serial.printf("[BLE] connect  — links=%d\n", bleLinkCount);
     screenDirty = true;
+    // Keep advertising, but non-connectably, so the busy flag is observable.
+    // Only where we were supposed to be discoverable in the first place —
+    // a commissioned lock outside its window stays dark, exactly as before.
+    if (!provisioned || bleWindowOpen()) {
+      bleSetBusy(true);
+      bleSetConnectable(false);
+      BLEDevice::startAdvertising();
+    }
     notifyStatus("BLE_OK");
   }
   void onDisconnect(BLEServer *) override {
@@ -1494,6 +1923,16 @@ class ServerCB : public BLEServerCallbacks {
     Serial.printf("[BLE] disconnect — links=%d%s\n", bleLinkCount,
                   bleLinkCount > 0 ? "  (stale link closed, live link retained)" : "");
     screenDirty = true;
+    if (bleLinkCount == 0) {
+      // M3: the challenge never outlives its connection. This is not hygiene —
+      // M4 compares `control` frames against it, and a challenge that survived
+      // a disconnect would let a captured frame be replayed on a fresh link.
+      memset(bleChallenge, 0, sizeof(bleChallenge));
+      bleChallengeValid = false;
+      memberBuf = ""; // a half-written enrolment must not fuse with the next one
+      bleSetBusy(false);
+      bleSetConnectable(true); // undo the SCAN_IND switch BEFORE re-advertising
+    }
     delay(300);
     // Restart advertising only where we are SUPPOSED to be discoverable:
     //   - unprovisioned: the commissioning state, always advertise (this is the
@@ -1526,6 +1965,19 @@ void startBle() {
   chrStatus->addDescriptor(new BLE2902());
   chrStatus->setValue("BLE_OK");
 
+  // M3 …0005 challenge — READ only. Its value is (re)generated in the read
+  // callback; the seed below exists so a read that somehow races the callback
+  // still returns bytes rather than an empty attribute.
+  BLECharacteristic *chal = svc->createCharacteristic(CHR_CHALLENGE, BLECharacteristic::PROPERTY_READ);
+  chal->setCallbacks(new ChallengeCB());
+  esp_fill_random(bleChallenge, sizeof(bleChallenge));
+  chal->setValue(bleChallenge, sizeof(bleChallenge));
+
+  // M3 …0007 member_enroll — WRITE, chunked JSON (the invite QR alone is ~270 B,
+  // well past one MTU).
+  BLECharacteristic *mem = svc->createCharacteristic(CHR_MEMBER, BLECharacteristic::PROPERTY_WRITE);
+  mem->setCallbacks(new MemberCB());
+
   chrInfo = svc->createCharacteristic(CHR_INFO, BLECharacteristic::PROPERTY_READ);
   JsonDocument doc;
   doc["device_id"] = deviceId;
@@ -1552,8 +2004,9 @@ void startBle() {
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
   adv->setScanResponse(true);
+  bleSetBusy(false); // M3: publish the flag from the first advert, not on first connect
   BLEDevice::startAdvertising();
-  Serial.println("[BLE] advertising as OZLOCK");
+  Serial.println("[BLE] advertising as OZLOCK (busy=0)");
 }
 
 void buildTopics() {
@@ -1603,6 +2056,10 @@ bool touchRead(int &tx, int &ty) {
   bool down = (count > 0 && count <= 5);
   if (down) {
     lastActivityAt = millis();
+    // Stamped on TOUCH-DOWN, not on the completed tap, so the clock starts the
+    // instant the visitor's finger lands — the wake, Wi-Fi reassociation and
+    // broker dial that follow all happen inside the window they just opened.
+    lastTouchAt = lastActivityAt;
     if (touchWasDown) {
       int rawX = ((buf[3] & 0x0F) << 8) | buf[4];
       int rawY = ((buf[5] & 0x0F) << 8) | buf[6];
@@ -1755,9 +2212,19 @@ void setup() {
   // evidence — after a reset both info.pub AND this must change (pub re-minted,
   // owner back to "none"), since prefs.clear() wipes the whole "blelock"
   // namespace that holds the keypair and the bond together.
-  ozBond0Load();
+  ozBondsLoad();
   Serial.printf("[BOND] bond #0: %s\n",
-                g_bond0Present ? ozBond0PubHex().c_str() : "none (unowned)");
+                ozBond0Present() ? ozBond0PubHex().c_str() : "none (unowned)");
+  // M3: name every member at boot. A bond the operator cannot enumerate is a
+  // bond they cannot audit, and this is the only surface that lists them until
+  // the M4 uplink exists.
+  for (int i = 1; i < OZ_BOND_MAX; i++) {
+    if (!g_bonds[i].present) continue;
+    char h[65];
+    ozHex(g_bonds[i].pub, 32, h);
+    Serial.printf("[BOND] member %d: label='%s' floor=%llu pub=%.16s…\n", i,
+                  g_bonds[i].label, (unsigned long long)g_bonds[i].floor, h);
+  }
   ozCryptoSelfTest();
 
   if (provisioned && isThread()) {
@@ -1939,12 +2406,28 @@ void loop() {
   if (mrdyAsserted && millis() - lastWireActivityAt > MRDY_IDLE_RELEASE_MS)
     mrdySet(false);
 
-  // ── touch: factory reset only ('*' zone arms, '5' zone fires) ────────────
+  // ── touch: opens the BLE window (M3), and the factory-reset ceremony ─────
+  //
+  // ANY tap opens the window, not a designated zone. The keypad grid is a
+  // hit-test with nothing drawn on it, so "tap the invisible # key" is not an
+  // instruction a user at a door can follow — and the app's copy is already
+  // *"chạm/nhấn nút trên khoá"* (XF-55 §13.1), which promises exactly this.
+  //
+  // This is the M3 PREREQUISITE, not a convenience. BOOT is on the board, i.e.
+  // INSIDE the door; the keypad is outside. Without a touch path a member
+  // standing at a commissioned lock has no way to make it advertise, so
+  // member_enroll — and Wi-Fi/ECO owner unlock, and member unlock — are
+  // unreachable no matter how correct the ceremony is.
+  //
+  // Physical presence is the whole security property here, and a tap is exactly
+  // as physical as the BOOT press: nothing remote can open this window, and per
+  // XF-52 §4 there must never be an MQTT or DPID verb that does.
   {
     int tx, ty;
     if (touchRead(tx, ty)) {
       char k = keyAt(tx, ty);
       Serial.printf("[TOUCH] %d,%d -> key '%c'\n", tx, ty, k ? k : '-');
+      if (provisioned) openBleWindow("keypad touch"); // re-arms 60 s per tap
       if (resetArm) {
         resetArm = false;
         if (k == '5') factoryReset();
@@ -2003,8 +2486,18 @@ void loop() {
   // wake_sim skips). Thread SED polling as a wake source is still an open
   // decision (ozkey-10 §7 Q1) — Thread-transport locks never nap in this
   // pass rather than guess at an interaction that hasn't been decided.
+  //
+  // M3 BATTERY FIX: this used to require `bleServer == nullptr`, and bleServer
+  // is never set back to null once startBle() has run. So the first BLE window
+  // a lock ever opened stopped it napping again — permanently, until a reboot.
+  // Harmless while the window was a rare BOOT press; with M3 a touch opens one,
+  // so it would have become "any passer-by ends this lock's battery life".
+  // What actually blocks a nap is an OPEN window or a LIVE link, so test those.
+  // (The stack stays initialised across the nap: it is idle, not advertising.
+  // Reclaiming its ~40 KB would need BLEDevice::deinit() and a rebuild of the
+  // GATT server on the next window — a bigger change than M3 should carry.)
   if (!isThread() && !wakeSim && state == ST_OPERATIONAL && enrolled &&
-      bleServer == nullptr && !bleClientConnected && !resetArm &&
+      !bleWindowOpen() && !bleClientConnected && !resetArm &&
       doorStatus == "LOCKED" && !touchWasDown && !mrdyAsserted &&
       millis() - lastActivityAt > SLEEP_IDLE_MS) {
     enterKeepAliveSleep();

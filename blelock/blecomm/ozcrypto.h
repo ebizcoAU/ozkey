@@ -174,6 +174,10 @@ static String ozLockPubHex() {
 // needs it; ozFromHex() lives further down with the vector helpers, hence the
 // forward declaration.
 static void ozFromHex(const char *hex, uint8_t *out, size_t n);
+// Likewise the big-endian u64 helpers, defined with the envelope further down —
+// the bond table persists counter_floor in the same wire-order the envelope uses.
+static void ozPutU64BE(uint64_t v, uint8_t out[8]);
+static uint64_t ozGetU64BE(const uint8_t in[8]);
 //
 // CONTRACT.md "Bond #0 bootstrap" (XF-47, canonical). Bond #0 is minted from the
 // `app_id` field ALREADY present in the provision payload — BANOI has sent it
@@ -190,12 +194,39 @@ static void ozFromHex(const char *hex, uint8_t *out, size_t n);
 // M4: a bond whose floor resets to 0 on reboot would re-open every captured
 // frame, and the anti-replay rule (XF-47) leans on the floor surviving.
 
-static const uint8_t OZ_ROLE_ADMIN = 0;
+static const uint8_t OZ_ROLE_ADMIN  = 0;
+static const uint8_t OZ_ROLE_MEMBER = 1;
 
-static uint8_t  g_bond0Pub[32];
-static bool     g_bond0Present = false;
-static uint8_t  g_bond0Role    = OZ_ROLE_ADMIN;
-static uint64_t g_bond0Floor   = 0;
+// ── M3: the bond TABLE (bond #0 is slot 0) ───────────────────────────────────
+//
+// M2 stored the owner bond in three flat NVS keys (b0pub/b0role/b0ctr) because
+// there was exactly one. M3 adds members, so the same data becomes slot 0 of a
+// 16-slot table persisted as ONE blob ("bondtab"). CONTRACT.md caps bonds at 16
+// (1 admin + up to 15 members).
+//
+// One blob rather than 16×3 keys: a bond is added, revoked and floor-bumped as a
+// unit, and NVS gives no transaction across keys — a partial write that left a
+// pubkey without its role would be an unauthenticated bond. 1280 B is one NVS
+// page-ish write, and enrolments are rare.
+//
+// MIGRATION is silent and one-way: a lock already carrying b0pub from M2 loads
+// it into slot 0 on first M3 boot, writes the table, then deletes the old keys
+// so a stale owner cannot linger in an NVS dump and mislead a bench session.
+
+#define OZ_BOND_MAX   16
+#define OZ_LABEL_MAX  32  // bytes, UTF-8, NUL-terminated (labels live ON the lock)
+#define OZ_BOND_REC   80  // on-NVS record stride; 6 bytes spare for v2 fields
+#define OZ_BONDTAB_SZ (OZ_BOND_REC * OZ_BOND_MAX)
+
+struct OzBond {
+  bool     present;
+  uint8_t  role;
+  uint64_t floor;              // counter_floor — anti-replay, M4 moves it
+  uint8_t  pub[32];            // the member's X25519 public key == its app_id
+  char     label[OZ_LABEL_MAX];
+};
+
+static OzBond g_bonds[OZ_BOND_MAX];
 
 enum OzBondVerdict {
   OZ_BOND_ABSENT,    // no app_id in payload -> legacy path: no bond, NO error
@@ -205,16 +236,89 @@ enum OzBondVerdict {
   OZ_BOND_DENIED     // bond #0 exists and DIFFERS -> refuse, change NOTHING
 };
 
-static void ozBond0Load() {
+static bool ozBond0Present() { return g_bonds[0].present; }
+
+static int ozBondCount() {
+  int n = 0;
+  for (int i = 0; i < OZ_BOND_MAX; i++) if (g_bonds[i].present) n++;
+  return n;
+}
+
+// Slot index of the bond holding [pub], or -1. Linear over 16 — the table is
+// tiny and this runs once per enrol/control, not per packet.
+static int ozBondFind(const uint8_t pub[32]) {
+  for (int i = 0; i < OZ_BOND_MAX; i++)
+    if (g_bonds[i].present && memcmp(g_bonds[i].pub, pub, 32) == 0) return i;
+  return -1;
+}
+
+static void ozBondsSave() {
+  uint8_t *buf = (uint8_t *)calloc(1, OZ_BONDTAB_SZ);
+  if (!buf) {
+    Serial.println("[BOND] FATAL: no heap for bond table save");
+    return;
+  }
+  for (int i = 0; i < OZ_BOND_MAX; i++) {
+    uint8_t *r = buf + i * OZ_BOND_REC;
+    r[0] = g_bonds[i].present ? 1 : 0;
+    r[1] = g_bonds[i].role;
+    ozPutU64BE(g_bonds[i].floor, r + 2);
+    memcpy(r + 10, g_bonds[i].pub, 32);
+    memcpy(r + 42, g_bonds[i].label, OZ_LABEL_MAX);
+  }
+  prefs.begin("blelock", false);
+  prefs.putBytes("bondtab", buf, OZ_BONDTAB_SZ);
+  prefs.end();
+  free(buf);
+}
+
+static void ozBondsLoad() {
+  memset(g_bonds, 0, sizeof(g_bonds));
+
   prefs.begin("blelock", true);
-  g_bond0Present = (prefs.getBytesLength("b0pub") == 32);
-  if (g_bond0Present) {
-    prefs.getBytes("b0pub", g_bond0Pub, 32);
-    g_bond0Role  = prefs.getUChar("b0role", OZ_ROLE_ADMIN);
-    g_bond0Floor = prefs.getULong64("b0ctr", 0);
+  const bool haveTab = (prefs.getBytesLength("bondtab") == OZ_BONDTAB_SZ);
+  if (haveTab) {
+    uint8_t *buf = (uint8_t *)malloc(OZ_BONDTAB_SZ);
+    if (buf) {
+      prefs.getBytes("bondtab", buf, OZ_BONDTAB_SZ);
+      for (int i = 0; i < OZ_BOND_MAX; i++) {
+        const uint8_t *r = buf + i * OZ_BOND_REC;
+        g_bonds[i].present = (r[0] == 1);
+        g_bonds[i].role    = r[1];
+        g_bonds[i].floor   = ozGetU64BE(r + 2);
+        memcpy(g_bonds[i].pub, r + 10, 32);
+        memcpy(g_bonds[i].label, r + 42, OZ_LABEL_MAX);
+        g_bonds[i].label[OZ_LABEL_MAX - 1] = 0; // never trust NVS to terminate
+      }
+      free(buf);
+    }
+    prefs.end();
+    Serial.printf("[BOND] table loaded — %d bond(s)\n", ozBondCount());
+    return;
+  }
+
+  // No table yet: migrate the M2 singleton if this lock already has an owner.
+  const bool haveM2 = (prefs.getBytesLength("b0pub") == 32);
+  if (haveM2) {
+    g_bonds[0].present = true;
+    prefs.getBytes("b0pub", g_bonds[0].pub, 32);
+    g_bonds[0].role  = prefs.getUChar("b0role", OZ_ROLE_ADMIN);
+    g_bonds[0].floor = prefs.getULong64("b0ctr", 0);
+    strncpy(g_bonds[0].label, "owner", OZ_LABEL_MAX - 1);
   }
   prefs.end();
+
+  if (haveM2) {
+    ozBondsSave();
+    prefs.begin("blelock", false);
+    prefs.remove("b0pub");
+    prefs.remove("b0role");
+    prefs.remove("b0ctr");
+    prefs.end();
+    Serial.println("[BOND] migrated M2 bond #0 into the M3 table (old keys removed)");
+  }
 }
+
 
 // Strict: exactly n*2 chars, all hex. ozFromHex() silently maps junk to 0, so an
 // app_id of "zzzz…" would otherwise bond a lock to an all-zero pubkey nobody
@@ -236,28 +340,161 @@ static OzBondVerdict ozBond0Evaluate(const char *appIdHex, uint8_t outPub[32]) {
   if (!appIdHex || !*appIdHex) return OZ_BOND_ABSENT;
   if (!ozIsHex(appIdHex, 32)) return OZ_BOND_MALFORMED;
   ozFromHex(appIdHex, outPub, 32);
-  if (!g_bond0Present) return OZ_BOND_CREATE;
-  return memcmp(outPub, g_bond0Pub, 32) == 0 ? OZ_BOND_SAME : OZ_BOND_DENIED;
+  if (!g_bonds[0].present) return OZ_BOND_CREATE;
+  return memcmp(outPub, g_bonds[0].pub, 32) == 0 ? OZ_BOND_SAME : OZ_BOND_DENIED;
 }
 
 // Called ONLY on the accept path, after the payload is known good.
+//
+// M3: this mints slot 0 and deliberately leaves slots 1-15 alone. A re-provision
+// by the SAME owner never reaches here (OZ_BOND_SAME is idempotent) and one by a
+// different owner is refused before this point, so there is no path where a
+// member silently survives an ownership change — the only way to slot 0 with a
+// new key is a factory reset, which clears the whole table with prefs.clear().
 static void ozBond0Commit(const uint8_t pub[32]) {
-  memcpy(g_bond0Pub, pub, 32);
-  g_bond0Role  = OZ_ROLE_ADMIN;
-  g_bond0Floor = 0;
-  g_bond0Present = true;
-  prefs.begin("blelock", false);
-  prefs.putBytes("b0pub", g_bond0Pub, 32);
-  prefs.putUChar("b0role", g_bond0Role);
-  prefs.putULong64("b0ctr", g_bond0Floor);
-  prefs.end();
+  memcpy(g_bonds[0].pub, pub, 32);
+  g_bonds[0].role    = OZ_ROLE_ADMIN;
+  g_bonds[0].floor   = 0;
+  g_bonds[0].present = true;
+  strncpy(g_bonds[0].label, "owner", OZ_LABEL_MAX - 1);
+  ozBondsSave();
 }
 
 static String ozBond0PubHex() {
-  if (!g_bond0Present) return String("");
+  if (!g_bonds[0].present) return String("");
   char h[65];
-  ozHex(g_bond0Pub, 32, h);
+  ozHex(g_bonds[0].pub, 32, h);
   return String(h);
+}
+
+// ── M3: bond #0's pairing secret — the root the invite MAC hangs off ──────────
+//
+// s0 = X25519(lock_priv, bond0_pub). The app computes the mirror image,
+// X25519(app_priv, lock_pub), and the two agree by ECDH. Nothing persists it:
+// it is 32 bytes of derivation from two keys we already hold, and re-deriving
+// per enrolment (a few ms) is cheaper than owning a second secret at rest.
+static bool ozBond0Secret(uint8_t out[32]) {
+  if (!g_lockKeyReady || !g_bonds[0].present) return false;
+  return ozX25519(g_lockPriv, g_bonds[0].pub, out);
+}
+
+// Constant-time equality. Used on MAC comparison, where an early-exit memcmp
+// leaks the length of a correct prefix and turns forgery into 32 × 256 guesses.
+static bool ozCtEq(const uint8_t *a, const uint8_t *b, size_t n) {
+  uint8_t diff = 0;
+  for (size_t i = 0; i < n; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+  return diff == 0;
+}
+
+// ── M3: nonce replay cache (XF-47) ───────────────────────────────────────────
+//
+// Entry = {nonce[16], member_pubkey[32]}, 64 entries, one NVS blob, FIFO ring.
+//
+// TWO rules from XF-47, both load-bearing, neither obvious:
+//  1. ONLY SUCCESSFUL enrolments write here. If failures wrote, an attacker
+//     floods 64 junk nonces, evicts the record of a real one, and a captured
+//     invite becomes replayable — the cache would defeat itself.
+//  2. Burned nonce + MATCHING pubkey is an idempotent MEMBER_OK, not a replay.
+//     Without that, one dropped BLE notify strands a member permanently: they
+//     retry, get MEMBER_REPLAY, and the bond slot is consumed with no way back.
+//
+// Eviction is FIFO rather than LRU. LRU needs a touch on every read and buys
+// nothing here: entries are never re-read in the normal case (a nonce is
+// redeemed once), so recency and insertion order are the same ordering.
+
+#define OZ_NONCE_MAX 64
+#define OZ_NONCE_REC 48                                  // 16 nonce + 32 pubkey
+#define OZ_NONCE_HDR 4                                   // count, head, 2 spare
+#define OZ_NONCE_SZ  (OZ_NONCE_HDR + OZ_NONCE_REC * OZ_NONCE_MAX)
+
+enum OzNonceState {
+  OZ_NONCE_FRESH,    // never seen -> proceed with the enrolment
+  OZ_NONCE_SAME_PUB, // burned by THIS pubkey -> idempotent retry, MEMBER_OK
+  OZ_NONCE_REPLAY    // burned by a DIFFERENT pubkey -> MEMBER_REPLAY
+};
+
+// Read the blob into [buf] (OZ_NONCE_SZ bytes). Absent/short = empty cache.
+static void ozNonceRead(uint8_t *buf) {
+  memset(buf, 0, OZ_NONCE_SZ);
+  prefs.begin("blelock", true);
+  if (prefs.getBytesLength("noncecache") == OZ_NONCE_SZ)
+    prefs.getBytes("noncecache", buf, OZ_NONCE_SZ);
+  prefs.end();
+}
+
+static OzNonceState ozNonceCheck(const uint8_t nonce[16], const uint8_t pub[32]) {
+  uint8_t *buf = (uint8_t *)malloc(OZ_NONCE_SZ);
+  if (!buf) return OZ_NONCE_REPLAY; // fail CLOSED: no heap must not mean no check
+  ozNonceRead(buf);
+  const uint8_t count = buf[0] > OZ_NONCE_MAX ? OZ_NONCE_MAX : buf[0];
+  OzNonceState st = OZ_NONCE_FRESH;
+  for (uint8_t i = 0; i < count; i++) {
+    const uint8_t *r = buf + OZ_NONCE_HDR + i * OZ_NONCE_REC;
+    if (memcmp(r, nonce, 16) == 0) {
+      st = ozCtEq(r + 16, pub, 32) ? OZ_NONCE_SAME_PUB : OZ_NONCE_REPLAY;
+      break;
+    }
+  }
+  free(buf);
+  return st;
+}
+
+static void ozNonceBurn(const uint8_t nonce[16], const uint8_t pub[32]) {
+  uint8_t *buf = (uint8_t *)malloc(OZ_NONCE_SZ);
+  if (!buf) {
+    Serial.println("[MEMBER] FATAL: no heap for nonce cache write");
+    return;
+  }
+  ozNonceRead(buf);
+  uint8_t count = buf[0] > OZ_NONCE_MAX ? OZ_NONCE_MAX : buf[0];
+  uint8_t head  = buf[1] % OZ_NONCE_MAX;
+  uint8_t *r = buf + OZ_NONCE_HDR + head * OZ_NONCE_REC;
+  memcpy(r, nonce, 16);
+  memcpy(r + 16, pub, 32);
+  head = (uint8_t)((head + 1) % OZ_NONCE_MAX);
+  if (count < OZ_NONCE_MAX) count++;
+  buf[0] = count;
+  buf[1] = head;
+  prefs.begin("blelock", false);
+  prefs.putBytes("noncecache", buf, OZ_NONCE_SZ);
+  prefs.end();
+  free(buf);
+  Serial.printf("[MEMBER] nonce burned — cache %u/%u\n", count, OZ_NONCE_MAX);
+}
+
+// ── M3: base64url decode (the OZINV1 QR body) ────────────────────────────────
+//
+// Accepts both alphabets ('-_' and '+/') and tolerates missing padding, because
+// Dart's base64UrlEncode pads but a QR reader or a hand-pasted bench string may
+// not. Rejects any other character outright — a lenient "skip junk" decoder
+// would let two different QR strings decode to the same invite bytes.
+static int ozB64UrlDecode(const char *in, size_t inLen, uint8_t *out,
+                          size_t outCap) {
+  auto val = [](char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+  };
+  uint32_t acc = 0;
+  int bits = 0;
+  size_t n = 0;
+  for (size_t i = 0; i < inLen; i++) {
+    const char c = in[i];
+    if (c == '=') break; // padding: nothing after it carries data
+    const int v = val(c);
+    if (v < 0) return -1;
+    acc = (acc << 6) | (uint32_t)v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (n >= outCap) return -1;
+      out[n++] = (uint8_t)((acc >> bits) & 0xFF);
+    }
+  }
+  return (int)n;
 }
 
 // ── boot self-test (known-answer vectors) ─────────────────────────────────────
@@ -528,6 +765,34 @@ static bool ozCryptoSelfTest() {
     bool pass = !haveKeys ? false
                           : ozEnvOpen(kA2L, devId, env, 64, pt, sizeof(pt), nullptr) < 0;
     Serial.printf("[CRYPTO] selftest env-tamper-reject %s\n", pass ? "PASS" : "FAIL");
+    ok &= pass;
+  }
+
+  // 9) M3 invite QR codec — decode the SAME frozen invite leg 3 MACs, from its
+  //    real `OZINV1:` wire form. Leg 3 proves the MAC given already-parsed
+  //    fields; this proves we can get those fields off a phone screen. Together
+  //    they cover the whole enrolment authenticator without a bench phone.
+  {
+    const char *body =
+        "eyJ2IjoxLCJkIjoib3prLWE0Y2YxMjg3OWRhNyIsImkiOiJhYWFhYWFhYWFhYWFhYWFhYWFh"
+        "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwiciI6Im1lbWJlciIsImwiOiJC"
+        "YSBOZ29haSIsIm4iOiI0MjQyNDI0MjQyNDI0MjQyNDI0MjQyNDI0MjQyNDI0MiIsImUiOjE3"
+        "ODkwMDAwMDAsIm0iOiJlNzc4MGJhZWE4ZmVlZjU2NzRjMGZmZWNkMWI4M2YzNWRmZDkxOThk"
+        "YjUwY2VhNmQwNzM1YzdhNDNkMjY4YWFjIn0=";
+    const char *want =
+        "{\"v\":1,\"d\":\"ozk-a4cf12879da7\",\"i\":\"aaaaaaaaaaaaaaaaaaaaaaaa"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"r\":\"member\",\"l\":\"Ba "
+        "Ngoai\",\"n\":\"42424242424242424242424242424242\",\"e\":1789000000,"
+        "\"m\":\"e7780baea8feef5674c0ffecd1b83f35dfd9198db50cea6d0735c7a43d268aac\"}";
+    uint8_t dec[300];
+    int n = ozB64UrlDecode(body, strlen(body), dec, sizeof(dec));
+    bool pass = n == (int)strlen(want) && memcmp(dec, want, n) == 0;
+    // …and a malformed body must be refused, not silently truncated.
+    pass &= ozB64UrlDecode("abc$def", 7, dec, sizeof(dec)) < 0;
+    // …and a body larger than the caller's buffer must fail rather than run off it.
+    pass &= ozB64UrlDecode(body, strlen(body), dec, 8) < 0;
+    Serial.printf("[CRYPTO] selftest invite-b64url %s (len=%d)\n",
+                  pass ? "PASS" : "FAIL", n);
     ok &= pass;
   }
 

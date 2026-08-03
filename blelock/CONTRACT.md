@@ -115,6 +115,73 @@ sync (OZLOCK builds the door→apps map passively).
 (control). These are OUTSIDE the commissioning ladder — apps consume them on
 a raw-status stream, `OzkeyStatus.parse` ignores them.
 
+### M3 — BUILT 2026-08-03, `doorlock-1.5`. Realization notes
+
+Everything below is implemented and compiles clean; hardware verification is the
+open item. Six points where the build made a decision the spec above left open —
+all are now canonical.
+
+**1. The touch window is REAL, and it is what makes any of this reachable.**
+The "~60 s after any keypad touch" rule above was specified in XF-46 and had
+never been built: only a short BOOT press opened a window (v1.2, XF-52 R). BOOT
+is on the board — *inside* the door. The keypad is *outside*. A member standing
+at a commissioned lock therefore had no way to make it advertise, so
+`member_enroll` was unreachable no matter how correct the ceremony was. v1.5
+opens the same 60 s window on **any tap**, not a designated key: the keypad grid
+is a hit-test with nothing drawn on it, so "tap the invisible # key" is not an
+instruction a user at a door can follow. Every tap re-arms the 60 s. BOOT stays
+as the hardware escape hatch for a unit with a dead touch controller. There is
+still no remote verb, and per XF-52 §4 there must never be one.
+
+**2. `role: "admin"` is REFUSED in v1** — `MEMBER_FAIL`. A second admin is
+listed under "Deferred (v2)" together with bond #0 transfer, and accepting one
+would create an authority with no revoke story behind it. BANOI never sets
+`role` (`doorlock_service.dart` calls `buildMemberInvite` without it), so this
+costs nothing today.
+
+**3. Re-invite of a key that already holds a bond refreshes the label and KEEPS
+`counter_floor`.** BANOI's `reinviteMember` mints a fresh nonce for an existing
+member, so this path is normal, not exceptional. Resetting the floor to 0 here
+would re-open every frame that member had already sent — the same replay hole
+XF-47 closed for revoke→re-invite, arriving by a different road.
+
+**4. The nonce cache evicts FIFO, not LRU, and fails CLOSED.** A nonce is read
+once and never again in the normal case, so recency and insertion order are the
+same ordering and LRU buys nothing. If the 3 KB working buffer cannot be
+allocated, the check reports `MEMBER_REPLAY` rather than proceeding unchecked —
+a lock low on heap must not become a lock with no replay protection.
+
+**5. The busy flag is realized as SCAN_IND, and that IS the single-connection
+enforcement.** While connected the lock keeps advertising but switches to PDU
+type `ADV_TYPE_SCAN_IND` (scannable, **non-connectable**): a second phone can
+still see the lock and read `busy = 1` from the scan response, while the link
+layer refuses the connection outright, so a half-finished enrolment can never be
+aborted by someone else connecting. **This requires BANOI to scan ACTIVELY** —
+service data lives in the scan response because the ADV packet is full at 29 of
+31 bytes and the 0x07 UUID list cannot be displaced without breaking discovery.
+
+**6. `member_enroll` on an unowned lock is `MEMBER_FAIL`.** With no bond #0
+there is no issuer to verify against, so no invite can be authentic. The lock
+refuses rather than inventing a trust root.
+
+**Storage.** M2's three flat NVS keys (`b0pub`/`b0role`/`b0ctr`) become slot 0
+of a single 16-slot blob `bondtab`; a lock carrying the M2 keys migrates
+silently on first v1.5 boot and the old keys are deleted, so a stale owner
+cannot linger in an NVS dump. One blob rather than 48 keys because a bond is
+written as a unit and NVS has no cross-key transaction — a partial write that
+left a pubkey without its role would be an unauthenticated bond. Nonce cache is
+a second blob, `noncecache`. Both live in the `blelock` namespace that
+`factoryReset()` clears, so a reset still wipes owner, members and burned nonces
+together with the keypair.
+
+**`control` …0006 is deliberately NOT created yet.** It is M4. An advertised but
+inert characteristic would let the app's capability probe conclude the lock can
+authorise an unlock.
+
+**Cost:** +10,956 B flash (62% of 3.34 MB), +1,784 B RAM — the 16-slot bond
+table plus a 512 B invite-decode buffer. The 3 KB nonce cache is heap-transient,
+allocated per enrolment and freed.
+
 ### [XF-47] Bond #0 establishment, and the ownership-theft rule
 
 Bond #0 is created from the **`app_id`** field already present in

@@ -204,6 +204,52 @@ pattern as XF-46's MEMBER_*/UNLOCK_* additions in `CONTRACT.md`): `THREAD_OK`,
    transport and MQTT uplink).
 ```
 
+## Transport detection — CANONICAL (XF-55 (AE), confirmed 2026-08-03)
+
+**The doorlock is transport-agnostic; the APP decides.** One firmware, one SKU,
+both topologies. The lock branches on what it receives — `network_key` present →
+Thread, `ssid` present → Wi-Fi — and never on a mode flag. Keeping the firmware
+agnostic is what lets a single SKU serve both.
+
+```
+1. App has a lock to commission (new, or "Ghép lại" on a known one).
+2. App asks: do I hold a FORMED bridge network?
+     "formed" = listBridges().where(hasDataset) — a bridge whose dataset this
+     handset actually holds, not merely a bridge that exists. The app can only
+     hand over a network it has.
+   YES -> Thread flow.  NO -> Wi-Fi flow.
+3. Wi-Fi flow: the app collects Wi-Fi credentials + the ozlockserv URL + a
+   display name + the (AD) heartbeat interval. It does NOT collect broker or
+   server coordinates: broker_host, broker_tcp_port, broker_ws_port,
+   broker_ws_path, server_ip and server_port all come from `provision_payload`
+   in the POST /pairings response.
+4. Thread flow: the app couriers the bridge's dataset into the lock's
+   `provision` characteristic; the lock commits it and attaches.
+```
+
+**Step 3 is worded that way deliberately — one authority per fact.** The broker
+is an ozkey deployment detail: it changes when the lab moves or cloud stands up.
+A hand-typed copy on every phone goes stale silently and produces a lock that
+joins Wi-Fi and reaches nothing — a failure with no error anywhere.
+
+**A lock already KNOWN to be Thread stays Thread**, whatever this handset holds.
+XF-50/51 sync restores `ozlock_locks` including `transport`, but deliberately
+excludes `network_key` — so a reinstalled or replacement phone knows the lock is
+Thread and holds nothing to courier. Choosing Wi-Fi there does not merely show
+the wrong page: it silently moves a working lock off the mesh, points it at the
+broker directly, and its bridge simply stops seeing it. No error is raised
+anywhere. The rule is to **fail closed** — *"this lock runs Thread but this
+phone has no bridge network data; re-pair the Bridge here first — the lock is
+still working and nothing has been changed"* — and write nothing to the lock.
+
+This narrows, but does not replace, `GET /bridges?site=`: the sync covers a lock
+we already know, and the endpoint is still needed for a lock we do not — a *new*
+lock commissioned from a recovered handset.
+
+`info.transport == 'thread'` survives in the app's condition as a legacy arm for
+a board running the old split `threadcomm.ino`. It is inert for current
+firmware, which reports `xport=unset` until the app picks a transport.
+
 ## Not in this increment
 
 Both sketches compile and prove the BLE-provision → radio-join loop only.
