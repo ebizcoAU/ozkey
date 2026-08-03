@@ -220,8 +220,17 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //             the value. It printed identically either way, so the one hypothesis
 //             (Y) is about — a stale teardown clearing bleClientConnected, so
 //             notify() is skipped — was invisible in our own serial.
-#define FW_VERSION "doorlock-1.6"
-#define FW_DISPLAY_VERSION "v1.6" // shown on-screen next to the OZLOCK logo
+//   1.7  XF-58 press-then-touch: the lock now ARMS an assisted unlock it cannot
+//             satisfy yet, and fires it on the next keypad touch within 60 s.
+//             1.6 required touch-BEFORE-press, which contradicts both XF-58 §3.1.2
+//             and the countdown BANOI already ships (it starts on the press and
+//             asks the visitor to touch during it). A SLEEPING lock hid this — the
+//             press queues while it is offline, so the touch that wakes it is
+//             recent. An AWAKE lock receives instantly and discarded the press;
+//             at hb=60s with a 30s idle window that is ~half the time, failing
+//             intermittently with the app countdown still running.
+#define FW_VERSION "doorlock-1.7"
+#define FW_DISPLAY_VERSION "v1.7" // shown on-screen next to the OZLOCK logo
 
 // ── State machine ───────────────────────────────────────────────────────────
 enum CommState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
@@ -323,6 +332,25 @@ bool touchWasDown = false;
 // made an unattended open MORE likely, which is the opposite of the intent.
 unsigned long lastTouchAt = 0; // 0 = never touched since boot
 #define ASSISTED_TOUCH_MAX_MS 30000UL
+
+// The command may arrive on EITHER side of the touch, and both orderings are real:
+//   press-then-touch — the owner taps "Mở cửa cho khách" and then tells the
+//     visitor to touch. This is the flow BANOI's countdown is built around and the
+//     one XF-58 §3.1.2 documents, so it is the primary case.
+//   touch-then-press — "hold on, I'll open it", the visitor touches first.
+//
+// A sleeping lock gets press-then-touch for free: the command sits in the server
+// queue because the lock is offline, and by the time the touch wakes it the touch
+// is recent. An AWAKE lock does not — it receives instantly, and at the default
+// 60 s heartbeat with a 30 s idle window it is awake roughly half the time. So the
+// press was silently discarded on a coin flip, with the app's countdown still
+// running. Holding it closes that.
+//
+// Safety is unchanged: still bounded, still requires a touch, still single-shot.
+// RAM only — a reboot drops it, which is correct.
+unsigned long assistArmedUntil = 0; // 0 = nothing armed
+String assistArmedPayload;
+#define ASSISTED_ARM_MS 60000UL // matches ozlockserv's expires_at window
 
 // ── §0.2/§0.3 power & wake state (persistent-power keep-alive) ──────────────
 // wake_sim=true (bench default; CP2102 exposes TX/RX only): SRDY assumed
@@ -1351,12 +1379,18 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     const bool touched =
         lastTouchAt != 0 && (millis() - lastTouchAt) <= ASSISTED_TOUCH_MAX_MS;
     if (!touched) {
-      Serial.printf("[ASSIST] REFUSED — no keypad touch in the last %lus "
+      // ARM, do not discard. The owner has authorised; nobody has arrived yet.
+      // A second press replaces the first — two presses must never arm two
+      // unlocks, or one touch could open the door twice.
+      if (assistArmedUntil)
+        Serial.println("[ASSIST] replacing the previously armed unlock");
+      assistArmedPayload = String(hex);
+      assistArmedUntil = millis() + ASSISTED_ARM_MS;
+      Serial.printf("[ASSIST] ARMED %lus — waiting for a keypad touch "
                     "(last touch %s)\n",
-                    ASSISTED_TOUCH_MAX_MS / 1000,
+                    ASSISTED_ARM_MS / 1000,
                     lastTouchAt ? String((millis() - lastTouchAt) / 1000).c_str()
                                 : "never");
-      txlogAppend("refused", "assisted unlock — nobody at the door");
       return;
     }
     Serial.printf("[ASSIST] touch %lus ago — assisted unlock ALLOWED\n",
@@ -2296,6 +2330,18 @@ void loop() {
   // connected at the deadline keeps its link; onDisconnect() closes it then.
   // Cutting a live commissioning off at 60 s would produce exactly the
   // dropped-ladder "unknown" state XF-48 §21.3 exists to handle, self-inflicted.
+  // XF-58: an armed assisted unlock that nobody came for. Dropping it is the
+  // correct outcome of "no one was at the door", and saying so on the console is
+  // what makes a door that did not open diagnosable instead of mysterious.
+  if (assistArmedUntil && (long)(millis() - assistArmedUntil) >= 0) {
+    assistArmedUntil = 0;
+    assistArmedPayload = "";
+    Serial.printf("[ASSIST] armed window expired after %lus — nobody touched, "
+                  "command dropped\n",
+                  ASSISTED_ARM_MS / 1000);
+    txlogAppend("expired", "assisted unlock — nobody came to the door");
+  }
+
   if (bleWindowUntil && !bleWindowOpen() && !bleClientConnected) {
     closeBleWindow("60s elapsed");
   }
@@ -2453,6 +2499,18 @@ void loop() {
       char k = keyAt(tx, ty);
       Serial.printf("[TOUCH] %d,%d -> key '%c'\n", tx, ty, k ? k : '-');
       if (provisioned) openBleWindow("keypad touch"); // re-arms 60 s per tap
+
+      // XF-58: somebody just arrived, and the owner already authorised. Fire the
+      // held command and CONSUME it — single-shot, exactly as in the immediate
+      // path, so one touch can never satisfy a second press.
+      if (assistArmedUntil && (long)(millis() - assistArmedUntil) < 0) {
+        Serial.println("[ASSIST] touch received — armed assisted unlock ALLOWED");
+        const String payload = assistArmedPayload;
+        assistArmedUntil = 0;
+        assistArmedPayload = "";
+        lastTouchAt = 0; // consumed here too; do not also satisfy a later command
+        forwardHexToMcu(payload);
+      }
       if (resetArm) {
         resetArm = false;
         if (k == '5') factoryReset();
