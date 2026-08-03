@@ -1335,6 +1335,17 @@ function deviceIdentity(obj) {
 }
 
 function effectiveCaps(lock) {
+  // XF-58 (AS) — `bridge_id` is CONFIGURATION: is a bridge bound. Liveness must
+  // NEVER enter this function. Two reasons, and the second is the stronger:
+  //   1. remote_unlock would blink out during a bridge reboot, and the app would
+  //      send the user to walk to a door that would have opened in a second.
+  //   2. `caps` is now partly device-reported and CACHED in the app's local row
+  //      (XF-57). A field worth caching must be stable; mixing a by-the-second
+  //      signal in would make that cache wrong by design — XF-57's staleness bug
+  //      again, but unfixable, because the truth would change faster than sync.
+  // "Bound but currently unreachable" belongs in a SEPARATE `bridge_state` field
+  // (live / stale / unknown), deferred to the (AC) bridges table. Do not reach
+  // for a liveness signal here to "improve" the answer.
   const bridged = !!lock.bridge_id;
 
   // What we can deduce with no word from the device. Note `assisted_unlock` is
