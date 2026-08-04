@@ -260,8 +260,30 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //             is backwards; waiting is what lands the write inside the window.
 //             Now ctlConsume(n) drops only the processed bytes, under the
 //             critical section, BEFORE any status goes out.
-#define FW_VERSION "doorlock-1.9"
-#define FW_DISPLAY_VERSION "v1.9" // shown on-screen next to the OZLOCK logo
+//   1.10 THE ONE-CONNECT-PER-BOOT BUG. A commissioned lock accepted exactly one
+//             BLE connection after each reboot; every later touch window was
+//             discoverable but NON-CONNECTABLE, so at-the-door unlock, member
+//             enrolment and `Ghép lại` all failed with "sees the lock, cannot
+//             connect" until the lock was power-cycled. Reproduced 2026-08-05
+//             six times across TWO unrelated BLE stacks (bleak/CoreBluetooth and
+//             flutter_blue_plus/iOS), which is what ruled the app out.
+//             CAUSE: bleSetBusy() -> setScanResponseData() ->
+//             esp_ble_gap_config_scan_rsp_data_raw() is ASYNC, and the Arduino
+//             BLE library's completion handler for it calls
+//             esp_ble_gap_start_advertising(&m_advParams) — restarting the
+//             advert with whatever adv_type is set AT COMPLETION TIME. Both
+//             callbacks called bleSetBusy() BEFORE bleSetConnectable(), so the
+//             queued restart fired with the previous SCAN_IND while the struct
+//             was then edited to IND and never re-applied (Bluedroid ignores
+//             adv-param changes while advertising is running). Radio SCAN_IND,
+//             struct IND, and openBleWindow()'s bare startAdvertising() a no-op.
+//             FIX: one bleRearmAdvertising(connectable, why) — stop, settle, set
+//             the TYPE FIRST, then the scan response, settle, start, and say on
+//             the console which mode it is. bleSetConnectable() is deleted; a
+//             helper that sets adv_type without the surrounding sequence is the
+//             trap that caused this.
+#define FW_VERSION "doorlock-1.10"
+#define FW_DISPLAY_VERSION "v1.10" // shown on-screen next to the OZLOCK logo
 
 // ── State machine ───────────────────────────────────────────────────────────
 enum CommState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
@@ -921,7 +943,11 @@ void openBleWindow(const char *gesture) {
   bleWindowUntil = millis() + BLE_WINDOW_MS;
   if (bleServer == nullptr) startBle(); // first open: build the GATT server
   else if (!bleClientConnected)
-    BLEDevice::startAdvertising(); // already built: just go discoverable
+    // Full re-arm, not a bare startAdvertising(). If a previous link left
+    // adv_type at SCAN_IND, a bare start leaves the window discoverable but
+    // NON-CONNECTABLE — the "one BLE connection per boot" bug. This is the
+    // user-facing path (every keypad touch), so it has to be the safe one.
+    bleRearmAdvertising(true, "window opened");
   // A tap DURING a live connection must not restart advertising — the link is
   // already up and we are deliberately SCAN_IND while busy (see bleSetBusy).
   // It still extends the deadline, which is the point: a long enrolment must
@@ -2510,6 +2536,26 @@ class ProvisionCB : public BLECharacteristicCallbacks {
 // link layer refuses it, so a half-finished enrolment can never be aborted by
 // someone else connecting. Refusing at the link layer is indistinguishable from
 // out-of-range, which is exactly why the flag has to be observable.
+// ⚠ THIS FUNCTION RESTARTS ADVERTISING. It does not look like it does, and that
+// cost an entire bench session (2026-08-04/05) — the lock accepted exactly ONE
+// BLE connection per boot and was discoverable-but-unconnectable ever after.
+//
+// setScanResponseData() calls esp_ble_gap_config_scan_rsp_data_raw(), which is
+// ASYNCHRONOUS. Its completion event is handled inside the Arduino BLE library
+// (BLEAdvertising.cpp, ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT) and that
+// handler does:
+//
+//     m_advertisingPending = true;
+//     esp_ble_gap_start_advertising(&m_advParams);
+//
+// So it re-starts advertising using whatever `m_advParams.adv_type` holds AT
+// COMPLETION TIME — not at call time. The old comment here claimed the byte
+// could be updated "without a stop/start cycle", which is exactly backwards.
+//
+// CALLERS MUST SET THE ADVERTISEMENT TYPE FIRST — which is why the only caller
+// is bleRearmAdvertising() below. Reversed, the queued restart fires with the
+// PREVIOUS type and the later setAdvertisementType() only edits a struct field
+// that nothing re-applies, because advertising is already running.
 void bleSetBusy(bool busy) {
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   if (adv == nullptr) return;
@@ -2517,20 +2563,32 @@ void bleSetBusy(bool busy) {
   String sd;
   sd += (char)(busy ? 0x01 : 0x00);
   scanResp.setServiceData(BLEUUID(SVC_UUID), sd);
-  // Writes esp_ble_gap_config_scan_rsp_data_raw immediately, so the byte can be
-  // updated mid-advertising without a stop/start cycle.
   adv->setScanResponseData(scanResp);
 }
 
-// Connectable (normal) vs scannable-only (busy). MUST stop first — Bluedroid
-// ignores an adv-params change while advertising is running, and a silently
-// ignored change here would leave a lock permanently non-connectable.
-void bleSetConnectable(bool connectable) {
+// The one place advertising is (re)armed, so the ordering above can only be got
+// right once. `connectable` false = SCAN_IND, the M3 busy state: still
+// scannable so the busy byte is readable, but the link layer refuses — which IS
+// the single-connection enforcement (CONTRACT.md M3 realization note 5).
+//
+// The delays are not superstition. esp_ble_gap_stop_advertising() and the
+// scan-response config are both async, and Bluedroid silently ignores an
+// adv-params change while advertising is running. Settling between the steps is
+// what makes the sequence deterministic instead of a race we lose once per boot.
+void bleRearmAdvertising(bool connectable, const char *why) {
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   if (adv == nullptr) return;
   BLEDevice::stopAdvertising();
+  delay(40);                       // let the GAP stop land
   adv->setAdvertisementType(connectable ? OZ_ADV_TYPE_IND : OZ_ADV_TYPE_SCAN_IND);
+  bleSetBusy(!connectable);        // AFTER the type — its async restart uses it
+  delay(40);
+  BLEDevice::startAdvertising();   // idempotent if the callback already started
+  Serial.printf("[BLE] advertising %s (busy=%d) — %s\n",
+                connectable ? "IND/connectable" : "SCAN_IND/busy",
+                connectable ? 0 : 1, why);
 }
+
 
 class ServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer *) override {
@@ -2542,9 +2600,7 @@ class ServerCB : public BLEServerCallbacks {
     // Only where we were supposed to be discoverable in the first place —
     // a commissioned lock outside its window stays dark, exactly as before.
     if (!provisioned || bleWindowOpen()) {
-      bleSetBusy(true);
-      bleSetConnectable(false);
-      BLEDevice::startAdvertising();
+      bleRearmAdvertising(false, "client connected");
     }
     notifyStatus("BLE_OK");
   }
@@ -2568,8 +2624,6 @@ class ServerCB : public BLEServerCallbacks {
       ctlReset();     // M4: likewise, and it matters more here — a half-written
                       // control message fusing with the next connection's would
                       // put one bond's bytes in front of another's app_id
-      bleSetBusy(false);
-      bleSetConnectable(true); // undo the SCAN_IND switch BEFORE re-advertising
     }
     delay(300);
     // Restart advertising only where we are SUPPOSED to be discoverable:
@@ -2581,10 +2635,21 @@ class ServerCB : public BLEServerCallbacks {
     // Otherwise stay silent. Restarting unconditionally — which is what this did
     // until 2026-08-02 — would make one connection turn a bounded window into a
     // permanent one, quietly undoing the whole point of (R).
+    //
+    // ⚠ Must go through bleRearmAdvertising(), NOT a bare startAdvertising().
+    // The link that just closed left adv_type at SCAN_IND; a bare start would
+    // either be a no-op (advertising already running, Bluedroid ignores param
+    // changes) or restart non-connectably. Either way the lock stays visible and
+    // refuses every subsequent connection until reboot — one connect per boot,
+    // which is precisely the bug this call fixes.
     if (!provisioned || bleWindowOpen()) {
-      BLEDevice::startAdvertising();
+      bleRearmAdvertising(true, "link closed, back to discoverable");
     } else if (bleWindowUntil) {
       closeBleWindow("expired during session");
+    } else {
+      // Not supposed to be discoverable. Make sure the async scan-response
+      // restart inside bleSetBusy() cannot leave us advertising anyway.
+      BLEDevice::stopAdvertising();
     }
   }
 };
@@ -2650,9 +2715,10 @@ void startBle() {
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
   adv->setScanResponse(true);
-  bleSetBusy(false); // M3: publish the flag from the first advert, not on first connect
-  BLEDevice::startAdvertising();
-  Serial.println("[BLE] advertising as OZLOCK (busy=0)");
+  // Same path as every other advertise, so the ordering rule has exactly one
+  // implementation. A fresh stack defaults to ADV_TYPE_IND, but relying on that
+  // default is how the ordering bug hid for so long.
+  bleRearmAdvertising(true, "startBle");
 }
 
 void buildTopics() {
@@ -2795,6 +2861,21 @@ void setup() {
   delay(300);
   Serial.println("\n*** OZLOCK COMM MODULE — unified doorlock (MCU = LockSim on UART) ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
+
+  // WHY DID WE JUST BOOT? Never logged until 2026-08-05, and its absence cost a
+  // whole bench session: the board was resetting itself about every 10 minutes,
+  // which silently killed the serial capture (USB re-enumerates, the reader's fd
+  // goes stale) AND invalidated test results, because "it worked" sometimes just
+  // meant "a reset had happened moments earlier". A reboot with no stated cause
+  // is indistinguishable from a reboot someone asked for.
+  const esp_reset_reason_t rr = esp_reset_reason();
+  const char *rrName =
+      rr == ESP_RST_POWERON   ? "POWERON"  : rr == ESP_RST_EXT      ? "EXT/RESET-PIN"
+    : rr == ESP_RST_SW        ? "SW (ESP.restart)" : rr == ESP_RST_PANIC ? "PANIC/EXCEPTION"
+    : rr == ESP_RST_INT_WDT   ? "INT WATCHDOG" : rr == ESP_RST_TASK_WDT ? "TASK WATCHDOG"
+    : rr == ESP_RST_WDT       ? "OTHER WATCHDOG" : rr == ESP_RST_DEEPSLEEP ? "DEEPSLEEP WAKE"
+    : rr == ESP_RST_BROWNOUT  ? "BROWNOUT (power!)" : rr == ESP_RST_SDIO ? "SDIO" : "UNKNOWN";
+  Serial.printf("[BOOT] reset reason: %s (%d)\n", rrName, (int)rr);
 
   // Tuya MCU bus → LockSim Mode B (raw 55 AA frames, wire-tested 2026-07-19)
   Serial1.begin(9600, SERIAL_8N1, TUYA_RX_PIN, TUYA_TX_PIN);
