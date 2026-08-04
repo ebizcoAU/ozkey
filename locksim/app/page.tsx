@@ -191,6 +191,7 @@ export default function Page() {
     onHeartbeat: publishHeartbeat,
     heartbeatSeconds: settings.heartbeatSeconds,
     onAccess: publishAccessLog,
+    mcuAckDelayMs: settings.mcuAckDelayMs,
   });
   lockEventRef.current = lock.pushEvent;
 

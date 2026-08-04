@@ -155,6 +155,12 @@ export default function SettingsDialog({
             Deep-sleep wake to pull queued MQTT tasks. Touch/keypad also wakes the
             lock. Minimum 5 s.
           </div>
+          {field("MCU Ack Delay (ms)", draft.mcuAckDelayMs, (v) => setDraft({ ...draft, mcuAckDelayMs: Number(v) || 0 }), "number", "120")}
+          <div className="flex flex-col justify-end pb-1 text-[10px] leading-snug text-neutral-500">
+            Lag before the MCU answers a DP command with its DP 8 status report.
+            Raise past the module&apos;s deadline to simulate a slow or still-waking
+            MCU — that is the only way to test the module&apos;s timeout path.
+          </div>
         </div>
 
         <div className="mb-1 mt-4 text-[10px] font-bold uppercase tracking-widest text-teal-400">

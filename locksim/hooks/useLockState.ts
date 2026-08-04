@@ -44,6 +44,13 @@ const SCRAMBLE_MAX_DIGITS = 20;
 const UNLOCK_HOLD_MS = 5000; // remote/credential unlock auto-relock delay
 const MOTOR_TRAVEL_MS = 900;
 const ALARM_FLASH_MS = 1600;
+/**
+ * Default lag between receiving a DP command and answering with the DP 8 status
+ * report. 120 ms is "parsed the frame and started acting" — a GUESS, and one
+ * nobody has yet checked against Li's hardware. The single trace that settles it
+ * (send one DP 1, record what comes back and when) replaces this number.
+ */
+const MCU_ACK_DELAY_MS = 120;
 
 interface UseLockStateOptions {
   /** Fire an outbound Tuya frame onto the TX line (from useTuyaProtocol). */
@@ -56,6 +63,12 @@ interface UseLockStateOptions {
   heartbeatSeconds?: number;
   /** Fired on every door access transaction (Mode A: push usage log to MQTT). */
   onAccess?: (evt: AccessEvent) => void;
+  /**
+   * Milliseconds the MCU takes to answer a module-issued DP command with its
+   * DP 8 status report. Defaults to `MCU_ACK_DELAY_MS`. Raise it past the
+   * module's deadline to simulate a slow or still-waking MCU.
+   */
+  mcuAckDelayMs?: number;
 }
 
 export interface AccessEvent {
@@ -75,6 +88,7 @@ export function useLockState({
   onHeartbeat,
   heartbeatSeconds,
   onAccess,
+  mcuAckDelayMs,
 }: UseLockStateOptions) {
   const hbSeconds = Math.max(HEARTBEAT_MIN_SECONDS, Math.round(heartbeatSeconds || HEARTBEAT_SECONDS));
   const [powerState, setPowerState] = useState<PowerState>("SLEEPING");
@@ -93,6 +107,12 @@ export function useLockState({
   const sleepTimer = useRef<Timer | null>(null);
   const relockTimer = useRef<Timer | null>(null);
   const motorTimer = useRef<Timer | null>(null);
+  // A LIST, not a single timer. Each command earns its own answer: two DP 1
+  // frames arriving inside the ack delay must produce two reports, the way a
+  // real MCU would. A shared timer would have let the second command silently
+  // cancel the first one's report — building the exact "a command got no reply"
+  // defect this change exists to expose.
+  const ackTimers = useRef<Timer[]>([]);
   const alarmTimer = useRef<Timer | null>(null);
   const fingerprintPass = useRef(true); // alternates for deterministic bench testing
   const mechanicalRef = useRef(false);
@@ -105,6 +125,13 @@ export function useLockState({
   onAccessRef.current = onAccess;
   const nowRef = useRef(virtualNow);
   nowRef.current = virtualNow;
+  // Read through a ref, not a closure: the delay is edited live in Settings, and
+  // a pending ack must fire with the value in force when the command landed.
+  const ackDelayRef = useRef(MCU_ACK_DELAY_MS);
+  ackDelayRef.current =
+    typeof mcuAckDelayMs === "number" && Number.isFinite(mcuAckDelayMs)
+      ? mcuAckDelayMs
+      : MCU_ACK_DELAY_MS;
 
   // Load the EEPROM (LocalStorage) slot table once on mount.
   useEffect(() => {
@@ -162,6 +189,21 @@ export function useLockState({
     [wake, fireMotor]
   );
 
+  /**
+   * The DP 8 status report — the MCU's half of the Tuya UART contract.
+   *
+   * Single transmit site. It used to be written out twice (grant/deny), which
+   * is how the remote-unlock path came to have no report at all: the third
+   * caller simply never got written, and nothing pointed at its absence.
+   */
+  const reportAccessResult = useCallback((result: AccessResult, note: string) => {
+    transmitRef.current(
+      TuyaCommand.DP_REPORT,
+      buildDpPayload(DpId.ACCESS_RESULT, DpType.ENUM, [result]),
+      note
+    );
+  }, []);
+
   const deny = useCallback(
     (reason: string, result: AccessResult) => {
       accessDenied();
@@ -171,25 +213,50 @@ export function useLockState({
       });
       flashAlarm();
       setLastEvent(`ACCESS ${result === AccessResult.EXPIRED ? "EXPIRED" : "DENIED"} — ${reason}`);
-      transmitRef.current(
-        TuyaCommand.DP_REPORT,
-        buildDpPayload(DpId.ACCESS_RESULT, DpType.ENUM, [result]),
-        `Access result: ${AccessResult[result]} — ${reason}`
-      );
+      reportAccessResult(result, `Access result: ${AccessResult[result]} — ${reason}`);
     },
-    [flashAlarm]
+    [flashAlarm, reportAccessResult]
   );
 
+  /** Local credential entry (keypad / card / fingerprint). Unchanged ordering. */
   const grant = useCallback(
     (source: string) => {
-      transmitRef.current(
-        TuyaCommand.DP_REPORT,
-        buildDpPayload(DpId.ACCESS_RESULT, DpType.ENUM, [AccessResult.SUCCESS]),
-        `Access result: SUCCESS — ${source}`
-      );
+      reportAccessResult(AccessResult.SUCCESS, `Access result: SUCCESS — ${source}`);
       unlockCycle(source);
     },
-    [unlockCycle]
+    [unlockCycle, reportAccessResult]
+  );
+
+  /**
+   * Remote unlock arriving as DP 1 over the UART — the path that had NO status
+   * report until 2026-08-04.
+   *
+   * Two things differ from `grant()` deliberately:
+   *
+   * 1. **Execute, then report.** The Tuya contract for a module-issued command
+   *    is parse → execute → report, and the report is supposed to be evidence
+   *    that the bolt actually moved. Reporting first (as the local path does,
+   *    where nothing issued a command to answer) would make the report a
+   *    restatement of intent, which is the exact thing the module is currently
+   *    being criticised for doing one layer up.
+   * 2. **It can be LATE.** See `mcuAckDelayMs` — a simulator that always answers
+   *    in zero milliseconds cannot tell an ESP32 with timeout/retry logic apart
+   *    from one with none, and right now the firmware has none.
+   */
+  const remoteUnlock = useCallback(
+    (source: string) => {
+      unlockCycle(source);
+      const delay = Math.max(0, Math.round(ackDelayRef.current));
+      const t = setTimeout(() => {
+        ackTimers.current = ackTimers.current.filter((x) => x !== t);
+        reportAccessResult(
+          AccessResult.SUCCESS,
+          `Access result: SUCCESS — ${source} (+${delay}ms)`
+        );
+      }, delay);
+      ackTimers.current.push(t);
+    },
+    [unlockCycle, reportAccessResult]
   );
 
   // ---------------------------------------------------------------------
@@ -398,7 +465,10 @@ export function useLockState({
       for (const dp of frame.dataPoints) {
         switch (dp.dpId) {
           case DpId.UNLOCK_CHANNEL:
-            if (dp.type === DpType.BOOL && dp.value === 1) unlockCycle("REMOTE UNLOCK COMMAND");
+            // Was `unlockCycle(...)`, which opened the bolt and told the module
+            // NOTHING — the module's whole picture of "did it work" was the fact
+            // that it had written bytes to a serial port. Now it answers.
+            if (dp.type === DpType.BOOL && dp.value === 1) remoteUnlock("REMOTE UNLOCK COMMAND");
             break;
           case DpId.ADD_TEMP_PIN:
           case DpId.ADD_TEMP_RFID: {
@@ -430,7 +500,7 @@ export function useLockState({
         }
       }
     },
-    [wake, unlockCycle, persistCredentials]
+    [wake, remoteUnlock, persistCredentials]
   );
 
   useEffect(
@@ -438,6 +508,8 @@ export function useLockState({
       for (const t of [sleepTimer, relockTimer, motorTimer, alarmTimer]) {
         if (t.current) clearTimeout(t.current);
       }
+      for (const t of ackTimers.current) clearTimeout(t);
+      ackTimers.current = [];
     },
     []
   );

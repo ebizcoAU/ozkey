@@ -29,6 +29,19 @@ export interface BrokerSettings {
   mac: string;
   /** Deep-sleep timer-wake interval in seconds (lock "firmware" heartbeat). */
   heartbeatSeconds: number;
+  /**
+   * How long the MCU takes to answer a module-issued DP command with its
+   * status report, in milliseconds.
+   *
+   * This exists to make the bench able to FAIL. The Tuya UART contract requires
+   * the MCU to parse, execute and report back inside a window (the operator's
+   * figure is 1-2 s, unverified against Li's hardware); a simulator that always
+   * answers instantly can never exercise the module's timeout or retry path, so
+   * an ESP32 that has no timeout logic at all looks identical to one that does.
+   * Raise this past the module's deadline to see what a slow or sleeping MCU
+   * does to the flow.
+   */
+  mcuAckDelayMs: number;
   /** OZLOCK site (tenant) this lock enrolls into (Mode C). Lab default 'lab'. */
   ozlockSiteId: string;
 }
@@ -41,6 +54,10 @@ export const DEFAULT_BROKER: BrokerSettings = {
   gatewayBasePath: "/ozkeyserv/api",
   mac: DEVICE_MAC,
   heartbeatSeconds: 60,
+  // 120 ms = "parsed the frame and started acting". A GUESS, and flagged as one:
+  // nobody has yet captured what Li's MCU actually sends back or how fast. The
+  // one trace that settles it replaces this number.
+  mcuAckDelayMs: 120,
   ozlockSiteId: "lab",
 };
 
