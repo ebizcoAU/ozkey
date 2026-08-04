@@ -193,13 +193,137 @@ a second blob, `noncecache`. Both live in the `blelock` namespace that
 `factoryReset()` clears, so a reset still wipes owner, members and burned nonces
 together with the keypair.
 
-**`control` …0006 is deliberately NOT created yet.** It is M4. An advertised but
-inert characteristic would let the app's capability probe conclude the lock can
-authorise an unlock.
+**`control` …0006 is deliberately NOT created yet.** It is M4 — **now built, see
+below.** An advertised but inert characteristic would let the app's capability
+probe conclude the lock can authorise an unlock.
 
 **Cost:** +10,956 B flash (62% of 3.34 MB), +1,784 B RAM — the 16-slot bond
 table plus a 512 B invite-decode buffer. The 3 KB nonce cache is heap-transient,
 allocated per enrolment and freed.
+
+### M4 — BUILT 2026-08-04, `doorlock-1.8`. Realization notes
+
+`control` …0006, the DP dispatch split, DPID 101/102, role gates and the
+unconditional challenge. Compiles clean; **hardware verification is the open
+item** (the operator does all flashing). Seven points where the build decided
+something the spec above left open — all now canonical.
+
+**1. `control` reassembly uses the GCM tag as its completeness oracle.** The
+other two writable characteristics carry JSON and share the rule "a chunk
+starting `{` resets the buffer, parse when the JSON completes". `control` is
+binary, and the frozen wire shape — `utf8(app_id_hex,64) ‖ envelope` — carries
+**no length field**, so nothing in the bytes says how many chunks are still
+coming. Rather than change the wire, the lock attempts to open on every chunk
+once the buffer could hold a shortest-possible message: a truncated envelope
+fails the tag, the complete one passes. At the MTU 247 the app requests this is
+a single pass. **No wire change; ftpos need do nothing.**
+
+**2. …and an idle timer, because the tag cannot tell "incomplete" from
+"forged".** Both are simply a failure to open. Left there, a corrupted write
+gets silence — and silence is precisely the XF-53 hang: the app writes, waits
+for a status that never comes, and stalls forever. 400 ms with no further chunk
+closes the message out with a definite `UNLOCK_DENIED`.
+
+**3. The whole control path runs on the Arduino task, not the BLE task.** The
+BLE callback only appends, under a critical section (a torn `ctlLen` is a torn
+message). Two tasks opening envelopes into one buffer would race; this also
+keeps a 512 B plaintext buffer, an X25519 agreement and the 300 ms self-revoke
+flush off the BLE stack — the same constraint that forced M3's invite-decode
+buffer to be static.
+
+**4. The challenge is CONSUMED on a successful match, not just compared.** The
+spec says "fresh 16 bytes per read"; the build additionally invalidates it once
+a frame has used it. Without that, one `…0005` read would authorise every frame
+for the rest of the connection. The app already reads the challenge before each
+control write, so this costs a round trip that was being made anyway.
+
+**5. `counter_floor` advances BEFORE the frame executes.** If execution reboots
+the lock or the MCU write hangs, the frame must not be replayable on the way
+back up. An unlock that maybe happened is a far better outcome than one anybody
+who captured it can repeat.
+
+**6. Role-gate ordering leaks nothing.** For 101, "target is bond #0" is checked
+first (same answer for owner and member alike), then "a member may only revoke
+itself", and only then "no such bond". Reversed, a member could walk the table
+and learn which pubkeys hold a bond here from the difference between
+`REVOKE_DENIED` and `REVOKE_NOT_FOUND`.
+
+**7. `invite_cancel` reuses the replay cache rather than adding a second list.**
+Cancelling burns the nonce against an **all-zero pubkey**, which is not a usable
+X25519 key, so a later redeem arrives with the member's real key, sees a
+different pubkey, and is refused as `MEMBER_REPLAY`. An already-redeemed nonce
+answers `REVOKE_DENIED` (use 101 on the resulting bond); an already-cancelled
+one answers `REVOKE_OK`, idempotently. **Note the one asymmetry:** `ozNonceCheck`
+fails *closed*, which for a cancel is the unsafe direction — a heap failure
+leaves the invite alive. It reports `REVOKE_DENIED` so that is visible and
+retryable rather than silently ineffective.
+
+**BLE `control` accepts DP 1, 101 and 102 in v1 — NOT 21–24. CANONICAL
+(XF-59 (AV), confirmed by ftpos 2026-08-04.)** The row above says "DP 1
+remote-unlock in v1", and credential frames keep arriving on the server path
+where issuance actually lives.
+
+**The reason is normative, not just the rule: a PIN issued over BLE has no
+server record, so the lock and the server disagree about what is live on that
+door — two authorities for one operation, and the quieter one wins by
+accident.** An unlock has nothing to reconcile; it is a momentary actuation. That
+is XF-58's "one fact, one authority" arriving from the credential side.
+
+ftpos confirmed from their code rather than from intent: the only `DpidFrames`
+21–24 calls in BANOI are on the demo branch, and `Keyring.sealAddTempPin` and
+friends have exactly one caller in the repo — a test. No production path seals
+21–24 over any transport. A DP 21–24 frame on …0006 is answered
+`UNLOCK_DENIED`. If at-the-door PIN management is ever needed it is a v2 verb
+with its own status strings and a sync-back to the server, not a widened
+`control`.
+
+> **Comment hygiene, from the same round.** ftpos found `keyring.dart:212`
+> describing the sealed credential envelope as "the opaque envelope OZLOCK relays
+> (or the BLE `control` write, same bytes)" — true of the bytes, and it would have
+> read as permission. **The wire being capable of something is not the contract
+> permitting it.** Same class as the two comments XF-53 (Z) falsified. Comments on
+> the DP-forward path must state policy, not capability.
+
+**Test vectors for 101/102 are byte-exact, and a checksum is not a substitute
+(XF-59 §7.1).** The frames below are the literals in the `dp-frame-101/102`
+self-test leg. A Tuya checksum is `sum & 0xFF`, so it is invariant under any
+**permutation** of the value bytes — a byte-reversed `subject_pub` produces the
+identical trailer `9E`. Never validate a value layout with a checksum; it cannot
+see the defect that matters.
+
+```
+DP 101 subject_pub = A0 A1 … BF (32 B)
+55 AA 00 06 00 24 65 00 00 20 A0 A1 A2 A3 A4 A5 A6 A7 A8 A9 AA AB AC AD AE AF
+B0 B1 B2 B3 B4 B5 B6 B7 B8 B9 BA BB BC BD BE BF 9E                    (43 B)
+
+DP 102 nonce = 10 11 … 1F (16 B)
+55 AA 00 06 00 14 66 00 00 10 10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F 07   (27 B)
+```
+
+**DPIDs 101 and 102 are OURS**, invented for `bond_revoke` / `invite_cancel`.
+They sit in the custom DP range, but they are an extension in a third-party
+numbering space — recorded here so nobody later assumes the MCU vendor defined
+them.
+
+**The forward path is now an ALLOW-LIST, and this is the load-bearing change.**
+`forwardHexToMcu()` previously sent anything that parsed as hex. It now requires
+a 0x06 DP write whose DPID is in {1, 21–24}. 101/102 are dropped there with a
+named log line — **not executed**, because that path is the anon-open MQTT
+broker: a guest on the site Wi-Fi can publish to the command topic, and a
+revoke arriving unauthenticated must not be honoured. Bond verbs exist **only**
+on BLE `control`, where a bond, a challenge and a counter floor all have to line
+up first.
+
+**Boot self-test, two new legs.** `dp-allow-list` and `dp-frame-101/102`. The M4
+property that matters is a negative one, and a negative is what a bench capture
+is worst at proving — "I did not see the frame" and "I was not looking properly"
+produce identical hex. LockSim still shows the wire; these check the predicate
+that decides it, on every unit, every boot. Frames are **generated, not
+transcribed** (the 1.6 leg-9 lesson) and were verified byte-for-byte against
+the two frames specified below.
+
+**Cost:** +5,640 B flash (62% of 3.34 MB), +520 B RAM — the 512 B reassembly
+buffer and its bookkeeping.
 
 ### [XF-47] Bond #0 establishment, and the ownership-theft rule
 
@@ -280,9 +404,29 @@ frame = 55 AA 00 06 00 14 66 00 00 10 <nonce:16> <ck>         (27 bytes)
 Role gates: **101** — bond #0 revokes any bond; a non-admin bond may revoke
 exactly one target, **itself** (`subject_pub == sender app_id`, implements "Rời
 khỏi cửa này"); **revoking bond #0 is always `REVOKE_DENIED`**. **102** — bond #0
-only, unredeemed nonces only. Emit `REVOKE_OK` and let it flush *before* the bond
-becomes unusable; hold the connection until it is out, or a member can never
-confirm their own removal.
+only, unredeemed nonces only.
+
+> **⚠ CORRECTED 2026-08-04 — this paragraph used to say "emit `REVOKE_OK` and let
+> it flush *before* the bond becomes unusable; hold the connection until it is
+> out, or a member can never confirm their own removal." That premise is FALSE
+> and the rule it produced was fail-open.**
+>
+> `notifyStatus()` writes a **plaintext** string to `…0003` and gates only on the
+> link count. It is not sealed under the bond and knows nothing about one;
+> revoking does not drop the BLE link and cannot stop the answer arriving. A
+> member confirms their own removal perfectly well from the far side of it.
+>
+> What the old ordering actually bought was a window in which the app had been
+> told `REVOKE_OK` — and would drop the row — while the bond still sat in NVS. A
+> reset inside that window left a member believing they had left a door that
+> still trusted their key. **The rule is now: revoke and commit to NVS FIRST,
+> answer second**, on self-revoke as much as any other. Caught when ftpos
+> described the correct model independently ("the lock forgets first, then the
+> app drops the row").
+>
+> General form, worth keeping: **a confirmation must never outrun the state it
+> confirms.** Same shape as the `delivered ≠ the lock acted` problem on the
+> command path — a claim emitted before its evidence exists.
 
 New strings, **outside** the ladder: `REVOKE_OK`, `REVOKE_DENIED`,
 `REVOKE_NOT_FOUND`. Log event `bond_revoked`.

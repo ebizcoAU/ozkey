@@ -373,10 +373,43 @@ static String ozBond0PubHex() {
 // X25519(app_priv, lock_pub), and the two agree by ECDH. Nothing persists it:
 // it is 32 bytes of derivation from two keys we already hold, and re-deriving
 // per enrolment (a few ms) is cheaper than owning a second secret at rest.
-static bool ozBond0Secret(uint8_t out[32]) {
-  if (!g_lockKeyReady || !g_bonds[0].present) return false;
-  return ozX25519(g_lockPriv, g_bonds[0].pub, out);
+// M4 generalises this to any slot: `control` frames are opened under the SENDER's
+// pairing secret, and the sender may be any bond, not just the owner.
+static bool ozBondSecret(int slot, uint8_t out[32]) {
+  if (slot < 0 || slot >= OZ_BOND_MAX) return false;
+  if (!g_lockKeyReady || !g_bonds[slot].present) return false;
+  return ozX25519(g_lockPriv, g_bonds[slot].pub, out);
 }
+
+static bool ozBond0Secret(uint8_t out[32]) { return ozBondSecret(0, out); }
+
+// ── M4: revocation (DPID 101) ────────────────────────────────────────────────
+//
+// Clearing `present` is not enough. The pubkey must go too: ozBondFind() skips
+// absent slots, but a revoked key left in NVS is a key an attacker who dumps the
+// flash can still tie to this lock, and a later re-invite lands on a slot that
+// still holds its predecessor's counter_floor. Wipe the record and let the
+// re-invite path build it fresh — that is the branch XF-47's floor rule assumes.
+//
+// Slot 0 is never revocable here; the caller enforces that, but assert it too so
+// a future caller cannot orphan the lock by revoking its own owner.
+static bool ozBondRevoke(int slot) {
+  if (slot <= 0 || slot >= OZ_BOND_MAX) return false;
+  if (!g_bonds[slot].present) return false;
+  memset(&g_bonds[slot], 0, sizeof(OzBond));
+  ozBondsSave();
+  return true;
+}
+
+// ── M4: the invite-cancel marker (DPID 102) ──────────────────────────────────
+//
+// Cancelling an unredeemed invite burns its nonce against an all-zero pubkey.
+// That value is deliberately not a usable X25519 public key, so no real member
+// can ever present it: a later redeem of the cancelled nonce arrives with the
+// member's real key, ozNonceCheck() sees a DIFFERENT pubkey, and the enrolment
+// is refused as OZ_NONCE_REPLAY. The kill switch reuses the replay machinery
+// rather than adding a second list to keep consistent with it.
+static const uint8_t OZ_NONCE_CANCELLED[32] = {0};
 
 // Constant-time equality. Used on MAC comparison, where an early-exit memcmp
 // leaks the length of a correct prefix and turns forgery into 32 × 256 guesses.

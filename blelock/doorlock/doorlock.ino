@@ -129,10 +129,12 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 #define CHR_PROVISION "4f5a4b31-0002-4c4f-434b-000000000001"
 #define CHR_STATUS "4f5a4b31-0003-4c4f-434b-000000000001"
 #define CHR_INFO "4f5a4b31-0004-4c4f-434b-000000000001"
-// M3 (CONTRACT.md "Operational / member profile"). …0006 `control` is M4 and is
-// deliberately NOT created yet — an advertised-but-inert characteristic would
-// let the app's capability probe conclude the lock can authorise an unlock.
+// M3/M4 (CONTRACT.md "Operational / member profile"). …0006 `control` exists as
+// of M4; until then it was deliberately absent, because an advertised-but-inert
+// characteristic would let the app's capability probe conclude the lock can
+// authorise an unlock when it could not.
 #define CHR_CHALLENGE "4f5a4b31-0005-4c4f-434b-000000000001"
+#define CHR_CONTROL "4f5a4b31-0006-4c4f-434b-000000000001"
 #define CHR_MEMBER "4f5a4b31-0007-4c4f-434b-000000000001"
 
 // Bluedroid advertising PDU types (esp_ble_adv_type_t). Spelled out here rather
@@ -229,8 +231,37 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //             recent. An AWAKE lock receives instantly and discarded the press;
 //             at hb=60s with a 30s idle window that is ~half the time, failing
 //             intermittently with the app countdown still running.
-#define FW_VERSION "doorlock-1.7"
-#define FW_DISPLAY_VERSION "v1.7" // shown on-screen next to the OZLOCK logo
+//   1.8  M4 — `control` …0006 and the DP dispatch split. An authenticated,
+//             challenged, counter-floored command path: envelope opened under
+//             the SENDER's bond (not just bond #0), challenge compared on EVERY
+//             verb, floor advanced only on execution. DPID 101 `bond_revoke` and
+//             102 `invite_cancel` are handled IN-LOCK and are the first verbs
+//             that never touch the Tuya MCU.
+//             The negative property is the load-bearing one: forwardHexToMcu()
+//             now has an ALLOW-LIST (1, 21-24) instead of forwarding anything
+//             that parsed. Before this, 101/102 arriving on the UNAUTHENTICATED
+//             MQTT path would have been handed straight to a MCU that has no
+//             concept of a bond — and anyone on the site Wi-Fi can publish there.
+//             Also the 1.7 carry-in: the armed assisted unlock now fires BEFORE
+//             openBleWindow() rather than after it. startBle() allocates ~43 KB
+//             of Bluedroid and cost the unlock ~230 ms of latency behind a task
+//             that has nothing to do with opening the door.
+//   1.9  BENCH FIX — a `control` write could vanish with no answer at all.
+//             ozControlTry() consumed the whole buffer with ctlReset() AFTER
+//             notifying, and notifyStatus() holds a 150 ms settle after
+//             notify(). So the client got its answer while the lock was still
+//             inside that delay, wrote its next message immediately, the BLE
+//             task appended it to the not-yet-cleared buffer, and the reset
+//             then wiped both. ctlLen went to zero, so the idle backstop had
+//             nothing to time out and never fired: a write producing NO status,
+//             which is the exact XF-53 hang the backstop was added to prevent.
+//             I had reasoned this race away while writing M4 on the grounds
+//             that "the app waits for the status before writing again" — which
+//             is backwards; waiting is what lands the write inside the window.
+//             Now ctlConsume(n) drops only the processed bytes, under the
+//             critical section, BEFORE any status goes out.
+#define FW_VERSION "doorlock-1.9"
+#define FW_DISPLAY_VERSION "v1.9" // shown on-screen next to the OZLOCK logo
 
 // ── State machine ───────────────────────────────────────────────────────────
 enum CommState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
@@ -305,6 +336,44 @@ String provBuf;
 uint8_t bleChallenge[16];
 bool bleChallengeValid = false;
 String memberBuf; // chunked …0007 JSON, same reassembly rule as provBuf
+
+// ── M4: the …0006 `control` reassembly buffer ────────────────────────────────
+//
+// `control` is the one characteristic whose payload is BINARY, so it cannot use
+// the "a chunk starting '{' resets the buffer, parse when the JSON completes"
+// rule the other two share. The wire shape is frozen —
+// utf8(app_id_hex, 64) ‖ envelope — and the envelope carries no length field, so
+// there is nothing in the bytes that says how many chunks are still coming.
+//
+// The GCM tag IS the completeness oracle, so we use it as one: on every chunk,
+// once enough bytes exist to be a shortest-possible message, try to open. A
+// truncated envelope fails the tag; the complete one passes. That makes the
+// happy path instant and needs no wire change. (At the MTU 247 the app requests,
+// a control write is one chunk anyway and this never loops.)
+//
+// What the tag CANNOT tell us is "incomplete" from "forged" — both are just a
+// failure. Left there, a corrupted write would get silence, and silence is the
+// exact failure mode XF-53 was: the app writes, waits for a status that is never
+// coming, and hangs. So an idle timer closes it out: no further chunk for
+// OZ_CTL_IDLE_MS means the message is as complete as it is ever going to be, and
+// it gets a definite UNLOCK_DENIED.
+//
+// WHICH TASK runs this is a design decision, not an accident. onWrite() fires on
+// the BLE task; the idle timer fires in loop() on the Arduino task. If both
+// could open envelopes, they would race over this buffer and over the plaintext
+// they decrypt into. So the BLE task ONLY appends — under a critical section,
+// because a torn ctlLen is a torn message — and every expensive or blocking step
+// (X25519, GCM, the NVS floor write, the 300 ms self-revoke flush) happens in
+// loop(). That also keeps a 512-byte plaintext buffer and a key agreement off
+// the BLE stack, which is the same constraint that forced M3's invite decode
+// buffer to be static.
+#define OZ_CTL_MAX 512      // 64 hex + envelope(21+16) + the largest v1 frame
+#define OZ_CTL_IDLE_MS 400UL
+static uint8_t ctlBuf[OZ_CTL_MAX];
+static size_t ctlLen = 0;
+static unsigned long ctlLastChunkAt = 0;
+static volatile bool ctlNewBytes = false;
+static portMUX_TYPE ctlMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Networking
 WiFiClient wifiTcp;
@@ -930,6 +999,11 @@ String describeDpid(const uint8_t *f, size_t n) {
   }
   if (dpid == 1) return String("unlock channel report");
   if (dpid == 5) return String("battery alarm");
+  // M4 verbs. Named here so a bench capture reads as English rather than "DP
+  // 101 type 0 len 32" — the whole point of the LockSim test is being able to
+  // see at a glance that these never crossed the wire.
+  if (dpid == 101) return String("bond_revoke (in-lock, never forwarded)");
+  if (dpid == 102) return String("invite_cancel (in-lock, never forwarded)");
   return String("DP ") + dpid + " type " + type + " len " + vlen;
 }
 
@@ -1090,6 +1164,39 @@ void publishUnpairedAnnounce() {
 // (Wi-Fi) or the F4 Thread UDP relay's "payload" field — parse the hex,
 // forward to the MCU, mirror a remote-unlock locally. Spaced or bare hex
 // both accepted (OZKEYSERV publishes spaced; bridge32's F4 envelope is bare).
+// ── M4: the DP dispatch split (CONTRACT.md [XF-47]) ──────────────────────────
+//
+// | DP       | handling                                        |
+// |----------|-------------------------------------------------|
+// | 1, 21-24 | forwarded to the Tuya MCU — the existing path   |
+// | 101, 102 | handled IN-LOCK, never forwarded                |
+// | unknown  | REJECTED, never forwarded                       |
+//
+// The reject rule is why this is an allow-list and not a pair of `if (dp == 101)`
+// guards. Blind forwarding of an authenticated-but-unrecognised verb is not a
+// property worth keeping, and on THIS path the frames are not authenticated at
+// all: the MQTT broker is anon-open (a guest on the site Wi-Fi can publish to the
+// command topic), so everything arriving here is attacker-reachable. 101 and 102
+// are bond verbs. The MCU has no concept of a bond, so forwarding one would at
+// best be silently ignored and at worst fault the MCU — and executing one here
+// would let an unauthenticated publisher revoke the owner's members. They are
+// BLE-`control`-only verbs, where a bond, a challenge and a counter floor all
+// have to line up first. On this path they are DROPPED, not executed.
+static bool ozDpForwardable(uint8_t dp) {
+  return dp == 1 || (dp >= 21 && dp <= 24);
+}
+
+// Send a parsed, already-vetted frame. Split out of forwardHexToMcu() so the M4
+// `control` path can reach the MCU with bytes it never had to re-hex.
+void forwardFrameToMcu(const uint8_t *frame, size_t fn) {
+  Serial.printf("[FWD] cmd -> MCU: %s\n", describeDpid(frame, fn).c_str());
+  tuyaWireSend(frame, fn);
+  // remote unlock (DP 1 BOOL 01): LockSim unlocks on receipt — mirror it
+  if (fn >= 11 && frame[3] == 0x06 && frame[6] == 1 && frame[7] == 0x01 &&
+      frame[10] == 0x01)
+    markDoorUnlocked();
+}
+
 void forwardHexToMcu(const String &hex) {
   static uint8_t frame[256];
   size_t fn = 0;
@@ -1107,12 +1214,24 @@ void forwardHexToMcu(const String &hex) {
     }
   }
   if (fn < 4) return;
-  Serial.printf("[FWD] server cmd -> MCU: %s\n", describeDpid(frame, fn).c_str());
-  tuyaWireSend(frame, fn);
-  // remote unlock (DP 1 BOOL 01): LockSim unlocks on receipt — mirror it
-  if (fn >= 11 && frame[3] == 0x06 && frame[6] == 1 && frame[7] == 0x01 &&
-      frame[10] == 0x01)
-    markDoorUnlocked();
+
+  // The dispatch gate. A DPID only exists on a 0x06 DP-write, which is the only
+  // shape a server has ever sent — so anything else is unrecognised by
+  // definition and falls to the same rejection.
+  if (fn < 11 || frame[3] != 0x06) {
+    Serial.printf("[FWD] REJECTED — not a DP write (cmd 0x%02X, %u B), not forwarded\n",
+                  fn >= 4 ? frame[3] : 0, (unsigned)fn);
+    return;
+  }
+  const uint8_t dp = frame[6];
+  if (!ozDpForwardable(dp)) {
+    Serial.printf("[FWD] REJECTED DP %u — %s, NOT forwarded to the MCU\n", dp,
+                  (dp == 101 || dp == 102)
+                      ? "a bond verb; BLE `control` is the only path that may carry it"
+                      : "not on the forward allow-list (1, 21-24)");
+    return;
+  }
+  forwardFrameToMcu(frame, fn);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1894,6 +2013,463 @@ class MemberCB : public BLECharacteristicCallbacks {
   }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// M4 — `control` …0006 (CONTRACT.md "Operational / member profile")
+//
+// Wire: utf8(app_id_hex, 64) ‖ OzkeyEnvelope, envelope plaintext =
+// challenge(16) ‖ DPID frame. Four gates, in this order, ALL of them mandatory:
+//
+//   1. the sender names a bond            — else there is no key to open with
+//   2. the envelope opens under that bond — AEAD authenticity
+//   3. the challenge matches the one THIS connection was just issued
+//   4. the counter is above that bond's floor
+//
+// Gate 3 is unconditional across every verb (XF-47), and the reason is not
+// obvious: when a revoked pubkey is later re-invited its bond is re-created with
+// counter_floor = 0, while frames captured from its previous life carry counters
+// 1..N — every one of which clears that floor. Gate 4 is blind to them. The
+// stale challenge is the ONLY thing standing between a captured frame and a door
+// that opens. Do not "optimise" it away for the non-unlock verbs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Structural validation of a Tuya DP-write frame, checksum included. The
+// envelope already proved WHO sent these bytes; this proves they are a frame at
+// all, before any field is read out of them. Length is checked twice over
+// (frame-level `len` and the DP's own `vlen`) because they are independent
+// fields that a malformed-but-authentic sender could disagree on, and every
+// later read indexes off one or the other.
+static bool ozTuyaFrameOk(const uint8_t *f, size_t n) {
+  if (n < 11 || f[0] != 0x55 || f[1] != 0xAA || f[3] != 0x06) return false;
+  const size_t dlen = ((size_t)f[4] << 8) | f[5];
+  if (6 + dlen + 1 != n) return false;
+  const size_t vlen = ((size_t)f[8] << 8) | f[9];
+  if (10 + vlen + 1 != n) return false;
+  uint8_t sum = 0;
+  for (size_t i = 0; i + 1 < n; i++) sum += f[i];
+  return sum == f[n - 1];
+}
+
+// Build a DP-write frame in place: 55 AA 00 06 <len:2> <dp> <type> <vlen:2>
+// <value> <ck>. Returns the frame length. Used by the self-test below and
+// nowhere else — the lock never mints 101/102, it only receives them — but
+// generating the vectors instead of transcribing them is the 1.6 lesson: leg 9
+// failed on its first flash because a hand-wrapped C literal had silently lost
+// 16 characters out of the middle.
+static size_t ozBuildDpFrame(uint8_t dp, uint8_t type, const uint8_t *val,
+                             size_t vlen, uint8_t *out) {
+  const size_t dlen = 4 + vlen;
+  out[0] = 0x55; out[1] = 0xAA; out[2] = 0x00; out[3] = 0x06;
+  out[4] = (uint8_t)(dlen >> 8); out[5] = (uint8_t)(dlen & 0xFF);
+  out[6] = dp; out[7] = type;
+  out[8] = (uint8_t)(vlen >> 8); out[9] = (uint8_t)(vlen & 0xFF);
+  memcpy(out + 10, val, vlen);
+  const size_t n = 6 + dlen + 1;
+  uint8_t sum = 0;
+  for (size_t i = 0; i + 1 < n; i++) sum += out[i];
+  out[n - 1] = sum;
+  return n;
+}
+
+// ── M4 boot self-test: the DP dispatch split ─────────────────────────────────
+//
+// The M4 property that matters is a NEGATIVE one — 101 and 102 must never reach
+// the Tuya MCU — and a negative is exactly what a bench capture is worst at
+// proving: "I did not see the frame" and "I was not looking properly" produce
+// identical hex. LockSim still shows the wire, but this checks the predicate
+// that decides it, on every unit, on every boot, in a line the operator can read
+// without a second terminal. Cheap: no I/O, no crypto, runs in microseconds.
+static bool ozM4SelfTest() {
+  bool ok = true;
+
+  {
+    // The forward allow-list. 101/102 are called out separately from the other
+    // rejects because they are the ones that would be MEANINGFUL to the MCU's
+    // parser if they ever arrived — the rest are merely unrecognised.
+    const uint8_t allow[] = {1, 21, 22, 23, 24};
+    const uint8_t deny[]  = {101, 102};
+    const uint8_t junk[]  = {0, 2, 5, 8, 20, 25, 100, 103, 200, 255};
+    bool pass = true;
+    for (uint8_t d : allow) if (!ozDpForwardable(d)) pass = false;
+    for (uint8_t d : deny)  if (ozDpForwardable(d))  pass = false;
+    for (uint8_t d : junk)  if (ozDpForwardable(d))  pass = false;
+    ok &= pass;
+    Serial.printf("[CRYPTO] selftest dp-allow-list %s (101/102 forwardable=%d/%d)\n",
+                  pass ? "PASS" : "FAIL — 101/102 COULD REACH THE MCU",
+                  (int)ozDpForwardable(101), (int)ozDpForwardable(102));
+  }
+
+  {
+    // The CONTRACT.md frames, byte-for-byte, through the structural validator.
+    uint8_t pub[32], nonce[16], f[64];
+    for (int i = 0; i < 32; i++) pub[i] = (uint8_t)(0xA0 + i);
+    for (int i = 0; i < 16; i++) nonce[i] = (uint8_t)(0x10 + i);
+
+    const size_t n101 = ozBuildDpFrame(101, 0x00, pub, 32, f);
+    bool pass = (n101 == 43) && ozTuyaFrameOk(f, n101) && f[4] == 0x00 &&
+                f[5] == 0x24 && f[6] == 0x65;
+    // A flipped checksum must fail. This is the branch that stops a corrupted
+    // relay frame being executed as a revoke.
+    f[n101 - 1] ^= 0xFF;
+    pass &= !ozTuyaFrameOk(f, n101);
+    f[n101 - 1] ^= 0xFF;
+    // So must a frame whose two length fields disagree — they are independent,
+    // and every field read downstream indexes off one or the other.
+    f[9] = 0x1F;
+    pass &= !ozTuyaFrameOk(f, n101);
+
+    const size_t n102 = ozBuildDpFrame(102, 0x00, nonce, 16, f);
+    pass &= (n102 == 27) && ozTuyaFrameOk(f, n102) && f[4] == 0x00 &&
+            f[5] == 0x14 && f[6] == 0x66;
+    ok &= pass;
+    Serial.printf("[CRYPTO] selftest dp-frame-101/102 %s (%u B / %u B)\n",
+                  pass ? "PASS" : "FAIL", (unsigned)n101, (unsigned)n102);
+  }
+
+  Serial.printf("[CRYPTO] selftest M4 %s\n",
+                ok ? "PASS (dispatch split holds)" : "FAIL — do not ship this");
+  return ok;
+}
+
+// DPID 101 — bond_revoke. Value = the target's 32-byte pubkey, raw.
+static void handleBondRevoke(int senderSlot, const uint8_t *v, size_t vlen) {
+  if (vlen != 32) {
+    Serial.printf("[REVOKE] 101 value is %u B, expected 32\n", (unsigned)vlen);
+    notifyStatus("REVOKE_DENIED");
+    return;
+  }
+  const bool admin = (g_bonds[senderSlot].role == OZ_ROLE_ADMIN);
+  const int target = ozBondFind(v);
+
+  // Bond #0 is never revocable, by anyone, including itself. Checked FIRST so
+  // the answer is the same whether or not the caller is the owner.
+  if (target == 0) {
+    Serial.println("[REVOKE] target is bond #0 — never revocable");
+    notifyStatus("REVOKE_DENIED");
+    return;
+  }
+  // A member may revoke exactly one bond: its own ("Rời khỏi cửa này"). This is
+  // checked BEFORE the not-found branch on purpose — otherwise a member could
+  // walk the table and learn which pubkeys hold a bond on this lock by the
+  // difference between DENIED and NOT_FOUND.
+  if (!admin && memcmp(v, g_bonds[senderSlot].pub, 32) != 0) {
+    Serial.println("[REVOKE] a member may only revoke itself");
+    notifyStatus("REVOKE_DENIED");
+    return;
+  }
+  if (target < 0) {
+    Serial.println("[REVOKE] no bond holds that pubkey");
+    notifyStatus("REVOKE_NOT_FOUND");
+    return;
+  }
+
+  char label[OZ_LABEL_MAX];
+  copyLabelUtf8(g_bonds[target].label, label, sizeof(label));
+
+  // REVOKE FIRST, ANSWER SECOND — including on self-revoke.
+  //
+  // This was the other way round until 2026-08-04, on the reasoning XF-47 wrote
+  // down and I implemented without checking: "emit REVOKE_OK and let it flush
+  // BEFORE the bond becomes unusable, or a member can never confirm their own
+  // removal." **That premise is false.** `notifyStatus()` writes a plaintext
+  // string to …0003 and gates only on the LINK COUNT — it is not sealed under
+  // the bond and knows nothing about one. Revoking does not drop the BLE link
+  // and cannot stop the answer being delivered. The member confirms their own
+  // removal perfectly well from the far side of it.
+  //
+  // What the old order did buy was a 300 ms window in which the app had been
+  // told REVOKE_OK — and would drop the row — while the bond still sat in NVS.
+  // A reset or a flat battery inside that window left the member believing they
+  // had left a door that still trusted their key. Fail-OPEN, on the one verb
+  // whose entire job is withdrawal, in the case that matters most (a cleaner
+  // finishing a job, someone leaving a relationship).
+  //
+  // ftpos independently described the correct model in their member-management
+  // report — "the lock forgets first, then the app drops the row" — which is
+  // what caught this.
+  ozBondRevoke(target); // memsets the slot and commits NVS before we answer
+  Serial.printf("[REVOKE] bond %d ('%s') revoked by %s bond %d (%d/%d remain)\n",
+                target, label, admin ? "admin" : "member", senderSlot,
+                ozBondCount(), OZ_BOND_MAX);
+  screenDirty = true;
+  notifyStatus("REVOKE_OK"); // the user's answer first…
+  publishLog("bond_revoked", label); // …then the housekeeping
+}
+
+// DPID 102 — invite_cancel. Value = the 16-byte invite nonce. Kills a QR that
+// was photographed but never redeemed; this is the real expiry control, since
+// `expires` is parse-and-ignore on a lock with no clock (XF-47).
+static void handleInviteCancel(int senderSlot, const uint8_t *v, size_t vlen) {
+  if (vlen != 16) {
+    Serial.printf("[CANCEL] 102 value is %u B, expected 16\n", (unsigned)vlen);
+    notifyStatus("REVOKE_DENIED");
+    return;
+  }
+  if (g_bonds[senderSlot].role != OZ_ROLE_ADMIN) {
+    Serial.println("[CANCEL] 102 is admin-only");
+    notifyStatus("REVOKE_DENIED");
+    return;
+  }
+
+  const OzNonceState ns = ozNonceCheck(v, OZ_NONCE_CANCELLED);
+  if (ns == OZ_NONCE_SAME_PUB) {
+    // Already burned against the cancel marker. Idempotent: the invite is dead,
+    // which is what was asked for, so answering OK is the honest result.
+    Serial.println("[CANCEL] invite was already cancelled — idempotent OK");
+    notifyStatus("REVOKE_OK");
+    return;
+  }
+  if (ns == OZ_NONCE_REPLAY) {
+    // Burned against a REAL pubkey: the invite was redeemed and is now a bond.
+    // Cancelling it would do nothing — 101 is the verb for that. Note this is
+    // also where a heap failure lands (ozNonceCheck fails closed), which for a
+    // CANCEL is the unsafe direction: the invite stays alive. Saying DENIED is
+    // what makes that visible enough to retry.
+    Serial.println("[CANCEL] nonce already redeemed (or cache unreadable) — "
+                   "use 101 bond_revoke on the resulting bond");
+    notifyStatus("REVOKE_DENIED");
+    return;
+  }
+
+  ozNonceBurn(v, OZ_NONCE_CANCELLED);
+  Serial.println("[CANCEL] invite nonce burned — that QR can no longer enrol");
+  publishLog("invite_cancelled", "admin cancelled an unredeemed invite");
+  notifyStatus("REVOKE_OK");
+}
+
+static void ctlReset() {
+  portENTER_CRITICAL(&ctlMux);
+  ctlLen = 0;
+  portEXIT_CRITICAL(&ctlMux);
+  ctlLastChunkAt = 0;
+  ctlNewBytes = false;
+  memset(ctlBuf, 0, sizeof(ctlBuf));
+}
+
+// Drop the [n] bytes we just processed, KEEPING anything that arrived while we
+// were processing them.
+//
+// This replaced a flat ctlReset() after a bench failure on 2026-08-04, and the
+// reasoning that produced the bug is worth keeping written down. I decided a
+// write could not land mid-processing "because the app waits for the status
+// before sending anything else." That is exactly backwards: notifyStatus()
+// holds a 150 ms settle AFTER notify(), so the client receives its answer while
+// the lock is still inside that delay and writes immediately — landing the next
+// message in the window, every time, rather than rarely. The BLE task appended
+// it to the not-yet-cleared buffer and ctlReset() then wiped both.
+//
+// The failure mode was the worst available: ctlLen went to zero, so the idle
+// backstop had nothing left to time out and never fired. A write that produces
+// NO status at all — the precise XF-53 hang the backstop exists to prevent,
+// reconstructed inside the fix for it. Bench evidence: probe 2 of three
+// produced no `[CTL]` line whatsoever while probes 1 and 3, spaced 5 s apart,
+// both answered.
+static void ctlConsume(size_t n) {
+  portENTER_CRITICAL(&ctlMux);
+  if (n >= ctlLen) {
+    ctlLen = 0;
+  } else {
+    memmove(ctlBuf, ctlBuf + n, ctlLen - n);
+    ctlLen -= n;
+  }
+  const bool more = (ctlLen > 0);
+  portEXIT_CRITICAL(&ctlMux);
+  // Anything left is the head of the NEXT message and deserves its own idle
+  // budget — otherwise it inherits a stale timestamp and is closed out early.
+  ctlLastChunkAt = millis();
+  ctlNewBytes = more;
+}
+
+// Execute an opened, challenged, floor-cleared frame.
+static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen) {
+  const uint8_t dp = frame[6];
+  const size_t vlen = ((size_t)frame[8] << 8) | frame[9];
+  const uint8_t *v = frame + 10;
+
+  if (dp == 101) { handleBondRevoke(slot, v, vlen); return; }
+  if (dp == 102) { handleInviteCancel(slot, v, vlen); return; }
+
+  // v1 carries exactly one MCU verb over BLE: DP 1, the at-the-door unlock
+  // (CONTRACT.md …0006, "DP 1 remote-unlock in v1"). Credential frames 21-24
+  // are NOT accepted here — they reach the MCU on the server path, which is
+  // where issuance lives. Accepting them over BLE too would mean two authorities
+  // for one operation, and the BLE one has no server-side record of what it
+  // issued. Anything else is unknown and is rejected, never forwarded.
+  if (dp != 1) {
+    Serial.printf("[CTL] DP %u is not a v1 `control` verb — rejected, "
+                  "NOT forwarded\n", dp);
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+
+  Serial.printf("[CTL] unlock authorised by bond %d ('%s', %s)\n", slot,
+                g_bonds[slot].label,
+                g_bonds[slot].role == OZ_ROLE_ADMIN ? "admin" : "member");
+  forwardFrameToMcu(frame, flen);
+  publishLog("granted", slot == 0 ? "BLE unlock (owner)" : "BLE unlock (member)");
+  notifyStatus("UNLOCK_OK");
+}
+
+// Try to open whatever is buffered. [final] means the idle timer fired and no
+// more bytes are coming, so an unopenable buffer must be answered rather than
+// left to accumulate. Returns true when the buffer was consumed either way.
+static bool ozControlTry(bool final) {
+  // Snapshot the length once. The BLE task may append while we work; taking the
+  // value once means we open a consistent prefix rather than a buffer that grew
+  // underneath the AAD. A late chunk simply means this attempt fails to open and
+  // the next pass tries again with the longer buffer.
+  size_t n;
+  portENTER_CRITICAL(&ctlMux);
+  n = ctlLen;
+  portEXIT_CRITICAL(&ctlMux);
+
+  if (n < 64 + OZ_ENV_MIN) {
+    if (!final) return false;
+    Serial.printf("[CTL] %u B is too short to be a control message\n",
+                  (unsigned)n);
+    ctlConsume(n);
+    notifyStatus("UNLOCK_DENIED");
+    return true;
+  }
+
+  // The first 64 bytes are whole as soon as we are past the minimum length, so
+  // a malformed app_id is answerable now — no reason to make the caller wait
+  // out the idle timer for a verdict that cannot change.
+  char appIdHex[65];
+  memcpy(appIdHex, ctlBuf, 64);
+  appIdHex[64] = 0;
+  if (!ozIsHex(appIdHex, 32)) {
+    Serial.println("[CTL] leading 64 bytes are not an app_id hex string");
+    ctlConsume(n);
+    notifyStatus("UNLOCK_DENIED");
+    return true;
+  }
+  uint8_t senderPub[32];
+  ozFromHex(appIdHex, senderPub, 32);
+  const int slot = ozBondFind(senderPub);
+  if (slot < 0) {
+    Serial.printf("[CTL] %.16s… holds no bond on this lock\n", appIdHex);
+    ctlConsume(n);
+    notifyStatus("UNLOCK_DENIED");
+    return true;
+  }
+
+  uint8_t ps[32], key[32];
+  const bool haveKey =
+      ozBondSecret(slot, ps) &&
+      ozEnvKey(ps, 32, deviceId, String(appIdHex), true /*app->lock*/, key);
+  memset(ps, 0, sizeof(ps));
+  if (!haveKey) {
+    Serial.println("[CTL] could not derive the bond's app->lock key");
+    memset(key, 0, sizeof(key));
+    ctlConsume(n);
+    notifyStatus("UNLOCK_DENIED");
+    return true;
+  }
+
+  uint8_t pt[OZ_CTL_MAX];
+  uint64_t counter = 0;
+  const int ptLen = ozEnvOpen(key, deviceId, ctlBuf + 64, n - 64, pt,
+                              sizeof(pt), &counter);
+  memset(key, 0, sizeof(key));
+  if (ptLen < 0) {
+    // Indistinguishable from here: still arriving, or forged. Keep waiting
+    // unless the idle timer already gave up on it.
+    if (!final) return false;
+    Serial.printf("[CTL] envelope did not open (%u B, bond %d) — denied\n",
+                  (unsigned)(n - 64), slot);
+    ctlConsume(n);
+    notifyStatus("UNLOCK_DENIED");
+    return true;
+  }
+
+  // Opened successfully: the plaintext is in pt[] and ctlBuf is no longer
+  // needed. Release it here, before any status goes out.
+  ctlConsume(n);
+
+  if (ptLen < 16 + 11) {
+    Serial.printf("[CTL] plaintext is %d B — too short for challenge + frame\n",
+                  ptLen);
+    notifyStatus("UNLOCK_DENIED");
+    return true;
+  }
+
+  // Gate 3 — UNCONDITIONAL, every verb, no exceptions (XF-47).
+  if (!bleChallengeValid || !ozCtEq(pt, bleChallenge, 16)) {
+    Serial.printf("[CTL] challenge %s — denied\n",
+                  bleChallengeValid ? "does not match the one issued on this "
+                                      "connection"
+                                    : "was never read on this connection");
+    notifyStatus("UNLOCK_DENIED");
+    return true;
+  }
+  // Burn it. The app reads …0005 before every control write, so requiring a
+  // fresh one costs nothing — and without this, one challenge read would
+  // authorise every frame sent for the rest of the connection.
+  bleChallengeValid = false;
+
+  // Gate 4 — strictly greater. Equal is a replay of the frame we just accepted.
+  if (counter <= g_bonds[slot].floor) {
+    Serial.printf("[CTL] counter %llu is not above bond %d's floor %llu — replay\n",
+                  (unsigned long long)counter, slot,
+                  (unsigned long long)g_bonds[slot].floor);
+    notifyStatus("UNLOCK_DENIED");
+    return true;
+  }
+
+  const uint8_t *frame = pt + 16;
+  const size_t flen = (size_t)ptLen - 16;
+  if (!ozTuyaFrameOk(frame, flen)) {
+    Serial.printf("[CTL] plaintext is authentic but not a valid DP frame (%u B)\n",
+                  (unsigned)flen);
+    notifyStatus("UNLOCK_DENIED");
+    return true;
+  }
+
+  // Advance the floor BEFORE executing. If execution reboots the lock (or the
+  // MCU write hangs), the frame must not become replayable on the way back up —
+  // an unlock that maybe happened is a far better outcome than one that can be
+  // repeated by anyone who captured it.
+  g_bonds[slot].floor = counter;
+  ozBondsSave();
+
+  Serial.printf("[CTL] OPENED — bond %d, counter %llu, DP %u\n", slot,
+                (unsigned long long)counter, frame[6]);
+  ozControlDispatch(slot, frame, flen);
+  return true;
+}
+
+// APPEND ONLY. Everything that interprets these bytes runs in loop() — see the
+// ctlBuf comment for why. getData()/getLength(), never getValue().c_str(): the
+// payload is binary and a c_str() copy would truncate the whole message at the
+// first zero byte in the ciphertext, which one in 256 of them starts with.
+class ControlCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    const uint8_t *data = c->getData();
+    const size_t n = c->getLength();
+    if (!data || !n) return;
+
+    bool overflow = false;
+    portENTER_CRITICAL(&ctlMux);
+    if (ctlLen + n > sizeof(ctlBuf)) {
+      overflow = true;
+      ctlLen = 0;
+    } else {
+      memcpy(ctlBuf + ctlLen, data, n);
+      ctlLen += n;
+    }
+    portEXIT_CRITICAL(&ctlMux);
+
+    if (overflow) {
+      Serial.printf("[CTL] message exceeds %u B — dropped\n",
+                    (unsigned)sizeof(ctlBuf));
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    ctlLastChunkAt = millis();
+    ctlNewBytes = true;
+  }
+};
+
 // M3 `challenge` …0005 — fresh 16 bytes on EVERY read. Generating in the read
 // callback rather than at connect time is what makes it fresh: two unlocks on
 // one connection must not share a challenge, or the second is replayable.
@@ -1989,6 +2565,9 @@ class ServerCB : public BLEServerCallbacks {
       memset(bleChallenge, 0, sizeof(bleChallenge));
       bleChallengeValid = false;
       memberBuf = ""; // a half-written enrolment must not fuse with the next one
+      ctlReset();     // M4: likewise, and it matters more here — a half-written
+                      // control message fusing with the next connection's would
+                      // put one bond's bytes in front of another's app_id
       bleSetBusy(false);
       bleSetConnectable(true); // undo the SCAN_IND switch BEFORE re-advertising
     }
@@ -2031,6 +2610,14 @@ void startBle() {
   chal->setCallbacks(new ChallengeCB());
   esp_fill_random(bleChallenge, sizeof(bleChallenge));
   chal->setValue(bleChallenge, sizeof(bleChallenge));
+
+  // M4 …0006 control — WRITE, binary, reassembled by GCM-tag completeness with
+  // an idle-timer backstop (see ctlBuf). Creating this characteristic is itself
+  // the capability signal the app probes for: its absence means a lock that
+  // cannot authorise an unlock, and the app says so in Vietnamese rather than
+  // writing into the void.
+  BLECharacteristic *ctl = svc->createCharacteristic(CHR_CONTROL, BLECharacteristic::PROPERTY_WRITE);
+  ctl->setCallbacks(new ControlCB());
 
   // M3 …0007 member_enroll — WRITE, chunked JSON (the invite QR alone is ~270 B,
   // well past one MTU).
@@ -2285,6 +2872,7 @@ void setup() {
                   g_bonds[i].label, (unsigned long long)g_bonds[i].floor, h);
   }
   ozCryptoSelfTest();
+  ozM4SelfTest();
 
   if (provisioned && isThread()) {
     // Thread resume (ported from threadcomm.ino): relies entirely on
@@ -2340,6 +2928,29 @@ void loop() {
                   "command dropped\n",
                   ASSISTED_ARM_MS / 1000);
     txlogAppend("expired", "assisted unlock — nobody came to the door");
+  }
+
+  // M4: the whole `control` path runs here, on this task — the BLE callback only
+  // appends. Try to open on every new chunk (at the MTU 247 the app requests
+  // that is the first and only one, so this is a single pass), and when the
+  // chunks stop, close it out.
+  //
+  // The idle backstop exists because the GCM tag cannot distinguish "still
+  // coming" from "forged" — both are just a failure to open. Without it a
+  // corrupted write would get silence, and the app would wait for a status that
+  // is never coming: the XF-53 hang, rebuilt in a new place.
+  if (ctlLen) {
+    const bool idle = (millis() - ctlLastChunkAt) >= OZ_CTL_IDLE_MS;
+    if (ctlNewBytes || idle) {
+      ctlNewBytes = false;
+      if (idle)
+        Serial.printf("[CTL] no chunk for %lums — closing out %u buffered B\n",
+                      OZ_CTL_IDLE_MS, (unsigned)ctlLen);
+      // NOT ctlReset() on success — ozControlTry() consumes exactly the bytes it
+      // processed via ctlConsume(), so a message that arrived while it was
+      // working survives. Wiping wholesale here is what silently ate one.
+      ozControlTry(idle);
+    }
   }
 
   if (bleWindowUntil && !bleWindowOpen() && !bleClientConnected) {
@@ -2498,11 +3109,18 @@ void loop() {
     if (touchRead(tx, ty)) {
       char k = keyAt(tx, ty);
       Serial.printf("[TOUCH] %d,%d -> key '%c'\n", tx, ty, k ? k : '-');
-      if (provisioned) openBleWindow("keypad touch"); // re-arms 60 s per tap
 
       // XF-58: somebody just arrived, and the owner already authorised. Fire the
       // held command and CONSUME it — single-shot, exactly as in the immediate
       // path, so one touch can never satisfy a second press.
+      //
+      // FIRST, before openBleWindow(). 1.7 had these the other way round, which
+      // put the ~43 KB Bluedroid allocation of a cold startBle() — ~230 ms on the
+      // bench — in front of the one action here that is time-critical and already
+      // authorised. Opening the door does not depend on BLE being up, and if
+      // startBle() ever stalled or failed outright it would have delayed or lost
+      // an unlock the owner had already granted. The window is the thing that can
+      // afford to wait.
       if (assistArmedUntil && (long)(millis() - assistArmedUntil) < 0) {
         Serial.println("[ASSIST] touch received — armed assisted unlock ALLOWED");
         const String payload = assistArmedPayload;
@@ -2511,6 +3129,9 @@ void loop() {
         lastTouchAt = 0; // consumed here too; do not also satisfy a later command
         forwardHexToMcu(payload);
       }
+
+      if (provisioned) openBleWindow("keypad touch"); // re-arms 60 s per tap
+
       if (resetArm) {
         resetArm = false;
         if (k == '5') factoryReset();
