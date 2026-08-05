@@ -310,8 +310,8 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 // zero reboots between them (the acceptance test 1.10 was originally meant to
 // pass). XFtposDecisions-62.md has the full story, including the wrong async-
 // race theory this correction replaces.
-#define FW_VERSION "doorlock-1.11"
-#define FW_DISPLAY_VERSION "v1.11" // shown on-screen next to the OZLOCK logo
+#define FW_VERSION "doorlock-1.12"
+#define FW_DISPLAY_VERSION "v1.12" // shown on-screen next to the OZLOCK logo
 
 // ── State machine ───────────────────────────────────────────────────────────
 enum CommState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
@@ -359,7 +359,7 @@ unsigned long threadUdpLastAttempt = 0;
 
 // BLE
 BLEServer *bleServer = nullptr;
-BLECharacteristic *chrStatus = nullptr, *chrInfo = nullptr;
+BLECharacteristic *chrStatus = nullptr, *chrInfo = nullptr, *chrMember = nullptr;
 volatile bool bleClientConnected = false;
 // XF-53 (Y). bleClientConnected used to be a plain bool that onDisconnect set
 // false unconditionally — so ANY link teardown cleared it, including a stale
@@ -1058,6 +1058,7 @@ String describeDpid(const uint8_t *f, size_t n) {
   // see at a glance that these never crossed the wire.
   if (dpid == 101) return String("bond_revoke (in-lock, never forwarded)");
   if (dpid == 102) return String("invite_cancel (in-lock, never forwarded)");
+  if (dpid == 103) return String("list_bonds (in-lock, never forwarded)");
   return String("DP ") + dpid + " type " + type + " len " + vlen;
 }
 
@@ -2290,6 +2291,61 @@ static void handleInviteCancel(int senderSlot, const uint8_t *v, size_t vlen) {
   notifyStatus("REVOKE_OK");
 }
 
+// Send a JSON string out over chrMember in MTU-sized pieces, NOTIFY per piece.
+// Mirrors MemberCB::onWrite's reassembly rule in reverse: the receiver treats
+// a chunk starting with '[' as the start of a fresh buffer and re-tries
+// parsing after every piece, exactly like memberBuf does for an inbound
+// member_enroll payload. No length prefix, no end marker — "it parses" IS
+// the end marker, same convention both directions.
+//
+// 180 B keeps every piece well under the 244 B payload the app's MTU-247
+// request leaves (XF-65 §6) without needing to read back the negotiated MTU.
+static void ozNotifyChunked(const String &json) {
+  static const size_t CHUNK = 180;
+  for (size_t off = 0; off < json.length(); off += CHUNK) {
+    size_t remain = (size_t)json.length() - off;
+    size_t n = remain < CHUNK ? remain : CHUNK;
+    chrMember->setValue((uint8_t *)json.c_str() + off, n);
+    chrMember->notify();
+    delay(30); // let each notification actually transmit before the next
+  }
+}
+
+// DPID 103 — list_bonds. Value = empty (request only). Admin-only, same
+// leak-prevention reasoning as 101's ordering: a member enumerating every
+// other member's pubkey is the thing being prevented, not just self-revoke
+// abuse (doorlock.ino:2204-2212 above). Reply is the same {slot, label,
+// floor, pub} shape the boot serial dump already prints (line ~3001) —
+// reused, not reinvented — delivered via ozNotifyChunked() over chrMember.
+static void handleListBonds(int senderSlot, const uint8_t *v, size_t vlen) {
+  (void)v; (void)vlen; // request carries no payload
+  if (g_bonds[senderSlot].role != OZ_ROLE_ADMIN) {
+    Serial.println("[LIST] 103 is admin-only");
+    notifyStatus("LIST_DENIED");
+    return;
+  }
+
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 1; i < OZ_BOND_MAX; i++) {
+    if (!g_bonds[i].present) continue;
+    JsonObject o = arr.add<JsonObject>();
+    char h[65];
+    ozHex(g_bonds[i].pub, 32, h);
+    o["slot"] = i;
+    o["label"] = g_bonds[i].label;
+    o["floor"] = (unsigned long long)g_bonds[i].floor;
+    o["pub"] = h;
+  }
+  String out;
+  serializeJson(doc, out);
+  Serial.printf("[LIST] 103 — %d bond(s), %u B JSON, sending chunked\n",
+                (int)arr.size(), (unsigned)out.length());
+  ozNotifyChunked(out);
+  String detail = String(arr.size()) + " member(s)";
+  publishLog("bonds_listed", detail.c_str());
+}
+
 static void ctlReset() {
   portENTER_CRITICAL(&ctlMux);
   ctlLen = 0;
@@ -2341,6 +2397,7 @@ static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen) {
 
   if (dp == 101) { handleBondRevoke(slot, v, vlen); return; }
   if (dp == 102) { handleInviteCancel(slot, v, vlen); return; }
+  if (dp == 103) { handleListBonds(slot, v, vlen); return; }
 
   // v1 carries exactly one MCU verb over BLE: DP 1, the at-the-door unlock
   // (CONTRACT.md …0006, "DP 1 remote-unlock in v1"). Credential frames 21-24
@@ -2738,9 +2795,13 @@ void startBle() {
   ctl->setCallbacks(new ControlCB());
 
   // M3 …0007 member_enroll — WRITE, chunked JSON (the invite QR alone is ~270 B,
-  // well past one MTU).
-  BLECharacteristic *mem = svc->createCharacteristic(CHR_MEMBER, BLECharacteristic::PROPERTY_WRITE);
-  mem->setCallbacks(new MemberCB());
+  // well past one MTU). Also carries M4 …103 list_bonds' reply: NOTIFY added
+  // 2026-08-06 so the same chunked-JSON convention runs in both directions on
+  // one characteristic rather than inventing a second one (XF-65 §6).
+  chrMember = svc->createCharacteristic(CHR_MEMBER,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+  chrMember->addDescriptor(new BLE2902());
+  chrMember->setCallbacks(new MemberCB());
 
   chrInfo = svc->createCharacteristic(CHR_INFO, BLECharacteristic::PROPERTY_READ);
   JsonDocument doc;
