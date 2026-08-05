@@ -137,13 +137,34 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 #define CHR_CONTROL "4f5a4b31-0006-4c4f-434b-000000000001"
 #define CHR_MEMBER "4f5a4b31-0007-4c4f-434b-000000000001"
 
-// Bluedroid advertising PDU types (esp_ble_adv_type_t). Spelled out here rather
-// than included: BLEAdvertising::setAdvertisementType() takes a bare uint8_t and
-// the BLE library does not re-export Bluedroid's enum, while
-// esp_gap_ble_api.h is not on the sketch include path in core 3.3.11. Values are
-// the Bluetooth Core spec's own PDU type codes and cannot drift.
-#define OZ_ADV_TYPE_IND 0x00      // connectable, scannable, undirected
-#define OZ_ADV_TYPE_SCAN_IND 0x02 // scannable, NON-connectable, undirected
+// Advertising connectable/non-connectable selector for
+// BLEAdvertising::setAdvertisementType(uint8_t), which forwards the raw byte
+// straight into the active backend's own param struct with NO translation
+// (BLEAdvertising.cpp:140-148) — so the numeric value must already mean the
+// right thing for whichever backend this board actually compiles.
+//
+// BUG, found + fixed 2026-08-06 (doorlock-1.10 regression — see XF-62 §9's
+// correction and CONTRACT.md): this used to hardcode Bluedroid's
+// esp_ble_adv_type_t values (IND=0x00, SCAN_IND=0x02) unconditionally. This
+// board's actual build is NimBLE (confirmed via `arduino-cli --verbose` +
+// a #ifdef probe sketch — CONFIG_NIMBLE_ENABLED, not CONFIG_BLUEDROID_ENABLED),
+// whose conn_mode enum (ble_gap.h) is BLE_GAP_CONN_MODE_NON=0 /
+// _DIR=1 / _UND=2 — DIFFERENT meanings at the same numbers. The old values
+// were landing exactly backwards: "connectable" (0x00) actually set
+// non-connectable, and the busy state (0x02) actually set connectable. This
+// is why the lock always advertised (conn_mode doesn't gate basic scanning)
+// but never accepted a BLE connection when it believed it was available, on
+// every client, from the very first attempt of every boot.
+#if defined(CONFIG_NIMBLE_ENABLED)
+  #define OZ_ADV_TYPE_IND      BLE_GAP_CONN_MODE_UND  // connectable
+  #define OZ_ADV_TYPE_SCAN_IND BLE_GAP_CONN_MODE_NON  // scannable, NON-connectable
+#else
+  // Bluedroid esp_ble_adv_type_t — Bluetooth Core spec PDU type codes,
+  // spelled out rather than included (esp_gap_ble_api.h is not on the sketch
+  // include path in core 3.3.11).
+  #define OZ_ADV_TYPE_IND      0x00  // connectable, scannable, undirected
+  #define OZ_ADV_TYPE_SCAN_IND 0x02  // scannable, NON-connectable, undirected
+#endif
 // ── Firmware version ────────────────────────────────────────────────────────
 // BUMP THE MINOR ON EVERY FLASHED CHANGE (operator directive 2026-08-02). This
 // is not bookkeeping: FW_VERSION goes out on `info.fw` and is persisted as
@@ -282,8 +303,15 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //             the console which mode it is. bleSetConnectable() is deleted; a
 //             helper that sets adv_type without the surrounding sequence is the
 //             trap that caused this.
-#define FW_VERSION "doorlock-1.10"
-#define FW_DISPLAY_VERSION "v1.10" // shown on-screen next to the OZLOCK logo
+// 1.11 (2026-08-06): fixed the REAL cause of 1.10's "sees the lock, cannot
+// connect" — OZ_ADV_TYPE_IND/SCAN_IND were Bluedroid values on a NimBLE build,
+// landing exactly backwards on conn_mode. See the definitions above and
+// bleRearmAdvertising()'s comment. 4 consecutive BLE connects verified with
+// zero reboots between them (the acceptance test 1.10 was originally meant to
+// pass). XFtposDecisions-62.md has the full story, including the wrong async-
+// race theory this correction replaces.
+#define FW_VERSION "doorlock-1.11"
+#define FW_DISPLAY_VERSION "v1.11" // shown on-screen next to the OZLOCK logo
 
 // ── State machine ───────────────────────────────────────────────────────────
 enum CommState { ST_ADVERTISING, ST_JOINING, ST_OPERATIONAL };
@@ -2571,19 +2599,44 @@ void bleSetBusy(bool busy) {
 // scannable so the busy byte is readable, but the link layer refuses — which IS
 // the single-connection enforcement (CONTRACT.md M3 realization note 5).
 //
-// The delays are not superstition. esp_ble_gap_stop_advertising() and the
-// scan-response config are both async, and Bluedroid silently ignores an
-// adv-params change while advertising is running. Settling between the steps is
-// what makes the sequence deterministic instead of a race we lose once per boot.
+// 2026-08-06 CORRECTION — the real 1.10 bug was never an async race. That
+// theory (a first draft of this comment, and of XFtposDecisions-62.md §9)
+// was written reading BLEAdvertising.cpp's *Bluedroid* implementation
+// (BLEAdvertising.cpp:639-1434) — code this board never runs.
+// `arduino-cli --verbose` + a #ifdef probe sketch confirmed this exact
+// ESP32-C6 build compiles NimBLE (CONFIG_NIMBLE_ENABLED), whose start()/stop()
+// (BLEAdvertising.cpp:1440+) call ble_gap_adv_start()/ble_gap_adv_stop()
+// directly — synchronous host-stack calls, no async completion events for
+// configuration at all. There is no race to synchronize.
+//
+// The actual bug: OZ_ADV_TYPE_IND/OZ_ADV_TYPE_SCAN_IND (below) are Bluedroid's
+// esp_ble_adv_type_t numeric values (IND=0x00, SCAN_IND=0x02).
+// BLEAdvertising::setAdvertisementType()'s NimBLE branch
+// (BLEAdvertising.cpp:145-147) writes that raw byte straight into
+// m_advParams.conn_mode with NO translation — and NimBLE's conn_mode enum
+// (ble_gap.h:2156-2158) is BLE_GAP_CONN_MODE_NON=0 / _DIR=1 / _UND=2, a
+// DIFFERENT meaning at the same numeric values. So `connectable=true` (value
+// 0x00) was setting conn_mode=BLE_GAP_CONN_MODE_NON — genuinely
+// NON-connectable — and the busy state (0x02) was setting
+// BLE_GAP_CONN_MODE_UND, genuinely connectable: exactly backwards. This
+// explains every symptom without needing any race: the lock always advertised
+// (conn_mode doesn't affect basic scannability) but never accepted a
+// connection when it believed it was available, on any BLE stack, from the
+// very first attempt of every boot — matching XF-62 (BA)'s `trace=[]` finding
+// (the link layer never even reaches `connected`, because a non-connectable
+// PDU cannot be connected to by protocol, not because of any timing).
+//
+// FIX: define the two constants per-backend, the same discriminator pattern
+// the library itself uses throughout BLEAdvertising.cpp.
 void bleRearmAdvertising(bool connectable, const char *why) {
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   if (adv == nullptr) return;
   BLEDevice::stopAdvertising();
-  delay(40);                       // let the GAP stop land
+  delay(40);                       // let the stop land
   adv->setAdvertisementType(connectable ? OZ_ADV_TYPE_IND : OZ_ADV_TYPE_SCAN_IND);
-  bleSetBusy(!connectable);        // AFTER the type — its async restart uses it
+  bleSetBusy(!connectable);        // AFTER the type
   delay(40);
-  BLEDevice::startAdvertising();   // idempotent if the callback already started
+  BLEDevice::startAdvertising();
   Serial.printf("[BLE] advertising %s (busy=%d) — %s\n",
                 connectable ? "IND/connectable" : "SCAN_IND/busy",
                 connectable ? 0 : 1, why);
