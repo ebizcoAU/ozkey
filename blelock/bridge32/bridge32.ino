@@ -105,8 +105,19 @@ unsigned long lastLcdActivityAt = 0;
 //        this mesh)", which was false and misdirected a full day of debugging.
 //        Bench truth 2026-08-02: bridge and lock shared ext_pan the whole time
 //        with children==0, because the lock was Leader and parented the bridge.
-#define FW_VERSION "bridge32-1.3"
-#define FW_DISPLAY_VERSION "v1.3" // shown on-screen, doorlock.ino's badge convention
+// 1.4 (2026-08-06): [XF-47] bridge ownership guard actually implemented.
+// applyProvision() accepted a write from ANY BLE client, forever, with no
+// app_id check at all — the guard CONTRACT-BRIDGE.md documents as decided
+// since 2026-07-30 was never built. Confirmed exploitable on real hardware
+// (a second, unrelated BANOI identity successfully reconfigured an
+// already-owned bridge) before this fix. Adds: persisted owner_app_id
+// (prefs "owner", cleared only by factory reset), a short-BOOT-press ~60s
+// claim window (same pattern as doorlock.ino's touch/BOOT window), and the
+// exact guard table on both the normal provision path and the `reset`
+// sentinel (previously ungated too — a remote factory-reset was just as
+// reachable by anyone as the provision hijack).
+#define FW_VERSION "bridge32-1.4"
+#define FW_DISPLAY_VERSION "v1.4" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
 // existing mesh) in v0; it is the only network former in the home.
@@ -136,6 +147,21 @@ unsigned long wifiJoinStart = 0;
 unsigned long buttonHeldSince = 0;
 bool buttonWasDown = false;
 
+// [XF-47] Bridge ownership guard (CONTRACT-BRIDGE.md "Bridge ownership guard")
+// — DECIDED 2026-07-30, never actually implemented until now (found
+// 2026-08-06 during M4 bench testing: a second, unrelated BANOI identity
+// was able to open bridge32's provision characteristic and successfully
+// reconfigure an already-owned, already-deployed bridge — no app_id check,
+// no claim window, nothing gating it at all). `applyProvision()` used to
+// accept a write from any BLE client at any time, forever, per the "keep BLE
+// up even post-provision" note further down — exactly the exposure this
+// guard exists to close. Confirmed exploitable on real hardware before
+// being fixed, not merely inferred from reading the code.
+#define BRIDGE_CLAIM_WINDOW_MS 60000UL
+unsigned long claimWindowUntil = 0;
+bool claimWindowOpen() { return claimWindowUntil && (long)(millis() - claimWindowUntil) < 0; }
+String ownerAppId; // "" = unowned. Cleared only by factory reset (prefs.clear()).
+
 void checkFactoryResetButton() {
   bool down = digitalRead(USER_BUTTON) == LOW;
   if (down && !buttonWasDown) {
@@ -154,6 +180,15 @@ void checkFactoryResetButton() {
     } else if (held > 800 && (held / 500) % 2 == 0) {
       // cheap ~500ms-granularity progress blink, no extra timer needed
       Serial.printf("[RESET] holding BOOT... %lus/5s\n", held / 1000);
+    }
+  } else if (!down && buttonWasDown) {
+    // Released. A short press opens the claim window; a long one already
+    // wiped the device and never got here — same pattern as doorlock.ino's
+    // checkFactoryResetButton().
+    unsigned long held = millis() - buttonHeldSince;
+    if (held >= 60UL && held < FACTORY_RESET_HOLD_MS) {
+      claimWindowUntil = millis() + BRIDGE_CLAIM_WINDOW_MS;
+      Serial.printf("[CLAIM] window OPEN %lus (short BOOT press)\n", BRIDGE_CLAIM_WINDOW_MS / 1000);
     }
   }
   buttonWasDown = down;
@@ -205,6 +240,7 @@ void loadConfig() {
   cfgBrokerHost = prefs.getString("bhost", "");
   cfgBrokerPort = prefs.getUShort("bport", 0);
   cfgSiteId = prefs.getString("site", "");
+  ownerAppId = prefs.getString("owner", "");
   prefs.end();
 }
 
@@ -217,6 +253,7 @@ void saveConfig() {
   prefs.putString("bhost", cfgBrokerHost);
   prefs.putUShort("bport", cfgBrokerPort);
   prefs.putString("site", cfgSiteId);
+  prefs.putString("owner", ownerAppId);
   prefs.end();
 }
 
@@ -872,7 +909,40 @@ bool validModePayload(JsonDocument &doc, String &modeOut, String &hostOut,
   return true;
 }
 
+// [XF-47] Bridge ownership guard — the exact table from CONTRACT-BRIDGE.md:
+//   no owner, app_id present OR absent  -> claim window open?  yes: apply (claim
+//                                          if app_id present) | no: BRIDGE_CLAIM_REQUIRED
+//   owner == incoming app_id            -> ok, no window needed (normal re-provision)
+//   owner != incoming app_id            -> BRIDGE_DENIED
+//   owner exists, app_id ABSENT         -> BRIDGE_DENIED
+// Refusal is atomic — caller must not apply ANY field (broker/Wi-Fi/reset) when
+// this returns false, or an attacker who fails the app_id check can still
+// repoint the bridge by omitting it (the exact bypass XF-47 review closed).
+bool bridgeOwnershipCheck(const String &incomingAppId) {
+  if (ownerAppId.length() == 0) {
+    if (!claimWindowOpen()) {
+      Serial.println("[CLAIM] unowned, window closed — BRIDGE_CLAIM_REQUIRED");
+      notifyStatus("BRIDGE_CLAIM_REQUIRED");
+      return false;
+    }
+    if (incomingAppId.length()) {
+      ownerAppId = incomingAppId; // claimed — persisted by the caller's saveConfig()
+      Serial.printf("[CLAIM] bridge claimed by app_id=%.16s…\n", incomingAppId.c_str());
+    } else {
+      Serial.println("[CLAIM] window open, no app_id offered — applying unowned (bench)");
+    }
+    return true;
+  }
+  if (incomingAppId.length() && incomingAppId == ownerAppId) return true; // idempotent
+  Serial.printf("[CLAIM] owner mismatch (owner=%.16s… incoming=%s) — BRIDGE_DENIED\n",
+                ownerAppId.c_str(), incomingAppId.length() ? incomingAppId.c_str() : "(absent)");
+  notifyStatus("BRIDGE_DENIED");
+  return false;
+}
+
 void applyProvision(JsonDocument &doc) {
+  String incomingAppId = doc["app_id"] | "";
+
   // Reset sentinel (2026-07-26): reuses this same write characteristic —
   // same pattern threadcomm uses to tell a Thread dataset from Wi-Fi creds
   // by field presence, just a dedicated key here since "reset" can't be
@@ -887,6 +957,11 @@ void applyProvision(JsonDocument &doc) {
                     pid.c_str(), deviceId.c_str());
       return;
     }
+    // Same ownership guard as any other write — a remote reset is exactly as
+    // destructive as repointing the broker, and was previously reachable by
+    // ANY BLE client with no check at all. Found 2026-08-06 alongside the
+    // main provision-hijack bug; same root cause, same fix.
+    if (!bridgeOwnershipCheck(incomingAppId)) return;
     Serial.println("[PROV] factory reset requested over BLE");
     factoryReset(); // wipes NVS + ESP.restart(); does not return
     return;
@@ -898,6 +973,11 @@ void applyProvision(JsonDocument &doc) {
     notifyStatus("WIFI_FAIL");
     return;
   }
+
+  // Ownership guard BEFORE any field is touched (atomicity — CONTRACT-BRIDGE.md
+  // "Refusal is atomic in every branch"). notifyStatus() for the refusal is
+  // sent inside the check itself.
+  if (!bridgeOwnershipCheck(incomingAppId)) return;
 
   String mode, brokerHost, siteId;
   uint16_t brokerPort;
