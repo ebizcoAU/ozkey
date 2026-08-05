@@ -1,5 +1,6 @@
 # dependencies
 node_modules/
+ozvenv/
 
 # next.js build output
 .next/
