@@ -816,7 +816,36 @@ through it.
 101/102 and the role-gate matrix. Nothing remains open from the original M4
 scope (`XFtposDecisions-59.md` §3).
 
-### 11.5 Committed this session
+### 11.5 BANOI's OWN ceremony cross-verified — phone-to-phone, no bench
+    tooling involved at all
+
+§11.4 verified `ozctl.py`'s new invite/enroll implementation against real
+firmware. Immediately after, the operator ran the equivalent test with
+BANOI's actual production implementation on two physical phones
+(`banoi1`/`banoi2`) against `DoorA` (`ozk-acebe639f8c4`, a lock BANOI
+already owned as bond #0 — no re-provisioning needed):
+
+1. `banoi1` (bond #0) issued a member invite through BANOI's own UI —
+   pure local computation, no BLE write, same as `ozctl.py invite`.
+2. `banoi2` scanned/accepted it. Serial: `[MEMBER] invite VERIFIED
+   label='M1' expires=... (not enforced)` → `nonce burned — cache 1/64` →
+   **`MEMBER_OK`**.
+3. `banoi2`, as the new member, immediately issued "Mở cửa" (open door).
+   Serial: `[CTL] OPENED — bond 1, counter 1, DP 1` → `[CTL] unlock
+   authorised by bond 1 ('M1', member)` → **`UNLOCK_OK`**.
+4. `banoi1`, the owner, also tested "Mở cửa" — confirmed good, unaffected
+   by the new member's bond existing alongside bond #0.
+
+This is the first time BANOI's own member-ceremony implementation has been
+verified end to end against real firmware — everything before this session
+was either bench-tooling verification (§11.4, `ozctl.py` against
+`ozk-b0a6048b5fd8`) or, per ftpos's XF-60 tally, simply never bench-
+verified at all. Two independent app-side implementations (ftpos's dart
+reference test vector, and now BANOI's own production code) and the bench's
+third (`ozctl.py`) all agree with the firmware. Nothing in `blelock/`
+changed to make this pass — it worked on the first attempt.
+
+### 11.6 Committed this session
 
 `ozctl.py` — `invite`, `--state`, `--addr`. No firmware changes; nothing
 else in `blelock/` touched.
