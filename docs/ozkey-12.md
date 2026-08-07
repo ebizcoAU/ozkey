@@ -645,6 +645,7 @@ their 10s timeout fired anyway, for every control verb, not just
 self-revoke. Full exchange in `XFtposDecisions-67.md`.
 
 ### 10.5 Thread-relay unlock latency — investigation opened, NOT concluded
+    (⚠ CLOSED in §12 — modem-sleep theory below was falsified by data)
 
 Operator-reported: some remote unlocks take 5-15s to reach the door, wildly
 variable, units 10-15cm apart (so not a signal-strength story). Traced the
@@ -849,3 +850,174 @@ changed to make this pass — it worked on the first attempt.
 
 `ozctl.py` — `invite`, `--state`, `--addr`. No firmware changes; nothing
 else in `blelock/` touched.
+
+## 12. 2026-08-08 — Thread-relay unlock latency (§10.5) — CLOSED, modem-sleep
+    theory falsified by data, real cause identified
+
+Operator reported the felt latency had dropped to 1-3s and wondered if the
+app team had fixed something on their side. Checked both possible causes
+before trusting the observation:
+
+- **Firmware**: `bridge32.ino` still has no `WiFi.setSleep()` call anywhere
+  in the tree — the §10.5 fix was never applied. Whatever changed, it
+  wasn't that.
+- **App**: the only latency-adjacent ftpos commit in the window is XF-67's
+  `_control()` outcome-wait fix (`af7443f`) — scoped to the member-ceremony
+  `REVOKE_*`/`LIST_*`/`UNLOCK_DENIED` path in `member_ceremony.dart`, not
+  the plain owner-unlock path (`bleUnlock`). Doesn't touch what a normal
+  unlock button press does.
+
+Neither explains a felt change, so the send-side relay path itself was
+re-measured directly instead of guessing.
+
+### 12.1 A capture was already running and covered both the "slow" and
+    "fast" periods
+
+A `duallog.py` (4 serial ports) + `mqttlog.py` pair from the §10.5
+investigation was still running in the background, unattended, since
+11:26 this morning through tonight — the same session that raised §10.5
+never actually stopped it. That gave one continuous, millisecond-
+timestamped record spanning the entire period in question, instead of a
+fresh one-off sample.
+
+Matched every `[MQTT] << .../command` line (server → bridge) to the
+corresponding `[FWD] cmd -> MCU` line (bridge/lock → Tuya MCU, i.e. the
+lock has fully received and is acting on it) by `target` device ID:
+
+| Time | Target | MQTT publish → lock receives |
+|---|---|---|
+| 11:29:50 | `ozk-acebe63acab8` | 217ms |
+| 11:29:56 | `ozk-acebe639f8c4` | 265ms |
+| 11:31:35 | `ozk-acebe63acab8` | 278ms |
+| 18:35:54 | `ozk-acebe639f8c4` | 215ms |
+| 18:35:59 | `ozk-b0a6048b5fd8` | 265ms |
+| 18:36:03 | `ozk-acebe63acab8` | 291ms |
+| 19:16:56 | `ozk-b0a6048b5fd8` | 236ms |
+| 22:16:49 | `ozk-acebe63acab8` | 282ms |
+| 23:44:42 | `ozk-acebe639f8c4` | 309ms |
+| 23:44:46 | `ozk-b0a6048b5fd8` | 291ms |
+
+**Every clean delivery, this morning and tonight alike, is 215-310ms.**
+There is no fast-period/slow-period split in the relay path itself — it
+has been uniformly fast the entire time the capture ran, including the
+exact hours when 5-15s delays were being reported. That rules out
+modem-sleep (or any other bridge/relay-side explanation) as the dominant
+cause: if it were real, it would show up in *some* of these deliveries,
+not none.
+
+### 12.2 The one real outlier traces to board connectivity, not the relay
+
+One command (11:31:39, target `ozk-b0a6048b5fd8`) never produced a
+matching `[FWD]` line within the normal window — the bridge sent its usual
+three-way multicast/unicast attempt, but nothing came back from that
+lock. Checked what that lock's own serial port (`port143101`, confirmed by
+`[ID] device_id=` lines through the rest of the log) was doing at the
+time: **silent for ~11 hours**, from 01:05 the previous night through
+12:04 the next day — no `[MON]` heartbeat, nothing, spanning the whole
+11:31 incident. That matches the already-documented flaky-USB-adapter-
+cable / intermittent-reset issue on this exact board
+([[doorlock-brownout-suspicion]]), not a firmware or relay defect — a
+board that's mid-reset or hasn't rejoined the Thread mesh yet will produce
+exactly this shape of multi-second-or-worse delay on the next command sent
+to it, independent of anything `bridge32` does.
+
+### 12.3 Conclusion
+
+The relay path (server → MQTT → bridge → Thread multicast/unicast → lock)
+was never the bottleneck, in either the slow period or now. The §10.5
+`WiFi.setSleep()` theory is **falsified** by this data, not just
+unconfirmed — dropped, no code change needed. The 5-15s reports are best
+explained by the same bench-level connectivity flakiness already tracked
+elsewhere (flaky USB adapter cable, intermittent `POWERON` resets); the
+"now it's 1-3s" observation isn't a fix, it's the relay being what it
+always measured as (sub-second) minus that flakiness happening not to hit
+during observation. No firmware or app change is warranted from this
+investigation. `duallog.py`/`mqttlog.py` remain in `blelock/bench/` as
+general-purpose tooling, still worth keeping.
+
+**Open only if it recurs**: if a multi-second delay is felt again, capture
+which physical board it hit and check that board's own serial/connectivity
+health at the time before re-opening any relay-side theory.
+
+## 13. 2026-08-08 (continued) — XF-68 live session: touch-window root cause,
+    then BANOI's first real owner-initiated admin revoke, hardware-verified
+
+ftpos raised `XFtposDecisions-68.md` mid-session: a live 2-phone bench
+(`banoi1` = owner, `banoi2` = already-enrolled member on DoorA,
+`ozk-acebe639f8c4`) working through XF-65/66/67's remaining untested
+surfaces, stuck on `banoi1`'s "Đồng bộ" (member-list sync) scan returning
+zero devices for DoorA despite `banoi2` genuinely using touch-assist
+unlock moments earlier.
+
+### 13.1 Root cause (BJ): touch-window timing, not a bug — answered live in
+    XF-68 §4
+
+Watched DoorA's serial (port141101, `duallog.py`, already running from the
+§10.5/§12 investigation) live. Every touch→connect cycle observed
+succeeded cleanly — DoorA (per `CONTRACT.md` line 101-104, 143-153) only
+advertises as BLE-connectable for 60s after a keypad/screen touch, closes
+automatically, no separate signal distinguishing "outside the window" from
+"out of range" (documented at `CONTRACT.md` line 457-461). `banoi1`'s
+zero-device scans landed outside a window; nothing lock-side was wrong.
+Answered in `XFtposDecisions-68.md` §4 with the live trace and a
+recommendation (prompt the user to touch the keypad before scanning,
+rather than a bare retry-or-fail).
+
+### 13.2 First real BANOI-initiated admin revoke — hardware-verified live
+
+Once inside a touch-opened window, `banoi1` revoked `banoi2` from DoorA's
+member sheet ("Thu hồi") — the one XF-68 §1 item explicitly never
+exercised through BANOI's own production code (§11.4/§11.5 of this doc
+verified DP 101/102 via `ozctl.py` bench tooling and BANOI's
+invite→enroll→unlock ceremony, but never a real owner-tap revoke):
+
+```
+02:17:10  [TOUCH] key '3' -> window OPEN 60s
+02:17:11  connect — links=1
+02:17:13  [CTL] OPENED — bond 0, counter 11, DP 101
+02:17:13  [REVOKE] bond 1 ('M1') revoked by admin bond 0
+02:17:13  STATUS: REVOKE_OK
+02:17:13  disconnect — clean, ~2s round trip after connect
+```
+
+**Confirmed effective, not just logged**: a follow-up connect at 02:20:14
+(a different pubkey, `63e371206add95f3…`, not bond 0 — banoi2) got
+`[CTL] ... holds no bond on this lock` -> `UNLOCK_DENIED`. Operator
+confirmed banoi2 could no longer open the door. Real end-to-end proof, not
+just a lock-side status string.
+
+**App-side note, resolved, not a bug**: banoi2's row kept showing `active`
+in banoi1's member sheet immediately after the revoke. Traced the code
+(`banoi_doorlock.dart:4053` `_runBondRevoke` -> `svc.markMemberRevoked` ->
+`_refresh()` on `changed==true`) and found nothing wrong — `REVOKE_OK` was
+already matched pre-XF-67 (`REVOKE_*` prefix), so the ceremony call itself
+never had the UNLOCK_DENIED-style bug. Operator confirmed a full re-open
+of the members sheet showed the correct revoked state. UI staleness only,
+not a data or protocol defect — not worth a ticket unless it recurs
+without the workaround.
+
+### 13.3 Net effect on M4 scope
+
+Closes the last realistic gap between "hardware-verified" (§8, §11) and
+"verified through BANOI's own production code" for the owner-revoke path.
+Combined with §11.5 (BANOI's own invite/enroll), the member ceremony's
+full lifecycle — invite, enroll, unlock, admin-revoke — has now each been
+exercised at least once through real BANOI app code against real
+firmware, phone-to-phone, not just bench tooling.
+
+## 14. 2026-08-08 (continued) — Next priorities, set by the Project Manager
+
+A scan of `ozkey-09.md` through this doc's outstanding items (§10.5/§13 above now closed)
+was reviewed by the Project Manager and returned this order. Recorded here as the
+authoritative backlog going forward — supersedes any priority ordering implied elsewhere in
+docs 09-12.
+
+| # | Item | Owner | Notes |
+|---|---|---|---|
+| 1 | `ozlockserv` relay-opaque migration — sovereignty-breach fix (server stops storing plaintext credentials) | Server/Firmware (ozkey team) | Highest remaining architectural promise from the whitepaper. M4 is done; this is the next step to restore full sovereignty. To be scoped and started. |
+| 2 | Bridge32 → MQTT uplink — lock heartbeat/logs back to server | Firmware (bridge32) | Enables lock state reporting, delivery confirmation, battery monitoring. Core product capability. |
+| 3 | QR trust anchor — commissioning (lock side) and bridge provisioning | Firmware | Designed but not built (lock side); not even designed (bridge side). Lower priority than #1/#2, needed for production trust. |
+| 4 | `bridge32-1.5` debug edit revert — `LCD_IDLE_OFF_MS` disabled | Firmware | Quick, non-blocking; revert in a spare moment. |
+| 5 | Hotel-through-bridge sign-off | System Architect | Architectural decision still pending, not a firmware task. |
+| 6 | Thread range stress test — residential RF validation | Firmware/QA | Important, not urgent; schedule after M4 is stable. |
+| 7 | `[BOOT] reset reason` serial capture | Firmware | Lowest priority, can be deferred indefinitely, not product-critical. |
