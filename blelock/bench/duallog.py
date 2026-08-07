@@ -47,11 +47,20 @@ sys.stderr.flush()
 # device comes back (which also covers "was never plugged in yet").
 RETRY_S = 1.0
 
+last_retry = 0.0
+
 while True:
-    if not fds:
-        time.sleep(RETRY_S)
-        # nothing open; try every known path
-        for p in PORTS:
+    # BUG (found 2026-08-06): this used to only run when `fds` was completely
+    # empty, so once ANY one port reconnected, a still-dropped OTHER port was
+    # never retried again — a single healthy port masked a permanently dead
+    # one. Check for missing ports on every pass instead, throttled to
+    # RETRY_S so a busy healthy port doesn't turn this into a spin.
+    open_paths = set(paths.values())
+    missing = [p for p in PORTS if p not in open_paths]
+    now = time.time()
+    if missing and (now - last_retry) >= RETRY_S:
+        last_retry = now
+        for p in missing:
             fd = try_open(p)
             if fd is not None:
                 paths[fd] = p
@@ -59,6 +68,9 @@ while True:
                 bufs[fd] = b''
                 sys.stderr.write(f"reconnected: {label(p)}\n")
                 sys.stderr.flush()
+
+    if not fds:
+        time.sleep(RETRY_S)
         continue
 
     r, _, _ = select.select(fds, [], [], 1.0)

@@ -29,6 +29,7 @@ Usage:
     ozctl.py revoke <pub_hex64>       # DP 101 — needs a bond
     ozctl.py cancel <nonce_hex32>     # DP 102 — needs bond #0
     ozctl.py enroll <OZINV1:...>      # redeem a BANOI invite, become a member
+    ozctl.py list_bonds               # DP 103 — needs bond #0 (admin-only)
 """
 import argparse, asyncio, json, os, secrets, sys, time
 
@@ -117,6 +118,7 @@ def dp_frame(dpid, dtype, value: bytes) -> bytes:
 FRAME_UNLOCK = lambda: dp_frame(1, 0x01, bytes([0x01]))
 FRAME_REVOKE = lambda pub: dp_frame(101, 0x00, pub)
 FRAME_CANCEL = lambda non: dp_frame(102, 0x00, non)
+FRAME_LIST_BONDS = lambda: dp_frame(103, 0x00, b"")
 
 
 # ── BLE session ─────────────────────────────────────────────────────────────
@@ -124,6 +126,8 @@ class Lock:
     def __init__(self, client):
         self.c = client
         self.status = []
+        self.member_buf = ""
+        self.bonds = None  # set once member_buf parses as JSON
 
     async def watch_status(self):
         def cb(_, data):
@@ -131,6 +135,29 @@ class Lock:
             self.status.append(s)
             log("STATUS<-", s)
         await self.c.start_notify(CHR_STAT, cb)
+
+    async def watch_member(self):
+        # Mirrors doorlock.ino's ozNotifyChunked()/memberBuf convention in
+        # reverse: a chunk starting with '[' begins a fresh buffer, every
+        # piece appends, and "it parses as JSON" IS the end marker — no
+        # length prefix, no explicit terminator.
+        def cb(_, data):
+            chunk = data.decode("utf-8", "replace")
+            self.member_buf = chunk if chunk.startswith("[") else self.member_buf + chunk
+            try:
+                self.bonds = json.loads(self.member_buf)
+                log("LIST<-", f"parsed {len(self.bonds)} bond(s), {len(self.member_buf)} B total")
+            except json.JSONDecodeError:
+                pass  # still assembling
+        await self.c.start_notify(CHR_MEMB, cb)
+
+    async def await_bonds(self, timeout=12.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self.bonds is not None:
+                return self.bonds
+            await asyncio.sleep(0.1)
+        return None
 
     async def info(self):
         raw = await self.c.read_gatt_char(CHR_INFO)
@@ -230,21 +257,38 @@ async def run(args):
             log("RESULT", s or "no MEMBER_* status within timeout")
             return
 
-        # the three control verbs
+        # the control verbs
         if args.cmd == "unlock":
             frame = FRAME_UNLOCK()
         elif args.cmd == "revoke":
             frame = FRAME_REVOKE(bytes.fromhex(args.arg))
         elif args.cmd == "cancel":
             frame = FRAME_CANCEL(bytes.fromhex(args.arg))
+        elif args.cmd == "list_bonds":
+            frame = FRAME_LIST_BONDS()
         else:
             raise SystemExit(f"unknown command {args.cmd}")
 
         log("FRAME", frame.hex(" ").upper())
+        if args.cmd == "list_bonds":
+            await lk.watch_member()
         ch = await lk.challenge()
         log("CHAL", f"issued {ch.hex()}")
         msg = build_control(st, device_id, lock_pub, ch, frame)
         await lk.write_control(msg, chunk=args.chunk)
+
+        if args.cmd == "list_bonds":
+            bonds = await lk.await_bonds(timeout=6.0)
+            if bonds is not None:
+                log("RESULT", f"LIST_OK — {len(bonds)} bond(s)")
+                for b in bonds:
+                    log("BOND", f"slot={b['slot']} label={b['label']!r} "
+                                f"floor={b['floor']} pub={b['pub'][:16]}…")
+            else:
+                s = await lk.await_status(["LIST_"], timeout=1.0)
+                log("RESULT", s or "NO ANSWER — neither a bond list nor LIST_DENIED (defect)")
+            return
+
         s = await lk.await_status(["UNLOCK_", "REVOKE_"])
         log("RESULT", s or "NO STATUS — the lock never answered (this is a defect)")
 
@@ -280,7 +324,7 @@ async def probe(lk, st, device_id, lock_pub):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["keys", "info", "probe", "unlock",
-                                    "revoke", "cancel", "enroll"])
+                                    "revoke", "cancel", "enroll", "list_bonds"])
     ap.add_argument("arg", nargs="?", default="")
     ap.add_argument("--name", default="OZLOCK")
     ap.add_argument("--scan", type=float, default=45.0)
