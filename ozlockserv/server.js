@@ -1127,6 +1127,19 @@ api.delete('/locks', async (req, res) => {
   }
 });
 
+// XF-66 (BH): "delivered" is not derivable from MQTT (QoS 1 only confirms the
+// broker got it, never the lock), so this is a best-effort heuristic, not a
+// guarantee — labeled honestly as `likely_delivered`, matching UnlockResult's
+// own "we know it left, not that the door moved" property. 2.5x heartbeat_s
+// grace: a lock naps between heartbeats by design, so "no heartbeat since
+// last interval" alone would call a perfectly healthy lock offline.
+const RESET_DELIVERY_GRACE = 2.5;
+function likelyOnline(lastSeenAt, heartbeatS) {
+  if (!lastSeenAt) return false;
+  const graceMs = (heartbeatS || CONFIG.DEFAULT_HEARTBEAT_S) * 1000 * RESET_DELIVERY_GRACE;
+  return Date.now() - new Date(lastSeenAt).getTime() < graceMs;
+}
+
 api.delete('/locks/:id', async (req, res) => {
   if (!guardDb(res)) return;
   const conn = await pool.getConnection();
@@ -1135,12 +1148,18 @@ api.delete('/locks/:id', async (req, res) => {
     // Unpair the physical lock too (BANOI "Gỡ khoá" must reset the device,
     // not just the record): tell it to wipe NVS and return to ADVERTISING.
     // Best-effort — an offline lock misses it and needs the on-device reset.
-    const [[lock]] = await conn.query('SELECT site_id FROM locks WHERE id = ?', [id]);
+    const [[lock]] = await conn.query(
+      'SELECT site_id, last_seen_at, heartbeat_s FROM locks WHERE id = ?',
+      [id]
+    );
+    let attempted = false;
+    let likelyDelivered = false;
     if (lock) {
-      mqttPublish(CONFIG.topicCommand(lock.site_id || CONFIG.SITE_ID, id), {
+      attempted = mqttPublish(CONFIG.topicCommand(lock.site_id || CONFIG.SITE_ID, id), {
         op: 'factory_reset',
         ts: new Date().toISOString(),
       });
+      likelyDelivered = attempted && likelyOnline(lock.last_seen_at, lock.heartbeat_s);
     }
     await conn.beginTransaction();
     await purgeLockRows(conn, 'device_id = ?', [id]);
@@ -1148,8 +1167,11 @@ api.delete('/locks/:id', async (req, res) => {
     await conn.commit();
     if (d.affectedRows === 0)
       return res.status(404).json({ ok: false, code: 'lock_not_found', error: `Lock ${id} not found` });
-    logEvent('info', `Doorlock ${id} removed + factory_reset sent`);
-    res.json({ ok: true, id });
+    logEvent(
+      'info',
+      `Doorlock ${id} removed + factory_reset sent (attempted=${attempted} likely_delivered=${likelyDelivered})`
+    );
+    res.json({ ok: true, id, reset: { attempted, likely_delivered: likelyDelivered } });
   } catch (err) {
     try {
       await conn.rollback();
