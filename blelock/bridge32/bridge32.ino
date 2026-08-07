@@ -65,7 +65,11 @@ String lastStatus = "BOOT";
 // wake it — screen state is intentionally independent of the status ladder
 // once it's gone dark, matching "only turn on if someone touch the boot
 // button").
-#define LCD_IDLE_OFF_MS 60000UL // 30s -> 60s (operator request 2026-07-28)
+// TEMP (operator request 2026-08-06): disabled for bench diagnostics — a
+// short BOOT press to wake the screen also opens the 60s ownership claim
+// window (see checkFactoryResetButton()), which contaminates any ownership
+// test. Restore to 60000UL once the bridge-ownership investigation is done.
+#define LCD_IDLE_OFF_MS 0xFFFFFFFFUL
 
 // RX activity flash (2026-07-28, operator request): when a command arrives over
 // MQTT, briefly swap the two footer lines (site / device_id) for a "received"
@@ -116,8 +120,14 @@ unsigned long lastLcdActivityAt = 0;
 // exact guard table on both the normal provision path and the `reset`
 // sentinel (previously ungated too — a remote factory-reset was just as
 // reachable by anyone as the provision hijack).
-#define FW_VERSION "bridge32-1.4"
-#define FW_DISPLAY_VERSION "v1.4" // shown on-screen, doorlock.ino's badge convention
+// 1.5 (2026-08-06): bench-only — LCD_IDLE_OFF_MS disabled (see its
+// definition). No wire/logic change.
+// 1.6 (2026-08-07): USER_BUTTON made an explicit, board-owned #define (was
+// silently inheriting the toolchain's generic BOOT_PIN, same gap found on
+// the doorlock boards). No behavior change on this board — GPIO9 unchanged,
+// still not independently hardware-verified here.
+#define FW_VERSION "bridge32-1.6"
+#define FW_DISPLAY_VERSION "v1.6" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
 // existing mesh) in v0; it is the only network former in the home.
@@ -140,9 +150,17 @@ unsigned long wifiJoinStart = 0;
 // reset even with no app/BLE reachable at all — the orphan case (bridge
 // still running its old config, nothing left to trigger a remote reset
 // from) needs a way out that doesn't depend on radio range or app state.
-#ifndef USER_BUTTON
-#define USER_BUTTON BOOT_PIN
-#endif
+// This is the ONLY reset path with no radio/app up at all, same reasoning
+// as the doorlock boards — so it must be a real, per-board-verified pin,
+// never inherited from the toolchain's generic default.
+//
+// 2026-08-07: this used to silently fall back to the ESP32-C6 core's generic
+// BOOT_PIN (GPIO9, esp32-hal.h) with no board-specific verification — same
+// gap found and fixed on doorlock.ino/doorlock19.ino this session (the 1.9"
+// board's BOOT-hold reset turned out not to work). Kept at 9 here too
+// (unchanged behavior) but NOT independently confirmed against this board's
+// actual schematic — flag if wrong on real hardware.
+#define USER_BUTTON 9
 #define FACTORY_RESET_HOLD_MS 5000UL
 unsigned long buttonHeldSince = 0;
 bool buttonWasDown = false;
