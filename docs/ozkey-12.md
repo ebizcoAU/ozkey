@@ -425,14 +425,62 @@ ending this session. `blelock/bench/` (the `duallog.py` CPU-spin fix from earlie
 in the session) and this doc are also being committed at the same time for the same
 reason — nothing else in the working tree is touched.
 
-### 9.7 Resume point for the next session
+### 9.8 2026-08-06 (continued) — the §9.3 mystery is CLOSED, not open
 
-1. **Run the BANOI #1-without-BOOT-press diagnostic** (§9.3) to settle whether the
-   bridge's owner record is actually intact or actually lost. Do not assume either
-   answer going in.
-2. If the owner record really is gone: figure out why (brownout? a reboot between
-   the claim and now? something in the reset-refusal path that shouldn't mutate
-   state but does?) before trusting `bridge32-1.4` as "done."
+Root cause, found by reading the actual diff of `60d2b82` rather than guessing
+further from live behavior: `ownerAppId`, `prefs.getString("owner", ...)`, and
+`prefs.putString("owner", ...)` are **all new lines in that exact commit** —
+nothing pre-existing was modified. `bridge32-1.3` and everything before it had
+no owner concept in NVS at all. So "the owner record didn't appear to
+persist" was the wrong framing — **there was never anything to persist.**
+Whatever BANOI #1 did earlier under 1.3 was ordinary WiFi/broker provisioning
+with nowhere to write an owner even if it had wanted to. Every "unowned"
+response the guard gave tonight, to both BANOI #1 and #2, was correct.
+
+This is also provable purely from app-level behavior, independent of the git
+diff: if BANOI #1 had ever successfully claimed the bridge since ownership
+tracking existed, BANOI #2 (a different `app_id`) would see `BRIDGE_DENIED`
+(mismatch), never `BRIDGE_CLAIM_REQUIRED` (unowned). Both saw unowned. Only
+one explanation fits both identities getting the same answer.
+
+**Resolution test, run for real tonight, all three branches now hardware-verified:**
+1. BANOI #1, no BOOT press → `BRIDGE_CLAIM_REQUIRED` (already recorded, §9.3).
+2. BANOI #1, BOOT pressed (claim window open) → **claim succeeded.** (One loose
+   end: BANOI #1's app showed this as adding a bridge under a new name rather
+   than recognizing the existing one — an app-side bookkeeping question, not a
+   firmware one; not yet followed up.)
+3. BANOI #2, no BOOT press, immediately after step 2 → `BRIDGE_DENIED`
+   ("Bridge already has owner. Connected with another phone") — the owner
+   guard now actively rejects a non-owner with no window needed, exactly per
+   `CONTRACT-BRIDGE.md`'s two-clause rule. **`bridge32-1.4`'s ownership guard
+   is fully confirmed end-to-end, not partial.**
+
+Serial corroboration was attempted for both step 2 and step 3 and got nothing
+either time — consistent with `bridge32.ino`'s own comment (line ~73) that
+this board's USB-CDC serial has been unreliable to capture all along; not
+treated as contradicting the app-level result, which is unambiguous on its
+own for the reason above.
+
+**Two bench-tooling items opened chasing this, both in the working tree,
+uncommitted as of this writing:**
+- `duallog.py` had a **second**, previously-undiscovered reconnect bug
+  (distinct from the 2026-08-05 EOF-spin fix in §5.1): the reconnect-scan
+  only ran when `fds` was completely empty, so once any one port
+  reconnected, a still-dead *other* port was never retried again. Fixed by
+  checking for missing ports every pass (throttled to 1/s).
+- `bridge32.ino`: `LCD_IDLE_OFF_MS` temporarily disabled (operator request,
+  bench-only) — a BOOT press to wake the idle-blanked screen was found to
+  also open the 60s claim window as a side effect, contaminating exactly the
+  kind of ownership test this section is about. Bumped to `bridge32-1.5`.
+  **Compiled? No — edited but not yet built or flashed.** Revert note is
+  inline at the `#define`.
+
+### 9.7 Resume point for the next session — updated post-§9.8
+
+1. ~~Run the BANOI #1-without-BOOT-press diagnostic~~ — done, §9.8. Bridge
+   ownership guard fully confirmed end-to-end, not just partially.
+2. ~~If owner record really is gone, find out why~~ — done, §9.8: it was never
+   set, not lost (owner tracking is new in `1.4`). No further digging needed.
 3. **Flash `doorlock-1.12`** and hardware-verify `list_bonds` (DPID 103): request
    from an admin bond, confirm the chunked JSON reassembles correctly on a real
    BLE client (a bench script is probably faster to stand up than waiting on
@@ -441,5 +489,204 @@ reason — nothing else in the working tree is touched.
    reconciliation pass (XF-65 (BD)) against a real wire capability instead of a
    proposed one — then the admin-revoke-a-member role-gate row (still untested)
    becomes reachable.
-5. `[BOOT] reset reason` — still open, still lowest priority.
-3. Thread relay latency (§8.6) — flagged, not investigated, operator says it's fine.
+5. **New, small:** figure out why BANOI #1's claim-under-BOOT-window showed up
+   in the app as adding the bridge under a new name instead of recognizing the
+   existing entry (§9.8 step 2's loose end) — app-side, not firmware, low
+   priority.
+6. Compile + flash `bridge32-1.5` (LCD idle-off disabled for bench work) if the
+   claim/deny testing above is considered done for now; revert the `#define`
+   once serial capture reliability on this board is no longer needed for active
+   debugging.
+7. `[BOOT] reset reason` — still open, still lowest priority.
+8. Thread relay latency (§8.6) — flagged, not investigated, operator says it's fine.
+
+## 10. 2026-08-07 — shared-core refactor, keypad+hex UI, XF-66/67, latency
+    investigation opened (not closed)
+
+Long session, several distinct threads. Recorded here so the next session
+doesn't have to reconstruct it from git log alone.
+
+### 10.1 `doorlock.ino`/`doorlock19.ino` unified onto a shared core
+
+`blelock/common/ozdoorlock_core.h` — new. Extracted the ~3260 lines that were
+byte-identical between the two boards (crypto, BLE GATT, bond table, MCU
+forwarding, self-tests, Wi-Fi/Thread transport, dispatch) into one shared
+header, `#include`d by both boards' now-thin `.ino` files (~150 lines each:
+pins, palette, display/touch driver, coordinate transform). `ozcrypto.h`
+consolidated the same way (was byte-identical duplicate, confirmed via
+`diff` before merging).
+
+**Real snag, now fixed**: Arduino's auto-prototype generator only scans the
+primary `.ino`, not `#include`d headers, so every forward-reference call
+(working "for free" in the old monolithic file) broke once the code moved
+into a header. Fixed with 67 explicit forward declarations at the top of
+the shared header, verified against the actual function list, not guessed.
+
+**Version scheme unified** (operator directive — "no point to keep them
+separated"): both boards now share one `FW_VERSION`/`FW_DISPLAY_VERSION`
+string (`doorlock-1.21` as of this write-up) instead of two diverging
+counters. Full per-version changelog lives in each board's own `.ino` file
+header (bumped together on every flashed change, per the existing "bump the
+minor" rule).
+
+**`blelock/Makefile`** — new, wraps `arduino-cli`. `BOARD` names the
+hardware (`147`, `19`, `GEEKC6`, `dlock19`), not the software role — bridge32
+firmware runs on `GEEKC6` today, `P4C6COMBO` is a reserved-but-unconfigured
+slot for the planned future hardware (P4+C6 combo, 32MB flash/32MB PSRAM/
+128GB SD/768KB RAM, meant to also host a hotel PMS server). Every board here
+needs `CDCOnBoot=cdc` in its FQBN or native USB serial never appears at all
+(confirmed the hard way on all three — 1.47", 1.9", and the bridge). Bridge
+is `FlashSize=16M` (confirmed via `esptool flash_id`, not assumed).
+
+**USER_BUTTON made explicit on all three boards** (doorlock, doorlock19,
+bridge32) — was silently inheriting the ESP32-C6 toolchain's generic
+`BOOT_PIN` default with zero board-specific verification. The 1.9" board's
+BOOT-hold factory reset "not working" turned out to be the operator holding
+the wrong physical button (board was upside down on the bench, BOOT/RESET
+swapped from expected) — GPIO9 is confirmed correct once the actual BOOT
+button is used. `ozdoorlock_core.h` now `#error`s at compile time if a board
+forgets to define it (tested: temporarily removed the define, confirmed the
+guard fires, restored it).
+
+**Hardware-verified**: both 1.47" and both 1.9" units flashed and boot
+clean on the final build of the night (`doorlock-1.21` firmware string, LCD
+layout at `1.21`/`v1.21` on-screen) — self-tests PASS, bonds survived every
+reflash (NVS untouched by app-partition writes, as expected), Thread
+rejoined as Child on the healthy units.
+
+**One casualty**: the 1.9" unit `ozk-acebe63acab8` hit three consecutive
+`esptool` write-timeout/serial-noise failures on one USB connection,
+corrupting its app partition into a genuine "no bootable app partition"
+boot loop (bootloader itself still responded fine — confirmed via
+`flash_id`). Recovered cleanly once the operator swapped to a known-good
+cable; NVS/bonds were untouched throughout since the corruption was
+app-partition-only, never a full chip erase.
+
+### 10.2 LCD UI — keypad simplified, hex-command readout, iterated live on
+    real hardware
+
+Multiple real bugs found and fixed only by looking at the actual screen —
+recording the mechanism-level lessons, not just the end state, since the
+end state will keep changing:
+
+- **The `#define` ordering bug**: layout macros (`BADGE_TOP`/`HEX_TOP`/
+  `KP_TOP`/etc.) were originally defined near `drawKeypad()`, far below
+  `drawOperational()` which uses them first — C preprocessor macros only
+  apply after their definition point in the file, so this silently used
+  stale/undefined values until moved earlier. Compiles clean either way;
+  only wrong at runtime. Worth remembering as a class of bug this codebase
+  can hit again.
+- **The real "big red line" bug**: `drawHexReadout()` kept using `STATUS_H`
+  as its y-coordinate after the badge macros were renamed to `BADGE_TOP` —
+  both pointed at the same pixel row, so the hex row's black background
+  painted directly over the color bar on every redraw. Two macros meaning
+  "the same row" by accident, not a typo in a single line.
+- **Flicker**: the 3s periodic "keep IP/role current" tick originally set
+  the same `screenDirty` flag a real state change does, triggering a full
+  `fillScreen()` every 3s. Split into `drawStatusLine()`, a function that
+  clears/redraws only its own thin row (deliberately inset 2px so it never
+  touches the border's own pixels) — the periodic tick calls it directly,
+  bypassing the full-redraw path entirely. Real state changes (lock/unlock,
+  BLE window, a tap) still go through the normal full-redraw path.
+
+**Current layout** (both boards, `1.21`): one status line — `OZLOCK
+V1.21 THREAD CHILD LOCKNAME10 [BLE 20s]` (version/transport/role-or-IP/
+10-char lock name/BLE countdown, countdown gets a filled amber badge when
+the window's open) — then a 40px LOCKED/UNLOCKED color bar + hex-command
+readout on line 2, then a 4×2 drawn keypad (`1234`/`*56#` — reduced from
+4×3 since these taps only exercise touch zones, there's no real PIN
+backend). LockSim/MCU-UART forwarding is unchanged and still real — the hex
+readout is additive, not a replacement (operator correction after an
+earlier wrong assumption on ozkey's part).
+
+This layout is the product of ~10 iterations against real hardware feedback
+in one session — treat it as current, not final. The next real screen
+complaint should be trusted over this doc.
+
+### 10.3 XF-66 — `DELETE /locks/:id` now reports delivery likelihood
+
+Real finding, not hypothetical: the operator hit this live — deleted an
+orphaned (Thread-partitioned) lock from BANOI, app showed it gone, physical
+lock never factory-reset, because the `factory_reset` MQTT publish had no
+path to a lock that wasn't on the bridge's mesh. Confirmed this was the
+exact XF-66 gap ftpos had already flagged (fire-and-forget MQTT, no
+delivery confirmation).
+
+**Shipped** (`ozlockserv/server.js`, live via `node --watch`, not yet
+independently re-verified against a real delete beyond the reload itself):
+`DELETE /locks/:id` now returns `{ ok: true, id, reset: { attempted,
+likely_delivered } }` — `attempted` from `mqttPublish()`'s own
+connected-check (previously computed and silently discarded),
+`likely_delivered` from a `last_seen_at`/`heartbeat_s` freshness heuristic
+(2.5× grace window) computed before publishing. Honestly labeled as a
+heuristic, not a delivery guarantee — ftpos's own `UnlockResult.delivery`
+already has the same "we know it left, not that the door moved" property,
+so this matches an existing convention rather than inventing a new one.
+
+ftpos confirmed the shape and built their side (`DeleteLockResult{attempted,
+likelyDelivered}`, three distinct outcome messages replacing one blanket
+`catch`) — full exchange in `XFtposDecisions-66.md`.
+
+### 10.4 XF-67 — `control`'s "no bond" vs "bad envelope" behavior
+
+ftpos asked whether an unrecognized sender gets a distinct denial, the
+generic denial, or silence. Read `ozControlTry()` directly
+(`ozdoorlock_core.h:2504-2571`) rather than reasoning about it: **no bond at
+all** answers immediately with `UNLOCK_DENIED` (fails at the `ozBondFind()`
+lookup, no envelope-open attempted); **bond exists but envelope fails to
+open** answers with the *same* `UNLOCK_DENIED`, but only after the idle
+timer gives up waiting for more chunks. Same token both ways, different
+timing — no wire change requested or made.
+
+Side effect: this answer led ftpos to find and fix a real bug on their own
+side — `_control()`'s outcome-wait only ever matched tokens starting with
+`REVOKE_`, so a real, already-arrived `UNLOCK_DENIED` sat unrecognized until
+their 10s timeout fired anyway, for every control verb, not just
+self-revoke. Full exchange in `XFtposDecisions-67.md`.
+
+### 10.5 Thread-relay unlock latency — investigation opened, NOT concluded
+
+Operator-reported: some remote unlocks take 5-15s to reach the door, wildly
+variable, units 10-15cm apart (so not a signal-strength story). Traced the
+send-side path end to end (server → MQTT → bridge → Thread) with real
+correlated timestamps (`duallog.py` extended to N ports for this — it was
+already generic despite the name, no code change needed — plus a new
+`blelock/bench/mqttlog.py` for millisecond-timestamped MQTT alongside serial):
+**one real capture showed the full send-side chain complete in under 130ms**
+(MQTT receipt → bridge multicast+unicast send, all three delivery attempts
+fired within 2ms of each other; a non-target node received the multicast in
+67ms). Send-side is not obviously the bottleneck, at least not in that one
+capture.
+
+**Working theory, NOT verified**: `bridge32.ino` never calls
+`WiFi.setSleep()`, and the installed Arduino-ESP32 core's own default for
+ESP32-C6 is `WIFI_PS_MIN_MODEM` (confirmed by reading
+`WiFiGeneric.cpp:385-389` directly — S2 defaults to `WIFI_PS_NONE`, every
+other target including C6 defaults to modem-sleep ON). Modem-sleep means the
+AP buffers packets for the bridge and only delivers at the next DTIM beacon
+— which would explain variable, distance-independent delay that disappears
+right after recent activity keeps the radio awake. Fits the reported
+symptom shape well, but **the confirming experiment was never completed**:
+the operator deliberately let the bench idle to test cold-start latency, a
+power reset happened before the test command was sent, and the whole
+capture was lost. Nothing was changed in code — `WiFi.setSleep(false)` is
+proposed, not applied.
+
+**Resume point**: redo the idle-then-command test with the same 4-port +
+MQTT `duallog.py`/`mqttlog.py` setup (both scripts already exist in
+`blelock/bench/`, both are keepers regardless of what this test finds). If
+the pattern holds — slow after genuine idle, fast back-to-back — add
+`WiFi.setSleep(false);` right after `WiFi.begin()` in `bridge32.ino` and
+retest. If it doesn't reproduce, the multicast/MPL theory from earlier in
+this same investigation (bridge32's own code comment calls its multicast
+relay a "v0" stopgap pending real unicast-to-mesh-local-address routing) is
+the fallback hypothesis, untested either way.
+
+### 10.6 Not committed as of this write-up
+
+`blelock/bench/ozctl_state.json` — contains a bench identity **private
+key**, deliberately never committed, should stay untracked (add to
+`.gitignore` if it keeps showing up in `git status`).
+`docs/Sovereign-Edge-Paper-v4_5.pdf` — appeared in the working tree this
+session, not part of any of the above work; left alone rather than guessed
+at.
