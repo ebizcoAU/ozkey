@@ -690,3 +690,133 @@ key**, deliberately never committed, should stay untracked (add to
 `docs/Sovereign-Edge-Paper-v4_5.pdf` — appeared in the working tree this
 session, not part of any of the above work; left alone rather than guessed
 at.
+
+## 11. 2026-08-07 (continued) — M4's last surface closed: member ceremony +
+    DPID 101/102, hardware-verified live, entirely from the bench
+
+§8.5 left one thing open for M4: a member bond had never actually existed on
+a lock, so DPID 101 (`bond_revoke`) and 102 (`invite_cancel`) — firmware-
+complete since `doorlock-1.8` — had never been reachable. The blocker was
+assumed to be a missing handoff path for getting a BANOI-generated QR's raw
+text into `ozctl.py`. That assumption was wrong, and the real path turned
+out to need no phone at all.
+
+### 11.1 The invite doesn't need BANOI — bond #0 already has everything
+
+The invite MAC (`CONTRACT.md` "Member-enroll lock-side algorithm") is keyed
+on `mac_key = HKDF-SHA256(ikm = bond#0 pairing secret, ...)` — the SAME
+X25519 secret `ozctl.py` already derives for every `control` write
+(`build_control()`'s `our_priv(st).exchange(lock_pub)`). Whichever identity
+holds bond #0 can mint a valid invite by pure local computation; no BLE
+write, no BANOI, no QR. Added to `ozctl.py`:
+
+- `invite <label> [--role] [--ttl]` — connects only to read `info`
+  (device_id + lock pub), then builds `OZINV1:` + base64url JSON locally.
+- `--state <path>` — lets one script act as two identities in the same
+  ceremony (bond #0 mints, a second identity redeems), since a real
+  invite/enroll round-trip needs two distinct keypairs.
+
+**Verified byte-exact against ftpos's own frozen test vector**
+(`packages/ozkey_commissioner/tool/gen_invite_vector.dart`) before trusting
+it against real hardware: `pairing_secret=01..20 hex,
+device_id="ozk-a4cf12879da7", issuer="aa"*32, label="Ba Ngoai",
+nonce="42"*16, expires=1789000000` → both the dart tool and the new Python
+implementation independently produced
+`mac=e7780baea8feef5674c0ffecd1b83f35dfd9198db50cea6d0735c7a43d268aac`. This
+is the same vector the firmware's own boot self-test (`invite-mac`,
+`invite-b64url`, present since `v1.6`) already checks on every boot — so all
+three independent implementations (firmware, ftpos's dart reference,
+ozctl.py's new one) now agree.
+
+### 11.2 Live hardware finding: the bench identity wasn't bond #0 on ANY
+    currently-powered lock
+
+Before minting a real invite, `list_bonds` against the bench's default
+identity was run as a sanity check — and it failed, on **two different**
+boards in a row: the 1.9" unit (`ozk-acebe639f8c4`) and the 1.47" unit
+(`ozk-b0a6048b5fd8`, which had held a bench bond as recently as the M4
+gate-3/4 verification session, §8.4). Serial confirmed directly both times:
+`[CTL] 9d8a16dd1654fdc0… holds no bond on this lock` → `UNLOCK_DENIED`. The
+operator had since paired all 3 bench locks to BANOI, and `BOND_DENIED`'s
+atomic-refusal guarantee (XF-47) meant a later BANOI provision attempt on
+`b0a6048b5fd8` would have been refused outright if the bench bond were still
+there — so the most likely explanation is the lock was factory-reset (by the
+operator, deliberately or as part of BANOI's own pairing flow) between that
+session and this one. Point worth keeping: **`ozctl_state.json`'s identity
+being bond #0 on a given lock is a claim that decays over time and must be
+re-checked live, not assumed from a prior session's memory.**
+
+**Resolution**: factory-reset the 1.47" board (`* 5` on the keypad — no
+remote path exists, deliberately, XF-52) and re-provision it with the bench
+identity as bond #0, dedicating that one unit to bench ceremony testing
+going forward. `info.pub` changing (`de0e8149…` → `6ade7eec…`) confirmed the
+reset on serial, matching `CONTRACT.md`'s own factory-reset acceptance test.
+
+### 11.3 Two more bench-tooling defects found live (same pattern as §5 —
+    tools untested against real hardware since they were written)
+
+1. **`ozprov.py`'s `--server-ip`/`--server-port` write the WRONG field.**
+   `build_payload()` only sets `broker_host`/`broker_tcp_port` — what
+   firmware actually gates provisioning acceptance on
+   (`ozdoorlock_core.h:1882`, `ENROLL_FAIL` if empty) — when `--broker
+   HOST:PORT` is passed explicitly. `--server-ip`/`--server-port` populate a
+   *different* pair of fields entirely (presumably the hotel/PMS server
+   address, unused by the WiFi provisioning ladder). First provision attempt
+   with only the (more prominent, better-defaulted) `--server-ip` flag
+   produced `ENROLL_FAIL`; fixed by adding `--broker 10.1.1.20:1883`
+   explicitly. `ozprov.py` was not changed — this is a usage gotcha, not a
+   code defect, but one sharp enough to record: **the flag that looks like
+   "where's the server" is not the one firmware checks.**
+2. **`ozctl.py` had no way to pin a specific lock**, and `BleakScanner.
+   find_device_by_name("OZLOCK")` matches whichever advertiser answers
+   first. With 2+ boards genuinely in their touch window at once (a real
+   condition on a bench with several units), a `list_bonds` aimed at the
+   1.47" unit silently ran against the 1.9" unit instead — same generic
+   name, no error, wrong device, and the only evidence was the returned
+   `device_id` not matching. Harmless in this instance (a `UNLOCK_DENIED`
+   either way) but a real correctness gap. **Fixed**: added `--addr <BLE
+   address>` to `ozctl.py`, pinning `find_device_by_address()` instead of
+   scanning by name when supplied. Every command after this fix targeted
+   the lock's BLE address directly rather than trusting the advertised
+   name to be unique.
+
+### 11.4 Full ceremony, hardware-verified end to end, entirely from the
+    bench (no BANOI, no QR)
+
+Six-step run against `ozk-b0a6048b5fd8` (1.47", bench-owned per §11.2), each
+step gated by a real keypad touch opening the lock's own 60s BLE window —
+no shortcuts, no simulated input:
+
+1. `list_bonds` (owner identity) — confirmed bond #0, `LIST_OK` with 0
+   members (correct: `handleListBonds()` starts enumeration at slot 1,
+   deliberately excluding the owner, `ozdoorlock_core.h:2408`).
+2. `invite "Ba Ngoai"` (owner identity) — minted `OZINV1:...` locally, no
+   write.
+3. `enroll <invite>` with a fresh second identity (`--state
+   ozctl_state_member.json`) — **`MEMBER_OK`**. First time this path has
+   ever fired over real BLE.
+4. `list_bonds` (owner identity) — confirmed the new bond: `slot=1
+   label='Ba Ngoai' floor=0`, pubkey matching the member identity exactly.
+5. `revoke <own pubkey>` (member identity, DPID 101 self-revoke) —
+   **`REVOKE_OK`**. Serial: `[CTL] OPENED — bond 1, counter 1, DP 101`.
+6. `invite "throwaway"` → `cancel <nonce>` (owner identity, DPID 102) —
+   **`REVOKE_OK`**, then a third identity's `enroll` against that same
+   invite string returned **`MEMBER_REPLAY`** (not `MEMBER_OK`), serial
+   confirming the MAC itself still verified (`invite VERIFIED
+   label='throwaway'`) but the burned nonce blocked redemption — proving
+   102 is a real kill switch, not just an accepted-and-ignored write.
+
+A `POWERON` reset landed on the 1.47" board mid-session (operator power-
+cycled it deliberately) between steps 4 and 5 — bond table and self-tests
+(`invite-mac`, `invite-b64url`, `dp-frame-101/102`, `M4 dispatch split
+holds`) all came back clean afterward, confirming NVS persistence held
+through it.
+
+**M4 is now fully hardware-verified** — every row in §2's table plus DPID
+101/102 and the role-gate matrix. Nothing remains open from the original M4
+scope (`XFtposDecisions-59.md` §3).
+
+### 11.5 Committed this session
+
+`ozctl.py` — `invite`, `--state`, `--addr`. No firmware changes; nothing
+else in `blelock/` touched.
