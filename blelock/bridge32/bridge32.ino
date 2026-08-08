@@ -65,11 +65,7 @@ String lastStatus = "BOOT";
 // wake it — screen state is intentionally independent of the status ladder
 // once it's gone dark, matching "only turn on if someone touch the boot
 // button").
-// TEMP (operator request 2026-08-06): disabled for bench diagnostics — a
-// short BOOT press to wake the screen also opens the 60s ownership claim
-// window (see checkFactoryResetButton()), which contaminates any ownership
-// test. Restore to 60000UL once the bridge-ownership investigation is done.
-#define LCD_IDLE_OFF_MS 0xFFFFFFFFUL
+#define LCD_IDLE_OFF_MS 60000UL
 
 // RX activity flash (2026-07-28, operator request): when a command arrives over
 // MQTT, briefly swap the two footer lines (site / device_id) for a "received"
@@ -126,8 +122,12 @@ unsigned long lastLcdActivityAt = 0;
 // silently inheriting the toolchain's generic BOOT_PIN, same gap found on
 // the doorlock boards). No behavior change on this board — GPIO9 unchanged,
 // still not independently hardware-verified here.
-#define FW_VERSION "bridge32-1.6"
-#define FW_DISPLAY_VERSION "v1.6" // shown on-screen, doorlock.ino's badge convention
+// 1.7 (2026-08-08): 1.5's LCD_IDLE_OFF_MS disable reverted, back to 60000UL
+// (60s). The bridge-ownership investigation it was disabled for closed
+// 2026-08-06 (ozkey-12 §9.8) — no reason left to keep the bench diagnostic
+// override in place.
+#define FW_VERSION "bridge32-1.7"
+#define FW_DISPLAY_VERSION "v1.7" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
 // existing mesh) in v0; it is the only network former in the home.
