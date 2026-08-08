@@ -97,6 +97,17 @@ const CONFIG = {
   // SUB_LOG removed 2026-07-31 — see the header. We do not subscribe to
   // `ozkey/<site>/locks/+/log` at all, so door events are never delivered to
   // this process. Locks may still publish there; nothing here consumes it.
+  //
+  // S8/S9 (ozkey-15 §3, async orchestrated removal): app-to-app messages
+  // between banoi2 (member) and banoi1 (admin). The topic is already
+  // addressed to the specific recipient's device_id, so the MQTT broker
+  // delivers publish -> subscribe directly between the two apps with no
+  // help from this process — same pattern as any other MQTT topic both a
+  // publisher and a subscriber happen to share. ozlockserv subscribes only
+  // to observe/log for visibility (ozkey-15 §2: "pure relay, no state, no
+  // persistence"), not to republish.
+  SUB_MEMBER_REQUEST_REMOVE: 'ozkey/lab/members/+/request_remove',
+  SUB_MEMBER_ACK_REMOVE: 'ozkey/lab/members/+/ack_remove',
   topicCommand: (site, deviceId) => `ozkey/${site}/locks/${deviceId}/command`,
   // A Thread lock has no MQTT client of its own — bridge32 is its gateway and
   // subscribes to its OWN topic (blelock/bridge32/bridge32.ino:489), then
@@ -540,6 +551,53 @@ async function flushQueueForDevice(siteId, deviceId) {
   return sent;
 }
 
+/** S8/S9 (ozkey-15 §3, async orchestrated removal). `request_remove` (banoi2
+ * -> banoi1) and `ack_remove` (banoi1 -> banoi2) are already addressed to the
+ * specific recipient's device_id in the topic path, so the broker delivers
+ * publish -> subscribe directly between the two apps — nothing here needs to
+ * republish anything. (It also MUST NOT: this process is itself subscribed
+ * to both wildcards, so publishing back onto the same topic would be a
+ * self-triggering infinite loop, not a relay.) This only logs for
+ * visibility — no DB write, no `pending_queue`/`grants` involvement — per
+ * §2 "pure relay, no state, no persistence". `targetDeviceId` is the
+ * recipient named in the topic path (the admin's device_id for
+ * request_remove, the member's for ack_remove).
+ *
+ * "Basic payload structure" check only, per §3 — not full validation. Who
+ * may publish is an MQTT ACL matter (§"No authentication changes"), not
+ * this code's job.
+ */
+function logMemberRelay(targetDeviceId, kind, payload) {
+  let obj;
+  try {
+    obj = JSON.parse(payload);
+  } catch (_) {
+    logEvent('warn', `Non-JSON payload on members/${targetDeviceId}/${kind}: "${payload.slice(0, 60)}"`);
+    return;
+  }
+  if (!obj.request_id || !obj.target_lock_id || !obj.target_member_app_id) {
+    logEvent(
+      'warn',
+      `members/${targetDeviceId}/${kind} missing request_id/target_lock_id/target_member_app_id`
+    );
+    return;
+  }
+  const memberTag = String(obj.target_member_app_id).slice(0, 12) + '…';
+  if (kind === 'request_remove') {
+    logEvent(
+      'key',
+      `Removal request ${obj.request_id}: member ${memberTag} -> admin ${targetDeviceId} ` +
+        `for lock ${obj.target_lock_id}`
+    );
+  } else {
+    logEvent(
+      'key',
+      `Removal ACK ${obj.request_id}: status=${obj.status || '?'} -> member ${targetDeviceId} ` +
+        `for lock ${obj.target_lock_id}`
+    );
+  }
+}
+
 function initMqtt() {
   mqttClient = mqtt.connect(CONFIG.MQTT_URL, {
     clientId: `ozlockserv-${Math.random().toString(16).slice(2, 8)}`,
@@ -550,14 +608,20 @@ function initMqtt() {
   mqttClient.on('connect', () => {
     logEvent('info', `MQTT online — broker ${CONFIG.MQTT_URL}`);
     mqttClient.subscribe(
-      [CONFIG.SUB_ENROLL, CONFIG.SUB_HEARTBEAT],
+      [
+        CONFIG.SUB_ENROLL,
+        CONFIG.SUB_HEARTBEAT,
+        CONFIG.SUB_MEMBER_REQUEST_REMOVE,
+        CONFIG.SUB_MEMBER_ACK_REMOVE,
+      ],
       { qos: 1 },
       (err) => {
         if (err) logEvent('error', `MQTT subscribe failed: ${err.message}`);
         else
           logEvent(
             'info',
-            `Subscribed: ${CONFIG.SUB_ENROLL} + ${CONFIG.SUB_HEARTBEAT}` +
+            `Subscribed: ${CONFIG.SUB_ENROLL} + ${CONFIG.SUB_HEARTBEAT} + ` +
+              `${CONFIG.SUB_MEMBER_REQUEST_REMOVE} + ${CONFIG.SUB_MEMBER_ACK_REMOVE}` +
               ' (door-event topic deliberately NOT subscribed — see header)'
           );
       }
@@ -572,7 +636,12 @@ function initMqtt() {
     const payload = payloadBuf.toString('utf8').trim();
     try {
       const m = topic.match(/^ozkey\/([^/]+)\/locks\/([^/]+)\/(enroll|heartbeat|log)$/);
-      if (!m) return;
+      if (!m) {
+        // S8/S9 (ozkey-15 §3): observe-only, see the SUB_MEMBER_* comment above.
+        const mm = topic.match(/^ozkey\/([^/]+)\/members\/([^/]+)\/(request_remove|ack_remove)$/);
+        if (mm) logMemberRelay(mm[2], mm[3], payload);
+        return;
+      }
       const [, siteId, topicDeviceId, kind] = m;
 
       let obj = {};
