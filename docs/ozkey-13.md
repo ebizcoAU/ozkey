@@ -178,12 +178,20 @@ in-lock verbs rather than MCU forwards — exact shape is firmware's call during
 | A4 | Keep legacy `raw_value` path for older servers (fallback during rollout) | Medium |
 | A5 | Update the `POST /grants` call site to the sealed-envelope path | High |
 | A6 | BLE grant/delete — **not needed**: `XF-59` §4/§7.2 (AV) already confirms BLE `control` carries DP 1/101/102 only, never 21-24; this migration is MQTT-only by design, consistent with that. | — |
+| A7 | **Found by ftpos in review, XF-69 §6, not originally scoped here.** The persistent credential-list UI (`banoi_doorlock.dart:3998`) displays `g.pin`, sourced from server `GrantInfo.rawValue` — for every row, not just freshly-issued ones. Once S3 drops `grants.raw_value`, that field is gone server-side by design (B1, §4) and the app can no longer redisplay a PIN it didn't itself just create. Fix: cache the PIN locally at issuance time (keyed by grant id/slot); rows the app holds no local PIN for (pre-existing grants, or issued from a different device) fall back to metadata-only display (label/type/slot/dates, no PIN) — honest rather than broken. The freshly-created-grant toast is unaffected (echoes a locally-held value, never round-trips through the server). | High |
 
 **Acceptance:**
 - App builds and seals DPID 21/23 (add) and 22/24 (delete) frames.
 - Envelope freshness is `counter > floor` only (no live challenge) — matches §5.
 - App sends `envelope_hex` to the server; no `raw_value` on the sealed path.
 - Legacy `raw_value` path still works against an unmigrated server.
+- Credential list renders correctly post-cutover: locally-known PINs shown, unknown ones fall back to metadata-only, never a blank/broken row.
+
+**ftpos findings, XF-69 §6 (2026-08-08), worth recording here directly:**
+- A1/A2 were **already built**, not new work — `Keyring.sealAddTempPin`/`sealAddTempRfid`/`sealDeletePin`/`sealDeleteRfid` (`keyring.dart:263-295`) already seal DPID 21-24 with no challenge parameter at all (built under XF-42/46 for a server path that was never finished). Existing round-trip test coverage is self-consistent but not yet checked against firmware's byte-exact vectors — the one residual item under §8's recommendation.
+- A3/A5 are real, scoped work — `issuePin()` (`doorlock_service.dart:1472-1504`) still calls plaintext `raw_value`; `envelope_hex` doesn't exist yet on the request/response types (`directory_client.dart:574-592`). Straightforward once S1 ships.
+- **Revoke is further behind than issue** — `revokeGrant()` doesn't build a frame client-side at all today, sealed or plaintext (bare `DELETE /grants/:grantId`). Reaching parity needs an extra step this doc didn't call out: look up the grant's `slot_number` (already returned by `listGrants()`) and build/seal the DPID 22/24 delete frame before the call.
+- ftpos's estimate: 3-4 days holds, proceeding on A3/A5 + the revoke slot-lookup/seal path + A7 in one pass.
 
 ## 9. Implementation sequence
 

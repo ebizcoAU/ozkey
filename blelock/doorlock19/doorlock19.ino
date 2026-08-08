@@ -160,8 +160,12 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 //   1.21 (2026-08-07): BLE-open countdown gets a filled amber badge + white
 //        text again (operator: "BLE 20s in amber background white text"),
 //        reapplied after the status line was rebuilt.
-#define FW_VERSION "doorlock-1.21"
-#define FW_DISPLAY_VERSION "V1.21" // shown on-screen: "OZLOCK V1.21 THREAD/WIFI"
+//   1.22 (2026-08-08): ozkey-13 F1 — shared-core `ozControlTry()` factored
+//        into open/verify + dispatch halves so MQTT can reuse it (F2, not
+//        yet wired). See doorlock.ino's own changelog for the detail. No UI
+//        change, no behavior change on BLE.
+#define FW_VERSION "doorlock-1.22"
+#define FW_DISPLAY_VERSION "V1.22" // shown on-screen: "OZLOCK V1.22 THREAD/WIFI"
 
 // Brief startup splash before the operational dashboard (operator request) —
 // shown once at boot, before WiFi/Thread/BLE bring-up starts, so there's

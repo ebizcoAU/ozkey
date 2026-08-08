@@ -72,6 +72,12 @@ void drawKeypad();
 void drawHexReadout();
 int hexNibble(char c);
 static bool ozControlTry(bool final);
+enum OzCtlOpen { OZCTL_OPENED, OZCTL_FAILED_DEFINITE, OZCTL_FAILED_MAYBE_INCOMPLETE };
+static OzCtlOpen ozControlOpen(const uint8_t *buf, size_t n, int *outSlot,
+                                uint8_t *pt, size_t ptCap, size_t *outPtLen,
+                                uint64_t *outCounter);
+static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
+                                        uint64_t counter, bool hasChallenge);
 static bool ozDpForwardable(uint8_t dp);
 static bool ozM4SelfTest();
 static bool ozTuyaFrameOk(const uint8_t *f, size_t n);
@@ -2498,9 +2504,133 @@ static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen) {
   notifyStatus("UNLOCK_OK");
 }
 
-// Try to open whatever is buffered. [final] means the idle timer fired and no
-// more bytes are coming, so an unopenable buffer must be answered rather than
-// left to accumulate. Returns true when the buffer was consumed either way.
+// ── F1 (ozkey-13 §8): the open/verify core, shared between BLE `control` and
+// the MQTT `envelope_hex` path added in F2. Everything through "envelope
+// opened, here is the plaintext + counter" is identical for both transports —
+// same bond lookup, same key derivation, same AES-GCM open. What differs is
+// what happens AFTER: BLE requires a live per-connection challenge prefix
+// (Gate 3, XF-47, unconditional on that transport); a queued/remote MQTT
+// command has no live connection to have issued one over, so its freshness is
+// counter-only (ozkey-13 §5 — confirmed acceptable, documented as honestly
+// weaker than BLE's, not hidden). `ozControlOpen` stays transport-agnostic;
+// `ozControlVerifyAndDispatch` takes `hasChallenge` to select the wire shape.
+
+// Try to open `app_id_hex(64) ‖ envelope` into a plaintext frame. Does not
+// consume any buffer or notify status itself — the caller does both once it
+// knows the full verdict, since only the caller knows whether "envelope did
+// not open" means forged (MQTT: always) or possibly-still-arriving (BLE only,
+// mid-chunk).
+static OzCtlOpen ozControlOpen(const uint8_t *buf, size_t n, int *outSlot,
+                                uint8_t *pt, size_t ptCap, size_t *outPtLen,
+                                uint64_t *outCounter) {
+  if (n < 64 + OZ_ENV_MIN) return OZCTL_FAILED_DEFINITE;
+
+  char appIdHex[65];
+  memcpy(appIdHex, buf, 64);
+  appIdHex[64] = 0;
+  if (!ozIsHex(appIdHex, 32)) {
+    Serial.println("[CTL] leading 64 bytes are not an app_id hex string");
+    return OZCTL_FAILED_DEFINITE;
+  }
+  uint8_t senderPub[32];
+  ozFromHex(appIdHex, senderPub, 32);
+  const int slot = ozBondFind(senderPub);
+  if (slot < 0) {
+    Serial.printf("[CTL] %.16s… holds no bond on this lock\n", appIdHex);
+    return OZCTL_FAILED_DEFINITE;
+  }
+
+  uint8_t ps[32], key[32];
+  const bool haveKey =
+      ozBondSecret(slot, ps) &&
+      ozEnvKey(ps, 32, deviceId, String(appIdHex), true /*app->lock*/, key);
+  memset(ps, 0, sizeof(ps));
+  if (!haveKey) {
+    Serial.println("[CTL] could not derive the bond's app->lock key");
+    memset(key, 0, sizeof(key));
+    return OZCTL_FAILED_DEFINITE;
+  }
+
+  uint64_t counter = 0;
+  const int ptLen = ozEnvOpen(key, deviceId, buf + 64, n - 64, pt, ptCap, &counter);
+  memset(key, 0, sizeof(key));
+  if (ptLen < 0) {
+    Serial.printf("[CTL] envelope did not open (%u B, bond %d)\n",
+                  (unsigned)(n - 64), slot);
+    return OZCTL_FAILED_MAYBE_INCOMPLETE;
+  }
+
+  *outSlot = slot;
+  *outPtLen = (size_t)ptLen;
+  *outCounter = counter;
+  return OZCTL_OPENED;
+}
+
+// Given an OPENED plaintext (past ozControlOpen), verify freshness and
+// execute. `hasChallenge` selects whether the first 16 bytes of `pt` are a
+// live challenge to check-and-strip (BLE) or the frame starts at byte 0
+// (MQTT — see the block comment above).
+static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
+                                        uint64_t counter, bool hasChallenge) {
+  const size_t need = (hasChallenge ? 16u : 0u) + 11u; // 11 = smallest legal DP frame
+  if (ptLen < need) {
+    Serial.printf("[CTL] plaintext is %u B — too short for %s\n",
+                  (unsigned)ptLen,
+                  hasChallenge ? "challenge + frame" : "a frame");
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+
+  if (hasChallenge) {
+    // Gate 3 — UNCONDITIONAL, every verb, no exceptions (XF-47).
+    if (!bleChallengeValid || !ozCtEq(pt, bleChallenge, 16)) {
+      Serial.printf("[CTL] challenge %s — denied\n",
+                    bleChallengeValid ? "does not match the one issued on this "
+                                        "connection"
+                                      : "was never read on this connection");
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    // Burn it. The app reads …0005 before every control write, so requiring a
+    // fresh one costs nothing — and without this, one challenge read would
+    // authorise every frame sent for the rest of the connection.
+    bleChallengeValid = false;
+  }
+
+  // Gate 4 — strictly greater. Equal is a replay of the frame we just accepted.
+  if (counter <= g_bonds[slot].floor) {
+    Serial.printf("[CTL] counter %llu is not above bond %d's floor %llu — replay\n",
+                  (unsigned long long)counter, slot,
+                  (unsigned long long)g_bonds[slot].floor);
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+
+  const uint8_t *frame = pt + (hasChallenge ? 16 : 0);
+  const size_t flen = ptLen - (hasChallenge ? 16 : 0);
+  if (!ozTuyaFrameOk(frame, flen)) {
+    Serial.printf("[CTL] plaintext is authentic but not a valid DP frame (%u B)\n",
+                  (unsigned)flen);
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+
+  // Advance the floor BEFORE executing. If execution reboots the lock (or the
+  // MCU write hangs), the frame must not become replayable on the way back up —
+  // an unlock that maybe happened is a far better outcome than one that can be
+  // repeated by anyone who captured it.
+  g_bonds[slot].floor = counter;
+  ozBondsSave();
+
+  Serial.printf("[CTL] OPENED — bond %d, counter %llu, DP %u\n", slot,
+                (unsigned long long)counter, frame[6]);
+  ozControlDispatch(slot, frame, flen);
+}
+
+// Try to open whatever is buffered on the BLE `control` characteristic.
+// [final] means the idle timer fired and no more bytes are coming, so an
+// unopenable buffer must be answered rather than left to accumulate. Returns
+// true when the buffer was consumed either way.
 static bool ozControlTry(bool final) {
   // Snapshot the length once. The BLE task may append while we work; taking the
   // value once means we open a consistent prefix rather than a buffer that grew
@@ -2520,110 +2650,26 @@ static bool ozControlTry(bool final) {
     return true;
   }
 
-  // The first 64 bytes are whole as soon as we are past the minimum length, so
-  // a malformed app_id is answerable now — no reason to make the caller wait
-  // out the idle timer for a verdict that cannot change.
-  char appIdHex[65];
-  memcpy(appIdHex, ctlBuf, 64);
-  appIdHex[64] = 0;
-  if (!ozIsHex(appIdHex, 32)) {
-    Serial.println("[CTL] leading 64 bytes are not an app_id hex string");
-    ctlConsume(n);
-    notifyStatus("UNLOCK_DENIED");
-    return true;
-  }
-  uint8_t senderPub[32];
-  ozFromHex(appIdHex, senderPub, 32);
-  const int slot = ozBondFind(senderPub);
-  if (slot < 0) {
-    Serial.printf("[CTL] %.16s… holds no bond on this lock\n", appIdHex);
-    ctlConsume(n);
-    notifyStatus("UNLOCK_DENIED");
-    return true;
-  }
-
-  uint8_t ps[32], key[32];
-  const bool haveKey =
-      ozBondSecret(slot, ps) &&
-      ozEnvKey(ps, 32, deviceId, String(appIdHex), true /*app->lock*/, key);
-  memset(ps, 0, sizeof(ps));
-  if (!haveKey) {
-    Serial.println("[CTL] could not derive the bond's app->lock key");
-    memset(key, 0, sizeof(key));
-    ctlConsume(n);
-    notifyStatus("UNLOCK_DENIED");
-    return true;
-  }
-
+  int slot = -1;
   uint8_t pt[OZ_CTL_MAX];
+  size_t ptLen = 0;
   uint64_t counter = 0;
-  const int ptLen = ozEnvOpen(key, deviceId, ctlBuf + 64, n - 64, pt,
-                              sizeof(pt), &counter);
-  memset(key, 0, sizeof(key));
-  if (ptLen < 0) {
-    // Indistinguishable from here: still arriving, or forged. Keep waiting
-    // unless the idle timer already gave up on it.
-    if (!final) return false;
-    Serial.printf("[CTL] envelope did not open (%u B, bond %d) — denied\n",
-                  (unsigned)(n - 64), slot);
-    ctlConsume(n);
-    notifyStatus("UNLOCK_DENIED");
-    return true;
-  }
+  const OzCtlOpen r =
+      ozControlOpen(ctlBuf, n, &slot, pt, sizeof(pt), &ptLen, &counter);
 
-  // Opened successfully: the plaintext is in pt[] and ctlBuf is no longer
-  // needed. Release it here, before any status goes out.
+  // Indistinguishable from here: still arriving, or forged. Keep waiting
+  // unless the idle timer already gave up on it.
+  if (r == OZCTL_FAILED_MAYBE_INCOMPLETE && !final) return false;
+
+  // Opened or definitively failed either way: the buffer is spent.
   ctlConsume(n);
 
-  if (ptLen < 16 + 11) {
-    Serial.printf("[CTL] plaintext is %d B — too short for challenge + frame\n",
-                  ptLen);
+  if (r != OZCTL_OPENED) {
     notifyStatus("UNLOCK_DENIED");
     return true;
   }
 
-  // Gate 3 — UNCONDITIONAL, every verb, no exceptions (XF-47).
-  if (!bleChallengeValid || !ozCtEq(pt, bleChallenge, 16)) {
-    Serial.printf("[CTL] challenge %s — denied\n",
-                  bleChallengeValid ? "does not match the one issued on this "
-                                      "connection"
-                                    : "was never read on this connection");
-    notifyStatus("UNLOCK_DENIED");
-    return true;
-  }
-  // Burn it. The app reads …0005 before every control write, so requiring a
-  // fresh one costs nothing — and without this, one challenge read would
-  // authorise every frame sent for the rest of the connection.
-  bleChallengeValid = false;
-
-  // Gate 4 — strictly greater. Equal is a replay of the frame we just accepted.
-  if (counter <= g_bonds[slot].floor) {
-    Serial.printf("[CTL] counter %llu is not above bond %d's floor %llu — replay\n",
-                  (unsigned long long)counter, slot,
-                  (unsigned long long)g_bonds[slot].floor);
-    notifyStatus("UNLOCK_DENIED");
-    return true;
-  }
-
-  const uint8_t *frame = pt + 16;
-  const size_t flen = (size_t)ptLen - 16;
-  if (!ozTuyaFrameOk(frame, flen)) {
-    Serial.printf("[CTL] plaintext is authentic but not a valid DP frame (%u B)\n",
-                  (unsigned)flen);
-    notifyStatus("UNLOCK_DENIED");
-    return true;
-  }
-
-  // Advance the floor BEFORE executing. If execution reboots the lock (or the
-  // MCU write hangs), the frame must not become replayable on the way back up —
-  // an unlock that maybe happened is a far better outcome than one that can be
-  // repeated by anyone who captured it.
-  g_bonds[slot].floor = counter;
-  ozBondsSave();
-
-  Serial.printf("[CTL] OPENED — bond %d, counter %llu, DP %u\n", slot,
-                (unsigned long long)counter, frame[6]);
-  ozControlDispatch(slot, frame, flen);
+  ozControlVerifyAndDispatch(slot, pt, ptLen, counter, true /*hasChallenge*/);
   return true;
 }
 

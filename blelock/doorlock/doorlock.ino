@@ -131,7 +131,14 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //   1.21 (2026-08-07): BLE-open countdown gets a filled amber badge + white
 //        text again (operator: "BLE 20s in amber background white text"),
 //        reapplied after the status line was rebuilt.
-#define FW_VERSION "doorlock-1.21"
+//   1.22 (2026-08-08): ozkey-13 F1 — `ozControlTry()`'s open/verify core
+//        factored into `ozControlOpen()` (bond lookup, key derive, envelope
+//        open) + `ozControlVerifyAndDispatch()` (challenge/counter/frame
+//        checks, dispatch), so the MQTT sealed-envelope path (F2, not yet
+//        wired) can share it with BLE `control` instead of duplicating the
+//        crypto. Zero behavior change on BLE — same gates, same order, same
+//        UNLOCK_DENIED points. `ozdoorlock_core.h` only; no UI change.
+#define FW_VERSION "doorlock-1.22"
 #define FW_DISPLAY_VERSION "V1.21" // shown on-screen: "OZLOCK V1.21 THREAD/WIFI"
 
 // This board shows no startup splash (never did, pre-refactor) — no-op so
