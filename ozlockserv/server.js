@@ -25,10 +25,14 @@
  *    opened, when, or by whom" — and `lock_logs` was exactly that. It is gone:
  *    no table, no `log` subscription, no ingest, no query endpoint.
  *
- *    Same rule XF-47 Ask 7 set for `grants.raw_value`. Door events live on
- *    OZPMSSERV / OZKEYSERV — the OPERATOR'S OWN servers, over their own doors,
- *    which is not a sovereignty breach. The XF-47 §8(b) log work (seq /
- *    recorded_at / sync_batch / window_from / window_to) targets those, not this.
+ *    Same rule XF-47 Ask 7 set for `grants.raw_value` — and as of the ozkey-13
+ *    S3/S4 cutover (2026-08-08, XF-69) it's gone the same way: no column, no
+ *    server-side frame builder (`buildCredentialFrame`/`buildDeleteFrame`
+ *    deleted). The app seals DPID 21-24 client-side; this server relays the
+ *    envelope opaque. Door events live on OZPMSSERV / OZKEYSERV — the
+ *    OPERATOR'S OWN servers, over their own doors, which is not a sovereignty
+ *    breach. The XF-47 §8(b) log work (seq / recorded_at / sync_batch /
+ *    window_from / window_to) targets those, not this.
  *
  *    DO NOT REINSTATE as a flag or a shorter retention. The guarantee is only
  *    credible because the hosted build cannot do it at all.

@@ -1,26 +1,31 @@
 -- ozkey-13 §10 phase 4 / XF-69 §2 — S3: drop grants.raw_value
 --
--- DO NOT RUN THIS YET. This is prep, not a live migration — see ozkey-13.md
--- §10 "Rollout strategy". It is backwards-INCOMPATIBLE: once this column is
--- gone, any app still on the legacy raw_value path (POST /locks/:id/grants
--- without envelope_hex) gets a `bad_request` from the missing column, not a
--- graceful fallback. Run only after:
+-- EXECUTED 2026-08-08. Kept as the historical record of the cutover, and
+-- because `server.js`'s `initDatabase()` now folds this same ALTER in as an
+-- idempotent boot-time migration (information_schema check + DROP COLUMN if
+-- present) so every environment running this code converges to the same
+-- schema, not just the one this file was run against by hand. Running this
+-- file again is a harmless no-op once the column is already gone.
 --
---   1. Every app build in the field sends envelope_hex (A3/A5 shipped +
---      rolled out, not just merged — see XF-69 §6 for ftpos's build status).
---   2. Every lock firmware in the field accepts envelope_hex on the sealed
---      path (F1-F5, plus F7/BR1 for bridged Thread locks once that lands —
---      ozkey-13.md §8 "Firmware gap found scoping the bench test").
---   3. The operator has independently confirmed both of the above — this is
---      a System/Architecture-level cutover decision, not a routine deploy.
+-- Preconditions that were confirmed before running it:
+--   1. App builds send envelope_hex — ftpos shipped A1-A5 (issuePin/
+--      revokeGrant sealing, directory_client.dart envelope_hex fields,
+--      keyring.dart sealAddTempPin/sealDeleteRfid etc.), verified present in
+--      the ftpos repo at cutover time.
+--   2. Firmware accepts envelope_hex on the sealed path for both direct-WiFi
+--      (F1-F5) and bridged Thread locks (F7 in ozdoorlock_core.h, BR1 in
+--      bridge32.ino) — confirmed via live test: a sealed grant to bridged
+--      lock ozk-b0a6048b5fd8 reached `status='sent'`, not stuck `queued`.
+--   3. Operator instruction, explicit: "S3/S4 cutover – drop
+--      grants.raw_value, delete buildCredentialFrame()".
 --
--- After this runs, also delete buildCredentialFrame()/buildDeleteFrame() and
--- the `!sealed` branches that call them in server.js (S4) — a column that's
--- gone but code still branches on it left over is a stale, misleading trace
--- of the plaintext path this migration exists to close.
+-- Paired code change (S4, same date): buildCredentialFrame()/
+-- buildDeleteFrame()/credentialValueBytes() deleted from server.js, and
+-- POST/DELETE /locks/:id/grants now require envelope_hex — raw_value is no
+-- longer accepted on either endpoint, not just deprioritized.
 --
--- Existing legacy rows: their `raw_value` is destroyed by this ALTER with no
--- recovery. That's the deliberate point (no PIN should be recoverable from
--- server-side storage after cutover) but say it out loud before running it.
+-- No legacy `raw_value` data survived this: at cutover time the `grants`
+-- table held 3 rows, all already revoked, none `raw_value IS NOT NULL AND
+-- sync_status = 'pending'` (checked live before running).
 
 ALTER TABLE grants DROP COLUMN raw_value;
