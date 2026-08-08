@@ -164,8 +164,13 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 //        into open/verify + dispatch halves so MQTT can reuse it (F2, not
 //        yet wired). See doorlock.ino's own changelog for the detail. No UI
 //        change, no behavior change on BLE.
-#define FW_VERSION "doorlock-1.22"
-#define FW_DISPLAY_VERSION "V1.22" // shown on-screen: "OZLOCK V1.22 THREAD/WIFI"
+//   1.23 (2026-08-08): ozkey-13 F2-F5 — MQTT `envelope_hex` sealed-command
+//        path wired in, DP 21-24 credential frames join DP 1 on the sealed
+//        dispatch (role-gated to bond #0), legacy `payload_hex` kept for
+//        rollout. See doorlock.ino's own changelog for the full detail. No
+//        UI change. NOT YET HARDWARE-VERIFIED.
+#define FW_VERSION "doorlock-1.23"
+#define FW_DISPLAY_VERSION "V1.23" // shown on-screen: "OZLOCK V1.23 THREAD/WIFI"
 
 // Brief startup splash before the operational dashboard (operator request) —
 // shown once at boot, before WiFi/Thread/BLE bring-up starts, so there's

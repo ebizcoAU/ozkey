@@ -78,6 +78,7 @@ static OzCtlOpen ozControlOpen(const uint8_t *buf, size_t n, int *outSlot,
                                 uint64_t *outCounter);
 static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
                                         uint64_t counter, bool hasChallenge);
+static size_t ozHexDecode(const String &hex, uint8_t *out, size_t cap);
 static bool ozDpForwardable(uint8_t dp);
 static bool ozM4SelfTest();
 static bool ozTuyaFrameOk(const uint8_t *f, size_t n);
@@ -1336,6 +1337,31 @@ void forwardFrameToMcu(const uint8_t *frame, size_t fn) {
     markDoorUnlocked();
 }
 
+// ozkey-13 F2: decode a hex string (spaces/colons tolerated, same convention
+// forwardHexToMcu already uses) into `out`, capped at `cap` bytes. Returns
+// the decoded length, or 0 on bad hex / an odd nibble count / overflow — 0 is
+// never a valid envelope (shorter than the minimum sealed envelope alone),
+// so it doubles as the error signal with no separate out-parameter needed.
+static size_t ozHexDecode(const String &hex, uint8_t *out, size_t cap) {
+  size_t n = 0;
+  int hi = -1;
+  for (size_t i = 0; i < hex.length(); i++) {
+    char c = hex[i];
+    if (c == ' ' || c == ':') continue;
+    int v = hexNibble(c);
+    if (v < 0) return 0;
+    if (hi < 0) {
+      hi = v;
+    } else {
+      if (n >= cap) return 0;
+      out[n++] = (uint8_t)((hi << 4) | v);
+      hi = -1;
+    }
+  }
+  if (hi >= 0) return 0; // odd number of nibbles — truncated hex
+  return n;
+}
+
 void forwardHexToMcu(const String &hex) {
   static uint8_t frame[256];
   size_t fn = 0;
@@ -1619,6 +1645,41 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     screenDirty = true;
     return;
   }
+  // ozkey-13 F2/F5: `envelope_hex` — a sealed control envelope delivered over
+  // MQTT instead of BLE, opened/verified/dispatched through the SAME core F1
+  // built for the `control` characteristic (ozControlOpen +
+  // ozControlVerifyAndDispatch). Checked BEFORE `payload_hex` below so a
+  // sealed-capable server can send both during rollout and the authenticated
+  // one wins; `payload_hex` alone (pre-migration servers, or a verb not yet
+  // moved to sealed delivery) keeps working unchanged — F6 drops it once
+  // every server has cut over. No live challenge exists for a queued/remote
+  // command (ozkey-13 §5, confirmed acceptable) — freshness is counter-only.
+  const char *envHex = doc["envelope_hex"] | (const char *)nullptr;
+  if (envHex) {
+    uint8_t buf[OZ_CTL_MAX];
+    const size_t n = ozHexDecode(String(envHex), buf, sizeof(buf));
+    if (n == 0) {
+      Serial.println("[MQTT] envelope_hex is not valid hex — denied");
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    int slot = -1;
+    uint8_t pt[OZ_CTL_MAX];
+    size_t ptLen = 0;
+    uint64_t counter = 0;
+    const OzCtlOpen r =
+        ozControlOpen(buf, n, &slot, pt, sizeof(pt), &ptLen, &counter);
+    // MQTT delivers the envelope whole in one message — there is no "still
+    // arriving" case the way BLE's chunked writes have one, so both failure
+    // kinds are equally final here.
+    if (r != OZCTL_OPENED) {
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    ozControlVerifyAndDispatch(slot, pt, ptLen, counter, false /*hasChallenge*/);
+    return;
+  }
+
   // Command envelope {action, grant_id, payload_hex}: PURE FORWARD to the
   // MCU — the comm module never executes credentials.
   const char *hex = doc["payload_hex"] | (const char *)nullptr;
@@ -2473,7 +2534,8 @@ static void ctlConsume(size_t n) {
   ctlNewBytes = more;
 }
 
-// Execute an opened, challenged, floor-cleared frame.
+// Execute an opened, challenged (or MQTT counter-only, see
+// ozControlVerifyAndDispatch), floor-cleared frame.
 static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen) {
   const uint8_t dp = frame[6];
   const size_t vlen = ((size_t)frame[8] << 8) | frame[9];
@@ -2483,24 +2545,48 @@ static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen) {
   if (dp == 102) { handleInviteCancel(slot, v, vlen); return; }
   if (dp == 103) { handleListBonds(slot, v, vlen); return; }
 
-  // v1 carries exactly one MCU verb over BLE: DP 1, the at-the-door unlock
-  // (CONTRACT.md …0006, "DP 1 remote-unlock in v1"). Credential frames 21-24
-  // are NOT accepted here — they reach the MCU on the server path, which is
-  // where issuance lives. Accepting them over BLE too would mean two authorities
-  // for one operation, and the BLE one has no server-side record of what it
-  // issued. Anything else is unknown and is rejected, never forwarded.
-  if (dp != 1) {
+  // ozkey-13 F3: DP 21-24 (temp PIN/RFID add/delete) join DP 1 on the sealed
+  // dispatch — reusing ozDpForwardable(), the SAME allow-list the legacy
+  // plaintext MQTT path already forwards through, rather than maintaining a
+  // second competing list. This supersedes the old comment here (through
+  // doorlock-1.21): credential frames used to be refused on this path because
+  // the BLE-only `control` channel had no server-side record of what it
+  // issued. That reasoning doesn't apply once issuance is sealed-and-relayed
+  // over MQTT (ozkey-13 §3-4) — the server still keeps the record (B1, §4),
+  // it just never sees the credential value. Anything not in the allow-list
+  // is unknown and is rejected, never forwarded.
+  if (!ozDpForwardable(dp)) {
     Serial.printf("[CTL] DP %u is not a v1 `control` verb — rejected, "
                   "NOT forwarded\n", dp);
     notifyStatus("UNLOCK_DENIED");
     return;
   }
 
-  Serial.printf("[CTL] unlock authorised by bond %d ('%s', %s)\n", slot,
+  // ozkey-13 F4: role-gate 21-24 to bond #0. A member may unlock (DP 1, the
+  // door they're standing at) but must never issue or delete a credential —
+  // same admin-only bar as 101/102/103, checked the same way.
+  if (dp != 1 && g_bonds[slot].role != OZ_ROLE_ADMIN) {
+    Serial.printf("[CTL] DP %u role-gated to bond #0 — bond %d ('%s', member) "
+                  "denied\n", dp, slot, g_bonds[slot].label);
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+
+  Serial.printf("[CTL] %s authorised by bond %d ('%s', %s)\n",
+                dp == 1 ? "unlock" : "credential frame", slot,
                 g_bonds[slot].label,
                 g_bonds[slot].role == OZ_ROLE_ADMIN ? "admin" : "member");
   forwardFrameToMcu(frame, flen);
-  publishLog("granted", slot == 0 ? "BLE unlock (owner)" : "BLE unlock (member)");
+  // Status/log strings deliberately reused rather than inventing GRANT_OK/
+  // GRANT_DENIED: this tail was already the generic "sealed control verb
+  // forwarded to the MCU" path for DP 1, and 21-24 are the same shape of
+  // operation (build frame, forward, done) — one pair of wire strings for
+  // "forwarded verb succeeded/failed", not a growing set of near-duplicates.
+  // ftpos flagged in XF-69; no objection raised, but call it out to them
+  // explicitly since their app code has to match it.
+  publishLog("granted", slot == 0
+                             ? (dp == 1 ? "BLE unlock (owner)" : "credential (owner)")
+                             : "BLE unlock (member)");
   notifyStatus("UNLOCK_OK");
 }
 

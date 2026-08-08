@@ -138,7 +138,19 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //        wired) can share it with BLE `control` instead of duplicating the
 //        crypto. Zero behavior change on BLE — same gates, same order, same
 //        UNLOCK_DENIED points. `ozdoorlock_core.h` only; no UI change.
-#define FW_VERSION "doorlock-1.22"
+//   1.23 (2026-08-08): ozkey-13 F2-F5 — MQTT command topic now accepts
+//        `envelope_hex` (sealed, F2), opened via the F1 core with no live
+//        challenge (counter-only freshness, §5). `ozControlDispatch()`
+//        extended to forward DP 21-24 (temp PIN/RFID add/delete) alongside
+//        DP 1, reusing `ozDpForwardable()`'s existing allow-list instead of
+//        a second one (F3); role-gated to bond #0, same admin-only bar as
+//        101/102/103 — a member's DP 21-24 attempt gets UNLOCK_DENIED (F4).
+//        Legacy `payload_hex` (unauthenticated pure-forward) kept working
+//        unchanged for pre-1.23 servers during rollout (F5) — `envelope_hex`
+//        wins if a server sends both. NOT YET HARDWARE-VERIFIED — compiled
+//        + bench-tooling ready (`ozctl.py mqtt-grant`/`mqtt-delete`), needs
+//        a real flash + live test.
+#define FW_VERSION "doorlock-1.23"
 #define FW_DISPLAY_VERSION "V1.21" // shown on-screen: "OZLOCK V1.21 THREAD/WIFI"
 
 // This board shows no startup splash (never did, pre-refactor) — no-op so

@@ -31,6 +31,11 @@ Usage:
     ozctl.py invite <label>           # mint an OZINV1 invite — needs bond #0
     ozctl.py enroll <OZINV1:...>      # redeem an invite, become a member
     ozctl.py list_bonds               # DP 103 — needs bond #0 (admin-only)
+    ozctl.py mqtt-grant [slot]        # ozkey-13 F1-F5 bench test — DP 21/23,
+                                       #   sealed, published over MQTT, no BLE
+                                       #   control write. --type pin|rfid, --pin,
+                                       #   --broker, --site. Needs bond #0.
+    ozctl.py mqtt-delete [slot]       # DP 22/24, same shape as mqtt-grant
 
 `invite` and `enroll` are opposite ends of the same ceremony and must run as
 TWO DIFFERENT identities (bond #0 mints, a member redeems) — pass `--state
@@ -133,6 +138,25 @@ FRAME_UNLOCK = lambda: dp_frame(1, 0x01, bytes([0x01]))
 FRAME_REVOKE = lambda pub: dp_frame(101, 0x00, pub)
 FRAME_CANCEL = lambda non: dp_frame(102, 0x00, non)
 FRAME_LIST_BONDS = lambda: dp_frame(103, 0x00, b"")
+
+# ── ozkey-13 F1-F5 bench test: credential grant/delete frames, byte-layout
+# mirrors ozlockserv's buildCredentialFrame()/buildDeleteFrame() exactly
+# (server.js) — 2B slot BE ‖ cred bytes ‖ 4B from-ts BE ‖ 4B to-ts BE for a
+# grant, 2B slot BE alone for a delete. DP 21/23 = add pin/rfid, 22/24 =
+# delete pin/rfid (Tuya-standard DPIDs, same as the legacy server path).
+def dp_grant(dpid, slot, cred_bytes, ts_from, ts_to):
+    val = slot.to_bytes(2, "big") + cred_bytes + ts_from.to_bytes(4, "big") + ts_to.to_bytes(4, "big")
+    return dp_frame(dpid, 0x00, val)
+
+
+def dp_delete(dpid, slot):
+    return dp_frame(dpid, 0x00, slot.to_bytes(2, "big"))
+
+
+FRAME_GRANT_PIN = lambda slot, pin, tf, tt: dp_grant(21, slot, pin.encode("ascii"), tf, tt)
+FRAME_GRANT_RFID = lambda slot, uid_hex, tf, tt: dp_grant(23, slot, bytes.fromhex(uid_hex), tf, tt)
+FRAME_DELETE_PIN = lambda slot: dp_delete(22, slot)
+FRAME_DELETE_RFID = lambda slot: dp_delete(24, slot)
 
 
 # ── BLE session ─────────────────────────────────────────────────────────────
@@ -248,6 +272,36 @@ def build_control(st, state_path, device_id, lock_pub_hex, challenge, frame):
     return app_id.encode() + env
 
 
+# ── ozkey-13 §3/§5/F2: the MQTT sealed-envelope shape — utf8(app_id_hex) ‖
+# envelope(frame), NO challenge prefix. There is no live connection to a
+# queued/remote command to have read a fresh challenge over, so freshness is
+# counter-only (confirmed acceptable, ozkey-13 §5) — this is the one
+# structural difference from build_control above, not a shortcut.
+def build_mqtt_envelope(st, state_path, device_id, lock_pub_hex, frame):
+    app_id = our_app_id(st)
+    secret = our_priv(st).exchange(
+        X25519PublicKey.from_public_bytes(bytes.fromhex(lock_pub_hex)))
+    key = env_key(secret, device_id, app_id, app_to_lock=True)
+    ctr = next_counter(st, device_id, state_path)
+    env = env_seal(key, device_id, ctr, frame)  # no challenge prefix
+    payload = app_id.encode() + env
+    log("SEAL", f"(MQTT, no challenge) counter={ctr} plaintext={len(frame)} B "
+                f"envelope={len(env)} B total={len(payload)} B")
+    return payload
+
+
+def mqtt_publish_envelope(broker, site, device_id, envelope_bytes):
+    """Bare 'ozctl.py' JSON, no ozlockserv in the loop — talks straight to the
+    doorlock's own MQTT command topic, exactly what onMqttMessage() parses.
+    Uses mosquitto_pub (subprocess), matching mqttlog.py's own convention of
+    shelling out rather than adding a Python MQTT dependency."""
+    import subprocess
+    topic = f"ozkey/{site}/locks/{device_id}/command"
+    body = json.dumps({"envelope_hex": envelope_bytes.hex()})
+    log("MQTT->", f"{topic} ({len(body)} B JSON, envelope_hex={len(envelope_bytes)} B)")
+    subprocess.run(["mosquitto_pub", "-h", broker, "-t", topic, "-m", body], check=True)
+
+
 # ── member invite (CONTRACT.md "Member-enroll lock-side algorithm") ────────
 # Byte-exact-verified against ftpos's frozen vector
 # (packages/ozkey_commissioner/tool/gen_invite_vector.dart) before first use:
@@ -329,6 +383,36 @@ async def run(args):
             log("RESULT", s or "no MEMBER_* status within timeout")
             return
 
+        # ozkey-13 F1-F5 bench test: build+seal a credential frame exactly
+        # like the BLE verbs below, but publish it over MQTT instead of
+        # writing to CHR_CTL — proves the firmware's new envelope_hex path
+        # (onMqttMessage -> ozControlOpen -> ozControlVerifyAndDispatch)
+        # independently of ozlockserv or the app, per the operator's
+        # "no need to wait for app or server" direction. Still connects over
+        # BLE first (like every other command) purely to learn device_id/
+        # lock_pub and to keep chrStatus watching, since notifyStatus() only
+        # reaches a currently-connected BLE client — MQTT itself carries no
+        # reply channel until the ozkey-12 §8.6 uplink gap is closed.
+        if args.cmd in ("mqtt-grant", "mqtt-delete"):
+            slot = int(args.arg) if args.arg else 1
+            now = int(time.time())
+            if args.cmd == "mqtt-grant":
+                if args.type == "pin":
+                    frame = FRAME_GRANT_PIN(slot, args.pin or "135790", now, now + 86400)
+                else:
+                    frame = FRAME_GRANT_RFID(slot, args.pin or "DEADBEEF", now, now + 86400)
+            else:
+                frame = FRAME_DELETE_PIN(slot) if args.type == "pin" else FRAME_DELETE_RFID(slot)
+            log("FRAME", frame.hex(" ").upper())
+            env = build_mqtt_envelope(st, state_path, device_id, lock_pub, frame)
+            lk.status.clear()
+            mqtt_publish_envelope(args.broker, args.site, device_id, env)
+            s = await lk.await_status(["UNLOCK_"], timeout=8.0)
+            log("RESULT", s or "NO STATUS via BLE (expected — MQTT has no reply "
+                              "channel yet, ozkey-12 §8.6; check serial for "
+                              "[CTL]/[FWD] lines instead)")
+            return
+
         # the control verbs
         if args.cmd == "unlock":
             frame = FRAME_UNLOCK()
@@ -397,9 +481,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["keys", "info", "probe", "unlock",
                                     "revoke", "cancel", "invite", "enroll",
-                                    "list_bonds"])
+                                    "list_bonds", "mqtt-grant", "mqtt-delete"])
     ap.add_argument("arg", nargs="?", default="",
-                    help="revoke/cancel: hex arg. invite: label. enroll: OZINV1:...")
+                    help="revoke/cancel: hex arg. invite: label. enroll: OZINV1:... "
+                         "mqtt-grant/mqtt-delete: slot number (default 1)")
+    ap.add_argument("--type", default="pin", choices=["pin", "rfid"],
+                    help="mqtt-grant/mqtt-delete only — credential type")
+    ap.add_argument("--pin", default=None,
+                    help="mqtt-grant only — PIN digits (--type pin) or hex UID "
+                         "(--type rfid); default a fixed bench value")
+    ap.add_argument("--broker", default="10.1.1.20",
+                    help="mqtt-grant/mqtt-delete only — MQTT broker host")
+    ap.add_argument("--site", default="lab",
+                    help="mqtt-grant/mqtt-delete only — site id in the command topic")
     ap.add_argument("--state", default=None,
                     help="identity/state JSON path (default: ozctl_state.json next "
                          "to this script) — use a second file to act as a second "

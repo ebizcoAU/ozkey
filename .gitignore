@@ -1,6 +1,7 @@
 # dependencies
 node_modules/
 ozvenv/
+__pycache__/
 
 # next.js build output
 .next/

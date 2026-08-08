@@ -1,11 +1,12 @@
 # ozkey-13 — `ozlockserv` relay-opaque migration (PM priority #1, Option B)
 
-**Status: DECISIONS CONFIRMED 2026-08-08, work not started.** Scoped per the Project
-Manager's priority list (`ozkey-12.md` §14). Operator chose **Option B — full parity
-with the bond ceremony** over the minimal Option A. All three open questions this doc
-raised (§4/§6/§7 as originally written) are now resolved by the Project Manager — see
-§8. This doc is the spec of record for firmware, server, and app work; shareable with
-the app team as-is.
+**Status 2026-08-08: firmware F1-F5 code-complete, compiles clean, NOT YET
+HARDWARE-VERIFIED.** Scoped per the Project Manager's priority list (`ozkey-12.md`
+§14). Operator chose **Option B — full parity with the bond ceremony**. All three
+open questions this doc raised are resolved (§7). Firmware side (F1-F5) built this
+session — `doorlock-1.23`, compiles clean on all three boards, not yet flashed to
+hardware. Server (S1-S6) and app (A1-A7, ftpos already responded in XF-69 §6 — see
+below) not started. This doc is the spec of record; shareable with the app team.
 
 ## 1. What's actually broken — two things, not one
 
