@@ -169,8 +169,14 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 //        dispatch (role-gated to bond #0), legacy `payload_hex` kept for
 //        rollout. See doorlock.ino's own changelog for the full detail. No
 //        UI change. NOT YET HARDWARE-VERIFIED.
-#define FW_VERSION "doorlock-1.23"
-#define FW_DISPLAY_VERSION "V1.23" // shown on-screen: "OZLOCK V1.23 THREAD/WIFI"
+//   1.24 (2026-08-08): ozkey-13 §8 F7 — Thread UDP relay receive half gets
+//        the same `envelope_hex` branch, same F1 core, no live challenge.
+//        Closes the gap where sealed grants could never reach a bridged
+//        (Thread) lock — which is every bench lock. See doorlock.ino's own
+//        changelog for the full detail. No UI change. NOT YET HARDWARE-
+//        VERIFIED.
+#define FW_VERSION "doorlock-1.24"
+#define FW_DISPLAY_VERSION "V1.24" // shown on-screen: "OZLOCK V1.24 THREAD/WIFI"
 
 // Brief startup splash before the operational dashboard (operator request) —
 // shown once at boot, before WiFi/Thread/BLE bring-up starts, so there's

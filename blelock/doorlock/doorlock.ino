@@ -150,8 +150,21 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //        wins if a server sends both. NOT YET HARDWARE-VERIFIED — compiled
 //        + bench-tooling ready (`ozctl.py mqtt-grant`/`mqtt-delete`), needs
 //        a real flash + live test.
-#define FW_VERSION "doorlock-1.23"
-#define FW_DISPLAY_VERSION "V1.21" // shown on-screen: "OZLOCK V1.21 THREAD/WIFI"
+//   1.24 (2026-08-08): ozkey-13 §8 F7 — the Thread UDP relay's receive half
+//        (`pollThreadUdp()`) gets the same `envelope_hex` branch F2 added to
+//        `onMqttMessage()`, routed through the identical F1 core
+//        (`ozControlOpen`/`ozControlVerifyAndDispatch`, no live challenge).
+//        Closes the gap found bench-testing F2/F3: every bench lock is
+//        Thread-connected, so sealed grants/deletes could not reach ANY of
+//        them without this — F2 alone only ever covered a WiFi-direct lock.
+//        Legacy `payload` pure-forward unchanged when `envelope_hex` is
+//        absent. Also fixes a real bug: FW_DISPLAY_VERSION was stuck at
+//        "V1.21" through the 1.22/1.23 bumps (FW_VERSION moved, the on-
+//        screen badge didn't) — exactly the two-versions-disagreeing trap
+//        the 1.2 entry above was written to prevent. NOT YET HARDWARE-
+//        VERIFIED.
+#define FW_VERSION "doorlock-1.24"
+#define FW_DISPLAY_VERSION "V1.24" // shown on-screen: "OZLOCK V1.24 THREAD/WIFI"
 
 // This board shows no startup splash (never did, pre-refactor) — no-op so
 // the shared core's unconditional drawSplash() call is a well-defined hook.

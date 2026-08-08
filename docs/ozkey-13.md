@@ -152,6 +152,79 @@ in-lock verbs rather than MCU forwards — exact shape is firmware's call during
 - DPID 21-24 over the MQTT sealed path are role-gated to bond #0.
 - A member (non-admin) bond gets `UNLOCK_DENIED` attempting DPID 21-24.
 
+### Firmware gap found scoping the bench test (2026-08-08) — F2/F3 only cover
+    WiFi-direct locks; Thread locks behind a bridge get nothing
+
+Discovered trying to hardware-test F1-F5 against the actual bench fleet: **all
+three bench locks are Thread-connected** (`bridge_id` set on every row,
+`ozk-*` locks confirmed via `GET /locks`). F2's `envelope_hex` entry point
+only lives in `onMqttMessage()` — the direct-WiFi MQTT client's own handler. A
+Thread lock never runs that function; it receives commands through a
+completely separate path: `bridge32.ino`'s own MQTT client relays `{target,
+payload}` over Thread UDP multicast, and the lock's `pollThreadUdp()`
+(`ozdoorlock_core.h`) pure-forwards whatever `payload` it gets straight to
+`forwardHexToMcu()` — no crypto awareness anywhere in that chain.
+
+This isn't just a bench-testing inconvenience — it's a real scope gap. The
+whitepaper promise (no plaintext credentials, sealed issuance) is supposed to
+cover the fleet, and Thread locks behind a bridge are likely the *majority*
+of real deployments, not an edge case. Shipping F1-F5 alone would leave
+sealed credential issuance working only for WiFi-direct locks.
+
+**Extension is small — three places, same reused core, bridge stays dumb:**
+
+| Task | Where | Description |
+|---|---|---|
+| S7 | `ozlockserv` — `flushQueueForDevice()` | When relaying to a bridged lock, send `envelope_hex` instead of `payload` in the `{msg_id, target, ...}` body when the queued job is sealed (keys off S6's `msg_type` marker — no new column). |
+| BR1 | `bridge32.ino` — `mqttMessageReceived()` / `forwardOverThread()` / `sendToThreadGroup()` | Read `envelope_hex` alongside legacy `payload`/`payload_hex`; relay whichever field arrived under its own name, unchanged, over UDP multicast. **The bridge never decodes or understands it** — pure pass-through, consistent with its designed role (smarter relay, not an authority). One generalized field name instead of hardcoded `"payload"`. |
+| F7 | `ozdoorlock_core.h` — `pollThreadUdp()` | Same branch F2 added to `onMqttMessage()`: check `envelope_hex` first — if present, `ozHexDecode` + `ozControlOpen` + `ozControlVerifyAndDispatch(hasChallenge=false)`, exactly the F1 core, just fed from the UDP datagram instead of the MQTT JSON. Falls back to legacy `payload` + `forwardHexToMcu()` unchanged when absent. |
+
+No new crypto, no new wire format — `envelope_hex`'s byte layout is identical
+whether it arrives via direct MQTT or via the bridge relay; only the
+transport carrying it to the lock differs. F1's shared open/verify core
+already accounts for "no live challenge" (§5), which is exactly what a
+Thread-relayed command needs too — it was designed for this from the start,
+just not wired to this second transport yet.
+
+**Sequencing:** S7/BR1/F7 can go in the same pass as F2/F3 review, or as an
+immediate follow-up — not a separate migration, since it's additive to
+firmware that's already built and reuses everything F1 already did.
+
+**Status 2026-08-08 (later same day): S7/BR1/F7 all built, compiled clean,
+NOT YET HARDWARE-VERIFIED.** Built in parallel with a separate session that
+had already landed S1/S2/S5/S6 server-side (live-verified against the real
+broker/DB — see `[[ozkey-13-server-status]]` memory) and added the guard
+this section describes (sealed+bridged left `queued` rather than silently
+lost). S7 replaces that guard with the real relay, now that BR1/F7 exist to
+receive it:
+
+- **S7** — `flushQueueForDevice()`'s bridged branch now sends `envelope_hex`
+  when `job.msg_type === 'sealed_envelope'`, `payload` otherwise — mirrors
+  the direct-MQTT `envelope` object's existing pattern exactly. The "leave
+  queued, can't reach it" guard is gone; it can reach it now.
+- **BR1** — `bridge32-1.8`. `mqttMessageReceived()`/`forwardOverThread()`/
+  `sendToThreadGroup()` generalized to a `(fieldName, valueHex)` pair instead
+  of a hardcoded `payload` string — relays whichever field arrived
+  (`envelope_hex` checked first, `payload`/`payload_hex` as fallback) under
+  its own name, unchanged. Bridge still never decodes anything.
+- **F7** — `doorlock-1.24`. `pollThreadUdp()` gets the identical branch F2
+  added to `onMqttMessage()`: `envelope_hex` present → `ozHexDecode` +
+  `ozControlOpen` + `ozControlVerifyAndDispatch(hasChallenge=false)`; absent
+  → legacy `forwardHexToMcu()` path, unchanged.
+- **Also fixed while touching `doorlock.ino`**: `FW_DISPLAY_VERSION` had been
+  stuck at "V1.21" through the 1.22/1.23 bumps — `FW_VERSION` moved, the
+  on-screen badge didn't. Same two-versions-disagreeing trap the file's own
+  1.2 changelog entry exists to prevent. Fixed as part of 1.24.
+
+Compiles clean: `doorlock` (1.47"), `doorlock19` (1.9"), `dlock19`, `bridge32`
+(GEEKC6), `ozlockserv` (`node --check`, and live-reloaded cleanly under its
+own `--watch` process — `/health` confirms DB+MQTT still up post-reload).
+**Not flashed to any board yet** — firmware changes need the operator to
+flash `doorlock-1.24` + `bridge32-1.8` before any of this can be exercised
+against real hardware. `server.js` is uncommitted (shared with the parallel
+session's uncommitted S1/S2/S5/S6 work) — not committing without explicit
+confirmation, per [[workflow-conventions]].
+
 ### Server (ozlockserv)
 
 | Task | Description | Priority |

@@ -1568,13 +1568,47 @@ void pollThreadUdp() {
     return;
   }
   String target = (const char *)(doc["target"] | "");
-  String payloadHex = (const char *)(doc["payload"] | "");
   if (target != deviceId) { // not for us
     Serial.printf("[UDP] not for us (target='%s' me='%s')\n", target.c_str(), deviceId.c_str());
     return;
   }
-  Serial.printf("[UDP] << target=%s payload=%s\n", target.c_str(), payloadHex.c_str());
   lastActivityAt = millis();
+
+  // ozkey-13 §8 F7: `envelope_hex` (sealed, relayed by bridge32 BR1) is
+  // checked first and routed through the SAME F1 core the BLE `control`
+  // characteristic and the direct-MQTT path (F2) use — no live challenge
+  // exists for a Thread-relayed command any more than a direct-MQTT one, so
+  // freshness is counter-only here too (ozkey-13 §5). Falls back to the
+  // legacy `payload` pure-forward, unchanged, when absent.
+  const char *envHex = doc["envelope_hex"] | (const char *)nullptr;
+  if (envHex) {
+    Serial.printf("[UDP] << target=%s envelope_hex=%u chars\n", target.c_str(),
+                  (unsigned)strlen(envHex));
+    uint8_t ebuf[OZ_CTL_MAX];
+    const size_t n = ozHexDecode(String(envHex), ebuf, sizeof(ebuf));
+    if (n == 0) {
+      Serial.println("[UDP] envelope_hex is not valid hex — denied");
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    int slot = -1;
+    uint8_t pt[OZ_CTL_MAX];
+    size_t ptLen = 0;
+    uint64_t counter = 0;
+    const OzCtlOpen r =
+        ozControlOpen(ebuf, n, &slot, pt, sizeof(pt), &ptLen, &counter);
+    // Delivered whole in one UDP datagram — no "still arriving" case, same
+    // reasoning as F2's MQTT entry point.
+    if (r != OZCTL_OPENED) {
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    ozControlVerifyAndDispatch(slot, pt, ptLen, counter, false /*hasChallenge*/);
+    return;
+  }
+
+  String payloadHex = (const char *)(doc["payload"] | "");
+  Serial.printf("[UDP] << target=%s payload=%s\n", target.c_str(), payloadHex.c_str());
   forwardHexToMcu(payloadHex);
 }
 

@@ -126,8 +126,14 @@ unsigned long lastLcdActivityAt = 0;
 // (60s). The bridge-ownership investigation it was disabled for closed
 // 2026-08-06 (ozkey-12 §9.8) — no reason left to keep the bench diagnostic
 // override in place.
-#define FW_VERSION "bridge32-1.7"
-#define FW_DISPLAY_VERSION "v1.7" // shown on-screen, doorlock.ino's badge convention
+// 1.8 (2026-08-08): ozkey-13 §8 BR1 — mqttMessageReceived()/forwardOverThread()/
+// sendToThreadGroup() generalized to relay `envelope_hex` (sealed) alongside
+// legacy `payload`/`payload_hex`, whichever arrives, under its own field
+// name. Pure pass-through — this board never decodes or opens the envelope,
+// same as it never understood `payload` either. Closes the gap where a
+// sealed grant/delete could never reach any Thread lock behind this bridge.
+#define FW_VERSION "bridge32-1.8"
+#define FW_DISPLAY_VERSION "v1.8" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
 // existing mesh) in v0; it is the only network former in the home.
@@ -510,10 +516,13 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   for (unsigned int i = 0; i < len; i++) body += (char)payload[i];
   Serial.printf("[MQTT] << %s : %s\n", topic, body.c_str());
 
-  // F4: distill to {target, payload} for the Thread hop. Accepts either the
-  // lean v0 shape (a bench `mosquitto_pub` test) or the richer ozlockserv
-  // queue envelope (device_id/payload_hex) — S4 pins the exact server-side
-  // shape; both are handled defensively until then.
+  // F4: distill to {target, payload}/{target, envelope_hex} for the Thread
+  // hop. Accepts either the lean v0 shape (a bench `mosquitto_pub` test) or
+  // the richer ozlockserv queue envelope (device_id/payload_hex) — S4 pins
+  // the exact server-side shape; both are handled defensively until then.
+  // ozkey-13 §8 BR1: `envelope_hex` (sealed) is checked first and relayed
+  // under its own field name — the bridge never decodes it, same pure-
+  // forward treatment `payload`/`payload_hex` always got.
   JsonDocument doc;
   if (deserializeJson(doc, body) != DeserializationError::Ok) {
     Serial.println("[MQTT] payload not valid JSON, dropped");
@@ -521,8 +530,14 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   }
   String target = (const char *)(doc["target"] | "");
   if (!target.length()) target = (const char *)(doc["device_id"] | "");
-  String payloadHex = (const char *)(doc["payload"] | "");
-  if (!payloadHex.length()) payloadHex = (const char *)(doc["payload_hex"] | "");
+
+  String fieldName = "envelope_hex";
+  String valueHex = (const char *)(doc["envelope_hex"] | "");
+  if (!valueHex.length()) {
+    fieldName = "payload";
+    valueHex = (const char *)(doc["payload"] | "");
+    if (!valueHex.length()) valueHex = (const char *)(doc["payload_hex"] | "");
+  }
 
   // Show it on the panel for LCD_RX_FLASH_MS, then the footer restores itself
   // (loop() redraws once when lcdRxFlashUntil lapses).
@@ -531,7 +546,7 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   lcdRxFlashActive = true;
   lcdWake(); // redraws immediately with the banner
 
-  forwardOverThread(target, payloadHex);
+  forwardOverThread(target, fieldName, valueHex);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -581,16 +596,20 @@ void threadUdpBegin() {
 }
 
 // One multicast send, logged per destination group so the bench can tell which
-// group a datagram actually went out on.
+// group a datagram actually went out on. `fieldName` is "payload" (legacy,
+// pure-forward) or "envelope_hex" (sealed, ozkey-13 §8 BR1) — the bridge
+// never inspects `valueHex` either way, just relays it under whichever name
+// arrived. Kept generic rather than two near-duplicate functions.
 static bool sendToThreadGroup(const IPAddress &group, const String &target,
-                              const String &payloadHex, const char *label) {
+                              const String &fieldName, const String &valueHex,
+                              const char *label) {
   // "via" tags which multicast group carried this datagram. The doorlock reads
-  // only "target"/"payload" and ArduinoJson ignores unknown keys, so this is
-  // inert to the relay — but the doorlock's rx diagnostic dumps the whole
-  // buffer, making it obvious which group actually got through.
+  // only "target"/"payload"/"envelope_hex" and ArduinoJson ignores unknown
+  // keys, so this is inert to the relay — but the doorlock's rx diagnostic
+  // dumps the whole buffer, making it obvious which group actually got through.
   JsonDocument doc;
   doc["target"] = target;
-  doc["payload"] = payloadHex;
+  doc[fieldName] = valueHex;
   doc["via"] = label;
   String out;
   serializeJson(doc, out);
@@ -684,8 +703,9 @@ static void logThreadChildren() {
   }
 }
 
-void forwardOverThread(const String &target, const String &payloadHex) {
-  if (!target.length() || !payloadHex.length()) {
+void forwardOverThread(const String &target, const String &fieldName,
+                       const String &valueHex) {
+  if (!target.length() || !valueHex.length()) {
     Serial.println("[UDP] drop — command missing target/payload");
     return;
   }
@@ -694,10 +714,10 @@ void forwardOverThread(const String &target, const String &payloadHex) {
     return;
   }
   logThreadChildren(); // DIAGNOSTIC (temporary) — is the lock even on this mesh?
-  sendToThreadGroup(OZ_THREAD_GROUP, target, payloadHex, "ff03::4f5a");
+  sendToThreadGroup(OZ_THREAD_GROUP, target, fieldName, valueHex, "ff03::4f5a");
   // DIAGNOSTIC (2026-07-28, temporary): same datagram to realm-local
   // all-nodes — see the OZ_REALM_ALLNODES note above.
-  sendToThreadGroup(OZ_REALM_ALLNODES, target, payloadHex, "ff03::1");
+  sendToThreadGroup(OZ_REALM_ALLNODES, target, fieldName, valueHex, "ff03::1");
 
   // DIAGNOSTIC (2026-07-28, temporary — REMOVE, hard-codes one bench lock).
   // Unicast control test. The doorlock's mesh-local EID, read from its own
@@ -713,7 +733,7 @@ void forwardOverThread(const String &target, const String &payloadHex) {
   //     test below our code entirely.
   IPAddress benchLock;
   if (benchLock.fromString("fd30:4e72:549c:3c5b:5630:8734:5090:340b")) {
-    sendToThreadGroup(benchLock, target, payloadHex, "unicast-ML-EID");
+    sendToThreadGroup(benchLock, target, fieldName, valueHex, "unicast-ML-EID");
   } else {
     Serial.println("[UDP] bench unicast address failed to parse");
   }

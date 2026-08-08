@@ -12,8 +12,10 @@
  *    1. Mint single-use enrollment tokens (BANOI "Add Doorlock" begins here)
  *    2. Enroll locks: verify token, bind device -> site/owner, issue broker
  *       credentials, ack on the command topic
- *    3. Issue/revoke user keys as Tuya 55 AA DPID frames, queue them, flush
- *       on the lock's wake (ozkey/<site>/locks/<id>/heartbeat)
+ *    3. Relay app-sealed Tuya 55 AA DPID envelopes (grant/revoke), queue
+ *       them, flush on the lock's wake (ozkey/<site>/locks/<id>/heartbeat) —
+ *       the server never builds a frame or sees a PIN/RFID (ozkey-13, S4
+ *       cutover 2026-08-08)
  *
  *  NOT a responsibility, deliberately — DOOR EVENTS ARE NEVER INGESTED.
  *    Removed 2026-07-31 (operator decision, XF-48 §9.4). This server is the
@@ -165,54 +167,12 @@ function toSpacedHex(buf) {
     .join(' ');
 }
 
-function credentialValueBytes(type, rawValue) {
-  const value = String(rawValue).trim();
-  if (type === 'pin') {
-    if (!/^\d+$/.test(value)) {
-      throw new Error(`PIN must be digits only (got "${value}")`);
-    }
-    return Buffer.from(value, 'ascii');
-  }
-  const hex = value.replace(/[^0-9a-fA-F]/g, '');
-  if (hex.length === 0 || hex.length % 2 !== 0) {
-    throw new Error(`RFID UID must be an even-length hex string (got "${value}")`);
-  }
-  return Buffer.from(hex, 'hex');
-}
-
-// ozkey-13 §10 phase 4 / S4 (XF-69): legacy-path only, once the sealed-envelope
-// migration cuts over. The server building a credential frame at all is the
-// plaintext-storage breach the whitepaper names — after cutover the app
-// always sends a pre-sealed envelope_hex and this function is deleted, not
-// just unused. See migrations/S3_drop_raw_value.sql for the paired schema cut.
-function buildCredentialFrame({ type, slotNumber, rawValue, dateFrom, dateTo }) {
-  if (!SUPPORTED_CRED_TYPES.includes(type)) {
-    throw new Error(`unsupported credential type "${type}" for the DP codec`);
-  }
-  const credBytes = credentialValueBytes(type, rawValue);
-  const fromTs = Math.floor(new Date(dateFrom).getTime() / 1000) || 0;
-  const toTs = Math.floor(new Date(dateTo).getTime() / 1000) || 0;
-
-  const value = Buffer.alloc(2 + credBytes.length + 8);
-  value.writeUInt16BE(slotNumber & 0xffff, 0);
-  credBytes.copy(value, 2);
-  value.writeUInt32BE(fromTs >>> 0, 2 + credBytes.length);
-  value.writeUInt32BE(toTs >>> 0, 2 + credBytes.length + 4);
-
-  const dpId = type === 'pin' ? DPID.ADD_TEMP_PIN : DPID.ADD_TEMP_RFID;
-  return buildTuyaFrame(TUYA_CMD.DP_REPORT, buildDpPayload(dpId, DP_TYPE.RAW, value));
-}
-
-// S4 removal candidate too — same cutover as buildCredentialFrame() above.
-function buildDeleteFrame({ type, slotNumber }) {
-  if (!SUPPORTED_CRED_TYPES.includes(type)) {
-    throw new Error(`unsupported credential type "${type}" for the DP codec`);
-  }
-  const value = Buffer.alloc(2);
-  value.writeUInt16BE(slotNumber & 0xffff, 0);
-  const dpId = type === 'pin' ? DPID.DELETE_PIN : DPID.DELETE_RFID;
-  return buildTuyaFrame(TUYA_CMD.DP_REPORT, buildDpPayload(dpId, DP_TYPE.RAW, value));
-}
+// S4 cutover (ozkey-13 §10 phase 4, XF-69), executed 2026-08-08: the server
+// building a credential frame at all was the plaintext-storage breach the
+// whitepaper named. credentialValueBytes()/buildCredentialFrame()/
+// buildDeleteFrame() are gone — the app always sends a pre-sealed
+// envelope_hex now (A1-A5, ftpos shipped), the server only relays it opaque.
+// See migrations/S3_drop_raw_value.sql for the paired schema cut.
 
 /** Remote unlock request: DP_REPORT / DPID 1 (UNLOCK_CHANNEL) BOOL value 1.
  *  Byte-matches LockSim's SAMPLE_REMOTE_UNLOCK_FRAME; the lock's handleFrame
@@ -386,13 +346,24 @@ async function initDatabase() {
       user_name VARCHAR(255),
       type ENUM('pin','rfid','fingerprint'),
       slot_number INT,
-      raw_value VARCHAR(255),
       date_from VARCHAR(50),
       date_to VARCHAR(50),
       sync_status VARCHAR(50) DEFAULT 'pending',
       issued_by VARCHAR(50) DEFAULT 'owner',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB`);
+
+  // S3 cutover (ozkey-13 §10 phase 4, XF-69), executed 2026-08-08:
+  // migrations/S3_drop_raw_value.sql, folded in here so every environment
+  // running this code — not just the one it was run against by hand —
+  // converges to the same schema. Irreversible on purpose: no plaintext
+  // PIN/RFID should be recoverable from server-side storage after cutover.
+  const [[{ hasRawValue }]] = await pool.query(
+    `SELECT COUNT(*) AS hasRawValue FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'grants' AND column_name = 'raw_value'`,
+    [CONFIG.DB.database]
+  );
+  if (hasRawValue) await pool.query('ALTER TABLE grants DROP COLUMN raw_value');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pending_queue (
@@ -1231,25 +1202,21 @@ api.post('/locks/:id/grants', async (req, res) => {
     const {
       user_name,
       type = 'pin',
-      raw_value,
       envelope_hex,
       slot_number = 1,
       date_from,
       date_to,
     } = req.body || {};
 
-    // ozkey-13 §8 S1 (XF-69): during rollout the app sends EITHER the legacy
-    // plaintext `raw_value` (server builds the DP frame, see 1b below) OR a
-    // pre-sealed `envelope_hex` (app already built + AES-GCM sealed it — the
-    // server relays it opaque, never decrypts, never sees the PIN/RFID).
-    // `envelope_hex` wins if a caller somehow sends both.
-    const sealed = Boolean(envelope_hex);
-
-    if (!user_name || (!raw_value && !envelope_hex)) {
+    // S4 cutover (ozkey-13 §10 phase 4, XF-69), executed 2026-08-08: the app
+    // seals the DP frame client-side (A1-A5, ftpos shipped) — `raw_value` is
+    // no longer accepted at all, not just deprioritized. The server relays
+    // envelope_hex opaque, never builds or sees the PIN/RFID.
+    if (!user_name || !envelope_hex) {
       return res.status(400).json({
         ok: false,
         code: 'missing_fields',
-        error: 'user_name and one of raw_value/envelope_hex are required',
+        error: 'user_name and envelope_hex are required',
       });
     }
     if (type === 'fingerprint') {
@@ -1278,54 +1245,26 @@ api.post('/locks/:id/grants', async (req, res) => {
     const from = date_from || new Date().toISOString();
     const to = date_to || new Date(Date.now() + 24 * 3600 * 1000).toISOString();
 
-    // S4 prep (ozkey-13 §10 phase 4): buildCredentialFrame() only runs on the
-    // legacy path. Once every app is sealed-capable this whole branch — and
-    // the function itself — is deleted; see migrations/S3_drop_raw_value.sql.
-    let payloadHex = null;
-    if (!sealed) {
-      let frame;
-      try {
-        frame = buildCredentialFrame({
-          type,
-          slotNumber: slot_number,
-          rawValue: raw_value,
-          dateFrom: from,
-          dateTo: to,
-        });
-      } catch (err) {
-        return res.status(400).json({ ok: false, code: 'bad_request', error: err.message });
-      }
-      payloadHex = toSpacedHex(frame);
-    }
-
     await conn.beginTransaction();
-    // S3 prep: sealed grants store raw_value = NULL — the server genuinely
-    // never learns the PIN/RFID for these rows, which is the actual property
-    // migrations/S3_drop_raw_value.sql later makes structural.
+    // S3 cutover: grants has no raw_value column anymore — the server
+    // genuinely cannot know the PIN/RFID for a row it stores, structurally.
     const [grantResult] = await conn.query(
-      `INSERT INTO grants (device_id, site_id, user_name, type, slot_number, raw_value, date_from, date_to, sync_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
-      [deviceId, lock.site_id, user_name, type, slot_number, sealed ? null : raw_value, from, to]
+      `INSERT INTO grants (device_id, site_id, user_name, type, slot_number, date_from, date_to, sync_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      [deviceId, lock.site_id, user_name, type, slot_number, from, to]
     );
     const grantId = grantResult.insertId;
     const [queueResult] = await conn.query(
-      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, payload_hex, envelope_hex, msg_type, status)
-       VALUES (?, ?, ?, 'grant-key', ?, ?, ?, 'queued')`,
-      [
-        deviceId,
-        lock.site_id,
-        grantId,
-        sealed ? null : payloadHex,
-        sealed ? envelope_hex : null,
-        sealed ? 'sealed_envelope' : 'legacy_payload',
-      ]
+      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, envelope_hex, msg_type, status)
+       VALUES (?, ?, ?, 'grant-key', ?, 'sealed_envelope', 'queued')`,
+      [deviceId, lock.site_id, grantId, envelope_hex]
     );
     await conn.commit();
 
     logEvent(
       'key',
       `Granted ${type.toUpperCase()} to "${user_name}" -> "${lock.label}" slot ${slot_number} ` +
-        `(grant #${grantId}, queue #${queueResult.insertId}, ${sealed ? 'sealed' : 'legacy'}) — awaiting wake`
+        `(grant #${grantId}, queue #${queueResult.insertId}, sealed) — awaiting wake`
     );
     await recordAudit(
       lock.app_id,
@@ -1341,7 +1280,7 @@ api.post('/locks/:id/grants', async (req, res) => {
       grant_id: grantId,
       queue_id: queueResult.insertId,
       device_id: deviceId,
-      ...(sealed ? { envelope_hex } : { payload_hex: payloadHex }),
+      envelope_hex,
       sync_status: 'pending',
     });
   } catch (err) {
@@ -1599,11 +1538,15 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
   try {
     const deviceId = req.params.id;
     const grantId = Number(req.params.gid);
-    // ozkey-13 §8 S1/S4 parity: revoke gets the same envelope_hex option as
-    // issue, for whenever the app ships sealed DPID 22/24 delete frames
-    // (XF-69 §6: not built yet on their side — bare DELETE today).
+    // S4 cutover, executed 2026-08-08: envelope_hex is required — ftpos
+    // shipped sealed DPID 22/24 delete frames (revokeGrant() ->
+    // sealDeletePin/sealDeleteRfid), buildDeleteFrame() is gone.
     const { envelope_hex } = req.body || {};
-    const sealed = Boolean(envelope_hex);
+    if (!envelope_hex) {
+      return res
+        .status(400)
+        .json({ ok: false, code: 'missing_fields', error: 'envelope_hex is required' });
+    }
 
     const [[grant]] = await conn.query('SELECT * FROM grants WHERE id = ? AND device_id = ?', [
       grantId,
@@ -1634,29 +1577,11 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
         queue_id: dupe.id,
       });
 
-    let payloadHex = null;
-    if (!sealed) {
-      let frame;
-      try {
-        frame = buildDeleteFrame({ type: grant.type, slotNumber: grant.slot_number });
-      } catch (err) {
-        return res.status(422).json({ ok: false, code: 'unprocessable', error: err.message });
-      }
-      payloadHex = toSpacedHex(frame);
-    }
-
     await conn.beginTransaction();
     const [queueResult] = await conn.query(
-      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, payload_hex, envelope_hex, msg_type, status)
-       VALUES (?, ?, ?, 'revoke-key', ?, ?, ?, 'queued')`,
-      [
-        deviceId,
-        grant.site_id,
-        grantId,
-        sealed ? null : payloadHex,
-        sealed ? envelope_hex : null,
-        sealed ? 'sealed_envelope' : 'legacy_payload',
-      ]
+      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, envelope_hex, msg_type, status)
+       VALUES (?, ?, ?, 'revoke-key', ?, 'sealed_envelope', 'queued')`,
+      [deviceId, grant.site_id, grantId, envelope_hex]
     );
     await conn.query("UPDATE grants SET sync_status = 'revoking' WHERE id = ?", [grantId]);
     await conn.commit();
@@ -1664,7 +1589,7 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
     logEvent(
       'key',
       `Revoking ${grant.type.toUpperCase()} for "${grant.user_name}" on ${deviceId} slot ${grant.slot_number} ` +
-        `(grant #${grantId}, queue #${queueResult.insertId}, ${sealed ? 'sealed' : 'legacy'}) — awaiting wake`
+        `(grant #${grantId}, queue #${queueResult.insertId}, sealed) — awaiting wake`
     );
     await recordAudit(
       null,
@@ -1680,7 +1605,7 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
       grant_id: grantId,
       queue_id: queueResult.insertId,
       device_id: deviceId,
-      ...(sealed ? { envelope_hex } : { payload_hex: payloadHex }),
+      envelope_hex,
       sync_status: 'revoking',
     });
   } catch (err) {
@@ -1792,8 +1717,6 @@ if (require.main === module) {
     DP_TYPE,
     buildTuyaFrame,
     buildDpPayload,
-    buildCredentialFrame,
-    buildDeleteFrame,
     toSpacedHex,
     normalizeMac,
     deviceIdFromMac,
