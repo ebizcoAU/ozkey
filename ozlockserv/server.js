@@ -37,10 +37,28 @@
  *    DO NOT REINSTATE as a flag or a shorter retention. The guarantee is only
  *    credible because the hosted build cannot do it at all.
  *
- *  Lab simplifications (flagged, ozkey-05 §10 migration steps 3-5 pending):
+ *  Lab simplifications / PRODUCTION READINESS — NOT DONE YET (ozkey-05 §10
+ *  migration steps 3-5 pending). None of these are lab-only quirks to shrug
+ *  off; each is a real gap that must close before any non-lab deployment:
  *    - single seeded owner + site ('lab'); REST is unauthenticated
- *    - broker credentials are minted + stored + acked for contract shape, but
- *      the lab Mosquitto does not enforce them
+ *    - **Broker ACLs are not configured or enforced.** Verified live
+ *      2026-08-08 (ozkey-15 §8.1, S8/S9): `mosquitto_pub` with a fabricated
+ *      username and wrong password still published successfully — anyone who
+ *      can reach the broker can publish/subscribe to ANY topic, including
+ *      another device's command topic or another app's members/* topic.
+ *      This is a bigger deal after ozkey-15's S8/S9 (app-to-app relay):
+ *      that spec's own trust model states plainly "No authentication
+ *      changes — app_id and MQTT ACLs already handle routing" — which
+ *      assumes ACLs exist. They don't yet. Broker credentials ARE minted +
+ *      stored + acked per-device for contract shape (`locks.broker_username`/
+ *      `broker_secret`), so the wiring is there; enforcement is not.
+ *      **Configuring real ACLs is a FUTURE task, deliberately not done now**
+ *      (operator instruction 2026-08-08) — noted here so it isn't
+ *      rediscovered from scratch, not as something to act on yet. Also note
+ *      production is planned to run EMQX, not this lab's Mosquitto (see
+ *      "Broker" above) — so this is a spec/requirements note for whoever
+ *      provisions that broker, not a config file that exists in this repo
+ *      to edit.
  *    - device_id is derived from the MAC (real hardware: keypair, ozkey-04 §3)
  * ============================================================================
  */
