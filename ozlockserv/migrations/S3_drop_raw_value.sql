@@ -1,0 +1,26 @@
+-- ozkey-13 §10 phase 4 / XF-69 §2 — S3: drop grants.raw_value
+--
+-- DO NOT RUN THIS YET. This is prep, not a live migration — see ozkey-13.md
+-- §10 "Rollout strategy". It is backwards-INCOMPATIBLE: once this column is
+-- gone, any app still on the legacy raw_value path (POST /locks/:id/grants
+-- without envelope_hex) gets a `bad_request` from the missing column, not a
+-- graceful fallback. Run only after:
+--
+--   1. Every app build in the field sends envelope_hex (A3/A5 shipped +
+--      rolled out, not just merged — see XF-69 §6 for ftpos's build status).
+--   2. Every lock firmware in the field accepts envelope_hex on the sealed
+--      path (F1-F5, plus F7/BR1 for bridged Thread locks once that lands —
+--      ozkey-13.md §8 "Firmware gap found scoping the bench test").
+--   3. The operator has independently confirmed both of the above — this is
+--      a System/Architecture-level cutover decision, not a routine deploy.
+--
+-- After this runs, also delete buildCredentialFrame()/buildDeleteFrame() and
+-- the `!sealed` branches that call them in server.js (S4) — a column that's
+-- gone but code still branches on it left over is a stale, misleading trace
+-- of the plaintext path this migration exists to close.
+--
+-- Existing legacy rows: their `raw_value` is destroyed by this ALTER with no
+-- recovery. That's the deliberate point (no PIN should be recoverable from
+-- server-side storage after cutover) but say it out loud before running it.
+
+ALTER TABLE grants DROP COLUMN raw_value;
