@@ -218,13 +218,47 @@ static const uint8_t OZ_ROLE_MEMBER = 1;
 #define OZ_BOND_REC   80  // on-NVS record stride; 6 bytes spare for v2 fields
 #define OZ_BONDTAB_SZ (OZ_BOND_REC * OZ_BOND_MAX)
 
+// ozkey-17 U0: 48-bit big-endian, for the outbound counter below. Six bytes,
+// not eight, because that is exactly what OZ_BOND_REC left spare — and growing
+// the record would change OZ_BONDTAB_SZ, which ozBondsLoad() compares against
+// getBytesLength() to decide whether the blob is valid. A longer record would
+// therefore make every existing table fail that check and silently drop every
+// bond on the first boot after the upgrade. 2^48 sends is ~9 million years at
+// one per second; the spare bytes are the right size and always were.
+static void ozPutU48BE(uint64_t v, uint8_t out[6]) {
+  for (int i = 5; i >= 0; i--) { out[i] = (uint8_t)(v & 0xFF); v >>= 8; }
+}
+static uint64_t ozGetU48BE(const uint8_t in[6]) {
+  uint64_t v = 0;
+  for (int i = 0; i < 6; i++) v = (v << 8) | in[i];
+  return v;
+}
+
 struct OzBond {
   bool     present;
   uint8_t  role;
   uint64_t floor;              // counter_floor — anti-replay, M4 moves it
   uint8_t  pub[32];            // the member's X25519 public key == its app_id
   char     label[OZ_LABEL_MAX];
+
+  // ── ozkey-17 U0: lock->app send counter ────────────────────────────────────
+  // `floor` protects traffic coming IN. Sealing traffic going OUT (U1's uplink,
+  // query responses, pushed roster_changed) needs its own strictly-increasing
+  // counter, or the app cannot tell a fresh reply from a captured one.
+  //
+  // Only `txReserved` is persisted. Bumping NVS on every single send would be
+  // ~1400 writes/day at a 60 s heartbeat, which is real flash wear for no gain,
+  // so we reserve a block of counters per write instead: hand out from RAM
+  // until the reservation is exhausted, then persist a new high-water mark.
+  // After a reboot we resume from the persisted mark, skipping at most
+  // OZ_TX_RESERVE unused values — harmless, because the app requires strictly
+  // increasing, not gapless. This is what makes the counter survive the
+  // brownout reboots this hardware actually does.
+  uint64_t txCounter;          // RAM only — last counter handed out
+  uint64_t txReserved;         // persisted high-water mark (48-bit on NVS)
 };
+
+#define OZ_TX_RESERVE 64       // counters claimed per NVS write
 
 static OzBond g_bonds[OZ_BOND_MAX];
 
@@ -265,11 +299,27 @@ static void ozBondsSave() {
     ozPutU64BE(g_bonds[i].floor, r + 2);
     memcpy(r + 10, g_bonds[i].pub, 32);
     memcpy(r + 42, g_bonds[i].label, OZ_LABEL_MAX);
+    ozPutU48BE(g_bonds[i].txReserved, r + 74); // U0 — the 6 spare bytes
   }
   prefs.begin("blelock", false);
   prefs.putBytes("bondtab", buf, OZ_BONDTAB_SZ);
   prefs.end();
   free(buf);
+}
+
+// ozkey-17 U0: hand out the next lock->app counter for [slot], persisting a
+// fresh reservation only when the current block runs out. Returns 0 if the slot
+// holds no bond — 0 is never a valid outbound counter, so it doubles as the
+// error signal and a caller that ignores it seals nothing.
+static uint64_t ozBondNextTx(int slot) {
+  if (slot < 0 || slot >= OZ_BOND_MAX || !g_bonds[slot].present) return 0;
+  OzBond &b = g_bonds[slot];
+  b.txCounter++;
+  if (b.txCounter > b.txReserved) {
+    b.txReserved = b.txCounter + OZ_TX_RESERVE;
+    ozBondsSave(); // one NVS write per OZ_TX_RESERVE sends, not per send
+  }
+  return b.txCounter;
 }
 
 static void ozBondsLoad() {
@@ -289,6 +339,12 @@ static void ozBondsLoad() {
         memcpy(g_bonds[i].pub, r + 10, 32);
         memcpy(g_bonds[i].label, r + 42, OZ_LABEL_MAX);
         g_bonds[i].label[OZ_LABEL_MAX - 1] = 0; // never trust NVS to terminate
+        // U0: resume the send counter at the persisted reservation, so the
+        // next value handed out is strictly above anything used before the
+        // reboot. A pre-U0 table has these bytes zeroed by the calloc in
+        // ozBondsSave(), which starts the counter at 0 — exactly right.
+        g_bonds[i].txReserved = ozGetU48BE(r + 74);
+        g_bonds[i].txCounter  = g_bonds[i].txReserved;
       }
       free(buf);
     }

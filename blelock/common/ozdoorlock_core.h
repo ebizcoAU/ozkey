@@ -93,6 +93,7 @@ static void handleBondRevoke(int senderSlot, const uint8_t *v, size_t vlen);
 static void handleInviteCancel(int senderSlot, const uint8_t *v, size_t vlen);
 static void handleListBonds(int senderSlot, const uint8_t *v, size_t vlen);
 static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen);
+static void ozSemanticDispatch(int slot, const char *json, size_t len);
 static void ozNotifyChunked(const String &json);
 uint32_t clampHeartbeatS(uint32_t s);
 uint32_t txlogCountLines(const char *path);
@@ -375,7 +376,18 @@ unsigned long threadJoinStart = 0;
 const uint8_t OZ_THREAD_GROUP_BYTES[16] = {0xff, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x4f, 0x5a};
 const IPAddress OZ_THREAD_GROUP(IPv6, OZ_THREAD_GROUP_BYTES);
 const uint16_t OZ_THREAD_UDP_PORT = 5052;
-#define OZ_UDP_RX_BUF 512
+// ozkey-17 §2 U1: uplink gets its OWN port rather than sharing 5052. Two
+// directions on one port would mean every receiver has to answer "is this a
+// command for me, or my own echo coming back off the multicast group" on every
+// datagram — a distinction easy to get subtly wrong and impossible to notice
+// when it is. A second port makes it structural instead of conditional.
+const uint16_t OZ_THREAD_UPLINK_PORT = 5053;
+// ozkey-17 F8: 512 -> 1024. OZKIE semantic JSON is 2-3x the size of the Tuya
+// frame it replaces once hex-encoded into `envelope_hex` — a grant_pin with a
+// hex credential lands near 430 B of datagram against 512, with RFID
+// credentials longer still. Headroom is cheaper than a truncation bug that
+// only shows up on the longest credential anyone ever issues.
+#define OZ_UDP_RX_BUF 1024
 OThreadUDP threadUdp;
 bool threadUdpReady = false;
 unsigned long threadUdpLastAttempt = 0;
@@ -457,6 +469,7 @@ unsigned long lastEnrollSent = 0;
 uint8_t enrollAttempts = 0;
 unsigned long lastUnpairedAnnounce = 0;
 String topicCommand, topicEnroll, topicHeartbeat, topicLog, topicPairConfirm;
+String topicUplink; // ozkey-17 U1 — sealed lock->app content, opaque to the server
 #define TOPIC_UNPAIRED "hotel/locks/unpaired/heartbeat"
 
 bool screenDirty = true;
@@ -1612,6 +1625,169 @@ void pollThreadUdp() {
   forwardHexToMcu(payloadHex);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// U1 (ozkey-17 §6): the lock->app uplink — the half of OZKIE that has never
+// existed.
+//
+// Until now the lock could only ANSWER, and only over an active BLE session to
+// a phone physically at the door. That single gap produced most of the
+// 2026-08-09 XF traffic: XF-75/78 (an admin tapping cancel six times against a
+// roster it could not query), XF-77 (a revoke that happened but could not be
+// observed), XF-72/73/74/76 (retry loops compensating for unknowable state).
+// Every one of them is "the app cannot ask, and the lock cannot tell."
+//
+// The crypto for this direction has existed since ozkey-06 and was never used:
+// ozEnvSeal() + ozEnvKey(appToLock=false) are byte-verified against the Dart
+// side and their only caller was a self-test. What was missing is transport,
+// a counter that survives reboot (U0), and something to say.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// One datagram to the uplink group. Reuses the socket the receive half is bound
+// to — a bound UDP socket sends perfectly well, and a second fd would only be
+// another thing to leak. The DESTINATION port differs from the bind port, so
+// uplink never lands back in pollThreadUdp()'s stream as an echo.
+// ff03::1 — realm-local ALL-NODES. Every Thread node joins this automatically,
+// with no explicit subscription and no lwIP join required.
+static const uint8_t OZ_ALLNODES_BYTES[16] = {0xff, 0x03, 0, 0, 0, 0, 0, 0,
+                                              0,    0,    0, 0, 0, 0, 0, 0x01};
+
+// ozkey-17 U1, corrected 2026-08-10 after the first live uplink went nowhere.
+//
+// MEASURED, not assumed: across every downlink datagram this bench has ever
+// logged, 18 of 18 arrived `"via":"ff03::1"` and ZERO arrived via our own
+// group ff03::4f5a — while bridge32 was demonstrably sending 9 copies to each.
+// Our custom group has never delivered a single packet here.
+//
+// Why: `IPV6_JOIN_GROUP failed errno=125` on BOTH boards. OpenThread's
+// otIp6SubscribeMulticastAddress() succeeds and makes the stack accept the
+// frame off the radio, but lwIP never joined the group, so it never delivers
+// it to the socket. Subscribed at the Thread layer, dead at the socket layer.
+//
+// This went unnoticed for months because bridge32's downlink sprays every
+// command at ff03::4f5a, ff03::1 AND unicast — the shotgun worked, which hid
+// that two of the three barrels are blanks. The first thing to depend on
+// ff03::4f5a alone was this uplink, and it failed immediately.
+//
+// So: send to both, exactly as the proven downlink does. Success on either is
+// success — a duplicate is harmless (the app's counter dedups, and the bridge
+// republishing twice is idempotent at the topic level), whereas a miss is the
+// whole feature not working.
+static bool ozThreadUdpSend(const String &payload) {
+  if (!threadUdpReady || ozRxFd < 0) return false;
+
+  const uint8_t *groups[2] = {OZ_ALLNODES_BYTES, OZ_THREAD_GROUP_BYTES};
+  const char *names[2] = {"ff03::1", "ff03::4f5a"};
+  bool anySent = false;
+
+  for (int i = 0; i < 2; i++) {
+    struct sockaddr_in6 dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin6_family = AF_INET6;
+    dst.sin6_port = htons(OZ_THREAD_UPLINK_PORT);
+    memcpy(&dst.sin6_addr, groups[i], 16);
+    const int n = lwip_sendto(ozRxFd, payload.c_str(), payload.length(), 0,
+                              (struct sockaddr *)&dst, sizeof(dst));
+    if (n < 0)
+      Serial.printf("[UPLINK] sendto %s failed errno=%d\n", names[i], errno);
+    else
+      anySent = true;
+  }
+  return anySent;
+}
+
+// Seal [json] to the bond in [slot] and emit it on whatever transport this lock
+// has. Returns true only if it actually went out — a caller that needs to know
+// whether the app can possibly have heard must check, because "sealed fine but
+// nothing carried it" is the normal state of a Thread lock whose bridge is down.
+static bool ozUplinkSend(int slot, const String &json) {
+  if (slot < 0 || slot >= OZ_BOND_MAX || !g_bonds[slot].present) return false;
+
+  char appIdHex[65];
+  ozHex(g_bonds[slot].pub, 32, appIdHex);
+
+  uint8_t ps[32], key[32];
+  const bool haveKey =
+      ozBondSecret(slot, ps) &&
+      ozEnvKey(ps, 32, deviceId, String(appIdHex), false /*lock->app*/, key);
+  memset(ps, 0, sizeof(ps));
+  if (!haveKey) {
+    Serial.printf("[UPLINK] could not derive bond %d's lock->app key\n", slot);
+    memset(key, 0, sizeof(key));
+    return false;
+  }
+
+  // U0's counter. Claimed BEFORE sealing: a counter burned on a send that then
+  // fails to transmit is free, but reusing one on a retry would hand the app two
+  // different ciphertexts under the same counter — which is exactly the replay
+  // it is there to reject.
+  const uint64_t counter = ozBondNextTx(slot);
+  if (counter == 0) { memset(key, 0, sizeof(key)); return false; }
+
+  uint8_t env[OZ_CTL_MAX];
+  const int elen =
+      ozEnvSeal(key, deviceId, counter, (const uint8_t *)json.c_str(),
+                json.length(), env, sizeof(env), nullptr /*random nonce*/);
+  memset(key, 0, sizeof(key));
+  if (elen < 0) {
+    Serial.printf("[UPLINK] seal failed (%u B payload, buffer %u)\n",
+                  (unsigned)json.length(), (unsigned)sizeof(env));
+    return false;
+  }
+
+  String hex;
+  hex.reserve((size_t)elen * 2 + 1);
+  for (int i = 0; i < elen; i++) {
+    char b[3];
+    snprintf(b, sizeof(b), "%02x", env[i]);
+    hex += b;
+  }
+
+  JsonDocument doc;
+  doc["from"] = deviceId;      // which lock — the bridge routes on this
+  doc["to"] = appIdHex;        // which app — already public, it is an MQTT topic segment today
+  doc["envelope_hex"] = hex;   // the only part with anything in it
+  String out;
+  serializeJson(doc, out);
+
+  bool sent = false;
+  const char *via = "nothing";
+  if (mqtt.connected()) {
+    sent = mqtt.publish(topicUplink.c_str(), out.c_str());
+    via = "mqtt";
+  } else if (threadUdpReady) {
+    sent = ozThreadUdpSend(out);
+    via = "thread";
+  }
+  Serial.printf("[UPLINK] bond %d counter %llu %u B -> %s%s\n", slot,
+                (unsigned long long)counter, (unsigned)out.length(), via,
+                sent ? "" : " (FAILED)");
+  return sent;
+}
+
+// Push to every admin bond. Used for unprompted events (roster_changed) where
+// the audience is "whoever administers this lock" rather than one requester.
+// Members are deliberately not told: a member learning that OTHER bonds changed
+// is not something the access model ever promises, and it would leak the roster
+// to anyone holding a temporary invite.
+static void ozUplinkBroadcastAdmins(const String &json) {
+  for (int i = 0; i < OZ_BOND_MAX; i++)
+    if (g_bonds[i].present && g_bonds[i].role == OZ_ROLE_ADMIN)
+      ozUplinkSend(i, json);
+}
+
+// The event that retires XF-75/78 at the root: the lock says the roster moved,
+// instead of an admin phone finding out 20 minutes later off a stale cache —
+// or not finding out, and tapping "cancel invite" six times.
+static void ozNotifyRosterChanged(const char *reason) {
+  JsonDocument doc;
+  doc["kind"] = "roster_changed";
+  doc["reason"] = reason;
+  doc["bonds"] = ozBondCount();
+  String out;
+  serializeJson(doc, out);
+  ozUplinkBroadcastAdmins(out);
+}
+
 void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   String body; body.reserve(length);
   for (unsigned int i = 0; i < length; i++) body += (char)payload[i];
@@ -2230,6 +2406,11 @@ void handleMemberEnroll(JsonDocument &doc) {
   Serial.printf("[MEMBER] bond %d ADDED role=member label='%s' pub=%.16s… (%d/%d)\n",
                 slot, g_bonds[slot].label, appIdHex, ozBondCount(), OZ_BOND_MAX);
   screenDirty = true;
+  // ozkey-17 U1: the admin phone that issued this invite is usually nowhere
+  // near the door when it is redeemed — that gap is why its roster goes stale
+  // and why XF-75/78's "cancel invite" taps kept landing on a row that had
+  // already become a live bond.
+  ozNotifyRosterChanged("member_enrolled");
   notifyStatus("MEMBER_OK");
 }
 
@@ -2427,6 +2608,12 @@ static void handleBondRevoke(int senderSlot, const uint8_t *v, size_t vlen) {
   screenDirty = true;
   notifyStatus("REVOKE_OK"); // the user's answer first…
   publishLog("bond_revoked", label); // …then the housekeeping
+  // ozkey-17 U1: and tell every OTHER admin, unprompted. This is the event
+  // whose absence produced XF-77 — a revoke that genuinely happened, which the
+  // other side could not observe and therefore diagnosed as bond-table
+  // corruption. The lock knows; it should say so rather than wait to be asked
+  // by whoever next happens to stand in front of it.
+  ozNotifyRosterChanged("bond_revoked");
 }
 
 // DPID 102 — invite_cancel. Value = the 16-byte invite nonce. Kills a QR that
@@ -2624,6 +2811,176 @@ static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen) {
   notifyStatus("UNLOCK_OK");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// F8 (ozkey-17 §4): OZKIE semantic dispatch — the network speaks JSON, and the
+// Tuya frame is born HERE.
+//
+// ozkey-13 moved frame COMPOSITION off the server and encrypted it, but a Tuya
+// 55 AA frame still crossed three network hops — as ciphertext. Sealing a
+// proprietary wire format is not the same as not using one: it left every
+// command shaped by Tuya's single-byte DP id and fixed value layout, which is
+// exactly the cage ozkey-17 exists to leave. Encryption without a protocol of
+// our own is a locked door on a rented house.
+//
+// So the plaintext inside a sealed envelope is OZKIE JSON, and the 55 AA frame
+// is built in this function, microseconds before tuyaWireSend() pushes it at
+// the strike MCU. That isolates the proprietary dependency to one replaceable
+// sub-board rather than spreading it across the app, the server and the mesh.
+//
+// CONTRACT (normative — ozkey-17 §6c. The lock is the reference implementation;
+// server and app align to THIS, not the reverse):
+//
+//   {"kind":"unlock"}                                            any bond
+//   {"kind":"grant_pin",  "slot":N,"cred":hex,"from":ts,"to":ts}  bond #0 only
+//   {"kind":"delete_pin", "slot":N}                               bond #0 only
+//   {"kind":"grant_rfid", "slot":N,"cred":hex,"from":ts,"to":ts}  bond #0 only
+//   {"kind":"delete_rfid","slot":N}                               bond #0 only
+//   {"kind":"bond_revoke","pub":hex(64 chars)}                    bond #0 only
+//   {"kind":"invite_cancel","nonce":hex(32 chars)}                bond #0 only
+//   {"kind":"list_bonds"}                                         bond #0 only
+//
+// An unrecognised `kind` is REJECTED — never guessed at, never forwarded. Same
+// allow-list discipline ozDpForwardable() enforces on the legacy path, and for
+// the same reason: blind forwarding of an authenticated-but-unrecognised verb
+// is not a property worth keeping.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#define OZ_SEM_VAL_MAX 128 // largest DP value we will build (RFID cred + slot + window)
+
+// DP 21/23 RAW value: slot(2 BE) ‖ credential ‖ from(4 BE) ‖ to(4 BE) — the
+// layout ozctl.py's dp_grant() mirrors and the MCU already parses. Returns the
+// value length, or 0 if any field is missing/oversized (0 is never valid: a
+// grant always carries at least a slot and a window).
+static size_t ozSemGrantValue(JsonDocument &doc, uint8_t *out, size_t cap) {
+  const uint32_t slotNo = doc["slot"] | 0xFFFFFFFFu;
+  const uint32_t from   = doc["from"] | 0u;
+  const uint32_t to     = doc["to"]   | 0u;
+  if (slotNo > 0xFFFF) return 0;
+
+  uint8_t cred[72];
+  const size_t clen =
+      ozHexDecode(String((const char *)(doc["cred"] | "")), cred, sizeof(cred));
+  if (clen == 0 || 2 + clen + 8 > cap) return 0;
+
+  size_t n = 0;
+  out[n++] = (uint8_t)(slotNo >> 8);
+  out[n++] = (uint8_t)(slotNo & 0xFF);
+  memcpy(out + n, cred, clen);
+  n += clen;
+  for (int i = 3; i >= 0; i--) out[n++] = (uint8_t)(from >> (8 * i));
+  for (int i = 3; i >= 0; i--) out[n++] = (uint8_t)(to >> (8 * i));
+  return n;
+}
+
+static void ozSemanticDispatch(int slot, const char *json, size_t len) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json, len) != DeserializationError::Ok) {
+    Serial.println("[OZKIE] plaintext is authentic but not valid JSON — rejected");
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+  const char *kind = doc["kind"] | (const char *)nullptr;
+  if (!kind) {
+    Serial.println("[OZKIE] no `kind` field — rejected");
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+
+  // ── in-lock verbs — these never reach the MCU, which has no concept of a
+  // bond. Their own handlers own the role check (and 101's is subtler than
+  // "admin only": bond #0 is never revocable and a member may revoke itself),
+  // so they are called directly with the same value bytes the DP path fed them
+  // rather than being re-gated here.
+  if (strcmp(kind, "bond_revoke") == 0) {
+    uint8_t pub[32];
+    if (ozHexDecode(String((const char *)(doc["pub"] | "")), pub, sizeof(pub)) != 32) {
+      Serial.println("[OZKIE] bond_revoke: `pub` is not 32 bytes of hex");
+      notifyStatus("REVOKE_DENIED");
+      return;
+    }
+    handleBondRevoke(slot, pub, 32);
+    return;
+  }
+  if (strcmp(kind, "invite_cancel") == 0) {
+    uint8_t nonce[16];
+    if (ozHexDecode(String((const char *)(doc["nonce"] | "")), nonce, sizeof(nonce)) != 16) {
+      Serial.println("[OZKIE] invite_cancel: `nonce` is not 16 bytes of hex");
+      notifyStatus("REVOKE_DENIED");
+      return;
+    }
+    handleInviteCancel(slot, nonce, 16);
+    return;
+  }
+  if (strcmp(kind, "list_bonds") == 0) {
+    handleListBonds(slot, nullptr, 0);
+    return;
+  }
+
+  // ── MCU verbs — decide the DP, build the value, then build the frame.
+  uint8_t dp = 0, type = 0;
+  uint8_t val[OZ_SEM_VAL_MAX];
+  size_t vlen = 0;
+
+  if (strcmp(kind, "unlock") == 0) {
+    dp = 1; type = 0x01 /* BOOL */; val[0] = 0x01; vlen = 1;
+  } else if (strcmp(kind, "grant_pin") == 0 || strcmp(kind, "grant_rfid") == 0) {
+    dp = (strcmp(kind, "grant_pin") == 0) ? 21 : 23;
+    type = 0x00 /* RAW */;
+    vlen = ozSemGrantValue(doc, val, sizeof(val));
+    if (vlen == 0) {
+      Serial.printf("[OZKIE] %s: bad or missing slot/cred/from/to\n", kind);
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+  } else if (strcmp(kind, "delete_pin") == 0 || strcmp(kind, "delete_rfid") == 0) {
+    dp = (strcmp(kind, "delete_pin") == 0) ? 22 : 24;
+    type = 0x00 /* RAW */;
+    const uint32_t slotNo = doc["slot"] | 0xFFFFFFFFu;
+    if (slotNo > 0xFFFF) {
+      Serial.printf("[OZKIE] %s: bad or missing `slot`\n", kind);
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    val[0] = (uint8_t)(slotNo >> 8); val[1] = (uint8_t)(slotNo & 0xFF); vlen = 2;
+  } else {
+    Serial.printf("[OZKIE] unknown kind '%s' — rejected, NOT forwarded\n", kind);
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+
+  // Same admin bar the DP path applies (ozkey-13 F4): a member may unlock the
+  // door they're standing at, but must never issue or delete a credential.
+  if (dp != 1 && g_bonds[slot].role != OZ_ROLE_ADMIN) {
+    Serial.printf("[OZKIE] %s is role-gated to bond #0 — bond %d ('%s', member) "
+                  "denied\n", kind, slot, g_bonds[slot].label);
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+
+  uint8_t frame[OZ_SEM_VAL_MAX + 16];
+  const size_t flen = ozBuildDpFrame(dp, type, val, vlen, frame);
+
+  // Validate our OWN output with the same gate inbound frames pass. If this
+  // ever trips it is a bug in the builder above, not in anything the sender
+  // did — and a malformed frame must never reach the MCU regardless of which
+  // side authored it.
+  if (!ozTuyaFrameOk(frame, flen)) {
+    Serial.printf("[OZKIE] BUG: built an invalid DP %u frame (%u B) — not sent\n",
+                  dp, (unsigned)flen);
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+
+  Serial.printf("[OZKIE] %s -> DP %u authorised by bond %d ('%s', %s)\n", kind, dp,
+                slot, g_bonds[slot].label,
+                g_bonds[slot].role == OZ_ROLE_ADMIN ? "admin" : "member");
+  forwardFrameToMcu(frame, flen);
+  publishLog("granted", slot == 0
+                            ? (dp == 1 ? "OZKIE unlock (owner)" : "OZKIE credential (owner)")
+                            : "OZKIE unlock (member)");
+  notifyStatus("UNLOCK_OK");
+}
+
 // ── F1 (ozkey-13 §8): the open/verify core, shared between BLE `control` and
 // the MQTT `envelope_hex` path added in F2. Everything through "envelope
 // opened, here is the plaintext + counter" is identical for both transports —
@@ -2726,11 +3083,22 @@ static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
     return;
   }
 
-  const uint8_t *frame = pt + (hasChallenge ? 16 : 0);
-  const size_t flen = ptLen - (hasChallenge ? 16 : 0);
-  if (!ozTuyaFrameOk(frame, flen)) {
-    Serial.printf("[CTL] plaintext is authentic but not a valid DP frame (%u B)\n",
-                  (unsigned)flen);
+  const uint8_t *body = pt + (hasChallenge ? 16 : 0);
+  const size_t blen = ptLen - (hasChallenge ? 16 : 0);
+
+  // ozkey-17 F8: the plaintext is either OZKIE semantic JSON (the protocol from
+  // here on) or a legacy Tuya DP frame (pre-F8 senders). They are unambiguous
+  // on the first byte — '{' vs 0x55 — so no version field is needed to tell
+  // them apart, and neither can be mistaken for the other by accident.
+  //
+  // Dual-accept is deliberate and mirrors the discipline the server team
+  // applied to buildUnlockFrame(): keep the legacy path working until the app's
+  // sealed semantic sender is confirmed shipped, THEN delete it. Cutting the
+  // old path before the new one is live just breaks unlock for everyone.
+  const bool semantic = (body[0] == '{');
+  if (!semantic && !ozTuyaFrameOk(body, blen)) {
+    Serial.printf("[CTL] plaintext is authentic but is neither OZKIE JSON nor a "
+                  "valid DP frame (%u B)\n", (unsigned)blen);
     notifyStatus("UNLOCK_DENIED");
     return;
   }
@@ -2742,9 +3110,15 @@ static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
   g_bonds[slot].floor = counter;
   ozBondsSave();
 
-  Serial.printf("[CTL] OPENED — bond %d, counter %llu, DP %u\n", slot,
-                (unsigned long long)counter, frame[6]);
-  ozControlDispatch(slot, frame, flen);
+  if (semantic) {
+    Serial.printf("[CTL] OPENED — bond %d, counter %llu, OZKIE (%u B)\n", slot,
+                  (unsigned long long)counter, (unsigned)blen);
+    ozSemanticDispatch(slot, (const char *)body, blen);
+  } else {
+    Serial.printf("[CTL] OPENED — bond %d, counter %llu, DP %u (legacy frame)\n",
+                  slot, (unsigned long long)counter, body[6]);
+    ozControlDispatch(slot, body, blen);
+  }
 }
 
 // Try to open whatever is buffered on the BLE `control` characteristic.
@@ -3085,6 +3459,12 @@ void buildTopics() {
   topicEnroll = base + "enroll";
   topicHeartbeat = base + "heartbeat";
   topicLog = base + "log";
+  // ozkey-17 §6a: a SEPARATE topic from heartbeat/log on purpose. Those two are
+  // operational metadata the server legitimately reads (presence, fw, transport,
+  // and the wake that flushes its queue). This one carries sealed content the
+  // server must never parse. Splitting them at the topic level means the rule is
+  // enforced by routing rather than by everyone remembering it.
+  topicUplink = base + "uplink";
   topicPairConfirm = "hotel/locks/" + deviceId.substring(4) + "/pair/confirm";
 }
 

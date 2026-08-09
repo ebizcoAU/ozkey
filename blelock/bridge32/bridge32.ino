@@ -34,6 +34,15 @@
                                    // (FTD-only API) — see logThreadChildren()
 #include "esp_coexist.h"
 #include <OThreadUDP.h>
+// ozkey-17 U2: the RECEIVE half runs on lwIP, not OThreadUDP. Not a preference —
+// esp_openthread_netif_glue pushes inbound Thread packets up into lwIP, so an
+// otUdp* socket never sees them at all. This was root-caused the hard way on
+// 2026-07-28 (see ozdoorlock_core.h's threadUdpBegin()) after attach, subscribe
+// and transmit all verified working while parsePacket() returned nothing, ever.
+// This is a port of that proven receive path, not a second attempt at it.
+#include <lwip/sockets.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <Arduino_GFX_Library.h>
 
 // ── LCD (GEEK 1.14" ST7789, 135x240) — pins/offsets bench-confirmed in
@@ -132,8 +141,20 @@ unsigned long lastLcdActivityAt = 0;
 // name. Pure pass-through — this board never decodes or opens the envelope,
 // same as it never understood `payload` either. Closes the gap where a
 // sealed grant/delete could never reach any Thread lock behind this bridge.
-#define FW_VERSION "bridge32-1.8"
-#define FW_DISPLAY_VERSION "v1.8" // shown on-screen, doorlock.ino's badge convention
+// 1.9    ozkey-17 U2/U3 — the bridge can now LISTEN. Until this version
+//        `threadUdp` was send-only ("sender: plain unicast bind"): no
+//        parsePacket(), no read loop, nothing. It had only ever pushed commands
+//        at locks and never once heard one, which is the transport half of why
+//        an app cannot ask a lock anything. U2: lwIP raw-socket receive on the
+//        new uplink port 5053 (a port of ozdoorlock_core.h's proven path —
+//        OThreadUDP's receive half can never fire on ESP32, root-caused
+//        2026-07-28). U3: republish under the LOCK's own topic
+//        ozkey/<site>/locks/<from>/uplink, never the bridge's — that is what
+//        makes a bridged lock indistinguishable from a WiFi one to ozlockserv,
+//        so the server needs no change and stays a mailman. The bridge reads
+//        only `from`; `envelope_hex` is sealed to the app and opaque here.
+#define FW_VERSION "bridge32-1.9"
+#define FW_DISPLAY_VERSION "v1.9" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
 // existing mesh) in v0; it is the only network former in the home.
@@ -561,6 +582,11 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
 const uint8_t OZ_THREAD_GROUP_BYTES[16] = {0xff, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x4f, 0x5a};
 const IPAddress OZ_THREAD_GROUP(IPv6, OZ_THREAD_GROUP_BYTES);
 const uint16_t OZ_THREAD_UDP_PORT = 5052;
+// ozkey-17 U1/U2: uplink (lock -> bridge) has its own port. Downlink stays on
+// 5052. Two directions on one port would make every receiver decide "command
+// for me, or my own echo off the multicast group?" per datagram — structural
+// separation is cheaper and cannot be got subtly wrong.
+const uint16_t OZ_THREAD_UPLINK_PORT = 5053;
 
 // DIAGNOSTIC (2026-07-28, temporary — remove once the answer is known).
 // ff03::1 = realm-local ALL-NODES, which every Thread node subscribes to
@@ -593,6 +619,125 @@ void threadUdpBegin() {
   threadUdpReady = threadUdp.begin(OZ_THREAD_UDP_PORT) != 0; // sender: plain unicast bind
   Serial.printf("[UDP] socket %s on port %u\n", threadUdpReady ? "open" : "FAILED",
                 OZ_THREAD_UDP_PORT);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// U2/U3 (ozkey-17 §6): the uplink receive path — the capability this bridge has
+// never had.
+//
+// Until now `threadUdp` was send-only ("sender: plain unicast bind"): no
+// parsePacket(), no read loop, nothing. The bridge has only ever pushed
+// commands AT locks and never once listened to one. That is the transport half
+// of why an app can't ask a lock anything, and why the 2026-08-09 session spent
+// seven XF docs compensating for state nobody could observe.
+//
+// U3's routing rule is the load-bearing part: received uplink is republished
+// under the LOCK's own topic (ozkey/<site>/locks/<from>/uplink), never the
+// bridge's. ozlockserv already subscribes ozkey/<site>/locks/+/... wildcards, so
+// it cannot tell a bridged lock's message from a WiFi lock's — which is exactly
+// what lets the server need zero changes and stay a mailman. The bridge reads
+// only the routing fields; `envelope_hex` is sealed to the app and opaque to
+// every hop in between, this one included.
+// ─────────────────────────────────────────────────────────────────────────────
+#define OZ_UPLINK_RX_BUF 1024 // matches the lock's OZ_UDP_RX_BUF after F8's bump
+
+int ozUplinkRxFd = -1;
+bool uplinkRxReady = false;
+unsigned long uplinkRxLastAttempt = 0;
+
+void uplinkRxBegin() {
+  if (uplinkRxReady) return;
+  uplinkRxLastAttempt = millis();
+
+  otInstance *inst = thread.getInstance();
+  if (inst == nullptr) return; // Thread not up yet — loop() re-polls
+
+  // Subscribe at the OpenThread layer so the stack accepts the frame off the
+  // radio at all. Bounded lock wait: a busy OT task costs a retry, not a stall.
+  if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) return;
+  otIp6Address grp;
+  memcpy(grp.mFields.m8, OZ_THREAD_GROUP_BYTES, 16);
+  const otError e = otIp6SubscribeMulticastAddress(inst, &grp);
+  esp_openthread_lock_release();
+  if (e != OT_ERROR_NONE && e != OT_ERROR_ALREADY)
+    Serial.printf("[UPLINK] subscribe ff03::4f5a failed: %d (continuing)\n", (int)e);
+
+  ozUplinkRxFd = lwip_socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+  if (ozUplinkRxFd < 0) {
+    Serial.printf("[UPLINK] socket() failed errno=%d\n", errno);
+    return;
+  }
+  int on = 1;
+  lwip_setsockopt(ozUplinkRxFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+  struct sockaddr_in6 sa6;
+  memset(&sa6, 0, sizeof(sa6));
+  sa6.sin6_family = AF_INET6;
+  sa6.sin6_port = htons(OZ_THREAD_UPLINK_PORT);
+  if (lwip_bind(ozUplinkRxFd, (struct sockaddr *)&sa6, sizeof(sa6)) != 0) {
+    Serial.printf("[UPLINK] bind() failed errno=%d\n", errno);
+    lwip_close(ozUplinkRxFd);
+    ozUplinkRxFd = -1;
+    return;
+  }
+  // Non-blocking, so pollUplinkUdp() never stalls loop().
+  const int fl = lwip_fcntl(ozUplinkRxFd, F_GETFL, 0);
+  lwip_fcntl(ozUplinkRxFd, F_SETFL, fl | O_NONBLOCK);
+
+  // Join at the lwIP layer too: OpenThread's subscription makes the stack
+  // accept the frame, this makes lwIP deliver it to THIS socket. Interface 0 =
+  // default. Non-fatal on failure — unicast still works.
+  struct ipv6_mreq mreq;
+  memset(&mreq, 0, sizeof(mreq));
+  memcpy(&mreq.ipv6mr_multiaddr, OZ_THREAD_GROUP_BYTES, 16);
+  mreq.ipv6mr_interface = 0;
+  if (lwip_setsockopt(ozUplinkRxFd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq,
+                      sizeof(mreq)) != 0)
+    Serial.printf("[UPLINK] IPV6_JOIN_GROUP failed errno=%d (unicast still live)\n",
+                  errno);
+
+  uplinkRxReady = true;
+  Serial.printf("[UPLINK] listening on port %u (group ff03::4f5a) fd=%d\n",
+                OZ_THREAD_UPLINK_PORT, ozUplinkRxFd);
+}
+
+void pollUplinkUdp() {
+  if (!uplinkRxReady || ozUplinkRxFd < 0) return;
+
+  char buf[OZ_UPLINK_RX_BUF];
+  struct sockaddr_in6 src;
+  socklen_t srcLen = sizeof(src);
+  const int n = lwip_recvfrom(ozUplinkRxFd, buf, sizeof(buf) - 1, 0,
+                              (struct sockaddr *)&src, &srcLen);
+  if (n <= 0) return; // EWOULDBLOCK on an idle socket — the normal case
+  buf[n] = 0;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, buf) != DeserializationError::Ok) {
+    Serial.println("[UPLINK] rx payload not valid JSON, dropped");
+    return;
+  }
+  const char *from = doc["from"] | (const char *)nullptr;
+  const char *envHex = doc["envelope_hex"] | (const char *)nullptr;
+  if (!from || !envHex) {
+    Serial.println("[UPLINK] rx missing `from`/`envelope_hex`, dropped");
+    return;
+  }
+
+  if (!mqttClient.connected()) {
+    // Honest failure. The lock has already burned a send counter on this
+    // message, so it is gone — say so rather than let it vanish silently, which
+    // is precisely the class of invisible loss this whole feature exists to end.
+    Serial.printf("[UPLINK] %s: broker down, uplink DROPPED (%d B)\n", from, n);
+    return;
+  }
+
+  // U3: the lock's own topic, not ours. See the header note — this is what
+  // keeps ozlockserv a mailman and spares it any change at all.
+  const String topic = "ozkey/" + cfgSiteId + "/locks/" + String(from) + "/uplink";
+  const bool ok = mqttClient.publish(topic.c_str(), buf);
+  Serial.printf("[UPLINK] %s -> %s (%d B)%s\n", from, topic.c_str(), n,
+                ok ? "" : " PUBLISH FAILED");
 }
 
 // One multicast send, logged per destination group so the bench can tell which
@@ -1302,6 +1447,15 @@ void loop() {
       millis() - threadUdpLastAttempt > THREAD_UDP_RETRY_MS) {
     threadUdpBegin();
   }
+
+  // ozkey-17 U2: same retry discipline as threadUdpBegin() above, and for the
+  // same reason — the socket can fail to open in the first moments after Thread
+  // forms, so this is re-polled rather than attempted once.
+  if (state == ST_OPERATIONAL && !uplinkRxReady &&
+      millis() - uplinkRxLastAttempt > THREAD_UDP_RETRY_MS) {
+    uplinkRxBegin();
+  }
+  pollUplinkUdp();
 
   delay(50);
 }

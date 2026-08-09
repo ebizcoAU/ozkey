@@ -163,8 +163,29 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //        screen badge didn't) — exactly the two-versions-disagreeing trap
 //        the 1.2 entry above was written to prevent. NOT YET HARDWARE-
 //        VERIFIED.
-#define FW_VERSION "doorlock-1.24"
-#define FW_DISPLAY_VERSION "V1.24" // shown on-screen: "OZLOCK V1.24 THREAD/WIFI"
+// 1.25   ozkey-17 F8 + U0. F8: the plaintext inside a sealed envelope is now
+//        OZKIE semantic JSON ({"kind":"unlock"}, {"kind":"grant_pin",...}) and
+//        the Tuya 55 AA frame is built ON THE LOCK, immediately before the MCU
+//        write — ozkey-13 had moved frame composition from the server to the
+//        app and encrypted it, but a Tuya frame still crossed three network
+//        hops as ciphertext. Legacy Tuya-frame plaintext still accepted
+//        (discriminated on '{' vs 0x55); that path goes once the app's
+//        semantic sender ships. U0: per-bond outbound counter for lock->app
+//        sealing, persisted in OZ_BOND_REC's 6 spare bytes as 48-bit, block-
+//        reserved (OZ_TX_RESERVE) so it costs one NVS write per 64 sends
+//        rather than one per send. OZ_UDP_RX_BUF 512 -> 1024 (semantic JSON is
+//        2-3x the Tuya frame it replaces once hex-encoded).
+//        U1: the lock can now SPEAK, not only answer. ozUplinkSend() seals
+//        lock->app JSON with ozEnvSeal()+ozEnvKey(appToLock=false) — both built
+//        in ozkey-06 and never once called outside a self-test — and emits it
+//        over MQTT (topicUplink, separate from heartbeat/log so the server can
+//        route sealed content without parsing it) or Thread UDP to a new
+//        uplink port 5053. ozNotifyRosterChanged() fires on member enrol and
+//        bond revoke, pushed to every admin bond: the event whose absence
+//        produced XF-75/77/78, where a roster change was real but unobservable
+//        until someone next stood at the door.
+#define FW_VERSION "doorlock-1.26"
+#define FW_DISPLAY_VERSION "V1.26" // shown on-screen: "OZLOCK V1.26 THREAD/WIFI"
 
 // This board shows no startup splash (never did, pre-refactor) — no-op so
 // the shared core's unconditional drawSplash() call is a well-defined hook.
