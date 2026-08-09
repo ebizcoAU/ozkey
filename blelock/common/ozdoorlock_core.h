@@ -382,6 +382,44 @@ const uint16_t OZ_THREAD_UDP_PORT = 5052;
 // datagram — a distinction easy to get subtly wrong and impossible to notice
 // when it is. A second port makes it structural instead of conditional.
 const uint16_t OZ_THREAD_UPLINK_PORT = 5053;
+
+// ozkey-17 U1 hardening: the last peer that sent us a downlink — in practice
+// always the bridge, since nothing else sends this lock commands. Captured in
+// pollThreadUdp() and used by the uplink to answer by UNICAST, which is the
+// only destination that gets link-layer ACKs and MAC retries. Declared here
+// rather than beside the uplink code because pollThreadUdp() writes it and
+// appears earlier in this file.
+static struct sockaddr_in6 g_lastDownlinkPeer;
+static bool g_haveDownlinkPeer = false;
+
+// Diagnostic formatting. Added 1.29 after a uplink was lost WITH unicast
+// enabled and 3 retry bursts (counter 197, 05:08:50) — and I could not tell
+// why, because ozThreadUdpSendOnce() logged the destination's LABEL and never
+// its address. Same blind spot as `mcast joined: ff03::4f5a`, which reported
+// success for a group that has never delivered a packet: a log that names
+// intent rather than fact cannot be used to diagnose anything.
+static String ozIp6Str(const uint8_t a[16]) {
+  char b[48];
+  snprintf(b, sizeof(b),
+           "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+           a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+           a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]);
+  return String(b);
+}
+
+// fe80::/10. THE SUSPECTED CAUSE of the counter-197 loss: DoorA and the bridge
+// are both attached as Child to the same parent, so they are NOT link-layer
+// neighbours — their traffic routes via the parent. A link-local unicast
+// between two children is therefore undeliverable, and lwip_sendto() would
+// still return success, so `unicast=yes` could have been reporting a send to
+// an address that can never arrive.
+//
+// Thread mesh-local addresses (ML-EID / RLOC) sit under the fd00::/8 ULA
+// prefix — fd51:2839:… on this mesh — and ARE routable between children.
+// Prefer those; refuse to learn a link-local peer.
+static bool ozIp6IsLinkLocal(const uint8_t a[16]) {
+  return a[0] == 0xfe && (a[1] & 0xc0) == 0x80;
+}
 // ozkey-17 F8: 512 -> 1024. OZKIE semantic JSON is 2-3x the size of the Tuya
 // frame it replaces once hex-encoded into `envelope_hex` — a grant_pin with a
 // hex credential lands near 430 B of datagram against 512, with RFID
@@ -1575,6 +1613,36 @@ void pollThreadUdp() {
   // first end-to-end relay test (ozkey-11 §4.1).
   Serial.printf("[UDP] rx %d bytes: %s\n", n, buf);
 
+  // ozkey-17 U1 hardening: remember who sent us this, so the uplink can answer
+  // by UNICAST rather than relying only on multicast. In practice this is
+  // always the bridge — it is the only thing that sends us commands. Unicast
+  // is the one destination that gets link-layer ACKs and MAC retries, and a
+  // measured multicast loss (counter 131) is why we no longer trust multicast
+  // on its own. Captured before the target filter below, deliberately: a
+  // datagram addressed to a DIFFERENT lock still proves where the bridge is.
+  //
+  // 1.29: REFUSE a link-local source. See ozIp6IsLinkLocal() — two Children of
+  // the same parent are not link-layer neighbours, so fe80:: between them is
+  // undeliverable while lwip_sendto() still reports success. Learning one would
+  // make the log say `unicast=yes` for a send that can never arrive, which is
+  // worse than having no peer at all.
+  {
+    const uint8_t *sa = (const uint8_t *)&src.sin6_addr;
+    if (ozIp6IsLinkLocal(sa)) {
+      if (!g_haveDownlinkPeer)
+        Serial.printf("[UPLINK] peer %s is LINK-LOCAL — not routable between "
+                      "children, ignoring; uplink stays multicast-only\n",
+                      ozIp6Str(sa).c_str());
+    } else {
+      const bool changed = !g_haveDownlinkPeer ||
+                           memcmp(&g_lastDownlinkPeer.sin6_addr, sa, 16) != 0;
+      memcpy(&g_lastDownlinkPeer, &src, sizeof(g_lastDownlinkPeer));
+      g_haveDownlinkPeer = true;
+      if (changed)
+        Serial.printf("[UPLINK] peer learned: %s\n", ozIp6Str(sa).c_str());
+    }
+  }
+
   JsonDocument doc;
   if (deserializeJson(doc, buf) != DeserializationError::Ok) {
     Serial.println("[UDP] payload not valid JSON, dropped");
@@ -1672,27 +1740,118 @@ static const uint8_t OZ_ALLNODES_BYTES[16] = {0xff, 0x03, 0, 0, 0, 0, 0, 0,
 // success — a duplicate is harmless (the app's counter dedups, and the bridge
 // republishing twice is idempotent at the topic level), whereas a miss is the
 // whole feature not working.
+// ozkey-17 U1, hardened 2026-08-10 after a MEASURED loss.
+//
+// Uplink delivery observed: 1 unexplained loss in 4 valid attempts. The lost
+// one (counter 131, 03:39:17) had the bridge powered, its listener running,
+// a successful downlink relay 83 s later and a successful uplink relay 2.5 min
+// later — three boards a metre apart. Nothing was broken; the datagram just
+// did not arrive. The mesh was reconverging at the time (bridge partition had
+// changed from 0x353a218a to 0x0f4788a7), which is exactly when multicast is
+// lost.
+//
+// Root issue is structural, not a bug: UDP multicast on 802.15.4 has NO
+// acknowledgement and NO retransmission. One send is one chance. Worse, the
+// sender cannot tell — lwip_sendto() returns success for a datagram that
+// nothing ever receives, which is why the lock logged a confident "-> thread"
+// for a message the app never saw.
+//
+// Two mitigations, neither of which makes this guaranteed (that needs an
+// end-to-end ACK — see ozkey-17 §8):
+//
+//   1. UNICAST to the bridge's ML-EID, learned from whoever last sent us a
+//      downlink. Unicast gets link-layer ACKs and MAC retries; multicast gets
+//      neither. This is the single biggest improvement available and it is
+//      the third destination bridge32 has always used in the other direction.
+//   2. RETRY the multicast burst, spaced with jitter, so a collision or a
+//      brief reconvergence does not consume the only attempt.
+//
+// Jitter matters: several locks reacting to the same mesh event would
+// otherwise retry in lockstep and collide with each other repeatedly.
+#define OZ_UPLINK_TRIES     3
+#define OZ_UPLINK_GAP_MS   40   // base spacing between attempts
+#define OZ_UPLINK_JITTER_MS 35   // random 0..N added per attempt
+
+static bool ozThreadUdpSendOnce(const String &payload, const uint8_t addr[16],
+                                const char *label) {
+  struct sockaddr_in6 dst;
+  memset(&dst, 0, sizeof(dst));
+  dst.sin6_family = AF_INET6;
+  dst.sin6_port = htons(OZ_THREAD_UPLINK_PORT);
+  memcpy(&dst.sin6_addr, addr, 16);
+  const int n = lwip_sendto(ozRxFd, payload.c_str(), payload.length(), 0,
+                            (struct sockaddr *)&dst, sizeof(dst));
+  // 1.29: log the ADDRESS, not just the label. A send that "succeeds" to an
+  // unroutable address is indistinguishable from a real one otherwise, which
+  // is exactly how counter 197 was lost while the log read `unicast=yes`.
+  // Note lwip_sendto() returning >= 0 means QUEUED LOCALLY, never delivered —
+  // there is no ACK at this layer for multicast, and for unicast the MAC ACK
+  // is invisible from here. Treat this line as "left the building", not
+  // "arrived".
+  if (n < 0) {
+    Serial.printf("[UPLINK]   -> %-14s %s FAILED errno=%d\n", label,
+                  ozIp6Str(addr).c_str(), errno);
+    return false;
+  }
+  Serial.printf("[UPLINK]   -> %-14s %s queued %d B\n", label,
+                ozIp6Str(addr).c_str(), n);
+  return true;
+}
+
+// One burst = unicast (if known) + both multicast groups.
+static bool ozUplinkBurst(const String &payload) {
+  bool anySent = false;
+  if (g_haveDownlinkPeer &&
+      ozThreadUdpSendOnce(payload, (const uint8_t *)&g_lastDownlinkPeer.sin6_addr,
+                          "unicast-peer"))
+    anySent = true;
+  if (ozThreadUdpSendOnce(payload, OZ_ALLNODES_BYTES, "ff03::1")) anySent = true;
+  if (ozThreadUdpSendOnce(payload, OZ_THREAD_GROUP_BYTES, "ff03::4f5a")) anySent = true;
+  return anySent;
+}
+
+// Retries are scheduled, NOT blocking. ozUplinkSend() is reached from the BLE
+// `control` callback (via handleBondRevoke / handleMemberEnroll), and sleeping
+// ~110 ms inside a NimBLE host callback to space out retransmits would delay
+// the status notification the app is waiting on and risk disturbing the
+// connection. The first burst goes immediately; the rest ride loop().
+static String  g_uplinkPending;
+static uint8_t g_uplinkTriesLeft = 0;
+static uint32_t g_uplinkNextAt = 0;
+
 static bool ozThreadUdpSend(const String &payload) {
   if (!threadUdpReady || ozRxFd < 0) return false;
 
-  const uint8_t *groups[2] = {OZ_ALLNODES_BYTES, OZ_THREAD_GROUP_BYTES};
-  const char *names[2] = {"ff03::1", "ff03::4f5a"};
-  bool anySent = false;
+  const bool sent = ozUplinkBurst(payload);
 
-  for (int i = 0; i < 2; i++) {
-    struct sockaddr_in6 dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin6_family = AF_INET6;
-    dst.sin6_port = htons(OZ_THREAD_UPLINK_PORT);
-    memcpy(&dst.sin6_addr, groups[i], 16);
-    const int n = lwip_sendto(ozRxFd, payload.c_str(), payload.length(), 0,
-                              (struct sockaddr *)&dst, sizeof(dst));
-    if (n < 0)
-      Serial.printf("[UPLINK] sendto %s failed errno=%d\n", names[i], errno);
-    else
-      anySent = true;
-  }
-  return anySent;
+  // Arm the remaining attempts. A newer message supersedes an older pending
+  // one rather than queueing behind it — roster_changed is idempotent state
+  // ("something changed, resync"), so the freshest is always the useful one.
+  g_uplinkPending   = payload;
+  g_uplinkTriesLeft = OZ_UPLINK_TRIES - 1;
+  g_uplinkNextAt    = millis() + OZ_UPLINK_GAP_MS +
+                      (esp_random() % (OZ_UPLINK_JITTER_MS + 1));
+
+  Serial.printf("[UPLINK] burst 1/%d sent (unicast=%s), %u retr%s queued\n",
+                OZ_UPLINK_TRIES, g_haveDownlinkPeer ? "yes" : "no peer yet",
+                g_uplinkTriesLeft, g_uplinkTriesLeft == 1 ? "y" : "ies");
+  return sent;
+}
+
+// Called from loop(). Cheap when idle.
+static void ozUplinkRetryTick() {
+  if (g_uplinkTriesLeft == 0) return;
+  if ((int32_t)(millis() - g_uplinkNextAt) < 0) return; // wrap-safe compare
+
+  ozUplinkBurst(g_uplinkPending);
+  g_uplinkTriesLeft--;
+  Serial.printf("[UPLINK] retry burst, %u left\n", g_uplinkTriesLeft);
+
+  if (g_uplinkTriesLeft)
+    g_uplinkNextAt = millis() + OZ_UPLINK_GAP_MS +
+                     (esp_random() % (OZ_UPLINK_JITTER_MS + 1));
+  else
+    g_uplinkPending = String(); // release the buffer
 }
 
 // Seal [json] to the bond in [slot] and emit it on whatever transport this lock
@@ -4067,7 +4226,7 @@ void loop() {
       millis() - threadUdpLastAttempt > THREAD_UDP_RETRY_MS) {
     threadUdpBegin();
   }
-  if (isThread()) pollThreadUdp();
+  if (isThread()) { pollThreadUdp(); ozUplinkRetryTick(); }
 
   // ── MQTT + enroll retry / unpaired announce (Wi-Fi transport only) ───────
   if (!isThread()) {

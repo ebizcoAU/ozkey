@@ -184,8 +184,8 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //        bond revoke, pushed to every admin bond: the event whose absence
 //        produced XF-75/77/78, where a roster change was real but unobservable
 //        until someone next stood at the door.
-#define FW_VERSION "doorlock-1.27"
-#define FW_DISPLAY_VERSION "V1.27" // shown on-screen: "OZLOCK V1.27 THREAD/WIFI"
+#define FW_VERSION "doorlock-1.29"
+#define FW_DISPLAY_VERSION "V1.29" // shown on-screen: "OZLOCK V1.29 THREAD/WIFI"
 
 // This board shows no startup splash (never did, pre-refactor) — no-op so
 // the shared core's unconditional drawSplash() call is a well-defined hook.
