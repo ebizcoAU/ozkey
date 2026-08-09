@@ -13,9 +13,10 @@
  *    2. Enroll locks: verify token, bind device -> site/owner, issue broker
  *       credentials, ack on the command topic
  *    3. Relay app-sealed Tuya 55 AA DPID envelopes (grant/revoke), queue
- *       them, flush on the lock's wake (ozkey/<site>/locks/<id>/heartbeat) —
- *       the server never builds a frame or sees a PIN/RFID (ozkey-13, S4
- *       cutover 2026-08-08)
+ *       them, flush on the lock's wake (ozkie/<site>/locks/<id>/heartbeat,
+ *       legacy ozkey/<site>/... also accepted during the S16 migration —
+ *       ozkey-18 §S16) — the server never builds a frame or sees a PIN/RFID
+ *       (ozkey-13, S4 cutover 2026-08-08)
  *
  *  NOT a responsibility, deliberately — DOOR EVENTS ARE NEVER INGESTED.
  *    Removed 2026-07-31 (operator decision, XF-48 §9.4). This server is the
@@ -108,13 +109,29 @@ const CONFIG = {
   },
   // ozkey-04 §9 topic scheme (site-prefixed, device-scoped, room-free).
   // Site-pinned (NOT wildcard) so multiple servers can share one broker —
-  // OZKEYSERV (site 'hotel', ozkey-07) publishes device-scoped on the same
-  // ozkey/<site>/... root; each server must only consume its own site.
-  SUB_ENROLL: 'ozkey/lab/locks/+/enroll',
-  SUB_HEARTBEAT: 'ozkey/lab/locks/+/heartbeat',
+  // OZLODGESERV (site 'hotel', ozkey-07) publishes device-scoped on the same
+  // topic root; each server must only consume its own site.
+  //
+  // S16 (ozkey-18, 2026-08-10, TRADEMARK — not a style preference): OZKEY is
+  // already someone else's product, so the wire-visible topic root moves to
+  // `ozkie/`. This overrides the choice S12 made to leave the topic root
+  // alone — S12 was right that a shared-protocol rename is a bigger action
+  // than a product rename, S16 is that bigger action, done deliberately.
+  // Migration shape (do not skip): publishers use `ozkie/` ONLY;
+  // subscribers accept BOTH `ozkie/` and legacy `ozkey/` so update order
+  // across servers/bridges/locks never matters. Drop the legacy *_LEGACY
+  // subscriptions and the `ozk(?:ey|ie)` regex alternation once every
+  // component is confirmed on `ozkie/` — that is a follow-up, not this one.
+  // NOT touched: ozcrypto.h's `"ozkey/app->lock"` etc — those are HKDF
+  // domain-separation strings, not topic names; wrong file for this change,
+  // wrong kind of string, see ozkey-18 S16 for why they must stay put.
+  SUB_ENROLL: 'ozkie/lab/locks/+/enroll',
+  SUB_ENROLL_LEGACY: 'ozkey/lab/locks/+/enroll',
+  SUB_HEARTBEAT: 'ozkie/lab/locks/+/heartbeat',
+  SUB_HEARTBEAT_LEGACY: 'ozkey/lab/locks/+/heartbeat',
   // SUB_LOG removed 2026-07-31 — see the header. We do not subscribe to
-  // `ozkey/<site>/locks/+/log` at all, so door events are never delivered to
-  // this process. Locks may still publish there; nothing here consumes it.
+  // `<root>/<site>/locks/+/log` at all, so door events are never delivered
+  // to this process. Locks may still publish there; nothing here consumes it.
   //
   // S8/S9 (ozkey-15 §3, async orchestrated removal): app-to-app messages
   // between banoi2 (member) and banoi1 (admin). The topic is already
@@ -124,8 +141,10 @@ const CONFIG = {
   // publisher and a subscriber happen to share. ozlockserv subscribes only
   // to observe/log for visibility (ozkey-15 §2: "pure relay, no state, no
   // persistence"), not to republish.
-  SUB_MEMBER_REQUEST_REMOVE: 'ozkey/lab/members/+/request_remove',
-  SUB_MEMBER_ACK_REMOVE: 'ozkey/lab/members/+/ack_remove',
+  SUB_MEMBER_REQUEST_REMOVE: 'ozkie/lab/members/+/request_remove',
+  SUB_MEMBER_REQUEST_REMOVE_LEGACY: 'ozkey/lab/members/+/request_remove',
+  SUB_MEMBER_ACK_REMOVE: 'ozkie/lab/members/+/ack_remove',
+  SUB_MEMBER_ACK_REMOVE_LEGACY: 'ozkey/lab/members/+/ack_remove',
   // V1 (ozkey-17 §6, ozkey-14.md "Update 2026-08-09 late"): the lock->app
   // uplink channel, published under the LOCK'S OWN topic (bridge32-1.9
   // relays it there, not under the bridge's topic) — but this is NOT
@@ -136,12 +155,13 @@ const CONFIG = {
   // zero server-side activity before this subscription was added — the
   // "server already subscribes locks/+/... wildcards" assumption in
   // ozkey-14.md was wrong. This is the real V1 finding.
-  SUB_UPLINK: 'ozkey/lab/locks/+/uplink',
-  topicCommand: (site, deviceId) => `ozkey/${site}/locks/${deviceId}/command`,
+  SUB_UPLINK: 'ozkie/lab/locks/+/uplink',
+  SUB_UPLINK_LEGACY: 'ozkey/lab/locks/+/uplink',
+  topicCommand: (site, deviceId) => `ozkie/${site}/locks/${deviceId}/command`,
   // A Thread lock has no MQTT client of its own — bridge32 is its gateway and
   // subscribes to its OWN topic (blelock/bridge32/bridge32.ino:489), then
   // demuxes onto the mesh by `target`. ozkey-11 §3.
-  topicBridgeCommand: (site, bridgeId) => `ozkey/${site}/bridges/${bridgeId}/command`,
+  topicBridgeCommand: (site, bridgeId) => `ozkie/${site}/bridges/${bridgeId}/command`,
   ENROLL_TOKEN_TTL_MS: 10 * 60 * 1000, // ozkey-05 §7.5
   DEFAULT_HEARTBEAT_S: 60,
 };
@@ -675,13 +695,22 @@ function initMqtt() {
 
   mqttClient.on('connect', () => {
     logEvent('info', `MQTT online — broker ${CONFIG.MQTT_URL}`);
+    // S16: subscribe to both ozkie/ (new) and ozkey/ (legacy) roots during
+    // the migration — drop the *_LEGACY entries in a follow-up once every
+    // publisher (firmware, bridge, this server, ozpmsserv) is confirmed on
+    // ozkie/ only.
     mqttClient.subscribe(
       [
         CONFIG.SUB_ENROLL,
+        CONFIG.SUB_ENROLL_LEGACY,
         CONFIG.SUB_HEARTBEAT,
+        CONFIG.SUB_HEARTBEAT_LEGACY,
         CONFIG.SUB_MEMBER_REQUEST_REMOVE,
+        CONFIG.SUB_MEMBER_REQUEST_REMOVE_LEGACY,
         CONFIG.SUB_MEMBER_ACK_REMOVE,
+        CONFIG.SUB_MEMBER_ACK_REMOVE_LEGACY,
         CONFIG.SUB_UPLINK,
+        CONFIG.SUB_UPLINK_LEGACY,
       ],
       { qos: 1 },
       (err) => {
@@ -691,7 +720,7 @@ function initMqtt() {
             'info',
             `Subscribed: ${CONFIG.SUB_ENROLL} + ${CONFIG.SUB_HEARTBEAT} + ` +
               `${CONFIG.SUB_MEMBER_REQUEST_REMOVE} + ${CONFIG.SUB_MEMBER_ACK_REMOVE} + ` +
-              `${CONFIG.SUB_UPLINK}` +
+              `${CONFIG.SUB_UPLINK} (+ legacy ozkey/ roots during S16 migration)` +
               ' (door-event topic deliberately NOT subscribed — see header)'
           );
       }
@@ -705,10 +734,14 @@ function initMqtt() {
   mqttClient.on('message', async (topic, payloadBuf) => {
     const payload = payloadBuf.toString('utf8').trim();
     try {
-      const m = topic.match(/^ozkey\/([^/]+)\/locks\/([^/]+)\/(enroll|heartbeat|log)$/);
+      // S16: accept either the new `ozkie/` root or legacy `ozkey/` during
+      // the migration window (see the SUB_* comment near CONFIG). Drop the
+      // `(?:ozkey|ozkie)` alternation back to a plain `ozkie` once every
+      // publisher is confirmed off the legacy root.
+      const m = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/locks\/([^/]+)\/(enroll|heartbeat|log)$/);
       if (!m) {
         // S8/S9 (ozkey-15 §3): observe-only, see the SUB_MEMBER_* comment above.
-        const mm = topic.match(/^ozkey\/([^/]+)\/members\/([^/]+)\/(request_remove|ack_remove)$/);
+        const mm = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/members\/([^/]+)\/(request_remove|ack_remove)$/);
         if (mm) {
           logMemberRelay(mm[2], mm[3], payload);
           return;
@@ -719,7 +752,7 @@ function initMqtt() {
         // touching `envelope_hex`; `from`/`to`/size are the addressing
         // metadata, recorded to audit_log for OZPMS/OZLODGE compliance,
         // exactly like grant/revoke/unlock already are.
-        const um = topic.match(/^ozkey\/([^/]+)\/locks\/([^/]+)\/uplink$/);
+        const um = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/locks\/([^/]+)\/uplink$/);
         if (um) await logUplinkMetadata(um[2], payloadBuf, payload);
         return;
       }
