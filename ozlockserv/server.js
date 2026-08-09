@@ -1706,6 +1706,87 @@ api.post('/locks/:id/unlock', async (req, res) => {
   }
 });
 
+/* -- Bond-verb routes (S11, ozkey-14.md 2026-08-10): bond-revoke / invite-cancel --
+ * Firmware has dispatched sealed DP 101 (bond-revoke)/102 (invite-cancel) over
+ * MQTT identically to BLE since ozkey-13's F1 refactor — this was always
+ * deliverable, just unrouted. ftpos found the gap reading server.js before
+ * building: grants is grant_id-scoped, unlock is unlock-shaped, and bond verbs
+ * fit neither.
+ *
+ * Three deliberate differences from /unlock — do not copy its shape blindly:
+ *   1. Sealed only, no accept-both, no frame builder, now or ever. A bond verb
+ *      was never legal in plaintext — the lock's own plaintext path already
+ *      refuses DP 101/102 (broker is anon-open). This endpoint is born at the
+ *      S3/S4 end-state, not migrating to it.
+ *   2. Expiry is LONG (7 days), not unlock's 60s. Access removed late is still
+ *      correct; access never removed because the queue row expired first is a
+ *      security failure.
+ *   3. No remote_unlock capability gate. A revoke is key management — even an
+ *      eco/WiFi-direct lock with no bridge still syncs it on its own wake
+ *      cycle. Gate on reachability only, same check /unlock uses before its
+ *      (skipped-here) capability gate.
+ */
+const BOND_VERB_EXPIRY_MS = 7 * 24 * 3600 * 1000;
+
+async function handleBondVerb(req, res, actionType, label) {
+  if (!guardDb(res)) return;
+  try {
+    const deviceId = req.params.id;
+    const { envelope_hex } = req.body || {};
+    if (!envelope_hex) {
+      return res
+        .status(400)
+        .json({ ok: false, code: 'missing_fields', error: 'envelope_hex is required' });
+    }
+
+    const [[lock]] = await pool.query('SELECT * FROM locks WHERE id = ?', [deviceId]);
+    if (!lock)
+      return res
+        .status(404)
+        .json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
+
+    const reachable = lock.status === 'enrolled' || (lock.bridge_id && lock.status === 'registered');
+    if (!reachable) {
+      return res.status(409).json({
+        ok: false,
+        code: 'lock_not_enrolled',
+        error: `Lock ${deviceId} is not enrolled yet (status: ${lock.status})`,
+        status_now: lock.status,
+      });
+    }
+
+    const expiresAt = new Date(Date.now() + BOND_VERB_EXPIRY_MS);
+    const [queueResult] = await pool.query(
+      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, envelope_hex, msg_type, status, expires_at)
+       VALUES (?, ?, NULL, ?, ?, 'sealed_envelope', 'queued', ?)`,
+      [deviceId, lock.site_id, actionType, envelope_hex, expiresAt]
+    );
+
+    logEvent(
+      'key',
+      `${label} queued for "${lock.label}" (queue #${queueResult.insertId}, expires 7d)`
+    );
+    await recordAudit(lock.app_id, deviceId, actionType, `${label} "${lock.label}"`);
+    const sent = await flushQueueForDevice(lock.site_id, deviceId);
+
+    res.json({
+      ok: true,
+      device_id: deviceId,
+      queue_id: queueResult.insertId,
+      envelope_hex,
+      delivery: sent > 0 ? 'delivered' : 'queued',
+      expires_at: expiresAt.toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+}
+
+api.post('/locks/:id/bond-revoke', (req, res) => handleBondVerb(req, res, 'bond-revoke', 'Bond revoke'));
+api.post('/locks/:id/invite-cancel', (req, res) =>
+  handleBondVerb(req, res, 'invite-cancel', 'Invite cancel')
+);
+
 api.delete('/locks/:id/grants/:gid', async (req, res) => {
   if (!guardDb(res)) return;
   const conn = await pool.getConnection();
