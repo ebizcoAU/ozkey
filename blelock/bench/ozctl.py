@@ -296,7 +296,10 @@ def mqtt_publish_envelope(broker, site, device_id, envelope_bytes):
     Uses mosquitto_pub (subprocess), matching mqttlog.py's own convention of
     shelling out rather than adding a Python MQTT dependency."""
     import subprocess
-    topic = f"ozkey/{site}/locks/{device_id}/command"
+    # S16: topic root is ozkie/. NOTE lines above/below use "ozkey/app->lock"
+    # and "ozkey/invite-v1" as HKDF info — those are KEY DERIVATION inputs,
+    # frozen and byte-matched to the firmware. Never rename them.
+    topic = f"ozkie/{site}/locks/{device_id}/command"
     body = json.dumps({"envelope_hex": envelope_bytes.hex()})
     log("MQTT->", f"{topic} ({len(body)} B JSON, envelope_hex={len(envelope_bytes)} B)")
     subprocess.run(["mosquitto_pub", "-h", broker, "-t", topic, "-m", body], check=True)

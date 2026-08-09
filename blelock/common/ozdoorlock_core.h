@@ -508,6 +508,7 @@ uint8_t enrollAttempts = 0;
 unsigned long lastUnpairedAnnounce = 0;
 String topicCommand, topicEnroll, topicHeartbeat, topicLog, topicPairConfirm;
 String topicUplink; // ozkey-17 U1 — sealed lock->app content, opaque to the server
+String topicCommandLegacy; // S16 — pre-rename root, subscribed during migration only
 #define TOPIC_UNPAIRED "hotel/locks/unpaired/heartbeat"
 
 bool screenDirty = true;
@@ -1983,6 +1984,7 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     saveConfig();
     buildTopics();
     mqtt.subscribe(topicCommand.c_str(), 1);
+    if (topicCommandLegacy.length()) mqtt.subscribe(topicCommandLegacy.c_str(), 1); // S16
     Serial.printf("[PAIR] assigned room %s (site %s)\n", cfgRoomNo.c_str(),
                   cfgSiteId.c_str());
     notifyStatus("ENROLLED");
@@ -2105,6 +2107,7 @@ void ensureMqtt() {
   if (mqtt.connect(deviceId.c_str())) {
     lastActivityAt = millis();
     mqtt.subscribe(topicCommand.c_str(), 1);
+    if (topicCommandLegacy.length()) mqtt.subscribe(topicCommandLegacy.c_str(), 1); // S16
     if (isLocalMode() && !enrolled) mqtt.subscribe(topicPairConfirm.c_str(), 1);
     Serial.println("[MQTT] connected + subscribed command topic");
     if (state == ST_JOINING) {
@@ -3735,8 +3738,17 @@ void startBle() {
 }
 
 void buildTopics() {
-  String base = "ozkey/" + cfgSiteId + "/locks/" + deviceId + "/";
+  // S16 (operator directive 2026-08-10): the topic root is `ozkie/`, not
+  // `ozkey/` — OZKEY is already another company's product, so this is
+  // trademark exposure rather than naming taste. NOTE the boundary: the
+  // HKDF info strings in ozcrypto.h ("ozkey/app->lock", "ozkey/lock->app",
+  // "ozkey/invite-v1") are key-derivation INPUTS and must NEVER be renamed —
+  // changing one character breaks every bond and every outstanding invite.
+  // They are invisible on every product surface, so they carry no exposure.
+  String base = "ozkie/" + cfgSiteId + "/locks/" + deviceId + "/";
+  String legacyBase = "ozkey/" + cfgSiteId + "/locks/" + deviceId + "/";
   topicCommand = base + "command";
+  topicCommandLegacy = legacyBase + "command"; // S16 transition — subscribe both
   topicEnroll = base + "enroll";
   topicHeartbeat = base + "heartbeat";
   topicLog = base + "log";

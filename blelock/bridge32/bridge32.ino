@@ -153,8 +153,8 @@ unsigned long lastLcdActivityAt = 0;
 //        makes a bridged lock indistinguishable from a WiFi one to ozlockserv,
 //        so the server needs no change and stays a mailman. The bridge reads
 //        only `from`; `envelope_hex` is sealed to the app and opaque here.
-#define FW_VERSION "bridge32-1.9"
-#define FW_DISPLAY_VERSION "v1.9" // shown on-screen, doorlock.ino's badge convention
+#define FW_VERSION "bridge32-1.10"
+#define FW_DISPLAY_VERSION "v1.10" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
 // existing mesh) in v0; it is the only network former in the home.
@@ -524,7 +524,7 @@ void refreshInfo() {
 // bridge already subscribes to the correct final topic, so no further
 // firmware change is needed once S4 ships.
 // ─────────────────────────────────────────────────────────────────────────────
-String mqttCommandTopic;
+String mqttCommandTopic, mqttCommandTopicLegacy;
 unsigned long mqttLastAttempt = 0;
 #define MQTT_RETRY_MS 5000UL
 
@@ -701,27 +701,59 @@ void uplinkRxBegin() {
                 OZ_THREAD_UPLINK_PORT, ozUplinkRxFd);
 }
 
+// 1.10 — DRAIN the socket, do not sample it. This was the real cause of the
+// uplink losses, and it was here rather than on the lock.
+//
+// Until now this read exactly ONE datagram per call, and loop() ends with
+// delay(50) — so the bridge consumed at most one datagram per ~50 ms. Once
+// doorlock-1.28 added retry bursts, a single roster change sends NINE
+// datagrams (3 bursts x unicast + ff03::1 + ff03::4f5a) inside ~190 ms.
+// lwIP's UDP receive queue is only a few datagrams deep, so the remainder
+// overflowed and were dropped silently — nothing logs a full mbox.
+//
+// Measured 2026-08-10: 9 sent, 2 relayed, and relay latency stretched from
+// ~150 ms to ~470 ms as the survivors queued behind the poll. The retry
+// hardening I added to FIX a loss was making it worse, because more
+// datagrams against a fixed 20/s drain rate is strictly more overflow.
+//
+// Bounded, so a flood cannot starve the rest of loop(): drain up to N per
+// pass, then yield and continue on the next. At 20 passes/second that is
+// still 320 datagrams/s, far above anything the mesh can deliver.
+#define OZ_UPLINK_DRAIN_MAX 16
+
+static bool pollUplinkOne(); // fwd — defined below
 void pollUplinkUdp() {
   if (!uplinkRxReady || ozUplinkRxFd < 0) return;
+  for (int drained = 0; drained < OZ_UPLINK_DRAIN_MAX; drained++) {
+    if (!pollUplinkOne()) return; // EWOULDBLOCK — socket empty, normal case
+  }
+  // Hit the cap with more waiting: say so. Silence here would look identical
+  // to an idle socket, which is exactly the blind spot that hid this bug.
+  Serial.printf("[UPLINK] drained %d in one pass, more may be queued\n",
+                OZ_UPLINK_DRAIN_MAX);
+}
 
+// Returns true if a datagram was read (caller should try again), false when
+// the socket is empty or the read failed.
+static bool pollUplinkOne() {
   char buf[OZ_UPLINK_RX_BUF];
   struct sockaddr_in6 src;
   socklen_t srcLen = sizeof(src);
   const int n = lwip_recvfrom(ozUplinkRxFd, buf, sizeof(buf) - 1, 0,
                               (struct sockaddr *)&src, &srcLen);
-  if (n <= 0) return; // EWOULDBLOCK on an idle socket — the normal case
+  if (n <= 0) return false; // EWOULDBLOCK on an idle socket — the normal case
   buf[n] = 0;
 
   JsonDocument doc;
   if (deserializeJson(doc, buf) != DeserializationError::Ok) {
     Serial.println("[UPLINK] rx payload not valid JSON, dropped");
-    return;
+    return true; // consumed one; keep draining
   }
   const char *from = doc["from"] | (const char *)nullptr;
   const char *envHex = doc["envelope_hex"] | (const char *)nullptr;
   if (!from || !envHex) {
     Serial.println("[UPLINK] rx missing `from`/`envelope_hex`, dropped");
-    return;
+    return true; // consumed one; keep draining
   }
 
   if (!mqttClient.connected()) {
@@ -729,15 +761,16 @@ void pollUplinkUdp() {
     // message, so it is gone — say so rather than let it vanish silently, which
     // is precisely the class of invisible loss this whole feature exists to end.
     Serial.printf("[UPLINK] %s: broker down, uplink DROPPED (%d B)\n", from, n);
-    return;
+    return true; // consumed one; keep draining
   }
 
   // U3: the lock's own topic, not ours. See the header note — this is what
   // keeps ozlockserv a mailman and spares it any change at all.
-  const String topic = "ozkey/" + cfgSiteId + "/locks/" + String(from) + "/uplink";
+  const String topic = "ozkie/" + cfgSiteId + "/locks/" + String(from) + "/uplink"; // S16
   const bool ok = mqttClient.publish(topic.c_str(), buf);
   Serial.printf("[UPLINK] %s -> %s (%d B)%s\n", from, topic.c_str(), n,
                 ok ? "" : " PUBLISH FAILED");
+  return true;
 }
 
 // One multicast send, logged per destination group so the bench can tell which
@@ -893,6 +926,8 @@ void mqttConnect() {
     Serial.println("[MQTT] connected");
     notifyStatus("BROKER_OK");
     mqttClient.subscribe(mqttCommandTopic.c_str());
+    if (mqttCommandTopicLegacy.length())
+      mqttClient.subscribe(mqttCommandTopicLegacy.c_str()); // S16 transition
     Serial.printf("[MQTT] subscribed %s\n", mqttCommandTopic.c_str());
   } else {
     Serial.printf("[MQTT] connect failed, rc=%d\n", mqttClient.state());
@@ -902,7 +937,11 @@ void mqttConnect() {
 }
 
 void mqttBegin() {
-  mqttCommandTopic = "ozkey/" + cfgSiteId + "/bridges/" + deviceId + "/command";
+  // S16: publish/primary on `ozkie/`; also subscribe the legacy `ozkey/`
+  // root during migration so update order between firmware, server and app
+  // does not matter and nothing goes dark by being flashed second.
+  mqttCommandTopic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/command";
+  mqttCommandTopicLegacy = "ozkey/" + cfgSiteId + "/bridges/" + deviceId + "/command";
   mqttClient.setServer(cfgBrokerHost.c_str(), cfgBrokerPort);
   mqttClient.setCallback(mqttMessageReceived);
   // ROOT CAUSE of "the app can't open the door" (found 2026-07-29).

@@ -179,8 +179,8 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 //        F8: sealed-envelope plaintext is OZKIE semantic JSON; the lock builds
 //        the Tuya frame locally at the MCU boundary. U0: per-bond outbound
 //        counter for lock->app sealing, in OZ_BOND_REC's spare bytes.
-#define FW_VERSION "doorlock-1.29"
-#define FW_DISPLAY_VERSION "V1.29" // shown on-screen: "OZLOCK V1.29 THREAD/WIFI"
+#define FW_VERSION "doorlock-1.30"
+#define FW_DISPLAY_VERSION "V1.30" // shown on-screen: "OZLOCK V1.30 THREAD/WIFI"
 
 // Brief startup splash before the operational dashboard (operator request) —
 // shown once at boot, before WiFi/Thread/BLE bring-up starts, so there's

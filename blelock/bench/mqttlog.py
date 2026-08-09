@@ -5,7 +5,7 @@ a latency measurement (2026-08-07, Thread-relay-latency investigation)."""
 import subprocess, sys, time
 
 BROKER = sys.argv[1] if len(sys.argv) > 1 else "10.1.1.20"
-TOPIC = sys.argv[2] if len(sys.argv) > 2 else "ozkey/lab/#"
+TOPIC = sys.argv[2] if len(sys.argv) > 2 else "#"  # S16: watch BOTH roots during the ozkey/->ozkie/ migration
 
 proc = subprocess.Popen(
     ["mosquitto_sub", "-h", BROKER, "-t", TOPIC, "-v"],

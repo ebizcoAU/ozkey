@@ -75,6 +75,64 @@ MQTT topic prefixes, DB names, config keys, ports. Where a rename would
 break a live device, leave a documented alias rather than breaking it, and
 list what you aliased.
 
+### Server reply, 2026-08-10 — S12 done, committed `df2f92f`
+
+Before touching anything: confirmed `ozkeyserv` isn't currently running
+(clean rename, no live process to coordinate around), and confirmed the
+`ozkey/` webapp really is the hospitality tier's own admin tool — its
+`package.json` description already says "OZKEY Core Cockpit - 100-Room
+Matrix, Pairing & Credential Injection" — not a separate product, so both
+were in scope as one rename, not two.
+
+**Done:** `ozkeyserv/` → `ozlodgeserv/` (port 3200, DB `ozkey` → `ozlodge`,
+env vars `OZKEY_*` → `OZLODGE_*`, headers `X-OZKEY-*` → `X-OZLODGE-*`), and
+`ozkey/` → `ozlodge-cockpit/` (port 3300). Also fixed a stale header
+comment while in there — it said "Port: 4000", `HTTP_PORT` has always
+defaulted to 3200.
+
+**Deliberately NOT renamed, and worth being explicit about since this is
+exactly the kind of thing your own standing instruction (§0) says to
+verify rather than assume:**
+- The `ozkey/<site>/...` MQTT topic root. This is shared protocol
+  infrastructure (ozkey-04 §9) used identically by `ozlockserv` — not
+  OZKEYSERV product branding. I read it as in scope on a first pass, then
+  caught that renaming it would be a protocol-breaking change across
+  every tier's already-deployed devices at once, which is a much bigger
+  action than "the rename." Left untouched.
+- The live MySQL `ozkey` database itself — no atomic `RENAME DATABASE` in
+  MySQL, and dump/restore is destructive enough to need you running it
+  deliberately, not me doing it silently in a code change. Code default
+  is now `ozlodge` (auto-creates fresh, doesn't touch existing `ozkey`
+  data), `OZLODGE_DB_NAME` env var overrides back to `ozkey` if you want
+  to point at the existing data instead of migrating it.
+- `ozkey-NN §X.Y` comment citations — those name real doc files that
+  didn't move.
+
+**What I aliased, per your instruction to list it:**
+- HTTP: `/ozlodgeserv/api` primary, `/ozkeyserv/api` still mounted.
+- Auth headers: `X-OZLODGE-Secret`/`X-OZLODGE-Operator-Token` primary,
+  legacy `X-OZKEY-*` still accepted.
+- Env vars: `OZLODGE_*` read first, `OZKEY_*` still read as fallback.
+- **mDNS — the one that actually matters:** advertises both `_ozlodge._tcp`
+  and legacy `_ozkey._tcp`. This is how an already-commissioned lock
+  *finds* the server in the first place (per the file's own comment: "a
+  §7.5-provisioned lock needs only the service name") — dropping the old
+  type would silently dark every such lock's next reconnect with no
+  remote fix possible, since a lock that can't find the server can't be
+  told the server's name changed either. Judged this the highest-risk
+  item in the whole rename.
+- Cockpit's emergency-secret `localStorage` key: reads the new key, falls
+  back to the old one, so an operator's already-armed takeover doesn't
+  silently disarm on next page load.
+
+Both boot-tested clean post-rename: `ozlodgeserv` on :3200 (new path,
+legacy path, mDNS dual-publish all verified live), `ozlodge-cockpit` on
+:3300 (renders, correct title, no console errors). Neither left running.
+
+Starting S13 (C7, sealed door-event log) next per the queue order —
+flagging now, per §0, that I'll coordinate the payload shape with you
+before building rather than guess it, as instructed.
+
 ### S13 — C7: seal the door-event log
 
 **This is the change that makes OZLOCK's headline claim true.**
@@ -211,3 +269,103 @@ G3 recovery ┘                                                  │
 
 OZPMS ── HELD pending domain validation (tenancy law, real PM company)
 ```
+
+---
+
+## S16 — `ozkey/` → `ozkie/` MQTT topic root. TRADEMARK. Read the boundary first.
+
+**Operator directive 2026-08-10: OZKEY is already someone else's product.**
+The protocol is **OZKIE**, and the MQTT topic root must follow. This is a
+legal exposure, not a naming preference — which is why it overrides the
+correct decision you made in S12 to leave the topic root alone.
+
+**Do this NOW, while there is no field deployment.** Today it costs a
+coordinated reflash of three bench boards. After launch it means migrating
+or recalling devices. Same reasoning as S12's "the codebase will never be
+smaller than it is now," with a legal deadline attached.
+
+### 🔴 DO NOT FIND-REPLACE. Two categories of `ozkey/` exist.
+
+**RENAME — MQTT topic roots (wire-visible, no crypto impact):**
+
+| Where | Line |
+|---|---|
+| `ozlockserv/server.js` | `SUB_ENROLL`, `SUB_HEARTBEAT`, `SUB_UPLINK`, `SUB_MEMBER_REQUEST_REMOVE`, `SUB_MEMBER_ACK_REMOVE`, and every topic built for publish |
+| `ozpmsserv/server.js` | same pattern |
+| `blelock/common/ozdoorlock_core.h` | `:3738` `String base = "ozkey/" + cfgSiteId + ...` — **mine, I'll do it** |
+| `blelock/bridge32/bridge32.ino` | `:769` uplink topic, `:938` command topic — **mine** |
+| `blelock/bench/*.py`, `ozctl.py` | bench tools — **mine** |
+| ftpos app | raised separately as XF-85 |
+
+**DO NOT RENAME — cryptographic constants (`blelock/common/ozcrypto.h`):**
+
+```c
+"ozkey/app->lock"     // HKDF info — per-direction envelope key
+"ozkey/lock->app"     // HKDF info — per-direction envelope key
+"ozkey/invite-v1"     // HKDF info — invite MAC key
+```
+
+These are **key-derivation inputs**, not names. Changing one character
+changes every derived AES-GCM key and every invite MAC. The consequence is
+not a broken build — it is **every bond on every lock silently failing to
+open, every outstanding QR invite becoming invalid, and every device
+needing to be re-paired.** They are also byte-frozen against ftpos's
+`envelope.dart` and `member_invite.dart`, so a unilateral change breaks
+interop even if both sides were re-paired.
+
+They carry **zero trademark exposure**: they appear in no topic, no UI, no
+document, no packet field a customer or competitor ever sees. They are
+opaque domain-separation strings inside a hash.
+
+Leave them exactly as they are. If we ever want them changed, it is a
+versioned migration (like ozkey-17 §5e's v2→v3), never a rename.
+
+### Migration shape — order must not matter
+
+Three codebases and five devices cannot update simultaneously. So:
+
+- **Receivers subscribe to BOTH roots** — `ozkie/<site>/…` and legacy
+  `ozkey/<site>/…` — for the transition.
+- **Publishers publish to `ozkie/` only.**
+- Once every component is confirmed on the new root, drop the legacy
+  subscription in a follow-up change, not this one.
+
+That makes update order irrelevant and means no device goes dark because it
+was flashed second.
+
+### Also worth checking while you are in there
+
+`docs/`, `README`s and the product specs use `ozkey/…` in examples. Those
+are documentation, not wire — update them, but they are not a correctness
+risk. `ozkey-NN.md` filenames and `ozkey-NN §X` citations stay: they are
+document names, not the product.
+
+### Server reply, 2026-08-10 — S16 done for ozlockserv, committed `04bf422`
+
+Scoped to exactly what the table assigned me: `ozlockserv/server.js`. Left
+`ozpmsserv/server.js`, firmware, bridge, and bench tools alone — those show
+as already modified in the working tree, presumably you're on them in
+parallel.
+
+**Done:** every `SUB_*` constant and the two publish-side topic builders
+(`topicCommand`, `topicBridgeCommand`) now use `ozkie/`. Paired
+`SUB_*_LEGACY` constants added for all five subscriptions and included in
+the `mqttClient.subscribe()` call, and the three topic-matching regexes in
+the message handler changed from `^ozkey\/` to `^(?:ozkey|ozkie)\/` — per
+spec, receive both roots, publish the new one only.
+
+**Confirmed NOT touched:** `ozcrypto.h`'s HKDF info strings aren't in this
+file anyway, but flagged in a comment at the topic-config site so nobody
+later "helpfully" catches what looks like a missed rename and breaks every
+bond in the field.
+
+**Live-verified**, not just syntax-checked: published synthetic uplink
+messages to both `ozkie/lab/locks/.../uplink` and legacy
+`ozkey/lab/locks/.../uplink` — both received and logged identically. Then
+issued a real unlock command and confirmed the outbound publish (`SYNC`
+log line) went out on `ozkie/lab/bridges/.../command`, not the legacy root
+— publishers are actually publish-new-only, not just configured to be.
+
+Not dropping the `*_LEGACY` subscriptions or the regex alternation — per
+spec that's a follow-up once every publisher (firmware, bridge, ozpmsserv)
+is confirmed off `ozkey/`, not this change.
