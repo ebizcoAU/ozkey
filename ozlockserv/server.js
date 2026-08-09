@@ -126,6 +126,17 @@ const CONFIG = {
   // persistence"), not to republish.
   SUB_MEMBER_REQUEST_REMOVE: 'ozkey/lab/members/+/request_remove',
   SUB_MEMBER_ACK_REMOVE: 'ozkey/lab/members/+/ack_remove',
+  // V1 (ozkey-17 §6, ozkey-14.md "Update 2026-08-09 late"): the lock->app
+  // uplink channel, published under the LOCK'S OWN topic (bridge32-1.9
+  // relays it there, not under the bridge's topic) — but this is NOT
+  // covered by SUB_ENROLL/SUB_HEARTBEAT above despite both being
+  // `locks/+/...`: MQTT subscriptions match the full topic string, so
+  // subscribing to `locks/+/heartbeat` does not receive `locks/+/uplink`.
+  // Verified live 2026-08-10: a synthetic publish to this topic produced
+  // zero server-side activity before this subscription was added — the
+  // "server already subscribes locks/+/... wildcards" assumption in
+  // ozkey-14.md was wrong. This is the real V1 finding.
+  SUB_UPLINK: 'ozkey/lab/locks/+/uplink',
   topicCommand: (site, deviceId) => `ozkey/${site}/locks/${deviceId}/command`,
   // A Thread lock has no MQTT client of its own — bridge32 is its gateway and
   // subscribes to its OWN topic (blelock/bridge32/bridge32.ino:489), then
@@ -207,6 +218,13 @@ function toSpacedHex(buf) {
 // envelope_hex now (A1-A5, ftpos shipped), the server only relays it opaque.
 // See migrations/S3_drop_raw_value.sql for the paired schema cut.
 
+// S10 (ozkey-17 §4/§9, XF-72..78): legacy-path only. This is the last
+// server-composed Tuya frame in the system — ozkey-17 names it explicitly
+// ("the one command still violating both [mailman] properties"). Delete
+// this the same way S3/S4 deleted buildCredentialFrame()/buildDeleteFrame()
+// once the app's sealed `{"kind":"unlock",...}` path is confirmed live —
+// acceptance per ozkey-17 §4: `grep -rn "55 AA" ozlockserv/` returns only
+// comments.
 /** Remote unlock request: DP_REPORT / DPID 1 (UNLOCK_CHANNEL) BOOL value 1.
  *  Byte-matches LockSim's SAMPLE_REMOTE_UNLOCK_FRAME; the lock's handleFrame
  *  runs unlockCycle() on receipt. */
@@ -616,6 +634,38 @@ function logMemberRelay(targetDeviceId, kind, payload) {
   }
 }
 
+/** V1 (ozkey-17 §6a/§6c, normative wire wrapper corrected 2026-08-10):
+ * lock->app uplink's wrapper is `{from, to, envelope_hex}` — "read by the
+ * bridge for routing only" per §6c, i.e. addressing metadata, same as a
+ * postal envelope's To/From. `kind`/`reason`/`bonds`/anything else lives
+ * INSIDE `envelope_hex`, sealed, and is never touched. (Earlier revision
+ * of this function assumed a top-level `msg_id` — that field does not
+ * exist in the actual wire format; §6c is authoritative over the general
+ * §6 prose that suggested it.)
+ *
+ * Persisted via recordAudit(), not just logEvent() — per the operator's
+ * directive this is retained for OZPMS/OZLODGE audit-trail compliance,
+ * unlike S8/S9's member-relay observation which is deliberately
+ * ephemeral-only. `to` is read directly from the wrapper when present
+ * (it's the actual routing address ozSemanticDispatch put there); falls
+ * back to recordAudit()'s own `locks.app_id` lookup otherwise, so a
+ * malformed/legacy payload still gets an audit row.
+ */
+async function logUplinkMetadata(fromDeviceId, payloadBuf, payloadStr) {
+  const size = payloadBuf.length;
+  let to = null;
+  try {
+    const obj = JSON.parse(payloadStr);
+    if (typeof obj.to === 'string') to = obj.to;
+  } catch (_) {
+    // Not JSON — fine, log size/from anyway. Not a warn like the other
+    // topics: firmware/bridge versions may still be settling on this
+    // still-new wire shape.
+  }
+  logEvent('info', `Uplink from ${fromDeviceId} to ${to || '(unresolved)'}: ${size}B (content sealed, not read)`);
+  await recordAudit(to, fromDeviceId, 'uplink', `size=${size}B`);
+}
+
 function initMqtt() {
   mqttClient = mqtt.connect(CONFIG.MQTT_URL, {
     clientId: `ozlockserv-${Math.random().toString(16).slice(2, 8)}`,
@@ -631,6 +681,7 @@ function initMqtt() {
         CONFIG.SUB_HEARTBEAT,
         CONFIG.SUB_MEMBER_REQUEST_REMOVE,
         CONFIG.SUB_MEMBER_ACK_REMOVE,
+        CONFIG.SUB_UPLINK,
       ],
       { qos: 1 },
       (err) => {
@@ -639,7 +690,8 @@ function initMqtt() {
           logEvent(
             'info',
             `Subscribed: ${CONFIG.SUB_ENROLL} + ${CONFIG.SUB_HEARTBEAT} + ` +
-              `${CONFIG.SUB_MEMBER_REQUEST_REMOVE} + ${CONFIG.SUB_MEMBER_ACK_REMOVE}` +
+              `${CONFIG.SUB_MEMBER_REQUEST_REMOVE} + ${CONFIG.SUB_MEMBER_ACK_REMOVE} + ` +
+              `${CONFIG.SUB_UPLINK}` +
               ' (door-event topic deliberately NOT subscribed — see header)'
           );
       }
@@ -657,7 +709,18 @@ function initMqtt() {
       if (!m) {
         // S8/S9 (ozkey-15 §3): observe-only, see the SUB_MEMBER_* comment above.
         const mm = topic.match(/^ozkey\/([^/]+)\/members\/([^/]+)\/(request_remove|ack_remove)$/);
-        if (mm) logMemberRelay(mm[2], mm[3], payload);
+        if (mm) {
+          logMemberRelay(mm[2], mm[3], payload);
+          return;
+        }
+        // V1 (ozkey-17 §6/§6a/§6c): lock->app uplink, published under the
+        // lock's own topic. Wire wrapper is `{from, to, envelope_hex}`
+        // (§6c, normative) — "content you never parse" means never
+        // touching `envelope_hex`; `from`/`to`/size are the addressing
+        // metadata, recorded to audit_log for OZPMS/OZLODGE compliance,
+        // exactly like grant/revoke/unlock already are.
+        const um = topic.match(/^ozkey\/([^/]+)\/locks\/([^/]+)\/uplink$/);
+        if (um) await logUplinkMetadata(um[2], payloadBuf, payload);
         return;
       }
       const [, siteId, topicDeviceId, kind] = m;
@@ -1581,21 +1644,41 @@ api.post('/locks/:id/unlock', async (req, res) => {
     // WHEN the command may run, never WHETHER anybody was at the door, and a
     // sleeping lock wakes on its heartbeat timer too. The device-side check is
     // what makes "someone must be there" a requirement instead of a probability.
-    const payloadHex = toSpacedHex(buildUnlockFrame());
+    //
+    // S10 (ozkey-17 §4, rollout): during rollout the app sends EITHER a
+    // pre-sealed `envelope_hex` (app already built + sealed
+    // `{"kind":"unlock",...}` — server relays opaque, never sees/builds a
+    // Tuya frame) OR nothing, in which case the server still builds the
+    // legacy frame with `buildUnlockFrame()`. Same accept-both shape S1
+    // used for grants; `buildUnlockFrame()` is deleted only once the app's
+    // sealed unlock path is confirmed live (ozkey-17 §4's own instruction,
+    // mirroring S3/S4's cutover — see migrations/S3_drop_raw_value.sql for
+    // the precedent this follows).
+    const { envelope_hex } = req.body || {};
+    const sealed = Boolean(envelope_hex);
+    const payloadHex = sealed ? null : toSpacedHex(buildUnlockFrame());
     const actionType = assisted ? 'assisted-unlock' : 'unlock';
     const windowMs = assisted ? ASSISTED_UNLOCK_MS : 60_000;
     const expiresAt = new Date(Date.now() + windowMs);
     const [queueResult] = await pool.query(
-      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, payload_hex, status, expires_at)
-       VALUES (?, ?, NULL, ?, ?, 'queued', ?)`,
-      [deviceId, lock.site_id, actionType, payloadHex, expiresAt]
+      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, payload_hex, envelope_hex, msg_type, status, expires_at)
+       VALUES (?, ?, NULL, ?, ?, ?, ?, 'queued', ?)`,
+      [
+        deviceId,
+        lock.site_id,
+        actionType,
+        payloadHex,
+        sealed ? envelope_hex : null,
+        sealed ? 'sealed_envelope' : 'legacy_payload',
+        expiresAt,
+      ]
     );
 
     logEvent(
       'key',
       `${assisted ? 'ASSISTED' : 'Remote'} UNLOCK queued for "${lock.label}" ` +
         `(queue #${queueResult.insertId}, expires ${windowMs / 1000}s` +
-        `${assisted ? ', needs a keypad touch' : ''})`
+        `${assisted ? ', needs a keypad touch' : ''}, ${sealed ? 'sealed' : 'legacy'})`
     );
     await recordAudit(lock.app_id, deviceId, 'unlock', `remote unlock "${lock.label}"`);
     const sent = await flushQueueForDevice(lock.site_id, deviceId);
@@ -1604,7 +1687,7 @@ api.post('/locks/:id/unlock', async (req, res) => {
       ok: true,
       device_id: deviceId,
       queue_id: queueResult.insertId,
-      payload_hex: payloadHex,
+      ...(sealed ? { envelope_hex } : { payload_hex: payloadHex }),
       // In the lab LockSim keeps its MQTT link open, so delivery is immediate;
       // a real eco lock would report 'queued' until its next wake.
       delivery: sent > 0 ? 'delivered' : 'queued',
