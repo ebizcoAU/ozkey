@@ -2872,6 +2872,61 @@ static size_t ozSemGrantValue(JsonDocument &doc, uint8_t *out, size_t cap) {
   return n;
 }
 
+// ── Q1 (ozkey-17 §6b): query rate limiting ───────────────────────────────────
+// Sized against the threat that actually exists. A "rogue app" must already
+// hold a bond to send a sealed query at all, so that is the narrow case. The
+// observed case is our own software: XF-72/74/76 were all BANOI retry-looping
+// against a lock, and XF-81 caught it polling list_bonds 8 times in 90 seconds.
+// On a 4xAA battery lock the cost of a query storm is BATTERY, not CPU.
+//
+// So: generous enough never to interfere with legitimate admin use, firm
+// enough to stop a runaway loop, with a longer cooldown once a caller has
+// demonstrated it is looping rather than asking.
+#define OZ_QUERY_MIN_GAP_MS  2000UL   // per bond, between accepted queries
+#define OZ_QUERY_STRIKES_MAX 5        // rapid-fire attempts before cooldown
+#define OZ_QUERY_COOLDOWN_MS 30000UL  // enforced quiet period after that
+
+static uint32_t g_qLastMs[OZ_BOND_MAX];
+static uint8_t  g_qStrikes[OZ_BOND_MAX];
+
+// RAM-only by design: a rate limit that survived reboot would let a lock that
+// brownouts mid-storm come back still refusing its owner.
+static bool ozQueryRateOk(int slot) {
+  const uint32_t now = millis() ? millis() : 1; // 0 means "never queried"
+  const uint32_t last = g_qLastMs[slot];
+  if (last == 0) { g_qLastMs[slot] = now; g_qStrikes[slot] = 0; return true; }
+
+  // Unsigned subtraction is millis()-wrap safe; do not compare timestamps.
+  const uint32_t gap = now - last;
+  const uint32_t need = (g_qStrikes[slot] >= OZ_QUERY_STRIKES_MAX)
+                            ? OZ_QUERY_COOLDOWN_MS
+                            : OZ_QUERY_MIN_GAP_MS;
+  if (gap < need) {
+    if (g_qStrikes[slot] < 255) g_qStrikes[slot]++;
+    Serial.printf("[OZKIE] query from bond %d rate-limited (%lums < %lums, "
+                  "%u strikes)\n", slot, (unsigned long)gap,
+                  (unsigned long)need, g_qStrikes[slot]);
+    return false;
+  }
+  g_qLastMs[slot] = now;
+  g_qStrikes[slot] = 0; // asked politely — forgiven
+  return true;
+}
+
+// Budget for a query response's PLAINTEXT, before sealing.
+//
+// A Thread datagram is bounded by the IPv6 minimum MTU (1280 B). Our wire path
+// costs roughly: plaintext -> +37 B envelope -> x2 for hex -> +~130 B of
+// {from,to,envelope_hex} wrapper. Working backwards from ~1200 B of usable UDP
+// payload leaves about 500 B of plaintext. A full 15-member roster at ~106 B
+// per entry would be ~1600 B and would simply vanish — silently, since a
+// too-large sendto fails at a layer nothing here logs.
+//
+// So responses are BUDGETED and say so when truncated, rather than being
+// quietly lost. Full enumeration when standing at the door is what BLE
+// `list_bonds` is still for; pagination is future work if it is ever needed.
+#define OZ_QUERY_PLAINTEXT_BUDGET 480
+
 static void ozSemanticDispatch(int slot, const char *json, size_t len) {
   JsonDocument doc;
   if (deserializeJson(doc, json, len) != DeserializationError::Ok) {
@@ -2913,6 +2968,73 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
   }
   if (strcmp(kind, "list_bonds") == 0) {
     handleListBonds(slot, nullptr, 0);
+    return;
+  }
+
+  // ── Q1 queries — answered over the UPLINK, not over BLE ────────────────────
+  // Deliberate: the entire point of a query is to ask WITHOUT being present.
+  // A caller standing at the door already has BLE `list_bonds`. Answering
+  // remote questions on a transport that requires proximity would make the
+  // feature useless for the case it exists to serve (an admin phone that is
+  // nowhere near the lock — the exact situation that produced XF-75/77/78).
+  //
+  // `msg_id` is echoed INSIDE the seal. Putting a correlator in the clear
+  // would let anyone watching the broker link "admin asked" to "lock
+  // answered" and infer who administers which door and when — traffic
+  // analysis, without decrypting anything. The app can decrypt, so it
+  // correlates perfectly well from inside; no middle hop needs it.
+  if (strcmp(kind, "query_roster") == 0 || strcmp(kind, "query_bond_state") == 0) {
+    if (!ozQueryRateOk(slot)) { notifyStatus("QUERY_THROTTLED"); return; }
+    if (g_bonds[slot].role != OZ_ROLE_ADMIN) {
+      Serial.printf("[OZKIE] %s is admin-only — bond %d denied\n", kind, slot);
+      notifyStatus("QUERY_DENIED");
+      return;
+    }
+    const char *msgId = doc["msg_id"] | "";
+
+    JsonDocument rsp;
+    if (strcmp(kind, "query_roster") == 0) {
+      rsp["kind"] = "roster_response";
+      rsp["msg_id"] = msgId;
+      rsp["bonds"] = ozBondCount();
+      JsonArray arr = rsp["members"].to<JsonArray>();
+      bool truncated = false;
+      for (int i = 1; i < OZ_BOND_MAX; i++) {
+        if (!g_bonds[i].present) continue;
+        if (measureJson(rsp) > OZ_QUERY_PLAINTEXT_BUDGET) { truncated = true; break; }
+        JsonObject o = arr.add<JsonObject>();
+        char h[65];
+        ozHex(g_bonds[i].pub, 32, h);
+        h[16] = 0; // 8-byte prefix — enough to match a row the app already has,
+                   // and the full value is available over BLE when present
+        o["slot"] = i;
+        o["label"] = g_bonds[i].label;
+        o["pub8"] = h;
+      }
+      if (truncated) rsp["truncated"] = true;
+    } else {
+      uint8_t pub[32];
+      if (ozHexDecode(String((const char *)(doc["pub"] | "")), pub, sizeof(pub)) != 32) {
+        Serial.println("[OZKIE] query_bond_state: `pub` is not 32 bytes of hex");
+        notifyStatus("QUERY_DENIED");
+        return;
+      }
+      const int target = ozBondFind(pub);
+      rsp["kind"] = "bond_state_response";
+      rsp["msg_id"] = msgId;
+      rsp["present"] = (target >= 0);
+      if (target >= 0) {
+        rsp["slot"] = target;
+        rsp["label"] = g_bonds[target].label;
+        rsp["role"] = (g_bonds[target].role == OZ_ROLE_ADMIN) ? "admin" : "member";
+      }
+    }
+
+    String out;
+    serializeJson(rsp, out);
+    Serial.printf("[OZKIE] %s -> %u B response to bond %d\n", kind,
+                  (unsigned)out.length(), slot);
+    if (!ozUplinkSend(slot, out)) notifyStatus("QUERY_UNDELIVERABLE");
     return;
   }
 
