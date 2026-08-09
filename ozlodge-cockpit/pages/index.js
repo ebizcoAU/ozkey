@@ -1,8 +1,12 @@
 /*
  * ============================================================================
- *  OZKEY CORE COCKPIT — Sovereign Smart Lock Laboratory Dashboard (Port 3300)
+ *  OZLODGE COCKPIT — Sovereign Smart Lock Hospitality Dashboard (Port 3300)
+ *  (formerly OZKEY Core Cockpit, renamed ozkey-18 §2 S12, 2026-08-10 — API
+ *  base below points at the new /ozlodgeserv/api path; the server still
+ *  mounts the legacy /ozkeyserv/api alias too, so nothing broke by renaming
+ *  the sender, only by dropping the receiver's alias, which wasn't done)
  *  ---------------------------------------------------------------------------
- *  - 30-room pairing matrix (Block A) driven live from OZKEYSERV (Port 3200)
+ *  - 30-room pairing matrix (Block A) driven live from OZLODGESERV (Port 3200)
  *  - Discovered Unpaired Hardware panel (MQTT discovery + Web Serial capture)
  *  - Credential injector (PIN / RFID / Fingerprint) via the API gateway
  *  - Web Serial desk-module reader + scrolling green lab terminal
@@ -11,7 +15,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-const API = 'http://localhost:3200/ozkeyserv/api';
+const API = 'http://localhost:3200/ozlodgeserv/api';
 const MAC_REGEX = /(?:[0-9A-F]{2}[:\-]){5}[0-9A-F]{2}|[0-9A-F]{12}/gi;
 
 /* ---------------------------------------------------------------------------
@@ -105,7 +109,7 @@ export default function Cockpit() {
 
   /* -- emergency takeover (ozkey-07 §6.2 / XF-43 §7.6 rule 4) --
    * The cockpit is a monitor by default; declaring an emergency arms the
-   * X-OZKEY-Secret on every cockpit write so it can act as the fallback
+   * X-OZLODGE-Secret on every cockpit write so it can act as the fallback
    * writer while MAOI is lost. Operator-declared, never automatic. */
   const [emergencySecret, setEmergencySecret] = useState('');
 
@@ -347,27 +351,31 @@ export default function Cockpit() {
    *  With no server secret configured (lab) writes are open and this is moot. */
   const writeHeaders = () => ({
     'Content-Type': 'application/json',
-    ...(emergencySecret ? { 'X-OZKEY-Secret': emergencySecret } : {}),
+    ...(emergencySecret ? { 'X-OZLODGE-Secret': emergencySecret } : {}),
   });
 
-  /* Re-arm a takeover that survived a page reload. */
+  /* Re-arm a takeover that survived a page reload. S12 rename: reads the new
+   * localStorage key, falling back to the pre-rename key so an operator's
+   * already-armed takeover doesn't silently disarm on the next load. */
   useEffect(() => {
-    const stored = window.localStorage.getItem('ozkey.cockpit.emergencySecret');
+    const stored =
+      window.localStorage.getItem('ozlodge.cockpit.emergencySecret') ||
+      window.localStorage.getItem('ozkey.cockpit.emergencySecret');
     if (stored) setEmergencySecret(stored);
   }, []);
 
   const declareEmergency = () => {
     const secret = window.prompt(
-      'DECLARE EMERGENCY TAKEOVER?\n\nUse only when MAOI is lost/damaged/unreachable (ozkey-07 §6.2). The cockpit becomes the fallback writer for door ops — every write will carry X-OZKEY-Secret and is logged server-side. End the takeover when MAOI is back.\n\nEnter the OZKEYSERV shared secret:'
+      'DECLARE EMERGENCY TAKEOVER?\n\nUse only when MAOI is lost/damaged/unreachable (ozkey-07 §6.2). The cockpit becomes the fallback writer for door ops — every write will carry X-OZLODGE-Secret and is logged server-side. End the takeover when MAOI is back.\n\nEnter the OZLODGESERV shared secret:'
     );
     if (secret === null) return;
     if (!secret.trim()) {
       appendLog('warn', 'Emergency takeover aborted — empty secret');
       return;
     }
-    window.localStorage.setItem('ozkey.cockpit.emergencySecret', secret.trim());
+    window.localStorage.setItem('ozlodge.cockpit.emergencySecret', secret.trim());
     setEmergencySecret(secret.trim());
-    appendLog('warn', 'EMERGENCY TAKEOVER DECLARED — cockpit is the fallback writer (X-OZKEY-Secret armed on all writes). End it when MAOI resumes authority.');
+    appendLog('warn', 'EMERGENCY TAKEOVER DECLARED — cockpit is the fallback writer (X-OZLODGE-Secret armed on all writes). End it when MAOI resumes authority.');
   };
 
   const endEmergency = () => {
@@ -502,7 +510,7 @@ export default function Cockpit() {
    *  push starts from a blank mirror. Type-to-confirm; never automatic. */
   const doResetMirror = async () => {
     const typed = window.prompt(
-      'FACTORY-RESET the room mirror?\n\nThis wipes ALL rooms, credentials, the pending queue, door logs and guest users on OZKEYSERV. Locks must be re-paired and the PMS must re-push its roster.\n\nType ERASE to confirm:'
+      'FACTORY-RESET the room mirror?\n\nThis wipes ALL rooms, credentials, the pending queue, door logs and guest users on OZLODGESERV. Locks must be re-paired and the PMS must re-push its roster.\n\nType ERASE to confirm:'
     );
     if (typed === null) return;
     if (typed.trim() !== 'ERASE') {
@@ -615,7 +623,7 @@ export default function Cockpit() {
         }}
       >
         <div style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1.5 }}>
-          OZKEY <span style={{ color: C.green }}>//</span> LOCK COCKPIT
+          OZLODGE <span style={{ color: C.green }}>//</span> LOCK COCKPIT
         </div>
         <div style={{ display: 'flex', gap: 14, fontSize: 10, alignItems: 'center' }}>
           {[
@@ -640,7 +648,7 @@ export default function Cockpit() {
             onClick={emergencySecret ? endEmergency : declareEmergency}
             title={
               emergencySecret
-                ? 'Cockpit is the FALLBACK WRITER (X-OZKEY-Secret armed on all writes). Click to end the takeover and revert to monitoring.'
+                ? 'Cockpit is the FALLBACK WRITER (X-OZLODGE-Secret armed on all writes). Click to end the takeover and revert to monitoring.'
                 : 'Cockpit is a monitor. Declare an emergency takeover (MAOI lost/damaged) to arm the shared secret on cockpit writes — ozkey-07 §6.2'
             }
             style={{
@@ -867,7 +875,7 @@ export default function Cockpit() {
             })}
             {rooms.length === 0 && (
               <div style={{ gridColumn: '1 / -1', color: C.dim, fontSize: 12, padding: 20 }}>
-                Waiting for OZKEYSERV room matrix… (is the gateway on :3200 running?)
+                Waiting for OZLODGESERV room matrix… (is the gateway on :3200 running?)
               </div>
             )}
           </div>

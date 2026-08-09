@@ -1,11 +1,14 @@
 /*
  * ============================================================================
- *  OZKEYSERV — Sovereign Smart Lock Laboratory Gateway
+ *  OZLODGESERV — Sovereign Smart Lock Hospitality Gateway (formerly OZKEYSERV,
+ *  renamed ozkey-18 §2 S12 — see the header note further down for what did
+ *  and did not change)
  *  ---------------------------------------------------------------------------
  *  Role     : API Gateway + Rule Engine + MySQL Manager
- *  Port     : 4000
+ *  Port     : 3200 (header previously said 4000 — stale, HTTP_PORT below has
+ *             always defaulted to 3200; fixed while touching this header)
  *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.20:1883
- *  Database : MySQL (localhost / ozkey)
+ *  Database : MySQL (localhost / ozlodge — see the S12 note near CONFIG.DB)
  *
  *  Responsibilities
  *    1. Bootstrap relational schema + auto-seed 30-room matrix (Block A)
@@ -14,6 +17,21 @@
  *    4. Issue credentials as Tuya 55 AA serial frames, queue them, and burst
  *       them down on the next provisioned heartbeat
  *       (hotel/rooms/+/lock/heartbeat  ->  hotel/rooms/<room>/lock/command)
+ *
+ *  S12 rename (ozkey-18 §2, 2026-08-10): OZKEYSERV -> OZLODGESERV, directory
+ *  ozkeyserv/ -> ozlodgeserv/, env vars OZKEY_* -> OZLODGE_*, DB name
+ *  ozkey -> ozlodge (code default only — see the CONFIG.DB comment for why
+ *  the live MySQL database itself was NOT touched), HTTP headers
+ *  X-OZKEY-* -> X-OZLODGE-*. Deliberately NOT renamed: the `ozkey/<site>/...`
+ *  MQTT topic root (topicDevice/subDeviceHeartbeat/subDeviceLog below) —
+ *  that is the shared cross-tier wire protocol root (ozkey-04 §9), used
+ *  identically by ozlockserv and any future ozpmsserv, not OZKEYSERV product
+ *  branding; renaming it would break every tier's already-deployed devices
+ *  at once. Also not renamed: `ozkey-NN §X.Y` comments throughout this file
+ *  — those cite actual spec doc filenames (docs/ozkey-02.md etc.), which did
+ *  not move. Legacy `X-OZKEY-Secret`/`/ozkeyserv/api`/`_ozkey._tcp` mDNS
+ *  paths are kept as accepted aliases alongside the new names — see each
+ *  site for why a live-device break was the thing being avoided.
  * ============================================================================
  */
 
@@ -26,7 +44,8 @@ const mqtt = require('mqtt');
 const os = require('os');
 
 /** First non-internal IPv4 of this host — the lock's consistency value for
- *  the gateway address (ozkey-02 §3.2). Override with OZKEY_SERVER_IP. */
+ *  the gateway address (ozkey-02 §3.2). Override with OZLODGE_SERVER_IP
+ *  (OZKEY_SERVER_IP also still read, S12 rename compat). */
 function detectLanIp() {
   for (const ifaces of Object.values(os.networkInterfaces())) {
     for (const iface of ifaces || []) {
@@ -40,13 +59,22 @@ function detectLanIp() {
  * Configuration
  * ------------------------------------------------------------------------- */
 const CONFIG = {
-  HTTP_PORT: Number(process.env.OZKEY_HTTP_PORT) || 3200,
-  SERVER_IP: process.env.OZKEY_SERVER_IP || detectLanIp(),
+  // S12 rename: OZLODGE_* is primary; OZKEY_* still read as a fallback so an
+  // existing deploy's env/systemd config keeps working unchanged.
+  HTTP_PORT: Number(process.env.OZLODGE_HTTP_PORT || process.env.OZKEY_HTTP_PORT) || 3200,
+  SERVER_IP: process.env.OZLODGE_SERVER_IP || process.env.OZKEY_SERVER_IP || detectLanIp(),
   DB: {
     host: 'localhost',
     user: 'root',
     password: 'Cableman',
-    database: 'ozkey',
+    // S12 rename: code default is now 'ozlodge', but the LIVE MySQL database
+    // is still physically named 'ozkey' — MySQL has no atomic RENAME
+    // DATABASE, only dump/restore or per-table RENAME TABLE tricks, both
+    // destructive/hard-to-reverse enough that they need an operator to run
+    // deliberately, not a code change to do silently. Until that migration
+    // runs by hand, override with OZLODGE_DB_NAME=ozkey (or rename the live
+    // DB and drop this override).
+    database: process.env.OZLODGE_DB_NAME || 'ozlodge',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
@@ -55,7 +83,7 @@ const CONFIG = {
   // This deployment's site (tenant) prefix on the device-scoped topic root.
   // Distinct from ozlockserv's 'lab' — multiple servers share the broker and
   // each must own its own site (ozkey-07 §10 / ozkey-04 §9).
-  SITE_ID: process.env.OZKEY_SITE_ID || 'hotel',
+  SITE_ID: process.env.OZLODGE_SITE_ID || process.env.OZKEY_SITE_ID || 'hotel',
   TOPIC_UNPAIRED_HEARTBEAT: 'hotel/locks/unpaired/heartbeat',
   TOPIC_ROOM_HEARTBEAT: 'hotel/rooms/+/lock/heartbeat',
   TOPIC_LOCK_LOG: 'hotel/locks/+/log',
@@ -67,8 +95,9 @@ const CONFIG = {
   subDeviceLog: (siteId) => `ozkey/${siteId}/locks/+/log`,
   UNPAIRED_TTL_MS: 120_000, // forget an unpaired MAC if silent for 2 minutes
   // Shared secret for PMS write endpoints (ozkey-07 §4.4). Unset = open (lab);
-  // set OZKEY_PMS_SECRET to enforce `X-OZKEY-Secret` on /pms/* writes.
-  PMS_SECRET: process.env.OZKEY_PMS_SECRET || '',
+  // set OZLODGE_PMS_SECRET (OZKEY_PMS_SECRET also read) to enforce
+  // `X-OZLODGE-Secret` (or legacy `X-OZKEY-Secret`) on /pms/* writes.
+  PMS_SECRET: process.env.OZLODGE_PMS_SECRET || process.env.OZKEY_PMS_SECRET || '',
 };
 
 /* ---------------------------------------------------------------------------
@@ -435,10 +464,10 @@ async function initDatabase() {
 
   // 4. Room roster. RETIRED the auto-seed (ozkey-07 §4): the PMS (MAOI) is the
   //    source of truth for rooms and pushes them via POST /pms/rooms. The old
-  //    Block-A 101..310 seed only runs if OZKEY_SEED_ROOMS=1 (pure-lab bench
-  //    without a PMS).
+  //    Block-A 101..310 seed only runs if OZLODGE_SEED_ROOMS=1 (legacy
+  //    OZKEY_SEED_ROOMS also read) (pure-lab bench without a PMS).
   const [[{ cnt }]] = await pool.query('SELECT COUNT(*) AS cnt FROM rooms');
-  if (cnt === 0 && process.env.OZKEY_SEED_ROOMS === '1') {
+  if (cnt === 0 && (process.env.OZLODGE_SEED_ROOMS === '1' || process.env.OZKEY_SEED_ROOMS === '1')) {
     const rows = [];
     for (let floor = 1; floor <= 3; floor++) {
       for (let door = 1; door <= 10; door++) {
@@ -450,7 +479,7 @@ async function initDatabase() {
       'INSERT INTO rooms (building, floor, room_no, mac_address, status) VALUES ?',
       [rows]
     );
-    logEvent('info', `OZKEY_SEED_ROOMS=1 — seeded ${rows.length} lab rooms (Block A, floors 1-3)`);
+    logEvent('info', `OZLODGE_SEED_ROOMS=1 — seeded ${rows.length} lab rooms (Block A, floors 1-3)`);
   } else {
     logEvent('info', `Room roster: ${cnt} room(s) (source of truth = PMS via POST /pms/rooms)`);
   }
@@ -501,7 +530,7 @@ async function flushQueueForRoom(roomNo) {
       credential_id: job.credential_id,
       payload_hex: job.payload_hex,
       issued_at: new Date().toISOString(),
-      source: 'ozkeyserv',
+      source: 'ozlodgeserv',
     };
 
     const ok = mqttPublish(commandTopic, envelope);
@@ -547,7 +576,7 @@ async function flushQueueForRoom(roomNo) {
 
 function initMqtt() {
   mqttClient = mqtt.connect(CONFIG.MQTT_URL, {
-    clientId: `ozkeyserv-${Math.random().toString(16).slice(2, 8)}`,
+    clientId: `ozlodgeserv-${Math.random().toString(16).slice(2, 8)}`,
     reconnectPeriod: 5000,
     connectTimeout: 10_000,
   });
@@ -725,6 +754,9 @@ app.use(cors());
 app.use(express.json());
 
 const api = express.Router();
+app.use('/ozlodgeserv/api', api);
+// S12 rename compat: same router, old path, so a caller still hardcoded to
+// /ozkeyserv/api (Cockpit, a bench script, MAOI config) keeps working.
 app.use('/ozkeyserv/api', api);
 
 function guardDb(res) {
@@ -739,7 +771,7 @@ function guardDb(res) {
 api.get('/health', (req, res) => {
   res.json({
     ok: true,
-    service: 'ozkeyserv',
+    service: 'ozlodgeserv',
     db: !!pool,
     mqtt: !!(mqttClient && mqttClient.connected),
     unpaired_cached: unpairedCache.size,
@@ -764,14 +796,17 @@ api.get('/rooms', async (req, res) => {
 
 /* ===========================================================================
  * PMS roster sync (ozkey-07 §4) — MAOI is the source of truth for rooms;
- * OZKEYSERV is a read-only mirror for pairing + command routing.
+ * OZLODGESERV is a read-only mirror for pairing + command routing.
  * ========================================================================= */
 
-/** ozkey-07 §4.4: enforce X-OZKEY-Secret on PMS writes when a secret is set. */
+/** ozkey-07 §4.4: enforce X-OZLODGE-Secret on PMS writes when a secret is
+ *  set. Legacy `X-OZKEY-Secret` header also accepted (S12 rename compat) —
+ *  a caller sending the old header name still authenticates. */
 function guardPmsSecret(req, res) {
   if (!CONFIG.PMS_SECRET) return true; // lab: open when no secret configured
-  if (req.get('X-OZKEY-Secret') === CONFIG.PMS_SECRET) return true;
-  res.status(401).json({ ok: false, error: 'missing or invalid X-OZKEY-Secret' });
+  const got = req.get('X-OZLODGE-Secret') || req.get('X-OZKEY-Secret');
+  if (got === CONFIG.PMS_SECRET) return true;
+  res.status(401).json({ ok: false, error: 'missing or invalid X-OZLODGE-Secret' });
   return false;
 }
 
@@ -805,12 +840,13 @@ function audit(actor, action, detail) {
 /**
  * Credential-writer auth (§8): EITHER the org-level shared secret (MAOI /
  * declared-emergency cockpit — full scope) OR an operator bearer token
- * (X-OZKEY-Operator-Token) — scoped, revocable. Returns:
+ * (X-OZLODGE-Operator-Token, legacy X-OZKEY-Operator-Token also accepted)
+ * — scoped, revocable. Returns:
  *   { actor, operator }  — authorized (operator null for secret auth)
  *   null                 — response already written (401/403)
  */
 async function authorizeKeyWriter(req, res) {
-  const token = req.get('X-OZKEY-Operator-Token');
+  const token = req.get('X-OZLODGE-Operator-Token') || req.get('X-OZKEY-Operator-Token');
   if (token) {
     const [[op]] = await pool.query('SELECT * FROM operators WHERE token = ?', [token]);
     if (!op) {
@@ -1030,7 +1066,7 @@ api.get('/pms/rooms/status', async (req, res) => {
  * Factory-reset the mirror — wipes rooms, credentials, queue, door logs and
  * guest users. NEVER automatic (§4.2: removal is guarded, not silent): the
  * operator must confirm with body {"confirm":"ERASE"}, and the endpoint sits
- * behind the same X-OZKEY-Secret gate as every /pms/* write. Exists for the
+ * behind the same X-OZLODGE-Secret gate as every /pms/* write. Exists for the
  * lab/first-commissioning case where stale pre-PMS rows block the roster push.
  */
 api.post('/pms/reset', async (req, res) => {
@@ -1145,7 +1181,7 @@ api.post('/locks/pair', async (req, res) => {
       server_ip: CONFIG.SERVER_IP,
       server_port: CONFIG.HTTP_PORT,
       mac_token: macToken,
-      issued_by: 'OZKEYSERV/',
+      issued_by: 'OZLODGESERV/',
       issued_at: new Date().toISOString(),
     };
     mqttPublish(commandTopic, handshake);
@@ -1808,7 +1844,7 @@ api.post('/sim/room-heartbeat', async (req, res) => {
  * Boot sequence
  * ------------------------------------------------------------------------- */
 async function boot() {
-  logEvent('info', 'OZKEYSERV booting — Sovereign Smart Lock laboratory gateway');
+  logEvent('info', 'OZLODGESERV booting — Sovereign Smart Lock hospitality gateway');
 
   // MySQL with retry so the gateway survives a cold lab bench.
   let attempts = 0;
@@ -1826,7 +1862,11 @@ async function boot() {
   initMqtt();
 
   app.listen(CONFIG.HTTP_PORT, () => {
-    logEvent('info', `HTTP gateway listening on http://localhost:${CONFIG.HTTP_PORT}/ozkeyserv/api`);
+    logEvent(
+      'info',
+      `HTTP gateway listening on http://localhost:${CONFIG.HTTP_PORT}/ozlodgeserv/api ` +
+        `(legacy /ozkeyserv/api also mounted)`
+    );
   });
 
   startMdns();
@@ -1834,33 +1874,48 @@ async function boot() {
 
 /**
  * Stable server addressing (XF-43 §7.5 / ozkey-08 §5): advertise the gateway
- * as `_ozkey._tcp` on mDNS so locks and tablets resolve it by name instead of
- * a pinned DHCP IP — a lease change must not dark every lock at once. TXT
+ * as `_ozlodge._tcp` on mDNS so locks and tablets resolve it by name instead
+ * of a pinned DHCP IP — a lease change must not dark every lock at once. TXT
  * carries the site and the broker endpoint, so a §7.5-provisioned lock needs
  * only the service name to find both the HTTP API and MQTT.
+ *
+ * S12 rename: publishes BOTH the new `_ozlodge._tcp` type and a legacy
+ * `_ozkey._tcp` alias, same port/txt. This one is deliberate, not just
+ * convenient — a lock provisioned before this rename may have `_ozkey._tcp`
+ * baked into its discovery logic with no way to update it remotely (it is
+ * how the lock FINDS the server in the first place; it cannot fetch a
+ * config change from a server it cannot yet see). Dropping the alias would
+ * silently dark every already-commissioned lock's next reconnect.
  */
 function startMdns() {
   try {
     const { Bonjour } = require('bonjour-service');
     const bonjour = new Bonjour();
-    const name = `ozkeyserv-${CONFIG.SITE_ID}`;
-    const svc = bonjour.publish({
-      name,
+    const name = `ozlodgeserv-${CONFIG.SITE_ID}`;
+    const legacyName = `ozkeyserv-${CONFIG.SITE_ID}`;
+    const txt = {
+      site: CONFIG.SITE_ID,
+      api: '/ozlodgeserv/api',
+      broker: CONFIG.MQTT_URL.replace('mqtt://', ''),
+    };
+    const svc = bonjour.publish({ name, type: 'ozlodge', protocol: 'tcp', port: CONFIG.HTTP_PORT, txt });
+    const legacySvc = bonjour.publish({
+      name: legacyName,
       type: 'ozkey',
       protocol: 'tcp',
       port: CONFIG.HTTP_PORT,
-      txt: {
-        site: CONFIG.SITE_ID,
-        api: '/ozkeyserv/api',
-        broker: CONFIG.MQTT_URL.replace('mqtt://', ''),
-      },
+      txt: { ...txt, api: '/ozkeyserv/api' },
     });
     // Async failures (e.g. name already claimed by another instance) arrive
     // as events, not throws — swallow them; mDNS is best-effort by design.
     svc.on('error', (err) => logEvent('warn', `mDNS advertise error (non-fatal): ${err.message}`));
+    legacySvc.on('error', (err) =>
+      logEvent('warn', `mDNS legacy-alias advertise error (non-fatal): ${err.message}`)
+    );
     logEvent(
       'info',
-      `mDNS advertising "${name}" as _ozkey._tcp:${CONFIG.HTTP_PORT} (txt: site=${CONFIG.SITE_ID}, broker=${CONFIG.MQTT_URL.replace('mqtt://', '')})`
+      `mDNS advertising "${name}" as _ozlodge._tcp:${CONFIG.HTTP_PORT} + legacy "${legacyName}" ` +
+        `as _ozkey._tcp (txt: site=${CONFIG.SITE_ID}, broker=${CONFIG.MQTT_URL.replace('mqtt://', '')})`
     );
   } catch (err) {
     // Non-fatal: pinned-IP configuration still works without mDNS.

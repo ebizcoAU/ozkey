@@ -1,7 +1,7 @@
 {
-  "name": "ozkeyserv",
+  "name": "ozlodgeserv",
   "version": "1.0.0",
-  "description": "OZKEY Sovereign Smart Lock - API Gateway, Rule Engine & MySQL Manager",
+  "description": "OZLODGE Sovereign Smart Lock - API Gateway, Rule Engine & MySQL Manager (formerly ozkeyserv/OZKEY, renamed ozkey-18 S12)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
