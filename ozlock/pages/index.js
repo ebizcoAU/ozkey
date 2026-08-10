@@ -774,6 +774,11 @@ export default function OzlockConsole() {
       </div>
 
       {/* ---- General activity firehose (all incoming messages) --------- */}
+      {/* Bigger than the original 240px (this is the primary traffic panel,
+          it should get more room), but capped rather than growing to fill
+          the whole remaining viewport — same fixed-height + internal-scroll
+          pattern as the Door Transactions (500) and App Activity (464)
+          panels above, not flex-grow. */}
       <div style={{ ...panelStyle, marginTop: 10 }}>
         <PanelTitle
           dot={C.termGreen}
@@ -791,7 +796,7 @@ export default function OzlockConsole() {
             background: '#050B14',
             border: `1px solid ${C.panelEdge}`,
             borderRadius: 6,
-            height: 240,
+            height: 920,
             overflowY: 'auto',
             padding: '10px 12px',
             fontSize: 12,
