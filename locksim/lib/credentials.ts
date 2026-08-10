@@ -64,12 +64,37 @@ export function deleteCredential(
   return creds.filter((c) => !(c.kind === kind && c.slot === slot));
 }
 
-export type TemporalCheck = "VALID" | "NOT_YET_ACTIVE" | "EXPIRED";
+export type TemporalCheck = "VALID" | "NOT_YET_ACTIVE" | "EXPIRED" | "TIME_UNKNOWN";
 
 /** Strict temporal check of a credential window against the Virtual Master Clock. */
 export function checkWindow(cred: StoredCredential, virtualNowMs: number): TemporalCheck {
   const nowSec = Math.floor(virtualNowMs / 1000);
   if (nowSec < cred.start) return "NOT_YET_ACTIVE";
   if (nowSec > cred.end) return "EXPIRED";
+  return "VALID";
+}
+
+/**
+ * ozkey-21 — the HONEST check. Use this, not `checkWindow`, anywhere the
+ * simulator is standing in for the lock MCU.
+ *
+ * `checkWindow` reads the Virtual Master Clock, which is the browser's clock —
+ * i.e. it assumes the MCU always knows what time it is. A real Tuya MCU does
+ * not: it is served time by the module (see lib/mcuClock.ts), and we replaced
+ * the module without implementing that service.
+ *
+ * Passing `mcuUnix = null` models that state, and the result is TIME_UNKNOWN,
+ * never VALID. **Fail closed.** A lock that cannot tell whether a window has
+ * closed must not open the door — treating "I don't know" as "not expired" is
+ * exactly the failure ozkey-21 §2.3 suspects on real hardware, where a
+ * time-limited PIN would work forever.
+ */
+export function checkWindowMcu(
+  cred: StoredCredential,
+  mcuUnix: number | null
+): TemporalCheck {
+  if (mcuUnix === null) return "TIME_UNKNOWN";
+  if (mcuUnix < cred.start) return "NOT_YET_ACTIVE";
+  if (mcuUnix > cred.end) return "EXPIRED";
   return "VALID";
 }

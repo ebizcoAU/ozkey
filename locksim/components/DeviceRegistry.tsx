@@ -1,11 +1,12 @@
 "use client";
 
 import type { CredentialKind, StoredCredential } from "@/lib/credentials";
-import { checkWindow, type TemporalCheck } from "@/lib/credentials";
+import { checkWindowMcu, type TemporalCheck } from "@/lib/credentials";
 
 interface DeviceRegistryProps {
   credentials: StoredCredential[];
-  virtualNowMs: number;
+  /** ozkey-21 — the MCU's clock, null when the module never served time. */
+  mcuUnix: number | null;
   onRevoke: (kind: CredentialKind, slot: number) => void;
 }
 
@@ -20,6 +21,10 @@ const STATUS_LABEL: Record<TemporalCheck, string> = {
   VALID: "ACTIVE",
   EXPIRED: "EXPIRED",
   NOT_YET_ACTIVE: "PENDING",
+  // ozkey-21: the MCU was never told the time, so this window cannot be
+  // evaluated at all. Distinct from EXPIRED on purpose — "unenforceable" and
+  // "enforced and closed" are different facts and must not look alike.
+  TIME_UNKNOWN: "NO CLOCK",
 };
 
 /**
@@ -27,11 +32,11 @@ const STATUS_LABEL: Record<TemporalCheck, string> = {
  * table. Rows are colour-coded by live temporal status against the Master Clock:
  * active = low-saturation green border, inactive/expired = faded amber backdrop.
  */
-export default function DeviceRegistry({ credentials, virtualNowMs, onRevoke }: DeviceRegistryProps) {
-  const activeCount = credentials.filter((c) => checkWindow(c, virtualNowMs) === "VALID").length;
+export default function DeviceRegistry({ credentials, mcuUnix, onRevoke }: DeviceRegistryProps) {
+  const activeCount = credentials.filter((c) => checkWindowMcu(c, mcuUnix) === "VALID").length;
 
   return (
-    <div className="w-full max-w-3xl rounded-lg border border-neutral-800 bg-neutral-900/70 p-3">
+    <div className="w-full rounded-lg border border-neutral-800 bg-neutral-900/70 p-3">
       <div className="mb-2 flex items-center justify-between">
         <span className="text-[10px] font-bold uppercase tracking-widest text-emerald-400">
           ▤ Sovereign Device Registry DB
@@ -64,7 +69,7 @@ export default function DeviceRegistry({ credentials, virtualNowMs, onRevoke }: 
               </tr>
             )}
             {credentials.map((c) => {
-              const status = checkWindow(c, virtualNowMs);
+              const status = checkWindowMcu(c, mcuUnix);
               const active = status === "VALID";
               // Active: low-saturation green border. Inactive/expired: faded amber backdrop.
               const rowStyle = active

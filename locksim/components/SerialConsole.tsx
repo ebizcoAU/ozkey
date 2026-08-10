@@ -37,7 +37,14 @@ function Terminal({ title, entries, tint }: { title: string; entries: SerialLogE
         <span className={`text-[10px] font-bold uppercase tracking-widest ${tint}`}>{title}</span>
         <span className="text-[9px] text-neutral-600">{entries.length} FRAMES</span>
       </div>
-      <div ref={bodyRef} className="h-64 overflow-y-auto p-2 font-mono text-[11px] leading-relaxed">
+      {/*
+        h-64 (256px) -> 456px, operator +200px (2026-08-10). Both hex streams
+        share this component, so one number moves both. Fixed height rather than
+        flex-grow on purpose: the two terminals must stay the SAME height as each
+        other, and letting them size to content makes RX and TX drift apart
+        vertically as one fills faster than the other.
+      */}
+      <div ref={bodyRef} className="h-[456px] overflow-y-auto p-2 font-mono text-[11px] leading-relaxed">
         {entries.length === 0 && <div className="text-neutral-700">-- bus idle --</div>}
         {entries.map((e) => (
           <div key={e.id} className="mb-1.5">
@@ -105,7 +112,7 @@ export default function SerialConsole({
   );
 
   return (
-    <div className="flex w-full max-w-3xl flex-col gap-3">
+    <div className="flex w-full flex-col gap-3">
       {/* Virtual Master Clock */}
       <div className="rounded-lg border border-neutral-800 bg-neutral-900/70 p-3">
         <div className="mb-2 flex items-center justify-between">

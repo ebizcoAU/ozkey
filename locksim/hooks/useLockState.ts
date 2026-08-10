@@ -7,16 +7,32 @@ import {
   DpType,
   TuyaCommand,
   buildDpPayload,
+  buildFrame,
+  buildTimeReply,
+  buildMcuFactoryReset,
   fromHexString,
   parseSlotPayload,
   parseTempCredential,
+  parseTimePush,
+  parseTimeReply,
+  toHexString,
   u32be,
   type Byte,
   type ByteArray,
   type TuyaFrame,
 } from "@/lib/tuya";
 import {
+  applyTimeReply,
+  describeMcuClock,
+  initialMcuClock,
+  mcuClockState,
+  noteUnanswered,
+  readMcuUnix,
+  type McuClock,
+} from "@/lib/mcuClock";
+import {
   checkWindow,
+  checkWindowMcu,
   deleteCredential,
   loadCredentials,
   makeToken,
@@ -36,6 +52,8 @@ export const MASTER_PIN = "123456";
 export const MASTER_CARD_UID = "7B 3F 91 D2";
 const WAKE_HOLD_MS = 1000; // return to sleep after 1s of inactivity
 const HEARTBEAT_BURST_MS = 200;
+/** ozkey-21 — how long the MCU waits for a 0x1C reply before calling it unanswered. */
+const TIME_REPLY_TIMEOUT_MS = 2000;
 // Scramble / anti-peeping entry (ozkey-08 §0.3): the real PIN may be embedded
 // anywhere in a longer digit string — junk digits defeat shoulder-surfing AND
 // mask the wake-sync latency. Lockout (real MCUs) counts per ENTRY, never per
@@ -69,6 +87,36 @@ interface UseLockStateOptions {
    * module's deadline to simulate a slow or still-waking MCU.
    */
   mcuAckDelayMs?: number;
+  /**
+   * ozkey-21 — append a line to the RX console. Used for time-service
+   * diagnostics, which have no frame of their own when the answer never comes:
+   * "the module did not reply" is exactly the observation we need visible, and
+   * a missing frame cannot log itself.
+   */
+  pushRxLog?: (text: string, notes: string[], error?: boolean) => void;
+  /**
+   * ozkey-21 — what the EMULATED MODULE knows, in ms, or null if no module is
+   * emulating the time service.
+   *
+   * Mode A (pure software) passes the Virtual Master Clock: LockSim is playing
+   * both the MCU and the missing Wi-Fi chip, and a real Tuya module would
+   * answer. Mode B passes null, because the thing on the other end of the wire
+   * is our ESP32 — and whether IT answers is the entire question (ozkey-21
+   * §2.3). Silence in Mode B is a result, not a bug in the simulator.
+   */
+  moduleTimeSource?: () => number | null;
+  /** Inject a module -> MCU frame through the real parser (Mode A loopback). */
+  receiveFromModule?: (bytes: ByteArray) => void;
+  /**
+   * ozkey-21 — true when the physical wire is open and writable.
+   *
+   * Web Serial needs a user gesture on EVERY page load, so in Mode B the port
+   * is still disconnected when the boot time request fires and the request
+   * goes nowhere, every single time. A real Tuya MCU asks for time when the
+   * module reports itself ready, not on a fixed timer after its own power-up —
+   * so we do the same, and re-ask on the rising edge of this flag.
+   */
+  linkReady?: boolean;
 }
 
 export interface AccessEvent {
@@ -89,6 +137,10 @@ export function useLockState({
   heartbeatSeconds,
   onAccess,
   mcuAckDelayMs,
+  pushRxLog,
+  moduleTimeSource,
+  receiveFromModule,
+  linkReady,
 }: UseLockStateOptions) {
   const hbSeconds = Math.max(HEARTBEAT_MIN_SECONDS, Math.round(heartbeatSeconds || HEARTBEAT_SECONDS));
   const [powerState, setPowerState] = useState<PowerState>("SLEEPING");
@@ -101,6 +153,14 @@ export function useLockState({
   const [alarm, setAlarm] = useState(false);
   const [lastEvent, setLastEvent] = useState("COLD BOOT — ENTERED DEEP SLEEP");
   const [credentials, setCredentials] = useState<StoredCredential[]>([]);
+  /**
+   * ozkey-21 — the MCU's OWN clock, which starts UNSYNCED and only advances
+   * when the module answers 0x0C/0x1C. Deliberately NOT `virtualNow`: that is
+   * the browser's clock and modelling the MCU with it is what let this
+   * simulator pass tests that real hardware would fail.
+   */
+  const [mcuClock, setMcuClock] = useState<McuClock>(initialMcuClock);
+  const mcuClockRef = useRef<McuClock>(mcuClock);
 
   /** Source of truth for keypad entry; `pinBuffer` state mirrors it for the display. */
   const pinBufferRef = useRef("");
@@ -121,6 +181,12 @@ export function useLockState({
   transmitRef.current = transmit;
   const onHeartbeatRef = useRef(onHeartbeat);
   onHeartbeatRef.current = onHeartbeat;
+  const pushRxLogRef = useRef(pushRxLog);
+  pushRxLogRef.current = pushRxLog;
+  const moduleTimeSourceRef = useRef(moduleTimeSource);
+  moduleTimeSourceRef.current = moduleTimeSource;
+  const receiveFromModuleRef = useRef(receiveFromModule);
+  receiveFromModuleRef.current = receiveFromModule;
   const onAccessRef = useRef(onAccess);
   onAccessRef.current = onAccess;
   const nowRef = useRef(virtualNow);
@@ -272,6 +338,81 @@ export function useLockState({
     setCountdown(hbSeconds);
   }, [hbSeconds]);
 
+  /**
+   * ozkey-21 — the ONE place a time request is issued. Boot, heartbeat and
+   * serial-connect all call this, so the three cannot drift apart; the
+   * unanswered-timeout accounting in particular was easy to get subtly
+   * different per copy.
+   */
+  const requestMcuTime = useCallback((why: string) => {
+    transmitRef.current(
+      TuyaCommand.GET_LOCAL_TIME,
+      [],
+      `Time request (0x1C) -> module — ${why}, MCU has no clock of its own`
+    );
+
+    // Mode A: the emulated module answers, as real bytes through the real
+    // parser, so the wire format is exercised even without hardware.
+    const moduleMs = moduleTimeSourceRef.current?.();
+    if (moduleMs != null && receiveFromModuleRef.current) {
+      const reply = buildFrame(
+        TuyaCommand.GET_LOCAL_TIME,
+        buildTimeReply(Math.floor(moduleMs / 1000), true)
+      );
+      window.setTimeout(() => receiveFromModuleRef.current?.(reply), 60);
+      return;
+    }
+
+    // Mode B: nothing here answers. Whether the ESP32 does is the experiment.
+    const before = mcuClockRef.current.syncCount;
+    window.setTimeout(() => {
+      if (mcuClockRef.current.syncCount !== before) return; // someone answered
+      const next = noteUnanswered(mcuClockRef.current);
+      mcuClockRef.current = next;
+      setMcuClock(next);
+      pushRxLogRef.current?.(
+        "(no reply)",
+        [
+          `TIME REQUEST UNANSWERED (${why}) — module did not serve time ` +
+            `[${next.unansweredRequests} total]`,
+          describeMcuClock(next),
+        ],
+        true
+      );
+    }, TIME_REPLY_TIMEOUT_MS);
+  }, []);
+
+  /**
+   * Ask at boot. In Mode A this is the only trigger that matters. In Mode B it
+   * will usually MISS, because Web Serial needs a user gesture on every page
+   * load and the port is not open yet — which is why the link-ready effect
+   * below exists rather than this being the only attempt.
+   */
+  useEffect(() => {
+    const t = window.setTimeout(() => requestMcuTime("BOOT sync"), 800);
+    return () => window.clearTimeout(t);
+  }, [requestMcuTime]);
+
+  /**
+   * Ask on the RISING EDGE of the wire becoming ready.
+   *
+   * This is the one that actually fires in Mode B. Web Serial requires the
+   * operator to pick the port by hand after every refresh, so "connected" can
+   * happen many seconds after mount — the boot request above has already been
+   * spent by then. A real MCU asks when the module says it is ready; so do we.
+   */
+  const linkWasReady = useRef(false);
+  useEffect(() => {
+    const ready = Boolean(linkReady);
+    if (ready && !linkWasReady.current) {
+      // Small settle before the first byte, same reasoning as boot.
+      const t = window.setTimeout(() => requestMcuTime("LINK CONNECTED"), 400);
+      linkWasReady.current = true;
+      return () => window.clearTimeout(t);
+    }
+    if (!ready) linkWasReady.current = false; // re-arm for the next connect
+  }, [linkReady, requestMcuTime]);
+
   useEffect(() => {
     if (countdown !== 0) return;
     wake("MQTT HEARTBEAT BURST (TIMER WAKE)", HEARTBEAT_BURST_MS);
@@ -280,21 +421,43 @@ export function useLockState({
       [],
       `MQTT heartbeat ping -> Tuya broker (${hbSeconds}s timer wake)`
     );
+
+    // ozkey-21 — ride the heartbeat to re-ask, which is what a real Tuya MCU
+    // does ("synchronizes time with the server during each data interaction or
+    // every six hours"). Free: the MCU is already awake and transmitting.
+    requestMcuTime("heartbeat");
+
     onHeartbeatRef.current?.();
     setCountdown(hbSeconds);
-  }, [countdown, wake, hbSeconds]);
+  }, [countdown, wake, hbSeconds, requestMcuTime]);
 
   // ---------------------------------------------------------------------
   // Credential validation against the Virtual Master Clock
   // ---------------------------------------------------------------------
   const submitPin = useCallback(
     (pin: string) => {
-      // u32 report caps at 9 digits — longer scramble entries report as 0.
-      const numeric = pin.length <= 9 ? parseInt(pin, 10) : 0;
+      // 🔴 CHANGED 2026-08-11 — LockSim no longer sends the entered digits.
+      //
+      // It used to report DP 1 with the PIN as a u32 VALUE. That was our
+      // invention, not verified Tuya behaviour, and it modelled something a
+      // lock should not do: handing a credential to the wireless module over
+      // an unencrypted UART. The firmware does not recognise DP 1 inbound, so
+      // the frame fell through its unknown-DP path and the PIN was published
+      // to the SERVER as a door-log line (fixed the same day in
+      // ozdoorlock_core.h — see "UNCLASSIFIED DP, NOT published").
+      //
+      // A real lock reports the OUTCOME, not the keystrokes: DP 8
+      // ACCESS_RESULT, which grant()/deny() already send below. The module has
+      // no business knowing which digits were pressed — it cannot evaluate
+      // them anyway; the credential store is the DL MCU's.
+      //
+      // We still report that an attempt HAPPENED, with its length only, so the
+      // console shows keypad activity without carrying the secret.
       transmitRef.current(
         TuyaCommand.DP_REPORT,
-        buildDpPayload(DpId.UNLOCK_CHANNEL, DpType.VALUE, u32be(numeric)),
-        `Keypad PIN entry report: ${pin.length} digit(s)${pin.length > 9 ? " (scramble entry, value masked)" : ""}`
+        buildDpPayload(DpId.UNLOCK_CHANNEL, DpType.BOOL, [0x01]),
+        `Keypad entry attempt: ${pin.length} digit(s) — value NOT sent ` +
+          `(a lock reports the result, not the credential)`
       );
       // Scramble matching: any contiguous substring of the entry may be the
       // real PIN. A valid-window credential wins over an expired match.
@@ -309,15 +472,28 @@ export function useLockState({
         deny("NO STORED PIN IN ENTRY", AccessResult.DENIED);
         return;
       }
-      const now = nowRef.current();
-      const valid = candidates.find((c) => checkWindow(c, now) === "VALID");
+      // ozkey-21 — the MCU's own clock, NOT the browser's. If the module never
+      // served us the time, we cannot evaluate any window and must refuse.
+      const mcuNow = readMcuUnix(mcuClockRef.current);
+      const valid = candidates.find((c) => checkWindowMcu(c, mcuNow) === "VALID");
       if (valid) {
         grant(`TEMP PIN — SLOT ${valid.slot}`);
         return;
       }
       const first = candidates[0];
+      const verdict = checkWindowMcu(first, mcuNow);
+      if (verdict === "TIME_UNKNOWN") {
+        // FAIL CLOSED. A lock that cannot tell whether the window has closed
+        // must not open. Treating "I don't know" as "not expired" is exactly
+        // the real-hardware failure ozkey-21 §2.3 suspects.
+        deny(
+          `TEMP PIN SLOT ${first.slot} — TIME_UNKNOWN, MCU never served time by module (refusing)`,
+          AccessResult.EXPIRED
+        );
+        return;
+      }
       deny(
-        `TEMP PIN SLOT ${first.slot} ${checkWindow(first, now) === "EXPIRED" ? "EXPIRED" : "NOT YET ACTIVE"}`,
+        `TEMP PIN SLOT ${first.slot} ${verdict === "EXPIRED" ? "EXPIRED" : "NOT YET ACTIVE"}`,
         AccessResult.EXPIRED
       );
     },
@@ -374,9 +550,15 @@ export function useLockState({
         grant("RFID MASTER CARD");
         return;
       }
-      const window = checkWindow(cred, nowRef.current());
+      // ozkey-21 — MCU clock, same fail-closed rule as the PIN path.
+      const window = checkWindowMcu(cred, readMcuUnix(mcuClockRef.current));
       if (window === "VALID") {
         grant(`TEMP RFID — SLOT ${cred.slot}`);
+      } else if (window === "TIME_UNKNOWN") {
+        deny(
+          `TEMP RFID SLOT ${cred.slot} — TIME_UNKNOWN, MCU never served time by module (refusing)`,
+          AccessResult.EXPIRED
+        );
       } else {
         deny(
           `TEMP RFID SLOT ${cred.slot} ${window === "EXPIRED" ? "EXPIRED" : "NOT YET ACTIVE"}`,
@@ -386,6 +568,65 @@ export function useLockState({
     },
     [wake, grant, deny]
   );
+
+  /**
+   * ozkey-22 R1 — simulate the PHYSICAL factory-reset gesture on the lock body.
+   *
+   * That button is wired to the MCU, not to our ESP32, so on real hardware the
+   * MCU is the one that notices and it must tell the module. Tuya's door-lock
+   * protocol gives 0x34 sub-command 0x0A for exactly this.
+   *
+   * The firmware does NOT handle this yet (ozkey-22 R1 is unbuilt) — pressing
+   * this today should produce a frame on the wire and NO reaction from the
+   * lock, which is the point: it makes the gap visible and gives R1 something
+   * to be tested against the moment it lands.
+   */
+  /**
+   * PROPOSED DP 60 — the keypad pairing gesture, as the DL MCU would report it.
+   *
+   * On production the keypad is the DL MCU's, so this is the only way a member
+   * at the door can ask the lock to advertise. Emitting it here lets the
+   * firmware side be written and tested before the manufacturer allocates a
+   * real DP — but nothing on real hardware sends this today.
+   */
+  const keypadPairingGesture = useCallback(() => {
+    wake("KEYPAD PAIRING GESTURE (DL MCU owns the keypad)");
+    transmitRef.current(
+      TuyaCommand.DP_REPORT,
+      buildDpPayload(DpId.PAIRING_REQUEST_PROPOSED, DpType.BOOL, [0x01]),
+      "PROPOSED DP 60 -> OZKIE MCU — user asked for the BLE pairing window"
+    );
+    setLastEvent("PAIRING GESTURE SENT (proposed DP 60 — firmware may ignore)");
+  }, [wake]);
+
+  const mcuFactoryReset = useCallback(() => {
+    wake("USER FACTORY RESET GESTURE (lock body button -> DL MCU)");
+
+    // ── ORDER IS THE POINT (operator, 2026-08-10) ─────────────────────────
+    // The DL MCU owns the button AND owns the credential store, so wiping
+    // that store is its OWN local responsibility — done here, first,
+    // unconditionally, before anything is sent anywhere. It must NOT depend
+    // on the wireless side acknowledging, being awake, or even existing.
+    //
+    // This is what ozkey-22 §2.1 row 1 says should happen on real hardware,
+    // and it is the behaviour we are asking the lock manufacturer to confirm
+    // (ozkey-22 §6 Q0). Modelling it here means that when the answer comes
+    // back, LockSim already behaves the way a correct DL MCU would — and if
+    // the real one does NOT, the difference is visible against this baseline.
+    const wiped = credentialsRef.current.length;
+    persistCredentials([]);
+
+    // THEN tell the OZKIE MCU, so it can wipe its own half (bonds, keypair,
+    // mesh). Notification only — it is not what cleared the credentials.
+    transmitRef.current(
+      TuyaCommand.TIME_NOTIFY,
+      buildMcuFactoryReset(),
+      `FACTORY RESET (0x34 0x0A) -> OZKIE MCU — DL MCU wiped ${wiped} credential(s) locally first`
+    );
+    setLastEvent(
+      `DL MCU FACTORY RESET — ${wiped} credential(s) erased locally, module notified`
+    );
+  }, [wake, persistCredentials]);
 
   const scanFingerprint = useCallback(() => {
     const pass = fingerprintPass.current;
@@ -460,6 +701,47 @@ export function useLockState({
         transmitRef.current(TuyaCommand.HEARTBEAT, [0x01], "Heartbeat response (MCU alive)");
         return;
       }
+
+      // ozkey-21 — the module answering our time question. THIS is the frame
+      // whose absence on real hardware is the suspected bug: we ask, and if
+      // nothing comes back the MCU stays UNSYNCED and cannot enforce any
+      // credential window.
+      if (
+        frame.command === TuyaCommand.GET_GMT_TIME ||
+        frame.command === TuyaCommand.GET_LOCAL_TIME
+      ) {
+        if (frame.payload.length === 0) return; // our own request echoed back
+        const reply = parseTimeReply(frame.payload);
+        const { clock, accepted, reason } = applyTimeReply(
+          mcuClockRef.current,
+          reply?.valid ? reply.unix : null
+        );
+        mcuClockRef.current = clock;
+        setMcuClock(clock);
+        pushRxLogRef.current?.(
+          toHexString(frame.payload),
+          [`MCU TIME ${accepted ? "ACCEPTED" : "NOT ACCEPTED"} — ${reason}`, describeMcuClock(clock)],
+          !accepted
+        );
+        return;
+      }
+      if (frame.command === TuyaCommand.TIME_NOTIFY) {
+        const push = parseTimePush(frame.payload);
+        if (!push) return;
+        const { clock, accepted, reason } = applyTimeReply(
+          mcuClockRef.current,
+          push.valid ? push.unix : null
+        );
+        mcuClockRef.current = clock;
+        setMcuClock(clock);
+        pushRxLogRef.current?.(
+          toHexString(frame.payload),
+          [`MCU TIME PUSH ${accepted ? "ACCEPTED" : "NOT ACCEPTED"} — ${reason}`, describeMcuClock(clock)],
+          !accepted
+        );
+        return;
+      }
+
       if (frame.command !== TuyaCommand.DP_REPORT) return;
 
       for (const dp of frame.dataPoints) {
@@ -529,10 +811,17 @@ export function useLockState({
     tapRfid,
     scanFingerprint,
     triggerLowBattery,
+    mcuFactoryReset,
+    keypadPairingGesture,
     setMechanicalKey,
     revokeCredential,
     pushEvent,
     handleFrame,
+    /** ozkey-21 — the MCU's own clock state, for the diagnostic panel. */
+    mcuClock,
+    mcuClockState: mcuClockState(mcuClock),
+    mcuUnix: readMcuUnix(mcuClock),
+    describeMcuClock: () => describeMcuClock(mcuClock),
   };
 }
 

@@ -9,7 +9,6 @@ import { useVirtualClock } from "@/hooks/useVirtualClock";
 import { useSerialLink } from "@/hooks/useSerialLink";
 import { useProvisioning } from "@/hooks/useProvisioning";
 import { useMqttLink } from "@/hooks/useMqttLink";
-import { useElementWidth } from "@/hooks/useElementWidth";
 import {
   ANNOUNCE_TOPIC,
   ONBOARDING_TOPIC,
@@ -38,11 +37,8 @@ import PeripheralControls from "@/components/PeripheralControls";
 import KeySlider from "@/components/KeySlider";
 import SerialConsole from "@/components/SerialConsole";
 import DeviceRegistry from "@/components/DeviceRegistry";
-import HardwarePipelineToggle from "@/components/HardwarePipelineToggle";
-import ConversationPanel from "@/components/ConversationPanel";
 import SettingsDialog from "@/components/SettingsDialog";
 
-const THREE_COLUMN_MIN_WIDTH = 1280;
 const MAX_CONVERSATION = 200;
 
 const PAIR_CONFIRM_FILTER = "hotel/locks/+/pair/confirm";
@@ -75,11 +71,10 @@ function summarize(topic: string, payload: string): string {
 
 export default function Page() {
   const clock = useVirtualClock();
-  const [mode, setMode] = useState<HardwareMode>("SOFTWARE");
-  // Mode A and Mode C both run the SOFTWARE backend; this flag distinguishes
-  // them in the toggle so selecting Mode C sticks before enrollment completes.
-  const [ozlockSelected, setOzlockSelected] = useState(false);
-  const { ref: mainRef, width: mainWidth } = useElementWidth<HTMLElement>();
+  // Single mode (operator, 2026-08-10). The simulator is always the lock MCU
+  // talking to a real ESP32 over the wire; there is no software-emulation
+  // personality to pick any more.
+  const mode: HardwareMode = "HARDWARE";
 
   const [settings, setSettings] = useState<BrokerSettings>(DEFAULT_BROKER);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -192,6 +187,18 @@ export default function Page() {
     heartbeatSeconds: settings.heartbeatSeconds,
     onAccess: publishAccessLog,
     mcuAckDelayMs: settings.mcuAckDelayMs,
+    pushRxLog: protocol.pushRxLog,
+    // ozkey-21 — Mode A: LockSim is emulating the missing Wi-Fi module too, so
+    // it answers the MCU's time request like a real Tuya module would.
+    // Mode B: null, because the module is a physical ESP32 and whether it
+    // answers is the whole experiment (ozkey-21 §2.3). Silence is a RESULT.
+    // No emulated module: the ESP32 on the wire is the module, and whether it
+    // answers 0x1C is exactly the ozkey-21 §2.3 experiment. Silence is a RESULT.
+    moduleTimeSource: () => null,
+    receiveFromModule: protocol.receiveBytes,
+    // Fires the time request on the rising edge of the wire opening — Web Serial
+    // needs a manual port pick after every refresh, so BOOT always misses it.
+    linkReady: serial.ready,
   });
   lockEventRef.current = lock.pushEvent;
 
@@ -384,65 +391,11 @@ export default function Page() {
     else lock.pushEvent("REGISTER FAILED — broker link offline (open System Settings)");
   }, [settings.mac, mqtt, pushConversation, provisioning, lock]);
 
-  const ozlockActive =
-    ozlockSelected ||
-    provisioning.provisioning?.mode === "ozlock" ||
-    (provisioning.registering && ozlockPendingRef.current !== null);
 
-  const handleModeChange = useCallback(
-    (next: HardwareMode) => {
-      setMode(next);
-      setOzlockSelected(false); // Mode A / B are not the OZLOCK personal cloud
-      if (next === "SOFTWARE" && serial.ready) void serial.disconnect();
-      // Selecting Mode A while enrolled with OZLOCK leaves the personal cloud.
-      if (next === "SOFTWARE" && provisioningRef.current?.mode === "ozlock") {
-        ozlockPendingRef.current = null;
-        provisioning.resetProvisioning(
-          "LEFT OZLOCK — provisioning wiped, back to OZKEYSERV room pairing (Mode A)"
-        );
-      }
-    },
-    [serial, provisioning]
-  );
 
-  /** Mode C selected: stick to it, and (if not yet enrolled) explain how. */
-  const handleSelectOzlock = useCallback(() => {
-    setMode("SOFTWARE");
-    setOzlockSelected(true);
-    if (serial.ready) void serial.disconnect();
-    if (provisioningRef.current?.mode === "ozlock") return;
-    lock.pushEvent(
-      "MODE C — get a provision payload from the OZLOCK app (:4300 ADD DOORLOCK) and paste it into SERVER PUSH"
-    );
-  }, [serial, lock]);
-
-  const threeColumn = mainWidth >= THREE_COLUMN_MIN_WIDTH;
-
-  const conversationPanel = (
-    <ConversationPanel
-      messages={conversation}
-      mqttStatus={mqtt.status}
-      brokerUrl={mqtt.url || brokerUrl(settings)}
-      registering={provisioning.registering}
-      paired={provisioning.provisioning !== null}
-      ozlockMode={ozlockActive}
-      onRegister={registerDoorlock}
-      onEnrollOzlock={enrollOzlockDirect}
-      onOpenSettings={() => setSettingsOpen(true)}
-      onClear={() => setConversation([])}
-    />
-  );
 
   return (
-    <main ref={mainRef} className="mx-auto flex min-h-screen max-w-[1900px] flex-col gap-5 p-6 lg:p-10">
-      <HardwarePipelineToggle
-        mode={mode}
-        onModeChange={handleModeChange}
-        serial={serial}
-        ozlockActive={ozlockActive}
-        onSelectOzlock={handleSelectOzlock}
-      />
-
+    <main className="mx-auto flex min-h-screen max-w-[1900px] flex-col gap-5 p-6 lg:p-10">
       <div className="flex flex-col items-start justify-center gap-8 lg:flex-row">
         <div className="flex flex-col items-center gap-3">
           <PhoneShell>
@@ -477,9 +430,11 @@ export default function Page() {
               onTapRfid={lock.tapRfid}
               onScanFingerprint={lock.scanFingerprint}
               onLowBattery={lock.triggerLowBattery}
+              onFactoryReset={lock.mcuFactoryReset}
+              onPairingGesture={lock.keypadPairingGesture}
               lowBattery={lock.lowBattery}
               credentials={lock.credentials}
-              virtualNowMs={clock.virtualNowMs}
+              mcuUnix={lock.mcuUnix}
             />
           </PhoneShell>
           <div className="max-w-[390px] text-center text-[10px] leading-relaxed text-neutral-600">
@@ -489,13 +444,63 @@ export default function Page() {
         </div>
 
         <div className="flex w-full min-w-0 flex-1 flex-col gap-3 lg:mt-2">
-          <header>
-            <h1 className="text-lg font-bold tracking-tight text-neutral-100">
-              LockSim <span className="text-sky-500">·</span> Hardware Testbed
-            </h1>
-            <p className="text-[11px] text-neutral-500">
-              Tuya 0x55 0xAA MCU protocol · Mode A network = MQTT-over-WebSocket to OZKEYSERV
-            </p>
+          <header className="flex items-start justify-between gap-3">
+            <div>
+              <h1 className="text-lg font-bold tracking-tight text-neutral-100">
+                LockSim <span className="text-sky-500">·</span> Hardware Testbed
+              </h1>
+              <p className="text-[11px] text-neutral-500">
+                Tuya 0x55 0xAA MCU protocol · MCU time service (0x1C) · ozkey-21
+              </p>
+            </div>
+            {/*
+              Settings and the UART control both used to live in panels that are
+              now gone (provisioning panel, hardware-pipeline toggle). They move
+              here rather than disappearing: the port picker in particular CANNOT
+              be dropped, because Web Serial requires a user gesture for the
+              first authorization on a profile and no amount of autoconnect
+              removes that.
+            */}
+            {/*
+              ONE action (operator, 2026-08-10). Autoconnect handles every load
+              after the first, so this button exists for exactly one job: the
+              initial port authorization, which Web Serial will not do without a
+              user gesture. Once linked it stops being a control and just states
+              the fact — there is no disconnect, because nothing here wants one.
+            */}
+            <div className="flex shrink-0 items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void serial.connect()}
+                disabled={serial.status === "connected" || serial.status === "unsupported"}
+                title={
+                  serial.status === "connected"
+                    ? serial.portLabel || "UART linked"
+                    : "Pick the CP2102 once — remembered and auto-connected on later loads"
+                }
+                className={`rounded border px-3 py-1 text-[11px] font-semibold transition-colors ${
+                  serial.status === "connected"
+                    ? "cursor-default border-green-800/70 bg-green-950/40 text-green-400"
+                    : serial.status === "connecting"
+                      ? "animate-pulse border-amber-800 bg-amber-950/40 text-amber-300"
+                      : "border-sky-800 bg-sky-950/50 text-sky-300 hover:bg-sky-900/50 disabled:opacity-40"
+                }`}
+              >
+                {serial.status === "connected"
+                  ? "● UART Connected"
+                  : serial.status === "connecting"
+                    ? "Connecting…"
+                    : "Connect"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setSettingsOpen(true)}
+                className="rounded border border-neutral-700 bg-neutral-900 px-2.5 py-1 text-[11px] font-semibold text-neutral-300 transition-colors hover:bg-neutral-800 active:translate-y-[1px]"
+                title="Broker, MAC, MCU ack delay"
+              >
+                ⚙
+              </button>
+            </div>
           </header>
           <SerialConsole
             rxLog={protocol.rxLog}
@@ -508,25 +513,23 @@ export default function Page() {
           />
           <DeviceRegistry
             credentials={lock.credentials}
-            virtualNowMs={clock.virtualNowMs}
+            mcuUnix={lock.mcuUnix}
             onRevoke={lock.revokeCredential}
           />
-          {!threeColumn && conversationPanel}
         </div>
 
-        {threeColumn && (
-          <div className="flex w-[440px] shrink-0 flex-col gap-3 lg:mt-2">
-            <header>
-              <h2 className="text-lg font-bold tracking-tight text-neutral-100">
-                Provisioning <span className="text-blue-500">·</span> OZKEYSERV/
-              </h2>
-              <p className="text-[11px] text-neutral-500">
-                Live lock ⇄ server onboarding over the MQTT command pipeline
-              </p>
-            </header>
-            {conversationPanel}
-          </div>
-        )}
+        {/*
+          Provisioning / OZKEYSERV column REMOVED (operator, 2026-08-10):
+          onboarding is the app's job, not the simulator's, so the panel was
+          taking 440px of permanent width to show a handshake nobody drives
+          from here. The console and registry now expand into that space,
+          which is what this testbed is actually for.
+
+          The transcript machinery (`conversation`, `pushConversation`) is
+          deliberately LEFT IN PLACE and still records MQTT traffic — it just
+          has no viewer. Restoring the panel is re-adding one element, not
+          rebuilding the plumbing.
+        */}
       </div>
 
       <SettingsDialog
