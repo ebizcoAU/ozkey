@@ -420,6 +420,128 @@ static String ozIp6Str(const uint8_t a[16]) {
 static bool ozIp6IsLinkLocal(const uint8_t a[16]) {
   return a[0] == 0xfe && (a[1] & 0xc0) == 0x80;
 }
+
+// ── ozkey-19 R6 — is this peer address on a prefix WE are also on? ──────────
+//
+// 🔴 THE BUG THIS EXISTS FOR, measured 2026-08-11:
+//
+// The lock learned a peer at 02:51:13 and unicast every uplink to it from then
+// on. None arrived. Enrol and revoke both executed correctly on the lock and
+// the app was never told — the operator tapped revoke four times watching a
+// spinner that could never resolve.
+//
+// The address was from a PREVIOUS partition. Thread's mesh-local prefix is
+// regenerated per dataset, and the mesh re-formed underneath us: the same
+// bridge interface ID appeared under fd51:…, fde0:… and fd7e:… within minutes.
+// A cached full address does not survive that, and nothing detected it because
+// lwip_sendto() happily returns success for an unroutable destination.
+//
+// This is ozkey-19 R1's one genuine downside, and it is worth naming: unicast
+// is strictly better than multicast WHEN THE ADDRESS IS RIGHT (it gets
+// 802.15.4's MAC ACK and retries), and strictly worse when it is stale,
+// because multicast never needed an address at all. So we must validate.
+//
+// The check: does the peer share a /64 with any of our own non-link-local
+// addresses? If it does not, it belongs to a mesh we are no longer part of and
+// no amount of retrying will reach it.
+//
+// Deliberately permissive on failure — if we cannot read our own addresses we
+// return true rather than discarding a peer that may be perfectly good. This
+// guard exists to catch a specific, observed staleness, not to be a gatekeeper.
+static bool ozPeerPrefixIsOurs(const uint8_t addr[16]) {
+  otInstance *inst = esp_openthread_get_instance();
+  if (!inst) return true;
+  // Bounded wait, same discipline as threadUdpBegin(): a busy OT task must
+  // cost us a permissive answer, never a blocked loop().
+  if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(200))) return true;
+  bool match = false;
+  for (const otNetifAddress *a = otIp6GetUnicastAddresses(inst); a && !match;
+       a = a->mNext) {
+    const uint8_t *m = a->mAddress.mFields.m8;
+    if (ozIp6IsLinkLocal(m)) continue; // link-local prefixes are universal
+    if (memcmp(m, addr, 8) == 0) match = true; // /64 compare
+  }
+  esp_openthread_lock_release();
+  return match;
+}
+
+// ozkey-19 v2 R2 — PERSIST the uplink peer.
+//
+// g_haveDownlinkPeer used to be RAM-only, learned solely from an inbound
+// downlink. So every reboot dropped the lock back to multicast — which has no
+// MAC ACK and no retries (§2) — until the bridge happened to speak first. A
+// lock that reboots with a roster change to report was therefore in the WORST
+// delivery mode at exactly the moment it mattered, and on hardware with an
+// open brownout suspicion that is not a rare path.
+//
+// 16 raw bytes under one NVS key. Deliberately NOT part of saveConfig(): the
+// peer changes on its own schedule and must not drag the whole config blob
+// into a write every time the mesh re-parents.
+#define OZ_NVS_PEER_KEY "uppeer"
+
+// ozkey-19 v2 R5 / ozkey-20 §7.2 — ROSTER EPOCH.
+//
+// Monotonic, bumped on every roster mutation, persisted. This is the
+// correctness mechanism, not a convenience: the uplink push is a latency
+// optimisation, and the epoch is what lets the app notice a missed change
+// WITHOUT any push having succeeded. Compare-and-resync beats delivery
+// guarantees for idempotent state.
+//
+// uint32 at one bump per mutation will not wrap in the life of the hardware.
+// Persisted on every bump because the whole point is that it survives the
+// reboot that lost the notification.
+#define OZ_NVS_EPOCH_KEY "repoch"
+static uint32_t g_rosterEpoch = 0;
+
+static void ozRosterEpochLoad() {
+  prefs.begin("blelock", true);
+  g_rosterEpoch = prefs.getUInt(OZ_NVS_EPOCH_KEY, 0);
+  prefs.end();
+}
+
+// Returns the NEW value. Callers must bump BEFORE building any payload that
+// carries it, so the epoch an app receives is the one describing the change it
+// is being told about.
+static uint32_t ozRosterEpochBump() {
+  g_rosterEpoch++;
+  prefs.begin("blelock", false);
+  prefs.putUInt(OZ_NVS_EPOCH_KEY, g_rosterEpoch);
+  prefs.end();
+  return g_rosterEpoch;
+}
+
+static void ozUplinkSavePeer(const uint8_t a[16]) {
+  prefs.begin("blelock", false);
+  prefs.putBytes(OZ_NVS_PEER_KEY, a, 16);
+  prefs.end();
+}
+
+// Clear the NVS copy as well. Without this a reboot would faithfully restore
+// the very address we just proved unroutable (ozkey-19 R2 persists it).
+static void ozUplinkForgetPeer() {
+  prefs.begin("blelock", false);
+  prefs.remove(OZ_NVS_PEER_KEY);
+  prefs.end();
+}
+
+static void ozUplinkLoadPeer() {
+  uint8_t a[16];
+  prefs.begin("blelock", true);
+  const size_t n = prefs.getBytes(OZ_NVS_PEER_KEY, a, sizeof(a));
+  prefs.end();
+  if (n != 16) return;
+  // Refuse a stored link-local for the same reason we refuse a learned one.
+  // Also refuse all-zeroes, which is what a half-written key reads back as.
+  bool allZero = true;
+  for (int i = 0; i < 16; i++)
+    if (a[i]) { allZero = false; break; }
+  if (allZero || ozIp6IsLinkLocal(a)) return;
+  memset(&g_lastDownlinkPeer, 0, sizeof(g_lastDownlinkPeer));
+  g_lastDownlinkPeer.sin6_family = AF_INET6;
+  memcpy(&g_lastDownlinkPeer.sin6_addr, a, 16);
+  g_haveDownlinkPeer = true;
+  Serial.printf("[UPLINK] peer restored from NVS: %s\n", ozIp6Str(a).c_str());
+}
 // ozkey-17 F8: 512 -> 1024. OZKIE semantic JSON is 2-3x the size of the Tuya
 // frame it replaces once hex-encoded into `envelope_hex` — a grant_pin with a
 // hex credential lands near 430 B of datagram against 512, with RFID
@@ -503,6 +625,7 @@ static portMUX_TYPE ctlMux = portMUX_INITIALIZER_UNLOCKED;
 WiFiClient wifiTcp;
 PubSubClient mqtt(wifiTcp);
 unsigned long lastHeartbeat = 0, lastMqttAttempt = 0, wifiJoinStart = 0;
+unsigned long lastThreadBeaconAt = 0; // ozkey-20 R3 — Thread presence beacon
 unsigned long lastEnrollSent = 0;
 uint8_t enrollAttempts = 0;
 unsigned long lastUnpairedAnnounce = 0;
@@ -881,6 +1004,17 @@ void drawStatusLine() {
 
   gfx->fillRect(2, 2, PANEL_W - 4, STATUS_H - 2, C_BLACK);
 
+  // ── MCU link dot (operator, 2026-08-10) ──────────────────────────────────
+  // The MCU is the half of this product we do not control, and its state was
+  // visible only in the [MON] serial line — so a bench board with a dead UART
+  // looked identical to a healthy one on the panel. It sits in the gap left of
+  // the title, vertically centred on the 8px text row.
+  //
+  // GREEN = frames seen inside MCU_LINK_TIMEOUT_MS. RED = silent.
+  // Deliberately NOT amber-for-unknown: there is no unknown state here, the
+  // link has either produced a frame recently or it has not.
+  gfx->fillCircle(7, 10, 3, mcuLinkUp() ? C_GREEN : C_RED);
+
   gfx->setTextSize(1);
   gfx->setTextColor(border);
   gfx->setCursor(15, 6);
@@ -1217,6 +1351,56 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
 
   if (n >= 4 && f[3] == 0x00) return; // MCU heartbeat = link-alive only
 
+  // ── ozkey-22 R1 — 0x34, the MULTIPLEXED extended command ──────────────────
+  //
+  // 0x34 is not one command. Its first payload byte is a sub-command:
+  //   0x01 subscribe to time push    0x02 time push    0x0A factory reset
+  // Dispatch on it properly; assuming "0x34 means time" is a bug waiting for
+  // the first reset frame to arrive.
+  if (n >= 7 && f[3] == 0x34) {
+    const uint8_t sub = f[6];
+    if (sub == 0x0A) {
+      // THE PHYSICAL RESET BUTTON ON THE LOCK BODY.
+      //
+      // That button is wired to the DL MCU, not to us. Until now we never
+      // heard about it at all: the lock mechanism would reset and this chip
+      // would carry on owned, bonded and on the same mesh — a half-reset lock
+      // that looks fine to the app and belongs to nobody.
+      //
+      // Tuya: "The MCU can locally reset the module to factory settings
+      // through this command." Reply is 0x34 0x0A with data[1] 0=ok, 1=fail.
+      Serial.println("[RESET] DL MCU signalled FACTORY RESET (0x34 0x0A)");
+
+      // ⚠ ACK FIRST. factoryReset() ends in otInstanceFactoryReset(), which is
+      // a PLATFORM RESET and NEVER RETURNS (see factoryReset()'s own 2026-08-02
+      // ordering note). A success byte sent after it is a byte never sent, and
+      // the DL MCU would sit waiting for an answer that cannot arrive.
+      //
+      // Answering before acting means we are promising rather than reporting.
+      // That is the correct trade here: the DL MCU needs to know its message
+      // was understood, and there is no post-reset state left in which to tell
+      // it anything. If the wipe somehow fails, the board reboots and comes up
+      // still owned — visible on the panel and to the app.
+      const uint8_t ack[] = {0x55, 0xAA, 0x00, 0x34, 0x00, 0x02, 0x0A, 0x00, 0x00};
+      uint8_t frame[sizeof(ack)];
+      memcpy(frame, ack, sizeof(ack));
+      uint8_t sum = 0;
+      for (size_t i = 0; i + 1 < sizeof(frame); i++) sum += frame[i];
+      frame[sizeof(frame) - 1] = sum;
+      tuyaWireSend(frame, sizeof(frame));
+
+      // NOTE ON SCOPE: this wipes OUR half only — bonds, keypair, txlog, mesh.
+      // The DL MCU's own credentials (PINs/RFID/fingerprints) are ITS to clear,
+      // locally, as part of handling its own button; that is ozkey-22 §2.1
+      // row 1 and §6 Q0, still unconfirmed with the manufacturer. We must not
+      // pretend to have done it.
+      factoryReset(); // never returns
+      return;
+    }
+    Serial.printf("[TUYA<-] 0x34 sub 0x%02X — not handled\n", sub);
+    return;
+  }
+
   if (n >= 11 && f[3] == 0x06) {
     uint8_t dpid = f[6], type = f[7];
     uint16_t vlen = ((uint16_t)f[8] << 8) | f[9];
@@ -1228,14 +1412,77 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       return;
     }
     if (dpid == 5) { publishLog("battery_alarm", "MCU report"); return; }
+
+    // ── PROPOSED DP 60 — keypad pairing gesture (ozkey-22 §7) ──────────────
+    //
+    // On production the keypad belongs to the DL MCU and our board has NO
+    // touch panel, so this is the only way a member standing at the door can
+    // make the lock advertise. Without it member_enroll is unreachable on real
+    // hardware — see ozdoorlock_core.h's own "M3 PREREQUISITE" note, whose
+    // reasoning is right and whose mechanism does not exist in production.
+    //
+    // ⚠️ THE DP NUMBER IS A PLACEHOLDER pending manufacturer allocation. No
+    // shipping DL MCU sends this; only LockSim does. Handling it now lets the
+    // ceremony be developed and tested against the real topology instead of
+    // against a dev board's incidental touch screen.
+    //
+    // SECURITY: unchanged from the touch path it replaces. The gesture is
+    // still physical, still on the keypad outside the door, still in the
+    // user's hand. XF-52 §4 forbids a REMOTE verb opening this window; a
+    // keypress relayed over the in-door UART is not remote.
+    if (dpid == 60) {
+      if (!provisioned) {
+        Serial.println("[BLE] DL MCU pairing gesture ignored — lock not provisioned");
+        return;
+      }
+      Serial.println("[BLE] pairing gesture from DL MCU keypad (proposed DP 60)");
+      openBleWindow("DL MCU keypad gesture");
+      return;
+    }
   }
-  // unrecognised — forward raw hex upstream rather than dropping
+  // ── UNRECOGNISED DP — log locally, do NOT publish the payload ────────────
+  //
+  // 🔴 CHANGED 2026-08-11. This used to hex the WHOLE FRAME and hand it to
+  // publishLog(), i.e. straight to the server. That is a blind forward of
+  // bytes we have not classified, from a chip whose firmware is not ours.
+  //
+  // The DL MCU is the lock manufacturer's. We handle exactly two of its
+  // reports — DP 8 (access result) and DP 5 (battery). We do not have an
+  // enumeration of what else it emits. If any of that carries credential
+  // material — an entered PIN, a card UID, a fingerprint template ID — the old
+  // path shipped it off-device and into the door log, by DEFAULT, without
+  // anyone deciding to. That is exactly what XF-47's no-plaintext-credential
+  // rule exists to prevent, and "we did not know it was in there" is not a
+  // defence.
+  //
+  // Found because LockSim reports keypad PIN entry as DP 1 with the digits as
+  // a VALUE; our firmware does not recognise DP 1 inbound, so it fell here and
+  // the PIN went to the server as a `dp_report` log line. In the simulator
+  // that is a modelling artifact — the MECHANISM is real firmware, and we do
+  // not know what production hardware sends down it.
+  //
+  // So: keep full visibility on the SERIAL console (local, for exactly the
+  // discovery work we still owe), and publish only the shape — DP id, type,
+  // length — never the value. Once the manufacturer tells us what these DPs
+  // are (ozkey-22 §6 Q2), the known-safe ones can be promoted to real
+  // handlers above and reported properly.
   String hex; hex.reserve(n * 3);
   for (size_t i = 0; i < n; i++) {
     char b[4]; snprintf(b, sizeof(b), "%02X ", f[i]); hex += b;
   }
   hex.trim();
-  publishLog("dp_report", hex.c_str());
+  Serial.printf("[TUYA<-] UNCLASSIFIED DP, NOT published: %s\n", hex.c_str());
+
+  if (n >= 11 && f[3] == 0x06) {
+    // Shape only. Enough to discover which DPs exist and how often, with no
+    // possibility of leaking what they carry.
+    char shape[64];
+    snprintf(shape, sizeof(shape), "unclassified dp=%u type=%u len=%u", (unsigned)f[6],
+             (unsigned)f[7], (unsigned)(((uint16_t)f[8] << 8) | f[9]));
+    publishLog("dp_unclassified", shape);
+  } else {
+    publishLog("dp_unclassified", "non-DP frame");
+  }
 }
 
 // RX reassembly off the wire (LockSim frames arrive as raw bytes)
@@ -1282,6 +1529,15 @@ void publishHeartbeat() {
   doc["device_id"] = deviceId;
   doc["mac"] = macStr;
   doc["fw"] = FW_VERSION;
+  // R5 / ozkey-20 R4: the epoch rides the heartbeat so an app can detect a
+  // missed roster change with NO push having succeeded. This is the pull half
+  // of the design and it is what makes the system converge.
+  //
+  // NOTE the `mqtt.connected()` guard above: on a THREAD lock this whole
+  // function never runs, which is ozkey-20 §2.1 — the reason Thread locks have
+  // never reported liveness. Not fixed here; that is ozkey-20 R3 and it needs
+  // the uplink path, not this one.
+  doc["roster_epoch"] = g_rosterEpoch;
   // On EVERY heartbeat, not just enroll. A transport change does not always
   // re-enroll (a re-provision of an already-enrolled lock does not), and this is
   // the only message a lock in service sends unprompted — so it is the only
@@ -1635,12 +1891,26 @@ void pollThreadUdp() {
                       "children, ignoring; uplink stays multicast-only\n",
                       ozIp6Str(sa).c_str());
     } else {
+      // ozkey-19 R6: refuse a peer we cannot route to. Cheaper to stay on
+      // bootstrap multicast than to unicast into a dead prefix in silence.
+      if (!ozPeerPrefixIsOurs(sa)) {
+        Serial.printf("[UPLINK] peer %s is on a FOREIGN PREFIX — refusing; "
+                      "staying on bootstrap multicast\n", ozIp6Str(sa).c_str());
+        goto peer_done;
+      }
+      {
       const bool changed = !g_haveDownlinkPeer ||
                            memcmp(&g_lastDownlinkPeer.sin6_addr, sa, 16) != 0;
       memcpy(&g_lastDownlinkPeer, &src, sizeof(g_lastDownlinkPeer));
       g_haveDownlinkPeer = true;
-      if (changed)
+      if (changed) {
         Serial.printf("[UPLINK] peer learned: %s\n", ozIp6Str(sa).c_str());
+        // R2: only on CHANGE, never on every datagram — NVS has finite write
+        // endurance and the bridge's address is stable for long stretches.
+        ozUplinkSavePeer(sa);
+      }
+      }
+    peer_done:;
     }
   }
 
@@ -1757,21 +2027,36 @@ static const uint8_t OZ_ALLNODES_BYTES[16] = {0xff, 0x03, 0, 0, 0, 0, 0, 0,
 // nothing ever receives, which is why the lock logged a confident "-> thread"
 // for a message the app never saw.
 //
-// Two mitigations, neither of which makes this guaranteed (that needs an
-// end-to-end ACK — see ozkey-17 §8):
+// ────────────────────────────────────────────────────────────────────────────
+// ozkey-19 v2, 2026-08-10 — the burst is GONE. Unicast is the delivery path.
 //
-//   1. UNICAST to the bridge's ML-EID, learned from whoever last sent us a
-//      downlink. Unicast gets link-layer ACKs and MAC retries; multicast gets
-//      neither. This is the single biggest improvement available and it is
-//      the third destination bridge32 has always used in the other direction.
-//   2. RETRY the multicast burst, spaced with jitter, so a collision or a
-//      brief reconvergence does not consume the only attempt.
+// The comment block above reached the right conclusion in mitigation 1 and
+// then did not act on it: unicast stayed CONDITIONAL (`if (g_haveDownlinkPeer)`)
+// while the multicast burst stayed primary. Net effect of the old
+// ozUplinkBurst(): 3 tries x 3 destinations = 9 datagrams per event, of which
+//   - 3 went to ff03::4f5a, measured dead here, 0 of 18 ever delivered
+//   - 3 went to ff03::1, which has NO MAC ACK and NO retries
+//   - 3 went unicast, and only when a downlink had already been seen
+// So six copies bought nothing that the radio would not have done better with
+// one, and mitigation 2 (retry the multicast) was compensating for retries we
+// had switched off by choosing multicast in the first place.
 //
-// Jitter matters: several locks reacting to the same mesh event would
-// otherwise retry in lockstep and collide with each other repeatedly.
-#define OZ_UPLINK_TRIES     3
-#define OZ_UPLINK_GAP_MS   40   // base spacing between attempts
-#define OZ_UPLINK_JITTER_MS 35   // random 0..N added per attempt
+// Now: ONE unicast datagram. 802.15.4 retransmits it up to macMaxFrameRetries
+// per hop, which is the mechanism the burst was a bad imitation of.
+//
+// Multicast survives ONLY as bootstrap — a lock that has never seen a downlink
+// and has nothing in NVS (R2) still has to reach the bridge somehow. That path
+// genuinely has no MAC ARQ, so it keeps a small spaced retry. ff03::4f5a is
+// dropped entirely: IPV6_JOIN_GROUP fails errno=125 on BOTH boards, so it is
+// dead in both directions, and sending to it is pure airtime.
+//
+// Jitter still matters on the bootstrap path: several locks reacting to the
+// same mesh event would otherwise retry in lockstep and collide repeatedly.
+// The old 40 ms spacing was far too tight for the failure it was meant to ride
+// out — mesh reconvergence takes hundreds of ms, not tens.
+#define OZ_UPLINK_BOOTSTRAP_TRIES  3
+#define OZ_UPLINK_GAP_MS         500   // base spacing, bootstrap multicast only
+#define OZ_UPLINK_JITTER_MS      250   // random 0..N added per attempt
 
 static bool ozThreadUdpSendOnce(const String &payload, const uint8_t addr[16],
                                 const char *label) {
@@ -1799,16 +2084,11 @@ static bool ozThreadUdpSendOnce(const String &payload, const uint8_t addr[16],
   return true;
 }
 
-// One burst = unicast (if known) + both multicast groups.
-static bool ozUplinkBurst(const String &payload) {
-  bool anySent = false;
-  if (g_haveDownlinkPeer &&
-      ozThreadUdpSendOnce(payload, (const uint8_t *)&g_lastDownlinkPeer.sin6_addr,
-                          "unicast-peer"))
-    anySent = true;
-  if (ozThreadUdpSendOnce(payload, OZ_ALLNODES_BYTES, "ff03::1")) anySent = true;
-  if (ozThreadUdpSendOnce(payload, OZ_THREAD_GROUP_BYTES, "ff03::4f5a")) anySent = true;
-  return anySent;
+// Bootstrap only — no peer known, so we have no unicast target yet. ff03::1 is
+// the realm-local ALL-NODES group every Thread node joins implicitly; it needs
+// no lwIP join, which is precisely why it works where ff03::4f5a does not.
+static bool ozUplinkBootstrapSend(const String &payload) {
+  return ozThreadUdpSendOnce(payload, OZ_ALLNODES_BYTES, "ff03::1 BOOTSTRAP");
 }
 
 // Retries are scheduled, NOT blocking. ozUplinkSend() is reached from the BLE
@@ -1823,36 +2103,119 @@ static uint32_t g_uplinkNextAt = 0;
 static bool ozThreadUdpSend(const String &payload) {
   if (!threadUdpReady || ozRxFd < 0) return false;
 
-  const bool sent = ozUplinkBurst(payload);
+  // ── R1: the normal path. ONE datagram. ────────────────────────────────────
+  // 802.15.4 ACKs it per hop and retransmits on silence, up to
+  // macMaxFrameRetries. Nothing is armed here on purpose: an application-layer
+  // retry on top of a link layer that is already retrying is the mistake this
+  // change exists to undo.
+  // ozkey-19 R6: the prefix can go stale BETWEEN learning and sending — the
+  // mesh re-forms without asking us. Re-check every time; it is one pass over
+  // a short list and it is the difference between a delivered message and a
+  // silent hole.
+  if (g_haveDownlinkPeer &&
+      !ozPeerPrefixIsOurs((const uint8_t *)&g_lastDownlinkPeer.sin6_addr)) {
+    Serial.printf("[UPLINK] cached peer %s went STALE (mesh re-formed) — "
+                  "dropping it, falling back to bootstrap multicast\n",
+                  ozIp6Str((const uint8_t *)&g_lastDownlinkPeer.sin6_addr).c_str());
+    g_haveDownlinkPeer = false;
+    ozUplinkForgetPeer();
+  }
 
-  // Arm the remaining attempts. A newer message supersedes an older pending
-  // one rather than queueing behind it — roster_changed is idempotent state
-  // ("something changed, resync"), so the freshest is always the useful one.
+  if (g_haveDownlinkPeer) {
+    g_uplinkPending   = String(); // supersede any bootstrap attempt in flight
+    g_uplinkTriesLeft = 0;
+    // ── ozkey-19 R7 — unicast AND ff03::1. Two datagrams, not one. ────────
+    //
+    // 🔴 WHY, and this is a deliberate retreat from R4's "one datagram":
+    //
+    // R1 replaced a 9-datagram multicast burst with a single MAC-acknowledged
+    // unicast, and that is genuinely better — WHEN THE ADDRESS IS RIGHT. On
+    // 2026-08-11 it was not, twice, and the failure was silent: enrol and
+    // revoke both executed on the lock, both notifications vanished, and the
+    // operator tapped revoke four times at a spinner that could never resolve.
+    //
+    // I first assumed a stale prefix from a re-formed partition and shipped a
+    // validity check for it (ozPeerPrefixIsOurs, still above and still worth
+    // having). It never fired — the peer IS on a prefix we hold. So the
+    // address is plausible and the datagram still does not arrive, and I do
+    // not yet know why.
+    //
+    // THE POINT: we have NO ACKNOWLEDGEMENT. We cannot tell a delivered
+    // uplink from a lost one, so we cannot pick the right single path — that
+    // is ozkey-19's whole thesis applied to itself. Until an ACK exists,
+    // sending both is the only honest answer:
+    //
+    //   • unicast  — gets 802.15.4's MAC ACK and retries. Best when routable.
+    //   • ff03::1  — needs NO address at all. Every downlink on this bench
+    //                arrives this way, so it is demonstrably working.
+    //
+    // Cost: 2 datagrams instead of 1, against the 9 we started with. Cheap
+    // insurance against a whole class of addressing failure we have now been
+    // bitten by twice.
+    //
+    // REMOVE THE MULTICAST COPY when ozkey-20 R3/R7 give us a real
+    // reachability signal — not before, and not because one datagram is
+    // tidier.
+    const bool uni =
+        ozThreadUdpSendOnce(payload,
+                            (const uint8_t *)&g_lastDownlinkPeer.sin6_addr,
+                            "unicast");
+    const bool mc = ozThreadUdpSendOnce(payload, OZ_ALLNODES_BYTES, "ff03::1");
+    Serial.printf("[UPLINK] 2 datagrams: unicast=%s ff03::1=%s\n",
+                  uni ? "ok" : "FAILED", mc ? "ok" : "FAILED");
+    return uni || mc;
+  }
+
+  // ── Bootstrap: no peer, in RAM or NVS. Multicast, which has no MAC ARQ. ───
+  // A newer message supersedes an older pending one rather than queueing
+  // behind it — roster_changed is idempotent state ("something changed,
+  // resync"), so the freshest is always the useful one.
+  const bool sent = ozUplinkBootstrapSend(payload);
   g_uplinkPending   = payload;
-  g_uplinkTriesLeft = OZ_UPLINK_TRIES - 1;
+  g_uplinkTriesLeft = OZ_UPLINK_BOOTSTRAP_TRIES - 1;
   g_uplinkNextAt    = millis() + OZ_UPLINK_GAP_MS +
                       (esp_random() % (OZ_UPLINK_JITTER_MS + 1));
 
-  Serial.printf("[UPLINK] burst 1/%d sent (unicast=%s), %u retr%s queued\n",
-                OZ_UPLINK_TRIES, g_haveDownlinkPeer ? "yes" : "no peer yet",
-                g_uplinkTriesLeft, g_uplinkTriesLeft == 1 ? "y" : "ies");
+  Serial.printf("[UPLINK] NO PEER — bootstrap multicast 1/%d, %u retr%s queued "
+                "(unacknowledged transport)\n",
+                OZ_UPLINK_BOOTSTRAP_TRIES, g_uplinkTriesLeft,
+                g_uplinkTriesLeft == 1 ? "y" : "ies");
   return sent;
 }
 
-// Called from loop(). Cheap when idle.
+// Called from loop(). Cheap when idle. Only ever active on the BOOTSTRAP path —
+// a unicast send arms nothing, because the MAC is already retrying it.
 static void ozUplinkRetryTick() {
   if (g_uplinkTriesLeft == 0) return;
   if ((int32_t)(millis() - g_uplinkNextAt) < 0) return; // wrap-safe compare
 
-  ozUplinkBurst(g_uplinkPending);
+  // A downlink may have arrived since we armed this, which means we now have a
+  // real unicast target. Take it: one acknowledged send beats any number of
+  // unacknowledged ones, and it ends the retry immediately.
+  if (g_haveDownlinkPeer) {
+    ozThreadUdpSendOnce(g_uplinkPending,
+                        (const uint8_t *)&g_lastDownlinkPeer.sin6_addr,
+                        "unicast (peer arrived)");
+    g_uplinkTriesLeft = 0;
+    g_uplinkPending = String();
+    return;
+  }
+
+  ozUplinkBootstrapSend(g_uplinkPending);
   g_uplinkTriesLeft--;
-  Serial.printf("[UPLINK] retry burst, %u left\n", g_uplinkTriesLeft);
+  Serial.printf("[UPLINK] bootstrap retry, %u left\n", g_uplinkTriesLeft);
 
   if (g_uplinkTriesLeft)
     g_uplinkNextAt = millis() + OZ_UPLINK_GAP_MS +
                      (esp_random() % (OZ_UPLINK_JITTER_MS + 1));
-  else
+  else {
     g_uplinkPending = String(); // release the buffer
+    // R5 territory: this is a send we could not confirm and will not retry.
+    // Loud on purpose — silence on failure is what caused the ozkey-19
+    // investigation in the first place.
+    Serial.println("[UPLINK] bootstrap attempts exhausted, still NO PEER — "
+                   "message not acknowledged by anything");
+  }
 }
 
 // Seal [json] to the bond in [slot] and emit it on whatever transport this lock
@@ -1902,8 +2265,38 @@ static bool ozUplinkSend(int slot, const String &json) {
     hex += b;
   }
 
+  // ── ozkey-20 R2 — state our Thread identity so the bridge can join ──────
+  //
+  // 🔴 WHY THIS FIELD EXISTS. The bridge needs to map a Thread child to a
+  // device_id so its liveness report can name locks. Two attempts failed:
+  //
+  //  1. Match the uplink's SOURCE ADDRESS against the child's registered
+  //     IPv6 addresses. Measured 2026-08-11: `otThreadGetChildNextIp6Address()`
+  //     returns ZERO addresses for every child on this mesh, so there is
+  //     nothing to match against. Structurally impossible, not a tuning issue.
+  //  2. Derive it from the MAC. The Thread extended address is RANDOM, not
+  //     MAC-derived — DoorA is ozk-acebe639f8c4 but its link-local is
+  //     fe80::d879:a06:ac36:7e6f. Unrelated.
+  //
+  // So the lock states it. The bridge already has every child's mExtAddress
+  // from its own child table, making the join a direct 8-byte compare with no
+  // addressing, no prefixes, and nothing to go stale.
+  //
+  // Costs ~22 bytes on an uplink already at 343 B — still 4 6LoWPAN fragments,
+  // so no airtime change (ozkey-20 §4.1).
+  char extHex[17] = {0};
+  {
+    otInstance *inst = esp_openthread_get_instance();
+    if (inst && esp_openthread_lock_acquire(pdMS_TO_TICKS(200))) {
+      const otExtAddress *ea = otLinkGetExtendedAddress(inst);
+      if (ea) ozHex(ea->m8, 8, extHex);
+      esp_openthread_lock_release();
+    }
+  }
+
   JsonDocument doc;
   doc["from"] = deviceId;      // which lock — the bridge routes on this
+  if (extHex[0]) doc["ext"] = extHex; // Thread identity, for the bridge's join
   doc["to"] = appIdHex;        // which app — already public, it is an MQTT topic segment today
   doc["envelope_hex"] = hex;   // the only part with anything in it
   String out;
@@ -1939,12 +2332,20 @@ static void ozUplinkBroadcastAdmins(const String &json) {
 // instead of an admin phone finding out 20 minutes later off a stale cache —
 // or not finding out, and tapping "cancel invite" six times.
 static void ozNotifyRosterChanged(const char *reason) {
+  // R5: bump BEFORE building the payload — the epoch an admin receives must be
+  // the one that describes this change, not the one before it. Every caller of
+  // this function is a roster mutation, so this is the single correct choke
+  // point; bumping at the call sites would eventually miss one.
+  const uint32_t epoch = ozRosterEpochBump();
+
   JsonDocument doc;
   doc["kind"] = "roster_changed";
   doc["reason"] = reason;
   doc["bonds"] = ozBondCount();
+  doc["roster_epoch"] = epoch;
   String out;
   serializeJson(doc, out);
+  Serial.printf("[ROSTER] epoch -> %lu (%s)\n", (unsigned long)epoch, reason);
   ozUplinkBroadcastAdmins(out);
 }
 
@@ -2452,8 +2853,15 @@ void handleMemberEnroll(JsonDocument &doc) {
   const String      nonceHx = inv["n"] | "";
   const uint32_t    expires = inv["e"] | 0u;
   const String      macHex  = inv["m"] | "";
+  // XF-87 'me' — the MEMBERSHIP's own expiry, distinct from 'e' (which is only
+  // how long the QR stays redeemable). 0 = permanent. At v2 this is INSIDE the
+  // MAC, so unlike 'e' it cannot be altered by whoever holds the QR.
+  const uint32_t    memExp  = inv["me"] | 0u;
 
-  if (ver != 1 || nonceHx.length() != 32 || macHex.length() != 64) {
+  // XF-87: accept v1 AND v2. v2 carries the membership expiry inside the MAC.
+  // v1 invites minted before the app update must keep verifying byte-identically
+  // — anyone holding one in flight would otherwise be locked out of enrolling.
+  if ((ver != 1 && ver != 2) || nonceHx.length() != 32 || macHex.length() != 64) {
     Serial.printf("[MEMBER] invite shape rejected (v=%d n=%u m=%u)\n", ver,
                   nonceHx.length(), macHex.length());
     notifyStatus("MEMBER_FAIL");
@@ -2493,7 +2901,8 @@ void handleMemberEnroll(JsonDocument &doc) {
   }
   uint8_t want[32], got[32];
   const bool macOk =
-      ozInviteMac(s0, 32, invDev, issuer, roleStr, label, nonceHx, expires, want);
+      ozInviteMac(s0, 32, invDev, issuer, roleStr, label, nonceHx, expires, want,
+                  ver, memExp);
   ozFromHex(macHex.c_str(), got, 32);
   memset(s0, 0, sizeof(s0));
   if (!macOk || !ozCtEq(want, got, 32)) {
@@ -2502,11 +2911,21 @@ void handleMemberEnroll(JsonDocument &doc) {
     return;
   }
 
-  // `expires` is parse-and-ignore in v1 (XF-47): the lock has no clock, so
+  // `expires` is parse-and-ignore (XF-47): the lock has no clock yet, so
   // enforcing it would be theatre. MEMBER_EXPIRED is reserved and NEVER
   // emitted. The nonce is the hard guarantee; DPID 102 is the kill switch.
-  Serial.printf("[MEMBER] invite VERIFIED label='%s' expires=%u (not enforced)\n",
+  //
+  // XF-87/ozkey-21: at v2 `me` is now SIGNED, so it is trustworthy the moment
+  // we have a clock and somewhere to store it — T1 (clock) and T4 (bond
+  // expires_at). Until then we log it and do nothing, and the log says so
+  // rather than implying enforcement that does not exist.
+  Serial.printf("[MEMBER] invite v%d VERIFIED label='%s' qr_expires=%u", ver,
                 label.c_str(), (unsigned)expires);
+  if (ver >= 2)
+    Serial.printf(" membership_expires=%u%s", (unsigned)memExp,
+                  memExp ? " (SIGNED, not yet enforced — ozkey-21 T4/T5)"
+                         : " (permanent)");
+  Serial.println(" (expiry not enforced)");
 
   uint8_t nonce[16];
   ozFromHex(nonceHx.c_str(), nonce, 16);
@@ -3159,6 +3578,10 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
       rsp["kind"] = "roster_response";
       rsp["msg_id"] = msgId;
       rsp["bonds"] = ozBondCount();
+      // R5: the pull path must answer with the epoch too, or an app that
+      // resyncs after a missed push has no way to record what it just caught up
+      // TO — and would resync forever.
+      rsp["roster_epoch"] = g_rosterEpoch;
       JsonArray arr = rsp["members"].to<JsonArray>();
       bool truncated = false;
       for (int i = 1; i < OZ_BOND_MAX; i++) {
@@ -3855,7 +4278,13 @@ void drawKeypad() {
     for (int c = 0; c < 4; c++) {
       int x = c * KEY_W, y = KP_TOP + r * KEY_H;
       bool lit = litActive && r == litKeyR && c == litKeyC;
-      gfx->fillRect(x + 2, y + 2, KEY_W - 4, KEY_H - 4, lit ? C_GREEN : C_BLUE);
+      // '#' is the pairing key (2026-08-11) — it opens the BLE window, and no
+      // other key does. A designated key nobody can pick out is the same as no
+      // key, so it gets its own colour: amber, matching the amber BLE badge on
+      // the status line so the two read as the same feature.
+      const bool isPairKey = (KP_KEYS[r][c] == '#');
+      gfx->fillRect(x + 2, y + 2, KEY_W - 4, KEY_H - 4,
+                    lit ? C_GREEN : (isPairKey ? C_AMBER : C_BLUE));
       gfx->drawRect(x, y, KEY_W, KEY_H, C_GREY);
       gfx->setTextColor(lit ? C_BLACK : C_WHITE);
       gfx->setTextSize(3);
@@ -4030,6 +4459,10 @@ void setup() {
   Serial.printf("[ID] device_id=%s mac=%s\n", deviceId.c_str(), macStr.c_str());
 
   loadConfig();
+  ozUplinkLoadPeer(); // ozkey-19 v2 R2 — restore the unicast target BEFORE any
+                      // uplink can fire, so a reboot does not silently demote
+                      // this lock to unacknowledged multicast.
+  ozRosterEpochLoad(); // R5 — must survive the reboot that lost the push.
   buildTopics();
 
   // Ceremony identity (RF is up → TRNG seeded) + boot known-answer self-test.
@@ -4240,6 +4673,63 @@ void loop() {
   }
   if (isThread()) { pollThreadUdp(); ozUplinkRetryTick(); }
 
+  // ── ozkey-20 R3 — Thread presence beacon ─────────────────────────────
+  //
+  // A Thread lock has no MQTT session, so publishHeartbeat() can never run
+  // for it (there is a second gate inside the function itself). Consequences
+  // we hit tonight, all from this one hole:
+  //
+  //  • The server can never mark a Thread lock reachable, so after a bridge
+  //    restart every lock stays unreachable forever and the app falls back
+  //    to BLE.
+  //  • The bridge only learns a lock's identity from an uplink, and uplinks
+  //    only happen on roster changes — so the liveness report could not name
+  //    anyone until somebody happened to revoke a member.
+  //  • ftpos built epoch reconciliation (XF-89 §7.1) against a heartbeat we
+  //    do not send, so their correct code does nothing on our main transport.
+  //
+  // Deliberately UNSEALED and deliberately minimal: device_id, Thread
+  // identity, firmware, roster epoch. No credentials, no door state, nothing
+  // that would breach XF-47 if read in transit. It says "I exist, I am this
+  // lock, my roster is at N" — facts already public in the topic name.
+  //
+  // Fire-and-forget by design (ozkey-20 §7.2): a lost beacon is replaced by
+  // the next one, and retransmitting stale liveness is worse than useless.
+  if (isThread() && threadUdpReady &&
+      millis() - lastThreadBeaconAt > cfgHeartbeatS * 1000UL) {
+    lastThreadBeaconAt = millis();
+
+    char extHex[17] = {0};
+    otInstance *inst = esp_openthread_get_instance();
+    if (inst && esp_openthread_lock_acquire(pdMS_TO_TICKS(200))) {
+      const otExtAddress *ea = otLinkGetExtendedAddress(inst);
+      if (ea) ozHex(ea->m8, 8, extHex);
+      esp_openthread_lock_release();
+    }
+
+    JsonDocument hb;
+    hb["from"] = deviceId;
+    if (extHex[0]) hb["ext"] = extHex;
+    hb["kind"] = "presence";
+    hb["fw"] = FW_VERSION;
+    hb["roster_epoch"] = g_rosterEpoch;
+    hb["bonds"] = ozBondCount();
+    hb["mcu_link_up"] = mcuLinkUp();          // ozkey-20 §5a
+    hb["uptime_s"] = (uint32_t)(millis() / 1000);
+    String out;
+    serializeJson(hb, out);
+
+    // Same dual path as a real uplink (ozkey-19 R7) — unicast for the MAC
+    // ACK, ff03::1 because it needs no address.
+    if (g_haveDownlinkPeer)
+      ozThreadUdpSendOnce(out, (const uint8_t *)&g_lastDownlinkPeer.sin6_addr,
+                          "beacon unicast");
+    ozThreadUdpSendOnce(out, OZ_ALLNODES_BYTES, "beacon ff03::1");
+    Serial.printf("[BEACON] presence epoch=%lu bonds=%d mcu=%s\n",
+                  (unsigned long)g_rosterEpoch, ozBondCount(),
+                  mcuLinkUp() ? "up" : "down");
+  }
+
   // ── MQTT + enroll retry / unpaired announce (Wi-Fi transport only) ───────
   if (!isThread()) {
     if (provisioned) ensureMqtt();
@@ -4252,11 +4742,16 @@ void loop() {
       publishUnpairedAnnounce();
     }
 
-    // ── heartbeat (Wi-Fi/MQTT only — Thread has no uplink yet, ozkey-10 §5) ─
+    // ── heartbeat ────────────────────────────────────────────────────────
+    // The old comment here said "Wi-Fi/MQTT only — Thread has no uplink yet".
+    // That premise died when ozkey-17 U1 shipped the uplink, and the note
+    // outlived it by weeks — which is why Thread locks have NEVER reported
+    // liveness (ozkey-20 §2.1).
     if (mqtt.connected() && millis() - lastHeartbeat > cfgHeartbeatS * 1000UL) {
       lastHeartbeat = millis();
       publishHeartbeat();
     }
+
   }
 
   // ── door-status mirror auto-relock (matches LockSim's 5s) ────────────────
@@ -4313,7 +4808,32 @@ void loop() {
         forwardHexToMcu(payload);
       }
 
-      if (provisioned) openBleWindow("keypad touch"); // re-arms 60 s per tap
+      // ── BLE window: '#' ONLY, not any tap (operator, 2026-08-11) ───────
+      //
+      // WHY THIS PANEL IS NOT BENCH SCAFFOLDING — corrected after the operator
+      // pointed it out: this board is intended to work as a SELF-CONTAINED
+      // doorlock with no DL MCU and no LockSim attached. For that variant the
+      // LCD keypad is the product's real keypad, not a stand-in. So there are
+      // two legitimate pairing gestures, not one deprecated and one real:
+      //
+      //   • self-contained lock  -> '#' here
+      //   • lock with a DL MCU   -> the DL MCU's keypad -> DP 60 (ozkey-22 §7)
+      //
+      // WHY '#' AND NOT ANY TAP: any tap re-armed a 60 s advertising window,
+      // so a sleeve brushing the panel — or a user pressing digits for any
+      // reason at all — left the lock discoverable and connectable
+      // indefinitely. The window is a physical-presence CLAIM (XF-52 §4); it
+      // should cost a deliberate act, not an accident.
+      //
+      // '#' is free: '*' arms factory reset and '5' confirms it, and '#' reads
+      // as "enter/confirm" in the same idiom. The other keys still register as
+      // touches for assisted-unlock presence above — that is unchanged, and it
+      // SHOULD be any tap, because there the tap is proving a human is at the
+      // door, not requesting anything.
+      if (provisioned && k == '#') {
+        Serial.println("[BLE] '#' pressed — pairing window requested");
+        openBleWindow("keypad '#'");
+      }
 
       if (resetArm) {
         resetArm = false;

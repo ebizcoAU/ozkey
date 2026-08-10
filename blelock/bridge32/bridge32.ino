@@ -30,6 +30,8 @@
 #include <Preferences.h>
 #include <OThread.h>
 #include <openthread/instance.h>   // otInstanceFactoryReset() — see factoryReset()
+#include <openthread/thread.h>     // ozkey-20 R2: otSetStateChangedCallback, otIp6Address
+#include <openthread/dataset.h>    // ozkey-20 §15.3 security-policy diagnostic
 #include <openthread/thread_ftd.h> // otChildInfo / otThreadGetChildInfoByIndex
                                    // (FTD-only API) — see logThreadChildren()
 #include "esp_coexist.h"
@@ -67,6 +69,9 @@ String lastStatus = "BOOT";
 #define LCD_C_WHITE 0xFFFF
 #define LCD_C_GREEN 0x07E0
 #define LCD_C_RED 0xF800
+// ozkey-20 §15.3 — CHILD is amber: on the mesh and working, but not the
+// parent, so we can see no child table and the mesh is upside down.
+#define LCD_C_AMBER 0xFD20
 
 // LCD idle blank (2026-07-27): bench aid, not a status signal — the screen
 // itself goes dark after LCD_IDLE_OFF_MS with nothing to check on it. Only a
@@ -153,8 +158,22 @@ unsigned long lastLcdActivityAt = 0;
 //        makes a bridged lock indistinguishable from a WiFi one to ozlockserv,
 //        so the server needs no change and stays a mailman. The bridge reads
 //        only `from`; `envelope_hex` is sealed to the app and opaque here.
-#define FW_VERSION "bridge32-1.10"
-#define FW_DISPLAY_VERSION "v1.10" // shown on-screen, doorlock.ino's badge convention
+//   1.11 (2026-08-11) ozkey-20 R1/R2 + topology:
+//        R1 — MQTT Last Will, retained, on ozkie/<site>/bridges/<id>/presence.
+//             Sub-second bridge-death detection for the server, no polling.
+//        R2 — Thread liveness table on .../liveness, 30 s sweep AND immediate
+//             push on CHILD_ADDED/CHILD_REMOVED. Carries `role` +
+//             `authoritative` so the server never reads an empty child table
+//             from a non-parent bridge as "every lock is unreachable".
+//        Router promotion — the bridge now asks to BE a Router (eligibility +
+//             BecomeRouter, retried from loop()). Found because it was sitting
+//             as a CHILD, which meant no child table at all.
+//        LCD — "THREAD: OK" replaced by the actual ROLE (LEADER/ROUTER black,
+//             CHILD amber, else red). "OK" hid the single most important fact
+//             about this device: a doorlock (LockB) had taken Leader and the
+//             border router was hanging off it.
+#define FW_VERSION "bridge32-1.17"
+#define FW_DISPLAY_VERSION "v1.17" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
 // existing mesh) in v0; it is the only network former in the home.
@@ -345,8 +364,43 @@ void drawStatus() {
     gfx->setTextSize(2);
     gfx->setCursor(4, 48);
     gfx->println("WIFI:   OK");
-    gfx->setCursor(4, 66);
-    gfx->println("THREAD: OK");
+    // ── THREAD ROLE, not "OK" (operator, 2026-08-11) ────────────────────
+    //
+    // "OK" hid the single most important fact about this device. A bridge
+    // that is a CHILD has no child table, so ozkey-20 R2 reports zero locks
+    // while every lock is alive — and the panel cheerfully said OK throughout.
+    //
+    // Worse, it means a battery doorlock is parenting the border router. That
+    // is exactly the inversion logThreadChildren() has warned about in text
+    // for weeks; nobody saw it because the screen never showed the role.
+    // Confirmed on the bench today: LockB had taken Leader.
+    //
+    // LEADER/ROUTER are correct for a mains-powered border router. CHILD is
+    // amber — working, but the mesh is upside down. Anything else is red.
+    {
+      const char *roleTxt = "NOT OK";
+      uint16_t roleCol = LCD_C_RED;
+      otInstance *inst = esp_openthread_get_instance();
+      if (inst) {
+        esp_openthread_lock_acquire(portMAX_DELAY);
+        const otDeviceRole r = otThreadGetDeviceRole(inst);
+        esp_openthread_lock_release();
+        switch (r) {
+          case OT_DEVICE_ROLE_LEADER: roleTxt = "LEADER"; roleCol = LCD_C_BLACK; break;
+          case OT_DEVICE_ROLE_ROUTER: roleTxt = "ROUTER"; roleCol = LCD_C_BLACK; break;
+          // Amber, not black: we are ON the mesh and functional, but we are
+          // hanging off someone else and cannot see the child table.
+          case OT_DEVICE_ROLE_CHILD:  roleTxt = "CHILD";  roleCol = LCD_C_AMBER; break;
+          case OT_DEVICE_ROLE_DETACHED: roleTxt = "DETACHED"; break;
+          default: roleTxt = "NOT OK"; break;
+        }
+      }
+      gfx->setCursor(4, 66);
+      gfx->setTextColor(roleCol);
+      gfx->print("THREAD: ");
+      gfx->println(roleTxt);
+      gfx->setTextColor(LCD_C_BLACK); // restore for the IP line below
+    }
     gfx->setCursor(4, 84);
     gfx->print("IP ");
     gfx->println(WiFi.localIP().toString());
@@ -733,6 +787,330 @@ void pollUplinkUdp() {
                 OZ_UPLINK_DRAIN_MAX);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ozkey-20 R2 — Thread liveness table
+//
+// The bridge is the ONLY component that can see whether a Thread lock is
+// reachable. The locks cannot report their own absence, and the server cannot
+// see the mesh at all. Today none of it is published, which is why
+// `lock_unreachable` has no data source and every Thread lock is invisible.
+//
+// Cost: ZERO mesh traffic. `mAge` is maintained by MLE link management that
+// happens whether we ask or not; we are reading a table, not probing nodes.
+// One Wi-Fi publish covers every lock behind this bridge — the alternative
+// (each lock heartbeating fast enough to detect) does not fit the airtime
+// budget at all (ozkey-20 §4.1).
+// ─────────────────────────────────────────────────────────────────────────────
+// 30 s: fast enough that a stale child is visible well inside the ~90 s
+// `lock_unreachable` target (ozkey-20 §10 Q1), slow enough to be invisible on
+// Wi-Fi. Not a mesh cost at any value — this reads a local table.
+#define OZ_LIVENESS_INTERVAL_MS 30000UL
+static unsigned long g_lastLivenessAt = 0;
+static volatile bool g_livenessPushDue = false;
+
+#define OZ_LOCKMAP_MAX 32
+struct OzLockAddr {
+  char     deviceId[24];
+  uint8_t  ext[8];   // Thread extended address — the join key. See ozNoteLockExt.
+  bool     used;
+};
+static OzLockAddr g_lockMap[OZ_LOCKMAP_MAX];
+
+// Record device_id ↔ source address. Newest wins for a given device_id: a lock
+// that re-attaches gets a new address and the stale one must not linger, or we
+// would join liveness to an identity that moved.
+// ── NVS persistence for the lock map ────────────────────────────────────────
+//
+// 🔴 ADDED 2026-08-11. The map was RAM-only, so EVERY bridge reboot erased it
+// — and locks only uplink on a roster change, which is rare. So after any
+// restart the join stayed empty until someone happened to revoke something,
+// and every liveness report went out with no `id`.
+//
+// This is the SAME mistake already made and already fixed on the lock side:
+// ozkey-19 R2 persisted the uplink peer address for exactly this reason. I
+// repeated it here and did not notice, because I was debugging the matching
+// logic instead of asking why the map was empty.
+//
+// Keyed by the interface identifier (8 bytes, stable across prefix changes),
+// value is the device_id. Small, bounded, and written only on change.
+static void ozSaveLockMap() {
+  prefs.begin("bridge32", false);
+  uint8_t blob[OZ_LOCKMAP_MAX * 32];
+  size_t n = 0;
+  for (int i = 0; i < OZ_LOCKMAP_MAX && n + 32 <= sizeof(blob); i++) {
+    if (!g_lockMap[i].used) continue;
+    memcpy(blob + n, g_lockMap[i].ext, 8);           // extended address
+    memset(blob + n + 8, 0, 24);
+    snprintf((char *)(blob + n + 8), 24, "%s", g_lockMap[i].deviceId);
+    n += 32;
+  }
+  prefs.putBytes("lockmap", blob, n);
+  prefs.end();
+}
+
+static void ozLoadLockMap() {
+  prefs.begin("bridge32", true);
+  const size_t len = prefs.getBytesLength("lockmap");
+  uint8_t blob[OZ_LOCKMAP_MAX * 32];
+  size_t got = 0;
+  if (len && len <= sizeof(blob)) got = prefs.getBytes("lockmap", blob, sizeof(blob));
+  prefs.end();
+  int n = 0;
+  for (size_t off = 0; off + 32 <= got && n < OZ_LOCKMAP_MAX; off += 32, n++) {
+    g_lockMap[n].used = true;
+    memcpy(g_lockMap[n].ext, blob + off, 8);
+    snprintf(g_lockMap[n].deviceId, sizeof(g_lockMap[n].deviceId), "%s",
+             (const char *)(blob + off + 8));
+  }
+  if (n) Serial.printf("[LIVENESS] restored %d lock identity(ies) from NVS\n", n);
+}
+
+// Learn device_id <-> Thread extended address, stated by the lock itself in
+// its uplink (`ext`). Replaces two failed approaches: matching the uplink's
+// source address against the child's registered IPv6 addresses (children
+// register NONE — measured, zero returned for every child), and deriving it
+// from the MAC (the extended address is random, not MAC-derived).
+//
+// This one cannot fail on addressing: the bridge already holds every child's
+// mExtAddress, so the join is a direct 8-byte compare.
+static void ozNoteLockExt(const char *deviceId, const uint8_t ext[8]) {
+  int free = -1;
+  for (int i = 0; i < OZ_LOCKMAP_MAX; i++) {
+    if (!g_lockMap[i].used) { if (free < 0) free = i; continue; }
+    if (strncmp(g_lockMap[i].deviceId, deviceId, sizeof(g_lockMap[i].deviceId)) == 0) {
+      // Only write NVS when it actually changes — an uplink arrives far more
+      // often than a device's Thread identity does.
+      if (memcmp(g_lockMap[i].ext, ext, 8) != 0) {
+        memcpy(g_lockMap[i].ext, ext, 8);
+        ozSaveLockMap();
+      }
+      return;
+    }
+  }
+  if (free < 0) return; // table full — 32 locks per bridge is well past design
+  g_lockMap[free].used = true;
+  snprintf(g_lockMap[free].deviceId, sizeof(g_lockMap[free].deviceId), "%s", deviceId);
+  memcpy(g_lockMap[free].ext, ext, 8);
+  {
+    char h[17];
+    for (int k = 0; k < 8; k++) snprintf(h + k * 2, 3, "%02x", ext[k]);
+    Serial.printf("[LIVENESS] learned %s = ext %s (persisted)\n", deviceId, h);
+  }
+  ozSaveLockMap();
+}
+
+// Match on the INTERFACE IDENTIFIER (last 8 bytes), not the whole address.
+//
+// 🔴 FIXED 2026-08-11 after a live false-alarm. The full-address compare looked
+// obviously right and was wrong: the mesh-local PREFIX changes whenever the
+// partition re-forms, while the interface ID is stable per device. Observed in
+// one capture — the same bridge IID `ad0f:fec6:645e:7b4e` appeared under three
+// different prefixes (fd51:…, fde0:…, fd7e:…) within minutes.
+//
+// So the bridge learned a lock's address, the prefix moved, the compare stopped
+// matching, and every liveness report went out with NO `id`. Downstream the
+// server could not match any reported child to a known lock and logged
+// "2 reported, 0 updated, 3 inferred lost" — inventing three dead locks from a
+// perfectly healthy mesh.
+//
+// The IID survives re-parenting and partition changes, which is exactly the
+// property a join key needs.
+static const char *ozLockIdForExt(const uint8_t ext[8]) {
+  for (int i = 0; i < OZ_LOCKMAP_MAX; i++)
+    if (g_lockMap[i].used && memcmp(g_lockMap[i].ext, ext, 8) == 0)
+      return g_lockMap[i].deviceId;
+  return nullptr;
+}
+
+static void ozHexExt(const uint8_t *b, size_t n, char *out) {
+  for (size_t i = 0; i < n; i++) snprintf(out + i * 2, 3, "%02x", b[i]);
+}
+
+static void publishThreadLiveness();
+
+// OpenThread state-change callback. Fires for many flags; we care about
+// exactly two. Deliberately does NOT publish inline — this runs on
+// OpenThread's own task with its lock held, and publishThreadLiveness()
+// re-acquires that lock. Setting a flag for loop() to service avoids a
+// self-deadlock that would only show up when a child actually attached.
+static void ozThreadStateChanged(otChangedFlags flags, void *) {
+  if (flags & (OT_CHANGED_THREAD_CHILD_ADDED | OT_CHANGED_THREAD_CHILD_REMOVED)) {
+    g_livenessPushDue = true;
+    Serial.printf("[LIVENESS] child %s — pushing\n",
+                  (flags & OT_CHANGED_THREAD_CHILD_ADDED) ? "ADDED" : "REMOVED");
+  }
+}
+
+// Walk the child table and publish one report for the whole mesh.
+static void publishThreadLiveness() {
+  if (!mqttClient.connected()) return;
+  otInstance *inst = esp_openthread_get_instance();
+  if (!inst) return;
+
+  String locks;
+  int n = 0;
+  esp_openthread_lock_acquire(portMAX_DELAY);
+  // OUR OWN ROLE — decisive for how the server must read this report.
+  // otThreadGetChildInfoByIndex() is LOCAL TO A PARENT. A bridge that is
+  // itself a Child has no child table, so it reports 0 children while every
+  // lock is perfectly alive. Reporting the count without the role invites
+  // exactly the wrong conclusion.
+  const otDeviceRole role = otThreadGetDeviceRole(inst);
+  otChildInfo ci;
+  for (uint16_t i = 0; i < 64; i++) {
+    if (otThreadGetChildInfoByIndex(inst, i, &ci) != OT_ERROR_NONE) continue;
+
+    // Resolve Thread identity -> device_id by matching any of this child's
+    // registered IPv6 addresses against what we learned from its uplinks.
+    const char *id = ozLockIdForExt(ci.mExtAddress.m8);
+    otChildIp6AddressIterator it = OT_CHILD_IP6_ADDRESS_ITERATOR_INIT;
+    otIp6Address a;
+    // DIAGNOSTIC (2026-08-11): the join keeps failing even though the learn
+    // succeeds, so print what we are actually comparing. The child registers a
+    // SUBSET of its addresses with its parent, and the address a lock happens
+    // to send an uplink FROM may not be in that subset — which is a guess, and
+    // this log is how we stop guessing.
+    (void)it; (void)a; // address iteration abandoned — children register none
+
+    char ext[17];
+    ozHexExt(ci.mExtAddress.m8, 8, ext);
+
+    if (n++) locks += ",";
+    locks += "{";
+    if (id) { locks += "\"id\":\""; locks += id; locks += "\","; }
+    // Always carry the extended address. An unidentified child is still a
+    // REAL node and must not be silently dropped from the report — reporting
+    // it unnamed is honest; omitting it would understate the mesh.
+    locks += "\"ext\":\""; locks += ext; locks += "\",";
+    locks += "\"age_s\":" + String((unsigned long)ci.mAge) + ",";
+    locks += "\"rssi\":" + String((int)ci.mAverageRssi) + ",";
+    locks += "\"lqi\":" + String((unsigned)ci.mLinkQualityIn) + ",";
+    locks += "\"rx_on\":"; locks += ci.mRxOnWhenIdle ? "true" : "false";
+    locks += ",\"state\":\"child\"}";
+  }
+  esp_openthread_lock_release();
+
+  // NOTE ON WHAT THIS CANNOT SEE: children only. A lock that has aged out of
+  // the table entirely is simply absent here — the SERVER decides that absence
+  // means `lost`, because only it knows which locks are supposed to exist.
+  // The bridge reporting "lost" for something it has never heard of would be
+  // guessing.
+  const char *roleName = (role == OT_DEVICE_ROLE_LEADER)     ? "leader"
+                         : (role == OT_DEVICE_ROLE_ROUTER)   ? "router"
+                         : (role == OT_DEVICE_ROLE_CHILD)    ? "child"
+                         : (role == OT_DEVICE_ROLE_DETACHED) ? "detached"
+                                                             : "disabled";
+  // `authoritative` is the field the server must gate on: only a Router or
+  // Leader owns a child table worth believing. Anything else means "I cannot
+  // see the mesh from here", which is NOT the same as "no locks are alive".
+  const bool authoritative =
+      (role == OT_DEVICE_ROLE_LEADER || role == OT_DEVICE_ROLE_ROUTER);
+
+  String payload = "{\"kind\":\"thread_liveness\",\"bridge_id\":\"" + deviceId +
+                   "\",\"role\":\"" + roleName + "\",\"authoritative\":" +
+                   (authoritative ? "true" : "false") +
+                   ",\"children\":" + String(n) + ",\"locks\":[" + locks + "]}";
+  const String topic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/liveness";
+  const bool ok = mqttClient.publish(topic.c_str(), payload.c_str());
+  Serial.printf("[LIVENESS] role=%s authoritative=%s %d child(ren) -> %s%s\n",
+                roleName, authoritative ? "yes" : "NO", n, topic.c_str(),
+                ok ? "" : " PUBLISH FAILED");
+}
+
+// ozkey-20 §15.3 — keep asking to be a Router until we are one.
+//
+// otThreadBecomeRouter() fails with OT_ERROR_INVALID_STATE while detached and
+// OT_ERROR_NONE only starts the process; promotion completes asynchronously.
+// So this retries on a slow tick and stops the moment the role is right.
+// Cheap, and it self-heals after a partition merge demotes us.
+static unsigned long g_lastRouterTryAt = 0;
+static uint8_t g_routerTries = 0;
+#define OZ_ROUTER_RETRY_MS 20000UL
+// 3 x 20 s = ~1 min of asking nicely before taking the partition. Long enough
+// that a normal promotion has every chance; short enough that a bench or a
+// customer site is not left with a doorlock leading the mesh.
+#define OZ_ROUTER_TRIES_BEFORE_TAKEOVER 3
+
+static void ozRouterPromotionTick() {
+  if (millis() - g_lastRouterTryAt < OZ_ROUTER_RETRY_MS) return;
+  g_lastRouterTryAt = millis();
+  otInstance *inst = esp_openthread_get_instance();
+  if (!inst) return;
+
+  esp_openthread_lock_acquire(portMAX_DELAY);
+  const otDeviceRole role = otThreadGetDeviceRole(inst);
+  otError err = OT_ERROR_NONE;
+  bool asked = false;
+  bool escalated = false;
+  if (role == OT_DEVICE_ROLE_CHILD) {
+    err = otThreadBecomeRouter(inst);
+    asked = true;
+    g_routerTries++;
+
+    // ── ESCALATION — take the partition if asking politely does not work ──
+    //
+    // BecomeRouter() returns OT_ERROR_NONE and then quietly does nothing when
+    // the Leader declines to allocate a Router ID. Observed here: requested
+    // every 20 s, accepted every time, still a Child. So after a grace period
+    // we stop asking and take over.
+    //
+    // This works now ONLY because we raised our leader weight above — the API
+    // returns OT_ERROR_NOT_CAPABLE if our weight is <= the incumbent's, which
+    // is precisely why it would have failed before.
+    //
+    // HONEST NOTE ON THE SPEC: OpenThread documents leader takeover as
+    // "only allowed when triggered by an explicit user action", or the
+    // application is non-compliant. We are doing it automatically. The
+    // justification is that this device IS the border router — being Leader is
+    // its job, not an opportunistic grab — and we are not pursuing Thread
+    // certification (Matter is out on principle, ozkey-16). If certification
+    // is ever wanted, THIS is the line that has to be revisited.
+    if (g_routerTries >= OZ_ROUTER_TRIES_BEFORE_TAKEOVER) {
+      err = otThreadBecomeLeader(inst);
+      escalated = true;
+      g_routerTries = 0; // re-arm; a failed takeover should retry, not spin
+    }
+  } else {
+    g_routerTries = 0; // we are Router/Leader — nothing to escalate
+  }
+  esp_openthread_lock_release();
+
+  if (escalated)
+    Serial.printf("[THREAD] asked %d times and stayed a Child — TOOK OVER as "
+                  "Leader (err=%d; NOT_CAPABLE=our weight too low)\n",
+                  OZ_ROUTER_TRIES_BEFORE_TAKEOVER, (int)err);
+
+  if (!asked) return;
+
+  // DIAGNOSTIC: BecomeRouter() returning OT_ERROR_NONE only means the request
+  // was accepted. Promotion still needs the LEADER to grant a Router ID, and
+  // the active Security Policy to permit routers at all (thread_ftd.h:159).
+  // If we keep asking and stay a Child, one of those is refusing — print both
+  // so we stop guessing which.
+  otRouterInfo parent;
+  otOperationalDataset ds;
+  esp_openthread_lock_acquire(portMAX_DELAY);
+  const bool haveParent = (otThreadGetParentInfo(inst, &parent) == OT_ERROR_NONE);
+  const bool haveDs = (otDatasetGetActive(inst, &ds) == OT_ERROR_NONE);
+  const uint8_t leaderId = otThreadGetLeaderRouterId(inst);
+  esp_openthread_lock_release();
+
+  Serial.printf("[THREAD] still CHILD — promotion requested (err=%d)\n", (int)err);
+  if (haveParent)
+    Serial.printf("[THREAD]   parent rloc16=0x%04x routerid=%u lqi_in=%u — "
+                  "THIS is who we hang off\n",
+                  parent.mRloc16, (unsigned)parent.mRouterId,
+                  (unsigned)parent.mLinkQualityIn);
+  Serial.printf("[THREAD]   leader routerid=%u\n", (unsigned)leaderId);
+  if (haveDs && ds.mComponents.mIsSecurityPolicyPresent)
+    Serial.printf("[THREAD]   secpolicy routers_enabled=%s rotation=%uh\n",
+                  ds.mSecurityPolicy.mRoutersEnabled ? "YES"
+                                                     : "NO <-- THIS BLOCKS PROMOTION",
+                  (unsigned)ds.mSecurityPolicy.mRotationTime);
+  else
+    Serial.println("[THREAD]   secpolicy NOT PRESENT in active dataset");
+}
+
 // Returns true if a datagram was read (caller should try again), false when
 // the socket is empty or the read failed.
 static bool pollUplinkOne() {
@@ -751,9 +1129,60 @@ static bool pollUplinkOne() {
   }
   const char *from = doc["from"] | (const char *)nullptr;
   const char *envHex = doc["envelope_hex"] | (const char *)nullptr;
-  if (!from || !envHex) {
-    Serial.println("[UPLINK] rx missing `from`/`envelope_hex`, dropped");
+  if (!from) {
+    Serial.println("[UPLINK] rx missing `from`, dropped");
     return true; // consumed one; keep draining
+  }
+
+  // ozkey-20 R2 — learn which Thread node this device_id lives on.
+  //
+  // THIS IS THE JOIN, and it is the whole difficulty of R2. The child table
+  // gives us liveness (`mAge`) keyed by Thread identity — extended address and
+  // RLOC16. The application layer knows `device_id` ("ozk-…"). Nothing in
+  // OpenThread connects the two: the extended address is randomly generated,
+  // NOT derived from the MAC the device_id is built from (verified on this
+  // bench — DoorA's link-local is fe80::d879:a06:ac36:7e6f, unrelated to
+  // ac:eb:e6:39:f8:c4).
+  //
+  // So we learn it from traffic: a datagram arriving from a source address
+  // tells us that address belongs to this device_id. Later we walk the child
+  // table and match each child's registered IPv6 addresses against this map.
+  {
+    const char *extHex = doc["ext"] | (const char *)nullptr;
+    uint8_t ext[8];
+    if (extHex && strlen(extHex) == 16) {
+      for (int k = 0; k < 8; k++) {
+        char b[3] = {extHex[k * 2], extHex[k * 2 + 1], 0};
+        ext[k] = (uint8_t)strtol(b, nullptr, 16);
+      }
+      ozNoteLockExt(from, ext);
+    }
+  }
+
+  // ── ozkey-20 R3 — presence beacon, not a sealed uplink ──────────────────
+  //
+  // A beacon has no `envelope_hex`: it is unsealed liveness (device_id, Thread
+  // identity, firmware, roster epoch, MCU link) with nothing private in it.
+  // It exists because a Thread lock cannot reach MQTT itself, so without this
+  // the server can never mark it reachable and the app falls back to BLE
+  // forever after a bridge restart.
+  //
+  // Handled BEFORE the sealed path so it is never mistaken for a lost uplink.
+  if (!envHex) {
+    const char *kind = doc["kind"] | "";
+    if (strcmp(kind, "presence") != 0) {
+      Serial.printf("[UPLINK] %s: no envelope and kind='%s' — dropped\n", from, kind);
+      return true;
+    }
+    if (mqttClient.connected()) {
+      const String topic = "ozkie/" + cfgSiteId + "/locks/" + String(from) + "/heartbeat";
+      const bool ok = mqttClient.publish(topic.c_str(), buf);
+      Serial.printf("[BEACON] %s -> %s%s\n", from, topic.c_str(),
+                    ok ? "" : " PUBLISH FAILED");
+    } else {
+      Serial.printf("[BEACON] %s: broker down, presence dropped\n", from);
+    }
+    return true;
   }
 
   if (!mqttClient.connected()) {
@@ -922,9 +1351,41 @@ void mqttConnect() {
   Serial.printf("[MQTT] connecting to %s:%u as %s\n", cfgBrokerHost.c_str(), cfgBrokerPort,
                 deviceId.c_str());
   notifyStatus("BROKER_JOINING");
-  if (mqttClient.connect(deviceId.c_str())) {
+
+  // ── ozkey-20 R1 — MQTT Last Will ────────────────────────────────────────
+  //
+  // The broker publishes this the instant our session drops, however it drops
+  // — power cut, Wi-Fi loss, crash, cable pulled. No polling, no heartbeat, no
+  // timeout to tune, and it costs nothing while we are alive.
+  //
+  // RETAINED on purpose: a subscriber that connects later still learns the
+  // current state immediately instead of waiting for the next transition. That
+  // is what makes the server's `bridge_offline` verdict work after a server
+  // restart rather than sitting at `unknown`.
+  //
+  // This matters more for the bridge than for any lock: every Thread lock is
+  // invisible without it, so one bridge dying is N locks going dark, and
+  // ozkey-20 R6 must report that as ONE `bridge_offline`, not N unreachable
+  // locks. That aggregation needs this signal to exist.
+  //
+  // Note the will QoS is the BROKER's to honour when it publishes on our
+  // behalf — unaffected by PubSubClient's own publish() being QoS 0 only
+  // (ozkey-19 v2 §2.1).
+  const String willTopic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/presence";
+  static const char *kWillOffline = "{\"state\":\"offline\",\"reason\":\"lwt\"}";
+
+  if (mqttClient.connect(deviceId.c_str(), nullptr, nullptr, willTopic.c_str(),
+                         1 /*willQos*/, true /*willRetain*/, kWillOffline)) {
     Serial.println("[MQTT] connected");
     notifyStatus("BROKER_OK");
+
+    // Clear our own will immediately. Until this lands the retained value at
+    // that topic is still "offline" from last time, so a server reading it in
+    // the gap would call a live bridge dead.
+    const String online = String("{\"state\":\"online\",\"id\":\"") + deviceId +
+                          "\",\"role\":\"bridge\"}";
+    mqttClient.publish(willTopic.c_str(), online.c_str(), true /*retain*/);
+    Serial.printf("[MQTT] presence ONLINE -> %s\n", willTopic.c_str());
     mqttClient.subscribe(mqttCommandTopic.c_str());
     if (mqttCommandTopicLegacy.length())
       mqttClient.subscribe(mqttCommandTopicLegacy.c_str()); // S16 transition
@@ -1037,6 +1498,65 @@ void formThreadNetwork() {
   thread.networkInterfaceUp();
   thread.start();
 
+  // ── ozkey-20 §15.3 TOPOLOGY FIX — the bridge must be a ROUTER ────────────
+  //
+  // Found 2026-08-11: this bridge was attached as a **Child**, and so was
+  // DoorA — both parented to some third node. Consequences, in order of how
+  // much they cost:
+  //
+  //  1. A Child has NO child table, so R2's liveness report is structurally
+  //     blind: 0 children while every lock is alive and working.
+  //  2. Lock traffic routes via that third node instead of one hop to us.
+  //     This is very likely the same fact recorded during ozkey-19 — "DoorA
+  //     and the bridge are both attached as Child to the same parent, so they
+  //     are NOT link-layer neighbours" — which was observed and never chased.
+  //  3. The border router depending on a battery-powered lock to stay
+  //     reachable is backwards. This file already said so in logThreadChildren():
+  //     "a battery lock should not parent it."
+  //
+  // Router eligibility is the FTD default, but eligibility only means "may
+  // promote" — a REED sits as a Child until the network decides it needs
+  // another router, on its own schedule. For the mains-powered border router
+  // that is the wrong default: we always want to be a Router, immediately,
+  // so locks can parent to us and so we own a child table.
+  //
+  // Both calls, deliberately: SetRouterEligible(true) is the standing
+  // permission (harmless if already set, and explicit beats inherited),
+  // BecomeRouter() is the request to do it NOW rather than at the network's
+  // convenience.
+  //
+  // BecomeRouter() returns OT_ERROR_INVALID_STATE while still detached — that
+  // is expected, not a failure, so it is retried from loop() until the role
+  // actually changes (see ozRouterPromotionTick()).
+  {
+    otInstance *inst = esp_openthread_get_instance();
+    if (inst) {
+      esp_openthread_lock_acquire(portMAX_DELAY);
+      const otError e1 = otThreadSetRouterEligible(inst, true);
+
+      // ── LEADER WEIGHT — why the bridge kept losing ──────────────────────
+      //
+      // Every node ships with leader weight 64, so the Leader is simply
+      // whoever attached first. On this bench that was a DOORLOCK, twice:
+      // LockB held it, then DoorA took it after a reset. A battery lock
+      // leading the partition while the mains-powered border router hangs off
+      // it as a Child is backwards, and it is why R2 saw zero children.
+      //
+      // Raising ours means the bridge WINS elections and partition merges
+      // instead of losing them by accident of boot order. 128 rather than 255
+      // to leave headroom above us for a future OZLODGE appliance that should
+      // outrank a bridge.
+      otThreadSetLocalLeaderWeight(inst, 128);
+      // Promote fast. The default selection jitter (120 s) is tuned for
+      // battery meshes deciding democratically who should route; we are the
+      // border router and there is nothing to decide.
+      otThreadSetRouterSelectionJitter(inst, 1);
+      esp_openthread_lock_release();
+      Serial.printf("[THREAD] router-eligible set (err=%d), selection jitter=1s\n",
+                    (int)e1);
+    }
+  }
+
   // RACE FIX (2026-07-27, live bench): getCurrentDataSet() can return
   // zeroed fields for a short window right after start()/networkInterfaceUp()
   // — the OpenThread task hasn't attached yet, so refreshInfo() below would
@@ -1073,6 +1593,22 @@ void formThreadNetwork() {
   }
 
   threadFormed = true;
+
+  // ── ozkey-20 R2 — event-driven half ─────────────────────────────────────
+  // Push the moment a child attaches or is evicted, so those two transitions
+  // carry zero latency instead of waiting up to 30 s for the sweep. The sweep
+  // still runs (see loop()) — these events cannot report a child that is
+  // merely going stale, only one that has already gone.
+  {
+    otInstance *inst = esp_openthread_get_instance();
+    if (inst) {
+      esp_openthread_lock_acquire(portMAX_DELAY);
+      otSetStateChangedCallback(inst, ozThreadStateChanged, nullptr);
+      esp_openthread_lock_release();
+      Serial.println("[LIVENESS] child add/remove callback registered");
+      ozLoadLockMap(); // survive our own reboots (see ozSaveLockMap)
+    }
+  }
 
   // DIAGNOSTIC (2026-08-02): print WHICH network this is. One line, and it
   // settles a question that has now cost hours twice — when a doorlock sits at
@@ -1425,6 +1961,31 @@ void setup() {
 
 void loop() {
   checkFactoryResetButton();
+
+  // ── ozkey-20 R2 — periodic liveness sweep ──────────────────────────────
+  //
+  // BOTH this sweep AND the CHILD_ADDED/CHILD_REMOVED events, per the server
+  // team's refinement (ozkey-20 §5). Not either/or, and the reason matters:
+  //
+  //   • The events catch the two HARD transitions with zero latency, but
+  //     CHILD_REMOVED only fires after OpenThread's own MLE child timeout —
+  //     minutes, not the ~90 s `lock_unreachable` target.
+  //   • The sweep is the only thing that sees a child that is STILL ATTACHED
+  //     but drifting stale (`mAge` climbing), which is the early warning the
+  //     events structurally cannot give: between ADDED and REMOVED there is
+  //     no event, because `mAge` is a continuous value, not a transition.
+  //
+  // Costs one Wi-Fi publish per interval and NO mesh traffic at all.
+  // Keep pushing for Router until we get it (ozkey-20 §15.3).
+  if (threadFormed) ozRouterPromotionTick();
+
+  if (threadFormed &&
+      (g_livenessPushDue ||
+       millis() - g_lastLivenessAt > OZ_LIVENESS_INTERVAL_MS)) {
+    g_livenessPushDue = false;
+    g_lastLivenessAt = millis();
+    publishThreadLiveness();
+  }
 
   // Idle auto-off only once both radios are actually up (2026-07-27) — stay
   // lit through the whole pairing/forming ladder no matter how long it

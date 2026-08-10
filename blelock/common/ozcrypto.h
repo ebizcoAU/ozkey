@@ -112,17 +112,36 @@ static bool ozHmacSha256(const uint8_t *key, size_t keyLen, const uint8_t *msg,
 
 // Recompute a member-invite MAC under bond #0's pairing secret [s0]. The
 // canonical string + salt layout are frozen (ftpos member_invite.dart).
+// XF-87 — v1 AND v2. v2 appends the MEMBERSHIP expiry to the signed canonical
+// string, which is what lets the lock enforce "3 days then gone" itself instead
+// of trusting the member's own phone to stop working (ozkey-21).
+//
+//   v1: 1|device|issuer|role|label|nonce|expires
+//   v2: 2|device|issuer|role|label|nonce|expires|membershipExpires
+//
+// `membershipExpires` is rendered as literal 0 for "permanent", never omitted —
+// an empty slot in a canonical string is how canonicalisation bugs turn into
+// forgeries, and ftpos encode it the same way (member_invite.dart `?? 0`).
+//
+// The HKDF info stays "ozkey/invite-v1" at BOTH versions. It is a frozen crypto
+// constant, not a version marker and not a name — see XF-85 §2, which is the
+// exact trap of find-replacing `ozkey/` during the trademark rename. ftpos did
+// not rename theirs either; if these two strings ever diverge, every invite
+// fails to verify with no useful error.
 static bool ozInviteMac(const uint8_t *s0, size_t s0Len, const String &deviceId,
                         const String &issuerAppId, const String &roleWire,
                         const String &label, const String &nonceHex,
-                        uint32_t expires, uint8_t out[32]) {
+                        uint32_t expires, uint8_t out[32], int version = 1,
+                        uint32_t membershipExpires = 0) {
   String salt = deviceId + issuerAppId;
   uint8_t macKey[32];
   if (!ozHkdfSha256(s0, s0Len, (const uint8_t *)salt.c_str(), salt.length(),
                     (const uint8_t *)"ozkey/invite-v1", 15, macKey, 32))
     return false;
-  String canonical = "1|" + deviceId + "|" + issuerAppId + "|" + roleWire +
-                     "|" + label + "|" + nonceHex + "|" + String(expires);
+  String canonical = String(version) + "|" + deviceId + "|" + issuerAppId + "|" +
+                     roleWire + "|" + label + "|" + nonceHex + "|" +
+                     String(expires);
+  if (version >= 2) canonical += "|" + String(membershipExpires);
   return ozHmacSha256(macKey, 32, (const uint8_t *)canonical.c_str(),
                       canonical.length(), out);
 }

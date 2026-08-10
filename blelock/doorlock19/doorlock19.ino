@@ -179,8 +179,27 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 //        F8: sealed-envelope plaintext is OZKIE semantic JSON; the lock builds
 //        the Tuya frame locally at the MCU boundary. U0: per-bond outbound
 //        counter for lock->app sealing, in OZ_BOND_REC's spare bytes.
-#define FW_VERSION "doorlock-1.30"
-#define FW_DISPLAY_VERSION "V1.30" // shown on-screen: "OZLOCK V1.30 THREAD/WIFI"
+// 🔴 KEEP IN SYNC WITH doorlock/doorlock.ino — THIS FILE IS THE ONE THAT SHIPS
+//    ON THE BENCH BOARD.
+//
+// `make flash BOARD=19` builds THIS sketch (Makefile: SKETCH_19 := doorlock19).
+// BOARD=147 builds doorlock/doorlock.ino. The 1.15 note above says this board
+// "shares doorlock.ino's FW_VERSION" — it does NOT. Each sketch #defines its
+// own, and they have drifted before.
+//
+// 2026-08-10: bumped 1.30 -> 1.32 only after the operator saw V1.30 on the
+// panel of a board that had just been flashed with 1.32 code. The functional
+// changes were never missing — R1/R2/R4 (unicast uplink), R5 (roster_epoch)
+// and the MCU link dot all live in common/ozdoorlock_core.h, which both
+// sketches include — but the ON-SCREEN VERSION LIED, which is worse than a
+// missing feature: it makes the panel useless for telling what is running.
+//
+// This is the SECOND time this exact bug has shipped (see doorlock.ino:161,
+// "FW_DISPLAY_VERSION was stuck at V1.21 through the 1.22/1.23 bumps").
+// Editing one file's version string and flashing the other is the failure
+// mode. Change both, every time.
+#define FW_VERSION "doorlock-1.41"
+#define FW_DISPLAY_VERSION "V1.41" // shown on-screen: "OZLOCK V1.36 THREAD/WIFI"
 
 // Brief startup splash before the operational dashboard (operator request) —
 // shown once at boot, before WiFi/Thread/BLE bring-up starts, so there's

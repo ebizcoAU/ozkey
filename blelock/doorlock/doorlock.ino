@@ -184,8 +184,19 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //        bond revoke, pushed to every admin bond: the event whose absence
 //        produced XF-75/77/78, where a roster change was real but unobservable
 //        until someone next stood at the door.
-#define FW_VERSION "doorlock-1.30"
-#define FW_DISPLAY_VERSION "V1.30" // shown on-screen: "OZLOCK V1.30 THREAD/WIFI"
+// 1.31: ozkey-19 v2 R1/R2/R4 — the uplink burst is gone. One MAC-acknowledged
+//       unicast datagram replaces 9 mostly-multicast copies; the peer address
+//       persists in NVS so a reboot cannot demote the lock to unacknowledged
+//       multicast; ff03::4f5a dropped (dead in both directions, errno=125).
+// 1.32: ozkey-19 v2 R5 — roster_epoch. Monotonic, NVS-persisted, bumped in
+//       ozNotifyRosterChanged() (the single choke point for roster mutations),
+//       carried on roster_changed, the heartbeat, and query_roster responses.
+//       This is the CORRECTNESS mechanism: the push is a latency optimisation,
+//       the epoch is what lets an app notice a missed change with no push
+//       having succeeded.  NOT ON THE BENCH BOARD YET — DoorA runs 1.31, so
+//       R1 can be measured in isolation before R5 is added.
+#define FW_VERSION "doorlock-1.41"
+#define FW_DISPLAY_VERSION "V1.41" // shown on-screen: "OZLOCK V1.36 THREAD/WIFI"
 
 // This board shows no startup splash (never did, pre-refactor) — no-op so
 // the shared core's unconditional drawSplash() call is a well-defined hook.
