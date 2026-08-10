@@ -157,6 +157,21 @@ const CONFIG = {
   // ozkey-14.md was wrong. This is the real V1 finding.
   SUB_UPLINK: 'ozkie/lab/locks/+/uplink',
   SUB_UPLINK_LEGACY: 'ozkey/lab/locks/+/uplink',
+  // ozkey-20 R1 (LWT presence, not built by firmware yet): retained
+  // {"state":"online"|"offline","reason":"lwt"} on connect/disconnect, for
+  // both locks and bridges — spec names one topic shape,
+  // `{locks|bridges}/<id>/presence`, so two wildcard subs cover it.
+  SUB_PRESENCE_LOCKS: 'ozkie/lab/locks/+/presence',
+  SUB_PRESENCE_LOCKS_LEGACY: 'ozkey/lab/locks/+/presence',
+  SUB_PRESENCE_BRIDGES: 'ozkie/lab/bridges/+/presence',
+  SUB_PRESENCE_BRIDGES_LEGACY: 'ozkey/lab/bridges/+/presence',
+  // ozkey-20 R2 (bridge Thread-liveness table). Topic is firmware's actual
+  // shipped shape (§14.2, 2026-08-11): `bridges/<id>/liveness`, NOT
+  // `thread_liveness` — this server's own earlier proposal guessed wrong.
+  // Fixed after discovering, via live traffic, that the original name was
+  // never received at all.
+  SUB_THREAD_LIVENESS: 'ozkie/lab/bridges/+/liveness',
+  SUB_THREAD_LIVENESS_LEGACY: 'ozkey/lab/bridges/+/liveness',
   topicCommand: (site, deviceId) => `ozkie/${site}/locks/${deviceId}/command`,
   // A Thread lock has no MQTT client of its own — bridge32 is its gateway and
   // subscribes to its OWN topic (blelock/bridge32/bridge32.ino:489), then
@@ -379,6 +394,80 @@ async function initDatabase() {
   );
   if (!hasTransport)
     await pool.query('ALTER TABLE locks ADD COLUMN transport VARCHAR(16) NULL AFTER power_profile');
+
+  // ozkey-20 R5 (liveness/health/fault-attribution, 2026-08-10): observed
+  // state, replacing the likelyOnline() inference. `presence`/
+  // `presence_reason`/`presence_at` are R6's fault-attribution OUTPUT
+  // (computeFaultAttribution() below writes them), not a raw signal —
+  // `presence_reason` holds one of the R6 table's verdict strings
+  // (bridge_offline, lock_unreachable, battery_low, ...). Inputs feeding it
+  // (R1 presence topics, R2 thread_liveness, R4 heartbeat health fields)
+  // don't fully exist on the wire yet — this is the receiving side built
+  // ahead of the sender, same pattern as SUB_UPLINK before V1 shipped, so
+  // it lights up with zero further server change once firmware catches up.
+  const [[{ hasPresence }]] = await pool.query(
+    `SELECT COUNT(*) AS hasPresence FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'presence'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasPresence)
+    await pool.query(`
+      ALTER TABLE locks
+        ADD COLUMN presence         ENUM('online','offline','unknown') NOT NULL DEFAULT 'unknown',
+        ADD COLUMN presence_reason  VARCHAR(32) NULL,
+        ADD COLUMN presence_at      DATETIME NULL,
+        ADD COLUMN battery_pct      TINYINT NULL,
+        ADD COLUMN pending_uplinks  SMALLINT NOT NULL DEFAULT 0,
+        ADD COLUMN roster_epoch     INT UNSIGNED NOT NULL DEFAULT 0
+    `);
+
+  // last_mech_result/last_mech_at and thread_age_s are NOT in ozkey-20's own
+  // R5 schema block, even though R6's attribution table references
+  // last_mech_result and a threshold on age_s — a real gap between R5 and R6
+  // as specified. Filling it rather than silently working around it:
+  // last_mech_result/at store R4's heartbeat field once it exists;
+  // thread_age_s stores the most recent per-lock age_s from an R2
+  // thread_liveness report, kept for observability — it's what actually lets
+  // §10 Q1's threshold be tuned from real data instead of guessed.
+  // Guarded separately from the block above: an earlier restart could have
+  // already added `presence` before this block existed, which would leave
+  // this guard permanently false if it shared the `hasPresence` flag.
+  const [[{ hasMechResult }]] = await pool.query(
+    `SELECT COUNT(*) AS hasMechResult FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'last_mech_result'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasMechResult)
+    await pool.query(`
+      ALTER TABLE locks
+        ADD COLUMN last_mech_result VARCHAR(16) NULL,
+        ADD COLUMN last_mech_at     DATETIME NULL,
+        ADD COLUMN thread_age_s     SMALLINT NULL
+    `);
+
+  // ozkey-20 §5a (added 2026-08-11 on firmware review) — the DL MCU link was
+  // missing from the whole model. mcu_link_up is the R6 verdict input
+  // (mcu_link_down ranks above battery_low); mcu_last_frame_s is kept for
+  // observability only, same role thread_age_s plays for R2. Own guard, same
+  // reason as hasMechResult above — do not fold into an existing flag.
+  const [[{ hasMcuLink }]] = await pool.query(
+    `SELECT COUNT(*) AS hasMcuLink FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'mcu_link_up'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasMcuLink)
+    await pool.query(`
+      ALTER TABLE locks
+        ADD COLUMN mcu_link_up      TINYINT(1) NULL,
+        ADD COLUMN mcu_last_frame_s SMALLINT NULL
+    `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bridges_presence (
+      bridge_id   VARCHAR(64) PRIMARY KEY,
+      presence    ENUM('online','offline','unknown') NOT NULL DEFAULT 'unknown',
+      presence_at DATETIME NULL
+    ) ENGINE=InnoDB`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS enroll_tokens (
@@ -686,6 +775,243 @@ async function logUplinkMetadata(fromDeviceId, payloadBuf, payloadStr) {
   await recordAudit(to, fromDeviceId, 'uplink', `size=${size}B`);
 }
 
+/* ---------------------------------------------------------------------------
+ * ozkey-20 R5/R6 — observed presence + fault attribution
+ *
+ * Built ahead of firmware's R1/R2/R4 (LWT, bridge liveness table, health
+ * payload) — none of those exist on the wire yet, same position SUB_UPLINK
+ * was in before V1 shipped. The receiving/attribution logic is complete and
+ * live-testable with synthetic MQTT publishes now; it starts producing real
+ * verdicts with zero further server change the moment firmware catches up.
+ * ------------------------------------------------------------------------- */
+
+// ozkey-20 §10 Q1: provisional, NOT derived from measured mAge behavior —
+// R2 doesn't exist on the wire yet, so there is nothing to measure against.
+// 3x this doc's own assumed 30s R2 poll interval, so one missed report
+// doesn't false-positive. Revisit once real thread_liveness data exists.
+const THREAD_UNREACHABLE_AGE_S = 90;
+// Sentinel for thread_liveness `"state":"lost"` (aged out of the table
+// entirely) — treated as "even less reachable than the threshold" without
+// a second column, since both cases produce the identical R6 verdict.
+const THREAD_AGE_LOST_SENTINEL = 32767; // SMALLINT max — thread_age_s is a SMALLINT column
+const BATTERY_LOW_PCT = 15; // ozkey-20 R6 table's own figure, not derived here.
+
+/** ozkey-20 R6, evaluated exactly as the doc's table specifies — top-down,
+ * first match wins. `bridgePresence` is looked up by the caller so this
+ * function stays a pure function of its inputs (easy to unit-test/verify
+ * with synthetic rows, matching this session's "verify, don't assume"
+ * discipline). Q2 (flap damping) is NOT implemented here — server-side
+ * hysteresis is agreed (ozkey-20 reply) but is a separate, later addition;
+ * this is the bare attribution logic the doc calls "the deliverable".
+ */
+function computeFaultAttribution(lock, bridgePresence) {
+  const isThread = !!lock.bridge_id;
+
+  if (isThread) {
+    if (bridgePresence === 'offline') return 'bridge_offline';
+    if (lock.thread_age_s != null && lock.thread_age_s > THREAD_UNREACHABLE_AGE_S)
+      return 'lock_unreachable';
+  } else {
+    if (lock.presence === 'offline') return 'lock_offline_wifi';
+  }
+
+  // "either" rows — only reached once the lock is confirmed reachable over
+  // its own transport (the checks above). mcu_link_down sits above
+  // battery_low deliberately (ozkey-20 §5a, added 2026-08-11 on firmware
+  // review): a dead DL MCU link is total loss of function — no remote, no
+  // PIN, no card, no fingerprint — where a low battery is still a working
+  // lock. `=== 0` (not falsy) so a never-reported NULL doesn't trigger it.
+  if (lock.mcu_link_up === 0) return 'mcu_link_down';
+  if (lock.battery_pct != null && lock.battery_pct < BATTERY_LOW_PCT) return 'battery_low';
+  if (lock.last_mech_result && lock.last_mech_result !== 'ok') return 'mech_fault';
+  if (lock.pending_uplinks > 0) return 'pending_sync';
+  return 'ok';
+}
+
+/** Re-derives `presence`/`presence_reason` for one lock from whatever raw
+ * inputs are currently in its row + its bridge's row, and writes both.
+ * Called after any event that could change the verdict (presence,
+ * thread_liveness, heartbeat). `presence` (the simple online/offline/
+ * unknown the app can branch on for "should I fall back to BLE") is
+ * derived from the R6 reason, not a separate signal, for Thread locks —
+ * they never get their own LWT (no MQTT session of their own), so their
+ * only reachability evidence IS the bridge's report.
+ */
+async function recomputeAndStorePresence(deviceId) {
+  const [[lock]] = await pool.query('SELECT * FROM locks WHERE id = ?', [deviceId]);
+  if (!lock) return;
+
+  let bridgePresence = 'unknown';
+  if (lock.bridge_id) {
+    const [[bp]] = await pool.query('SELECT presence FROM bridges_presence WHERE bridge_id = ?', [
+      lock.bridge_id,
+    ]);
+    bridgePresence = bp ? bp.presence : 'unknown';
+  }
+
+  const reason = computeFaultAttribution(lock, bridgePresence);
+  const unreachable = reason === 'bridge_offline' || reason === 'lock_unreachable' || reason === 'lock_offline_wifi';
+  // Wi-Fi locks already had a direct presence signal (LWT) written before
+  // this runs; only *derive* presence from the reason for the Thread case,
+  // where there is no such direct signal to preserve.
+  const presence = lock.bridge_id
+    ? unreachable
+      ? 'offline'
+      : lock.thread_age_s != null
+        ? 'online'
+        : 'unknown'
+    : lock.presence;
+
+  await pool.query('UPDATE locks SET presence = ?, presence_reason = ?, presence_at = NOW() WHERE id = ?', [
+    presence,
+    reason,
+    deviceId,
+  ]);
+  return { presence, reason };
+}
+
+/** ozkey-20 R1: retained LWT on the lock's own presence topic (Wi-Fi-direct
+ * locks only — a Thread lock has no MQTT session to set a Will on).
+ * Payload: {"state":"online"|"offline","reason":"lwt"}. */
+async function handleLockPresence(deviceId, payload) {
+  let obj;
+  try {
+    obj = JSON.parse(payload);
+  } catch (_) {
+    logEvent('warn', `Non-JSON payload on locks/${deviceId}/presence: "${payload.slice(0, 60)}"`);
+    return;
+  }
+  const state = obj.state === 'online' || obj.state === 'offline' ? obj.state : 'unknown';
+  await pool.query('UPDATE locks SET presence = ? WHERE id = ?', [state, deviceId]);
+  const result = await recomputeAndStorePresence(deviceId);
+  if (result)
+    logEvent(
+      'info',
+      `Presence: lock ${deviceId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}, verdict=${result.reason}`
+    );
+}
+
+/** ozkey-20 R1, bridge half. Same payload shape, `bridges_presence` instead
+ * of `locks`. A bridge going offline is the aggregation trigger (R6
+ * "mandatory") — every Thread lock behind it gets re-verdicted in one pass
+ * rather than waiting for each lock's own next signal. */
+async function handleBridgePresence(bridgeId, payload) {
+  let obj;
+  try {
+    obj = JSON.parse(payload);
+  } catch (_) {
+    logEvent('warn', `Non-JSON payload on bridges/${bridgeId}/presence: "${payload.slice(0, 60)}"`);
+    return;
+  }
+  const state = obj.state === 'online' || obj.state === 'offline' ? obj.state : 'unknown';
+  await pool.query(
+    `INSERT INTO bridges_presence (bridge_id, presence, presence_at) VALUES (?, ?, NOW())
+     ON DUPLICATE KEY UPDATE presence = VALUES(presence), presence_at = VALUES(presence_at)`,
+    [bridgeId, state]
+  );
+  logEvent('info', `Presence: bridge ${bridgeId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}`);
+
+  // Aggregation: re-verdict every lock behind this bridge in one pass, so
+  // "bridge offline" produces one log line here and N correct per-lock
+  // verdicts, not N separate discoveries on each lock's own next report.
+  const [locks] = await pool.query('SELECT id FROM locks WHERE bridge_id = ?', [bridgeId]);
+  for (const { id } of locks) await recomputeAndStorePresence(id);
+  if (locks.length)
+    logEvent('info', `Presence: re-verdicted ${locks.length} lock(s) behind bridge ${bridgeId}`);
+}
+
+/** ozkey-20 R2. Real payload per §14.2/§15.3 (2026-08-11, firmware —
+ * differs from §3's original example in three ways firmware flagged, §14.3):
+ * {"kind":"thread_liveness","bridge_id":...,"role":...,"authoritative":bool,
+ *  "children":n,"locks":[{"id"?,"ext","age_s","rssi","lqi","rx_on","state":"child"}]}
+ * One Wi-Fi message covers every lock behind the bridge — that's the whole
+ * point (§3's table: 255 mesh messages avoided, 1 Wi-Fi message instead).
+ */
+async function handleThreadLiveness(bridgeId, payload) {
+  let obj;
+  try {
+    obj = JSON.parse(payload);
+  } catch (_) {
+    logEvent('warn', `Non-JSON payload on bridges/${bridgeId}/liveness: "${payload.slice(0, 60)}"`);
+    return;
+  }
+
+  // §15.3 (2026-08-11, firmware's live finding): the bridge can be a Thread
+  // Child, not a Router/Leader — in which case its child table is
+  // structurally empty regardless of mesh health, because a Child node has
+  // no child table at all. `authoritative` is the gate. Deriving
+  // `lock_unreachable` from a non-authoritative report would have marked
+  // every lock behind this bridge unreachable on a bridge working
+  // perfectly — exactly what firmware's first live report would have
+  // caused without this check. Non-authoritative says nothing about any
+  // lock; leave every prior verdict untouched, per their explicit
+  // instruction (§15.4 point 2).
+  if (obj.authoritative !== true) {
+    logEvent(
+      'info',
+      `Thread liveness from bridge ${bridgeId}: role=${obj.role || 'unknown'}, NOT authoritative — ignored, no verdict changed (§15.3)`
+    );
+    return;
+  }
+
+  // §14.3 point 1: there is no "lost" state on the wire — a lock that aged
+  // out is simply absent from the array. `state` is always "child" for
+  // whatever IS present, so it carries no information here.
+  const reported = Array.isArray(obj.locks) ? obj.locks : [];
+  const reportedIds = new Set();
+  let updated = 0;
+  let unidentified = 0;
+  for (const entry of reported) {
+    if (!entry) continue;
+    // §14.3 point 3: `id` is absent until the lock has sent its first
+    // uplink (the bridge only learns device_id↔extended-address from
+    // traffic it has seen) — or, per firmware's live finding 2026-08-11,
+    // until the bridge's learned map survives a restart at all (it's
+    // RAM-only today, wiped on every flash/reboot). Either way this entry
+    // is a real, present node the bridge just can't name yet.
+    if (typeof entry.id !== 'string') {
+      unidentified++;
+      continue;
+    }
+    reportedIds.add(entry.id);
+    const ageS = Number(entry.age_s);
+    if (!Number.isFinite(ageS)) continue;
+    await pool.query('UPDATE locks SET thread_age_s = ? WHERE id = ?', [ageS, entry.id]);
+    await recomputeAndStorePresence(entry.id);
+    updated++;
+  }
+
+  // 🔴 Bug found live 2026-08-11 (firmware's report): an unidentified entry
+  // was being silently dropped from `reportedIds`, so a lock that was
+  // actually present but not-yet-named looked identical to a lock that was
+  // genuinely absent — every expected lock got marked lost the moment the
+  // bridge's join map was empty, which is exactly the false alarm
+  // `authoritative` was built to prevent, just tripped by a different gap
+  // in the same payload. Absence is only a safe inference when the server
+  // can see EVERY reported entry's identity — if any entry is unidentified,
+  // it could be any one of the "missing" locks, so skip the whole
+  // inference rather than guess. Prior verdicts are left untouched, same
+  // discipline as the non-authoritative case above.
+  const [expected] = await pool.query('SELECT id FROM locks WHERE bridge_id = ?', [bridgeId]);
+  let lost = 0;
+  if (unidentified === 0) {
+    for (const { id } of expected) {
+      if (reportedIds.has(id)) continue;
+      await pool.query('UPDATE locks SET thread_age_s = ? WHERE id = ?', [THREAD_AGE_LOST_SENTINEL, id]);
+      await recomputeAndStorePresence(id);
+      lost++;
+    }
+  }
+
+  logEvent(
+    'info',
+    `Thread liveness from bridge ${bridgeId}: ${reported.length} reported (${unidentified} unidentified), ${updated} updated, ` +
+      (unidentified === 0
+        ? `${lost} inferred lost (absent from an authoritative, fully-identified report)`
+        : `absence-inference SKIPPED — unidentified entries present, cannot safely tell which lock they are`)
+  );
+}
+
 function initMqtt() {
   mqttClient = mqtt.connect(CONFIG.MQTT_URL, {
     clientId: `ozlockserv-${Math.random().toString(16).slice(2, 8)}`,
@@ -711,6 +1037,12 @@ function initMqtt() {
         CONFIG.SUB_MEMBER_ACK_REMOVE_LEGACY,
         CONFIG.SUB_UPLINK,
         CONFIG.SUB_UPLINK_LEGACY,
+        CONFIG.SUB_PRESENCE_LOCKS,
+        CONFIG.SUB_PRESENCE_LOCKS_LEGACY,
+        CONFIG.SUB_PRESENCE_BRIDGES,
+        CONFIG.SUB_PRESENCE_BRIDGES_LEGACY,
+        CONFIG.SUB_THREAD_LIVENESS,
+        CONFIG.SUB_THREAD_LIVENESS_LEGACY,
       ],
       { qos: 1 },
       (err) => {
@@ -720,7 +1052,9 @@ function initMqtt() {
             'info',
             `Subscribed: ${CONFIG.SUB_ENROLL} + ${CONFIG.SUB_HEARTBEAT} + ` +
               `${CONFIG.SUB_MEMBER_REQUEST_REMOVE} + ${CONFIG.SUB_MEMBER_ACK_REMOVE} + ` +
-              `${CONFIG.SUB_UPLINK} (+ legacy ozkey/ roots during S16 migration)` +
+              `${CONFIG.SUB_UPLINK} + ${CONFIG.SUB_PRESENCE_LOCKS} + ` +
+              `${CONFIG.SUB_PRESENCE_BRIDGES} + ${CONFIG.SUB_THREAD_LIVENESS}` +
+              ' (+ legacy ozkey/ roots during S16 migration)' +
               ' (door-event topic deliberately NOT subscribed — see header)'
           );
       }
@@ -753,7 +1087,29 @@ function initMqtt() {
         // metadata, recorded to audit_log for OZPMS/OZLODGE compliance,
         // exactly like grant/revoke/unlock already are.
         const um = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/locks\/([^/]+)\/uplink$/);
-        if (um) await logUplinkMetadata(um[2], payloadBuf, payload);
+        if (um) {
+          await logUplinkMetadata(um[2], payloadBuf, payload);
+          return;
+        }
+        // ozkey-20 R1: retained LWT presence, lock or bridge. Pure metadata
+        // (operational, per §6a's own class table) — updates `presence`
+        // directly, no content to protect.
+        const plm = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/locks\/([^/]+)\/presence$/);
+        if (plm) {
+          await handleLockPresence(plm[2], payload);
+          return;
+        }
+        const pbm = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/bridges\/([^/]+)\/presence$/);
+        if (pbm) {
+          await handleBridgePresence(pbm[2], payload);
+          return;
+        }
+        // ozkey-20 R2: bridge's aggregated Thread liveness table.
+        const tlm = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/bridges\/([^/]+)\/liveness$/);
+        if (tlm) {
+          await handleThreadLiveness(tlm[2], payload);
+          return;
+        }
         return;
       }
       const [, siteId, topicDeviceId, kind] = m;
@@ -791,15 +1147,50 @@ function initMqtt() {
         // device speaks. A frozen value answers that question wrongly and with
         // total confidence.
         const fw = typeof obj.fw === 'string' && obj.fw.length <= 50 ? obj.fw : null;
+        // ozkey-20 R4 (health payload) — read opportunistically. Firmware
+        // doesn't send battery_pct/pending_uplinks/last_mech_result yet
+        // (only roster_epoch exists on the wire so far, per a live check
+        // against ozdoorlock_core.h 2026-08-10) — COALESCE means an absent
+        // field leaves the column untouched rather than clobbering it to
+        // NULL/0, same discipline as fw/transport/caps above.
+        const batteryPct = Number.isFinite(obj.battery_pct) ? Math.max(0, Math.min(100, obj.battery_pct)) : null;
+        const pendingUplinks = Number.isFinite(obj.pending_uplinks) ? obj.pending_uplinks : null;
+        const lastMechResult = typeof obj.last_mech_result === 'string' ? obj.last_mech_result.slice(0, 16) : null;
+        const rosterEpoch = Number.isFinite(obj.roster_epoch) ? obj.roster_epoch : null;
+        // ozkey-20 §5a (2026-08-11) — mcu_link_up/mcu_last_frame_s. Same
+        // opportunistic COALESCE discipline: absent leaves the column
+        // untouched, doesn't clobber a last-known value to NULL.
+        const mcuLinkUp = typeof obj.mcu_link_up === 'boolean' ? (obj.mcu_link_up ? 1 : 0) : null;
+        const mcuLastFrameS = Number.isFinite(obj.mcu_last_frame_s) ? obj.mcu_last_frame_s : null;
         await pool.query(
           `UPDATE locks
-              SET last_seen_at = NOW(),
-                  fw        = COALESCE(?, fw),
-                  transport = COALESCE(?, transport),
-                  caps      = COALESCE(?, caps)
+              SET last_seen_at    = NOW(),
+                  fw              = COALESCE(?, fw),
+                  transport       = COALESCE(?, transport),
+                  caps            = COALESCE(?, caps),
+                  battery_pct     = COALESCE(?, battery_pct),
+                  pending_uplinks = COALESCE(?, pending_uplinks),
+                  last_mech_result = COALESCE(?, last_mech_result),
+                  last_mech_at    = CASE WHEN ? IS NOT NULL THEN NOW() ELSE last_mech_at END,
+                  roster_epoch    = COALESCE(?, roster_epoch),
+                  mcu_link_up     = COALESCE(?, mcu_link_up),
+                  mcu_last_frame_s = COALESCE(?, mcu_last_frame_s)
             WHERE id = ?`,
-          [fw, id.transport, id.caps, deviceId]
+          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, deviceId]
         );
+        // ozkey-20 R5/R6: a heartbeat is direct proof of reachability for a
+        // Wi-Fi-direct lock (no bridge_id) — set presence straight to
+        // 'online' the way an R1 LWT eventually will, then let R6 compute
+        // whatever reason applies (battery/mech/pending) on top of that. A
+        // Thread lock's presence is NOT touched here — Thread heartbeats
+        // don't exist yet (R3), and even once they do, reachability for a
+        // Thread lock comes from the bridge's report (R2), not its own
+        // heartbeat, per §3's "liveness is observed, not reported".
+        const [[hbLockRow]] = await pool.query('SELECT bridge_id FROM locks WHERE id = ?', [deviceId]);
+        if (hbLockRow && !hbLockRow.bridge_id) {
+          await pool.query("UPDATE locks SET presence = 'online' WHERE id = ?", [deviceId]);
+        }
+        if (hbLockRow) await recomputeAndStorePresence(deviceId);
         const sent = await flushQueueForDevice(siteId, deviceId);
         if (sent > 0) return; // flush already logged
         return; // quiet heartbeat
@@ -1090,9 +1481,14 @@ api.get('/locks', async (req, res) => {
     // single-lock read was not enough: the app builds its lock LIST from here, so
     // a lock could report remote_unlock when opened individually and still render
     // as BLE-only in the list the user actually taps. Both reads must agree.
+    // presence/presence_reason (ozkey-20 R6 verdict) exposed here so the app can
+    // decide Thread-vs-BLE revoke without re-deriving liveness itself — this is
+    // the field the app team asked about (2026-08-10): whether a lock is still
+    // reachable via Thread/bridge before falling back to asking the user for BLE.
     const [rows] = await pool.query(
       `SELECT id, site_id, app_id, mac, label, fw, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at, bridge_id, caps, transport
+              last_seen_at, enrolled_at, bridge_id, caps, transport,
+              presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s
          FROM locks ORDER BY enrolled_at DESC`
     );
     const locks = rows.map((l) => {
@@ -1176,7 +1572,8 @@ api.get('/locks/:id', async (req, res) => {
     // This is XF-48 ask 1 (the capability field) landing on the read path.
     const [[lock]] = await pool.query(
       `SELECT id, app_id, site_id, mac, label, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at, bridge_id, caps, transport
+              last_seen_at, enrolled_at, bridge_id, caps, transport,
+              presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s
          FROM locks WHERE id = ?`,
       [req.params.id]
     );
@@ -1723,7 +2120,15 @@ api.post('/locks/:id/unlock', async (req, res) => {
       ...(sealed ? { envelope_hex } : { payload_hex: payloadHex }),
       // In the lab LockSim keeps its MQTT link open, so delivery is immediate;
       // a real eco lock would report 'queued' until its next wake.
+      // KEPT for compat — the app parses this today, still live-testing.
       delivery: sent > 0 ? 'delivered' : 'queued',
+      // ozkey-20 R5: "delivered must stop meaning likelyOnline... report
+      // accepted/transport_ok, and let the lock's own ACK be the only thing
+      // that produces executed." `sent` only means "handed to the MQTT
+      // broker" — it says nothing about the lock. Added alongside `delivery`
+      // rather than replacing it (same alias discipline as S12/S16); this is
+      // the field to actually trust, `delivery` is the deprecated one.
+      transport_ok: sent > 0,
       expires_at: expiresAt.toISOString(),
       // XF-58: everything the app needs to run the countdown, so it never has to
       // hardcode our window. `mode: 'assisted'` is the app's cue to prompt
@@ -1807,7 +2212,8 @@ async function handleBondVerb(req, res, actionType, label) {
       device_id: deviceId,
       queue_id: queueResult.insertId,
       envelope_hex,
-      delivery: sent > 0 ? 'delivered' : 'queued',
+      delivery: sent > 0 ? 'delivered' : 'queued', // KEPT for compat, see /unlock
+      transport_ok: sent > 0, // ozkey-20 R5 — the field to trust
       expires_at: expiresAt.toISOString(),
     });
   } catch (err) {
