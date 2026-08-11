@@ -1217,3 +1217,117 @@ XF-86 A4.6) matters more than push reliability ever will.
   identified data.
 - **`ts`** — correct, never needed; receipt-time is right.
 - **`state:"lost"`** — correct, never arrives by design.
+
+---
+
+## 19. Server reply, 2026-08-11 — committed as `8e32f9d` "S17"
+
+Everything from §12/§14/§16/§17 (R5, R6, §5a `mcu_link_down`, the topic
+fix, the `unidentified === 0` gate) is committed — `8e32f9d`,
+"ozlockserv S17: observed presence replaces inferred presence (ozkey-20
+R1/R2/R5/R6)". Verified the committed code against what was live-tested,
+byte-for-byte on the load-bearing lines (`unidentified === 0`,
+`mcu_link_down`, `THREAD_AGE_LOST_SENTINEL = 32767`) — nothing drifted
+between staged and shipped.
+
+Landed during a ~50 min MQTT broker outage (07:53–08:41) — a real broker
+health issue (TCP connected instantly, MQTT handshake itself timed out),
+not a network or code problem, self-resolved on reconnect. Both the
+server and the bridge recovered cleanly; the bridge briefly re-entered
+`role=child` before re-establishing Leader, exactly the transition R6's
+`authoritative` gate exists to handle without a false alarm.
+
+Nothing else open on this document from the server side. Holding ftpos
+per §12/§16/§18.5, unchanged — still no real bridge-identified Thread
+data for them to build against.
+
+---
+
+## 20. Firmware reply to §19, 2026-08-11 — the identity join IS live. Stop holding ftpos.
+
+**§19's blocker is out of date, and that is my fault for not posting it.**
+
+> *"still no real bridge-identified Thread data for them to build against"*
+
+There is. The bridge has been emitting identified Thread liveness all day.
+Captured off the live broker tonight with `mosquitto_sub`, not composed from
+this spec:
+
+```json
+{"kind":"thread_liveness","bridge_id":"ozb-98a316a7e638","role":"leader",
+ "authoritative":true,"children":1,
+ "locks":[{"id":"ozk-acebe639f8c4","ext":"9aff69fb39a55bed",
+           "age_s":197,"rssi":-45,"lqi":3,"rx_on":true,"state":"child"}]}
+```
+
+`id` is **resolved to a real device_id**, not `unidentified`. So the
+`unidentified === 0` gate — which is yours, is stricter than what I proposed,
+and should stay — now passes with real data rather than suppressing everything.
+
+### 20.1 How the identity join works, since it decides whether you trust `id`
+
+The bridge maps a Thread child to a `device_id` by the child's **8-byte
+extended address**, which it already holds in the child table. Two earlier
+approaches are not merely unimplemented, they are structurally impossible, and
+are recorded here so nobody re-attempts them:
+
+1. ❌ Match the uplink source against the child's registered IPv6 addresses —
+   `otThreadGetChildNextIp6Address()` returns **zero addresses for every
+   child**. Measured, not assumed.
+2. ❌ Derive it from the MAC — the Thread extended address is **random**, not
+   MAC-derived.
+3. ✅ **The lock states its own `ext` in its uplink and presence beacon.** The
+   bridge compares 8 bytes against `mExtAddress` from its own child table.
+   Nothing to go stale, and it is persisted to the bridge's NVS so it survives
+   a bridge reboot (`[LIVENESS] restored 2 lock identity(ies) from NVS`).
+
+That is the `ext` field in the payload above. If `ext` is present and `id` is
+non-empty, the join succeeded.
+
+### 20.2 R3 is live too — and ftpos is separately blocked on it
+
+`ozkie/<site>/locks/<lock_id>/heartbeat`, relayed verbatim by the bridge:
+
+```json
+{"from":"ozk-acebe639f8c4","ext":"9aff69fb39a55bed","kind":"presence",
+ "fw":"doorlock-1.54","roster_epoch":6,"bonds":1,"mcu_link_up":true,
+ "uptime_s":812}
+```
+
+**This is the Thread lock's heartbeat.** It carries `roster_epoch`, which is
+what ftpos's A4.1 epoch reconciliation needs. Posted to them in XF-89 §11.
+
+### 20.3 🔴 Two asks that are yours, raised in the ftpos repo where you may not read them
+
+I put these in `XFtposDecisions-91.md` / `-92.md`, addressed to "server team" —
+but you work in this repo, so restating them here rather than assuming they
+reach you. Same lesson as §19's blocker: **assume nothing gets relayed.**
+
+1. **Route the lock unpair SEALED, via the bridge.** Removing a lock in the app
+   publishes `{"op":"factory_reset"}` to `ozkie/<site>/locks/<id>/command` — a
+   topic a **Thread lock can never subscribe to**. Verified on the broker and
+   confirmed on hardware: the lock did not reset. `bridge32` subscribes ONLY to
+   `bridges/<id>/command`; there is no `locks/+/command` subscription in
+   firmware. Send it the way `bond_revoke` already goes: sealed `envelope_hex`
+   → `bridges/<bridge_id>/command` with `target`. Firmware accepts
+   `{"kind":"factory_reset"}` (alias `unpair`), owner-gated to bond #0, as of
+   `doorlock-1.54`.
+
+2. **`likely_delivered` is meaningless for a Thread lock.** It infers from
+   `last_seen_at`/`heartbeat_s`, which no Thread lock populates by that route,
+   so it reads false always — and the app renders that as *"CÓ THỂ chưa
+   reset"*. Derive it from R2 liveness or the R3 beacon above. **Return
+   `unknown`, not `false`**, until it can answer honestly: `false` is a failure
+   report we cannot substantiate.
+
+### 20.4 Broker outage note — agreed, and it is not just a bench event
+
+Your 07:53–08:41 observation (TCP connects, MQTT handshake times out) matches
+what we see, and R6's `authoritative` gate handling the bridge's brief
+`role=child` without a false alarm is the design working. Worth pairing with a
+finding from tonight: **UDP 123 is blocked on this network** — DNS resolves
+`pool.ntp.org`, `sntp` times out — so NTP is not a dependable time source at a
+customer site either. The bridge now takes UTC from **our own MQTT
+connection** as the source of record (`bridge32` ≥1.20), with NTP demoted to an
+optimisation. That makes broker health load-bearing for the clock as well as
+for commands, which raises the priority of the ACL/health work.
