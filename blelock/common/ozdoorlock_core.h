@@ -571,6 +571,34 @@ volatile int bleLinkCount = 0;
 // but NOT variables, so a later declaration compiles as "not declared in this
 // scope" with a confusing line number.
 unsigned long bleWindowUntil = 0; // 0 = closed; millis deadline while open
+
+// ── PAIRING IS GESTURE-GATED, EVEN WHEN UNPROVISIONED (operator, 2026-08-12) ─
+//
+// An unprovisioned lock used to advertise CONTINUOUSLY AND FOREVER. Three
+// factory-reset locks in a hallway therefore showed up as three simultaneous
+// rows, and the app could not tell which was which — the problem XF-94 tried to
+// solve by labelling the rows. The operator's correction is better: do not
+// create the ambiguity. A lock nobody touched should not be advertising at all,
+// so the only device discoverable during pairing is the one in your hand.
+//
+// It also shrinks the attack surface (a lock nobody touched cannot be probed or
+// provisioned) and saves radio time, and it matches the rule we already apply
+// everywhere else: PHYSICAL PRESENCE GATES THE GRANT.
+//
+// WHY A BOOT WINDOW AND NOT PURELY THE GESTURE: if a freshly reset lock were
+// silent until someone pressed the right button, a lock whose button or touch
+// panel misbehaves would look dead to the app with no way in short of
+// reflashing — worse on a screen-less production unit. You have just reset it
+// and you are standing there, so the first two minutes are free; after that it
+// goes dark until a short BOOT press opens the normal 60 s window.
+#define BLE_BOOT_ADV_MS 120000UL
+unsigned long bleBootAdvUntil = 0; // millis deadline for the post-boot grace
+
+// Single source of truth for "should we be discoverable right now".
+bool bleAdvertisingAllowed() {
+  if (bleWindowOpen()) return true;                       // gesture, either state
+  return !provisioned && millis() < bleBootAdvUntil;      // post-boot grace only
+}
 bool bleWindowOpen();
 String provBuf;
 
@@ -1682,6 +1710,30 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       const char *result = v[0] == 0 ? "granted" : v[0] == 1 ? "denied" : "expired";
       if (v[0] == 0) markDoorUnlocked(); // mirror the bolt for the dashboard
       publishLog(result, "MCU report");
+
+      // ── KEYPAD AS THE PAIRING GESTURE (operator, 2026-08-12) ─────────────
+      //
+      // "even after factory reset, does the keypad signal from MCU reach the
+      // ESP? if so a user can press any key to turn on BLE?"
+      //
+      // Not for a bare key press: DP 60 is a PLACEHOLDER the manufacturer has
+      // never allocated, and no shipping DL MCU emits one (ozkey-22 §7, still
+      // open). Only LockSim sends it.
+      //
+      // But THIS frame does arrive on real hardware — it is the MCU reporting a
+      // completed unlock attempt. Crucially it fires on a DENIED attempt too,
+      // so it works on a lock whose credentials were just wiped: walk up, press
+      // anything that ends an entry, and the lock becomes discoverable.
+      //
+      // That is the closest thing to "press a key to pair" that exists today
+      // without waiting on the manufacturer, and it is a genuine physical
+      // presence signal — which is the property that justifies opening the
+      // window at all. On a production lock the BOOT button may be awkward to
+      // reach; the keypad never is.
+      //
+      // Safe because the window only makes the lock DISCOVERABLE. Every bond,
+      // envelope and role check still applies; nothing about access changes.
+      openBleWindow("keypad access attempt");
       return;
     }
     if (dpid == 5) { publishLog("battery_alarm", "MCU report"); return; }
@@ -4464,7 +4516,7 @@ class ServerCB : public BLEServerCallbacks {
     // Keep advertising, but non-connectably, so the busy flag is observable.
     // Only where we were supposed to be discoverable in the first place —
     // a commissioned lock outside its window stays dark, exactly as before.
-    if (!provisioned || bleWindowOpen()) {
+    if (bleAdvertisingAllowed()) {
       bleRearmAdvertising(false, "client connected");
     }
     notifyStatus("BLE_OK");
@@ -4507,7 +4559,7 @@ class ServerCB : public BLEServerCallbacks {
     // changes) or restart non-connectably. Either way the lock stays visible and
     // refuses every subsequent connection until reboot — one connect per boot,
     // which is precisely the bug this call fixes.
-    if (!provisioned || bleWindowOpen()) {
+    if (bleAdvertisingAllowed()) {
       bleRearmAdvertising(true, "link closed, back to discoverable");
     } else if (bleWindowUntil) {
       closeBleWindow("expired during session");
@@ -4984,7 +5036,13 @@ void setup() {
     wifiJoinStart = millis();
   } else {
     state = ST_ADVERTISING;
+    // Post-boot grace: discoverable for BLE_BOOT_ADV_MS without any gesture,
+    // because you have just reset/powered this lock and are standing at it.
+    // After that it goes dark until a short BOOT press. See bleAdvertisingAllowed().
+    bleBootAdvUntil = millis() + BLE_BOOT_ADV_MS;
     startBle();
+    Serial.printf("[BLE] discoverable for %lus after boot, then press BOOT to pair\n",
+                  BLE_BOOT_ADV_MS / 1000);
   }
   Serial.printf("[WAKE] wake_sim=%s hb=%us (SRDY=GPIO%d MRDY=GPIO%d)\n",
                 wakeSim ? "ON (bench: SRDY assumed, no sleep)" : "OFF (honest)",
@@ -5360,6 +5418,23 @@ void loop() {
   }
 
   // ── ozkey-21 T1/T2 — keep our clock fed, and push if the MCU subscribed ──
+  // ── Close the post-boot pairing grace once it lapses ────────────────────
+  // Without this the lock would keep advertising until something else re-armed
+  // it — the grace has to actually END, or it is just the old always-on
+  // behaviour with extra steps.
+  {
+    static bool bootAdvClosed = false;
+    if (!bootAdvClosed && bleBootAdvUntil && millis() >= bleBootAdvUntil) {
+      bootAdvClosed = true;
+      if (!bleAdvertisingAllowed() && !bleClientConnected) {
+        BLEDevice::stopAdvertising();
+        Serial.println("[BLE] post-boot pairing window lapsed — now dark until "
+                       "a short BOOT press (operator, 2026-08-12)");
+        screenDirty = true;
+      }
+    }
+  }
+
   ozClockRefreshFromSystem();
   ozClockPersist(false);
   if (mcuWantsTimePush && ozClockKnown(ozclock) &&

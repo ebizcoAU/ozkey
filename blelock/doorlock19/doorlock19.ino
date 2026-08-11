@@ -198,8 +198,8 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 // "FW_DISPLAY_VERSION was stuck at V1.21 through the 1.22/1.23 bumps").
 // Editing one file's version string and flashing the other is the failure
 // mode. Change both, every time.
-#define FW_VERSION "doorlock-1.55"
-#define FW_DISPLAY_VERSION "V1.55" // on-screen: "OZLOCK <this> THREAD/WIFI" — keep in
+#define FW_VERSION "doorlock-1.56"
+#define FW_DISPLAY_VERSION "V1.56" // on-screen: "OZLOCK <this> THREAD/WIFI" — keep in
                                    // step with FW_VERSION above; a literal
                                    // version in this comment goes stale and is
                                    // how it sat at V1.21 through two bumps.
