@@ -173,7 +173,7 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.28"
+#define FW_VERSION "bridge32-1.30"
 #define FW_DISPLAY_VERSION "v1.17" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
@@ -667,6 +667,60 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
                   (unsigned long)utcIn);
     // Push it straight out rather than waiting up to 24 h for the next beacon.
     sendTimeBeacon();
+  }
+
+  // ── XF-91/92 — REMOTE FACTORY RESET OF THE BRIDGE ITSELF ────────────────
+  //
+  // This did not exist. Not a routing bug like the lock's (XF-91) — the bridge
+  // had NO remote reset at all, over any transport: `grep factory_reset`
+  // returned nothing in this file. So "remove the bridge" in the app could
+  // never have wiped it, and the operator was left with a bridge that still
+  // owned a mesh nobody could see in the app.
+  //
+  // AUTHENTICATION — the ownership rule we already agreed, not a new one.
+  // CONTRACT-BRIDGE.md (XF-47 round 6): "Touching an unowned bridge requires
+  // physical presence. Touching an owned bridge requires a matching app_id."
+  // An owned bridge therefore demands a matching `app_id`; an unowned one has
+  // nothing to protect and no owner to check against.
+  //
+  // ⚠ WEAKER THAN THE LOCK'S SEALED PATH, deliberately and with eyes open.
+  // The lock takes a sealed envelope because it holds per-bond keys. The
+  // bridge holds none — it relays `envelope_hex` without ever decoding it, by
+  // design (relay, not authority). Sealing this would mean giving the bridge
+  // crypto authority over itself, which is a real design change, not a flag.
+  // `app_id` is an identifier, not a secret, so on a broker with no ACLs this
+  // is a speed bump. That is acceptable ONLY because the same broker already
+  // lets anyone unlock every door (ozkey-13 S8/S9 — a fabricated username
+  // still publishes); broker ACLs are the actual fix and remain a
+  // pre-production blocker. Do not read this as "authenticated".
+  {
+    const char *op = doc["op"] | (const char *)nullptr;
+    if (op && (strcmp(op, "factory_reset") == 0 || strcmp(op, "unpair") == 0)) {
+      // Reuse the AUDITED guard rather than the ad-hoc check I first wrote.
+      // My version only compared app_id when an owner existed, which silently
+      // allowed ANY remote client to wipe an UNOWNED bridge — and XF-47 round 6
+      // closed exactly that hole for provisioning: an unowned-but-deployed
+      // bridge is still relaying a live mesh, so it needs the physical claim
+      // window, not a free pass. bridgeOwnershipCheck() already encodes the
+      // whole table (claim window, BRIDGE_CLAIM_REQUIRED, idempotent match,
+      // BRIDGE_DENIED) and is the same gate the BLE reset uses.
+      const String reqApp = (const char *)(doc["app_id"] | "");
+      if (!bridgeOwnershipCheck(reqApp)) {
+        Serial.printf("[RESET] REFUSED over MQTT (app_id '%s')\n",
+                      reqApp.length() ? reqApp.c_str() : "(absent)");
+        return;
+      }
+      Serial.println("[RESET] remote factory_reset accepted over MQTT");
+      // Say so BEFORE wiping: factoryReset() ends in a platform reset and
+      // never returns, so anything published after it is never published.
+      // Same ordering rule as the lock's MCU reset ack (ozkey-22 R1).
+      if (mqttClient.connected()) {
+        const String t = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/presence";
+        mqttClient.publish(t.c_str(), "{\"state\":\"offline\",\"reason\":\"factory_reset\"}", true);
+      }
+      factoryReset(); // never returns
+      return;
+    }
   }
 
   String target = (const char *)(doc["target"] | "");
