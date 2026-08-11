@@ -1480,3 +1480,71 @@ direction, on the same night. Per the operator: **the ozkey doc that assigns a
 task is where the reply belongs** — so server-side asks go here, and I will
 stop filing them in the ftpos repo. Anything I need from ftpos still goes to
 XF, and I will mirror the *outcome* here rather than the ask.
+
+---
+
+## 23. Firmware — LIVE END-TO-END TEST, 2026-08-12. The sealed unpair works.
+
+First full run on a factory-reset bench: bridge re-paired, both locks
+re-provisioned by the app, then a real removal. Every half of this chain had
+been built by a different team and **none had ever been live-tested**.
+
+```
+01:21:13.765  MQTT    bridges/…/command  {"target":"ozk-acebe639f8c4","envelope_hex":"6364…"}
+01:21:13.958  BRIDGE  [MQTT] << … envelope_hex
+01:21:14.288  LOCK    [CTL] OPENED — bond 0, counter 2, OZKIE (24 B)
+01:21:14.289  LOCK    [OZKIE] factory_reset authorised by owner — wiping
+01:21:14.289  LOCK    [RESET] factory reset — wiping NVS + txlog
+01:21:16.245  LOCK    [BOOT] reset reason: SW (ESP.restart)
+```
+
+**~0.5 s** from server publish to wipe. `[CTL] OPENED — bond 0` is the line
+that matters: the envelope authenticated against the **owner's** bond, so the
+owner-gate is real rather than merely coded. The lock came back
+`ADVERTISING xport=unset clock=UNKNOWN` — genuinely factory reset.
+
+Also verified in the same run:
+
+| | |
+|---|---|
+| `tz` delivered at pairing (XF-90) | ✅ `+600 min` parsed, stored, panel-only |
+| MCU served **UTC**, not local | ✅ frame decoded to 14:42:39Z while local was 00:42 |
+| `need_time` pull path | ✅ lock asked; request survived the bridge having `utc=0` and fired when the clock landed |
+| Identity join on a **fresh** mesh | ✅ both locks resolved, `unidentified === 0` |
+| BLE bridge reset with `app_id` (XF-93 AY) | ✅ works |
+
+### 23.1 🔴 Two things the server team should expect
+
+1. **A wiped lock lingers in the child table for minutes.** After the wipe the
+   bridge still reported `children:2` for several minutes — OpenThread's MLE
+   child timeout, which ozkey-20 R2 already documents as why `CHILD_REMOVED`
+   cannot be the fast signal. New consequence now that a delete path exists: a
+   lock deleted from the DB **keeps appearing in liveness**, so the "identified
+   but no matching locks row" line will fire for it. Expected, not a fault.
+
+2. **`utc` is still not sent by the app at pairing.** The bridge came up with
+   `tz` but no clock and fell through to `[TIME] NTP started`, which cannot
+   resolve here (UDP 123 blocked). It sat at `utc=0` — no beacon, both locks
+   `clock=UNKNOWN` — until UTC was injected over MQTT. **The server is
+   currently the only viable clock source on this network.** Worth making the
+   server push UTC on bridge connect rather than waiting to be asked.
+
+### 23.2 One failure, and it was a bench-version gap, not a defect
+
+The second lock rejected the same command:
+
+```
+[CTL] OPENED — bond 0, counter 1, OZKIE (24 B)
+[OZKIE] unknown kind 'factory_reset' — rejected, NOT forwarded
+```
+
+It was on `doorlock-1.52`; the sealed verb landed in `1.54`. The envelope
+opened correctly, so app + server + bridge + crypto were all fine — the lock
+simply did not know the verb. Both locks are now on `1.55`.
+
+Worth noting the failure was **clean and diagnosable**: it named the unknown
+verb and refused to forward it to the MCU, rather than silently dropping it.
+
+**Process fix on my side:** the R3 heartbeat carries `fw`, so every lock's
+firmware version is readable off MQTT in one command. Checking that during
+staging would have caught this before it cost a test cycle.
