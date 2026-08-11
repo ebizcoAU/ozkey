@@ -911,6 +911,20 @@ async function handleBridgePresence(bridgeId, payload) {
   );
   logEvent('info', `Presence: bridge ${bridgeId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}`);
 
+  // ozkey-20 §23.1 (2026-08-12, firmware's live-test finding): UDP 123 is
+  // blocked on this network (see the NTP memory note), so a freshly
+  // connected bridge has no clock until something injects one. `bridge32`
+  // >=1.20 already accepts `{"utc": <unix_seconds>}` on its own command
+  // topic — this was previously a manual bench injection; push it
+  // proactively the moment we observe the bridge online rather than
+  // waiting to be asked, same "use the mechanism that already exists"
+  // discipline as everything else in this document.
+  if (state === 'online') {
+    const nowUtc = Math.floor(Date.now() / 1000);
+    mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, bridgeId), { utc: nowUtc });
+    logEvent('info', `Pushed utc=${nowUtc} to bridge ${bridgeId} on connect (ozkey-20 §23.1)`);
+  }
+
   // Aggregation: re-verdict every lock behind this bridge in one pass, so
   // "bridge offline" produces one log line here and N correct per-lock
   // verdicts, not N separate discoveries on each lock's own next report.
@@ -961,6 +975,7 @@ async function handleThreadLiveness(bridgeId, payload) {
   const reportedIds = new Set();
   let updated = 0;
   let unidentified = 0;
+  let noRow = 0;
   for (const entry of reported) {
     if (!entry) continue;
     // §14.3 point 3: `id` is absent until the lock has sent its first
@@ -976,9 +991,23 @@ async function handleThreadLiveness(bridgeId, payload) {
     reportedIds.add(entry.id);
     const ageS = Number(entry.age_s);
     if (!Number.isFinite(ageS)) continue;
-    await pool.query('UPDATE locks SET thread_age_s = ? WHERE id = ?', [ageS, entry.id]);
-    await recomputeAndStorePresence(entry.id);
-    updated++;
+    // `updated` must count rows actually matched, not attempts — an id the
+    // bridge correctly resolved but that has no corresponding `locks` row
+    // (never enrolled, or removed) previously still incremented this and
+    // logged "N updated", which reads as a live signal reaching the app when
+    // nothing landed anywhere. Found live 2026-08-11 when firmware's real,
+    // correctly-identified traffic produced this exact misleading line
+    // against an empty `locks` table.
+    const [result] = await pool.query('UPDATE locks SET thread_age_s = ? WHERE id = ?', [
+      ageS,
+      entry.id,
+    ]);
+    if (result.affectedRows > 0) {
+      await recomputeAndStorePresence(entry.id);
+      updated++;
+    } else {
+      noRow++;
+    }
   }
 
   // 🔴 Bug found live 2026-08-11 (firmware's report): an unidentified entry
@@ -1005,7 +1034,9 @@ async function handleThreadLiveness(bridgeId, payload) {
 
   logEvent(
     'info',
-    `Thread liveness from bridge ${bridgeId}: ${reported.length} reported (${unidentified} unidentified), ${updated} updated, ` +
+    `Thread liveness from bridge ${bridgeId}: ${reported.length} reported (${unidentified} unidentified` +
+      (noRow > 0 ? `, ${noRow} identified but no matching locks row` : '') +
+      `), ${updated} updated, ` +
       (unidentified === 0
         ? `${lost} inferred lost (absent from an authoritative, fully-identified report)`
         : `absence-inference SKIPPED — unidentified entries present, cannot safely tell which lock they are`)
@@ -1738,21 +1769,60 @@ api.delete('/locks/:id', async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const id = req.params.id;
+    const { envelope_hex } = req.body || {};
     // Unpair the physical lock too (BANOI "Gỡ khoá" must reset the device,
     // not just the record): tell it to wipe NVS and return to ADVERTISING.
     // Best-effort — an offline lock misses it and needs the on-device reset.
     const [[lock]] = await conn.query(
-      'SELECT site_id, last_seen_at, heartbeat_s FROM locks WHERE id = ?',
+      'SELECT site_id, bridge_id, last_seen_at, heartbeat_s, presence, presence_reason FROM locks WHERE id = ?',
       [id]
     );
     let attempted = false;
+    let transportOk = false;
     let likelyDelivered = false;
     if (lock) {
-      attempted = mqttPublish(CONFIG.topicCommand(lock.site_id || CONFIG.SITE_ID, id), {
-        op: 'factory_reset',
-        ts: new Date().toISOString(),
-      });
-      likelyDelivered = attempted && likelyOnline(lock.last_seen_at, lock.heartbeat_s);
+      if (envelope_hex) {
+        // XF-91 §5 — sealed unpair, required for a Thread lock: bridge32 has
+        // no `locks/+/command` subscription at all, so the plain path below
+        // reaches nothing on that transport (confirmed on hardware, XF-91
+        // §2/§7). Same shape as bond-revoke — queue + flushQueueForDevice
+        // already route a sealed_envelope job through the bridge with
+        // `target` when bridge_id is set (ozkey-11 §3).
+        const expiresAt = new Date(Date.now() + BOND_VERB_EXPIRY_MS);
+        const [queueResult] = await pool.query(
+          `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, envelope_hex, msg_type, status, expires_at)
+           VALUES (?, ?, NULL, 'factory-reset', ?, 'sealed_envelope', 'queued', ?)`,
+          [id, lock.site_id, envelope_hex, expiresAt]
+        );
+        attempted = true;
+        const sent = await flushQueueForDevice(lock.site_id, id);
+        transportOk = sent > 0;
+        logEvent(
+          'key',
+          `Factory reset (sealed) queued for lock ${id} (queue #${queueResult.insertId})`
+        );
+      } else {
+        // Legacy plain path — XF-91 §5: "can stay for now" for a Wi-Fi-direct
+        // lock, reachable only because it holds its own MQTT session. Same
+        // dead end as above on Thread; kept for back-compat with app builds
+        // that haven't added sealing for this verb yet.
+        attempted = mqttPublish(CONFIG.topicCommand(lock.site_id || CONFIG.SITE_ID, id), {
+          op: 'factory_reset',
+          ts: new Date().toISOString(),
+        });
+        transportOk = attempted;
+      }
+      // XF-91 (AW) / XF-92 — likely_delivered read false unconditionally for
+      // every Thread lock, because it was derived from a Wi-Fi heartbeat
+      // heuristic Thread locks never populate. Fold into ozkey-20 R5/R6's
+      // observed presence instead of inventing a second reachability notion,
+      // per both docs' explicit preference. `presence`/`presence_reason` are
+      // returned alongside so the app can render `unknown` distinctly from a
+      // real negative (XF-92 §7's ask), rather than collapsing both into one
+      // boolean the way this field alone still has to.
+      likelyDelivered = lock.bridge_id
+        ? lock.presence === 'online'
+        : likelyOnline(lock.last_seen_at, lock.heartbeat_s);
     }
     await conn.beginTransaction();
     await purgeLockRows(conn, 'device_id = ?', [id]);
@@ -1762,9 +1832,19 @@ api.delete('/locks/:id', async (req, res) => {
       return res.status(404).json({ ok: false, code: 'lock_not_found', error: `Lock ${id} not found` });
     logEvent(
       'info',
-      `Doorlock ${id} removed + factory_reset sent (attempted=${attempted} likely_delivered=${likelyDelivered})`
+      `Doorlock ${id} removed + factory_reset sent (attempted=${attempted} likely_delivered=${likelyDelivered} transport_ok=${transportOk})`
     );
-    res.json({ ok: true, id, reset: { attempted, likely_delivered: likelyDelivered } });
+    res.json({
+      ok: true,
+      id,
+      reset: {
+        attempted,
+        likely_delivered: likelyDelivered,
+        transport_ok: transportOk,
+        presence: lock ? lock.presence : 'unknown',
+        presence_reason: lock ? lock.presence_reason : null,
+      },
+    });
   } catch (err) {
     try {
       await conn.rollback();
@@ -2225,6 +2305,38 @@ api.post('/locks/:id/bond-revoke', (req, res) => handleBondVerb(req, res, 'bond-
 api.post('/locks/:id/invite-cancel', (req, res) =>
   handleBondVerb(req, res, 'invite-cancel', 'Invite cancel')
 );
+
+/** XF-93 (AZ) — remote bridge factory reset. No `bridges` table exists
+ * (ozkey-20 §10.2, confirmed again in XF-93 §6), so this is pure publish —
+ * nothing to read or write in the DB besides the audit trail. Deliberately
+ * UNSEALED, matching firmware's own design (`bridge32.ino`, XF-93 §5): the
+ * bridge holds no per-bond keys (a relay, not a crypto authority), so
+ * `app_id` is checked bridge-side by `bridgeOwnershipCheck()`, not
+ * cryptographically authenticated here. Built server-side rather than
+ * letting the app publish directly, per XF-93 §7.3's reasoning: the handset
+ * must never hold broker publish credentials, full stop — that outweighs
+ * the convenience of a direct publish for an unsealed command.
+ */
+api.post('/bridges/:id/reset', async (req, res) => {
+  try {
+    const bridgeId = req.params.id;
+    const { app_id } = req.body || {};
+    if (!app_id) {
+      return res
+        .status(400)
+        .json({ ok: false, code: 'missing_fields', error: 'app_id is required' });
+    }
+    const transportOk = mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, bridgeId), {
+      op: 'factory_reset',
+      app_id,
+    });
+    await recordAudit(app_id, bridgeId, 'bridge-reset', `factory reset requested for bridge ${bridgeId}`);
+    logEvent('key', `Bridge reset requested for "${bridgeId}" (transport_ok=${transportOk})`);
+    res.json({ ok: true, bridge_id: bridgeId, transport_ok: transportOk });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 api.delete('/locks/:id/grants/:gid', async (req, res) => {
   if (!guardDb(res)) return;
