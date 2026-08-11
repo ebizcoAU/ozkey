@@ -173,8 +173,28 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.31"
-#define FW_DISPLAY_VERSION "v1.17" // shown on-screen, doorlock.ino's badge convention
+#define FW_VERSION "bridge32-1.32"
+// ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
+//
+// It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
+// bumps, so the panel had been lying about which firmware it was running for
+// most of two days. The operator caught it on the LCD.
+//
+// This is the SECOND time: the changelog note above records it stuck at "v1.0"
+// through the 1.1 bump, and the fix then was to hand-sync the two constants —
+// which is what re-armed the trap. The operator's ruling was "FW_VERSION is
+// the single source", so make that structurally true instead of a convention:
+// derive the badge from FW_VERSION and there is nothing left to forget.
+//
+// "bridge32-1.32" -> "v1.31". Falls back to the whole string if the dash is
+// ever missing, which is wrong but visibly wrong rather than silently stale.
+static const char *fwDisplayVersion() {
+  static char buf[16];
+  const char *dash = strchr(FW_VERSION, '-');
+  snprintf(buf, sizeof(buf), "v%s", dash ? dash + 1 : FW_VERSION);
+  return buf;
+}
+#define FW_DISPLAY_VERSION fwDisplayVersion()
 
 // Thread network defaults — this bridge always FORMS (never joins an
 // existing mesh) in v0; it is the only network former in the home.
