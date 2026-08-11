@@ -1,5 +1,5 @@
 {
-  "name": "ozlodge-cockpit",
+  "name": "ozlodge",
   "version": "1.0.0",
   "description": "OZLODGE Cockpit - 100-Room Matrix, Pairing & Credential Injection (formerly OZKEY Core Cockpit, renamed ozkey-18 S12)",
   "scripts": {

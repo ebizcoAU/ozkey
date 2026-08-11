@@ -90,6 +90,10 @@ env vars `OZKEY_*` → `OZLODGE_*`, headers `X-OZKEY-*` → `X-OZLODGE-*`), and
 comment while in there — it said "Port: 4000", `HTTP_PORT` has always
 defaulted to 3200.
 
+**Renamed again 2026-08-12** (operator): `ozlodge-cockpit/` → `ozlodge/`,
+to match the `ozlock`+`ozlockserv` / `ozpms`+`ozpmsserv` naming pattern
+across all three tiers. `package.json`'s `name` field updated to match.
+
 **Deliberately NOT renamed, and worth being explicit about since this is
 exactly the kind of thing your own standing instruction (§0) says to
 verify rather than assume:**
