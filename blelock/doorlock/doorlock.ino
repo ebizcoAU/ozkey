@@ -195,11 +195,29 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //       the epoch is what lets an app notice a missed change with no push
 //       having succeeded.  NOT ON THE BENCH BOARD YET — DoorA runs 1.31, so
 //       R1 can be measured in isolation before R5 is added.
-#define FW_VERSION "doorlock-1.56"
-#define FW_DISPLAY_VERSION "V1.56" // on-screen: "OZLOCK <this> THREAD/WIFI" — keep in
-                                   // step with FW_VERSION above; a literal
-                                   // version in this comment goes stale and is
-                                   // how it sat at V1.21 through two bumps.
+#define FW_VERSION "doorlock-1.57"
+
+// ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ────────
+//
+// It used to be a second literal kept "in step with FW_VERSION above". It was
+// not: it sat at V1.21 through the 1.22/1.23 bumps here, and the identical
+// trap in bridge32 let its badge drift fourteen versions stale. That is three
+// occurrences of one bug across two firmwares, and the instruction to "change
+// both, every time" is what re-armed it each time.
+//
+// FW_VERSION is the single source (operator, 2026-08-02). Derive the badge and
+// there is nothing left to forget. bridge32 closed this in 1.32; this is the
+// doorlock half, done at the next bump exactly as that commit said it should be.
+//
+// "doorlock-1.57" -> "V1.57". Falls back to the whole string if the dash ever
+// goes missing — wrong, but visibly wrong rather than silently stale.
+static const char *fwDisplayVersion() {
+  static char buf[16];
+  const char *dash = strchr(FW_VERSION, '-');
+  snprintf(buf, sizeof(buf), "V%s", dash ? dash + 1 : FW_VERSION);
+  return buf;
+}
+#define FW_DISPLAY_VERSION fwDisplayVersion()
 
 // This board shows no startup splash (never did, pre-refactor) — no-op so
 // the shared core's unconditional drawSplash() call is a well-defined hook.

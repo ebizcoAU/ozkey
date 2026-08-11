@@ -198,11 +198,20 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 // "FW_DISPLAY_VERSION was stuck at V1.21 through the 1.22/1.23 bumps").
 // Editing one file's version string and flashing the other is the failure
 // mode. Change both, every time.
-#define FW_VERSION "doorlock-1.56"
-#define FW_DISPLAY_VERSION "V1.56" // on-screen: "OZLOCK <this> THREAD/WIFI" — keep in
-                                   // step with FW_VERSION above; a literal
-                                   // version in this comment goes stale and is
-                                   // how it sat at V1.21 through two bumps.
+#define FW_VERSION "doorlock-1.57"
+
+// ── DERIVED, not a second literal (2026-08-12) — see doorlock.ino for the
+// full reasoning. The warning above ("Change both, every time") described the
+// trap accurately and could not close it, because it relied on remembering.
+// Deriving the badge from FW_VERSION removes the thing to remember: this file
+// now has ONE version constant, and editing it is sufficient.
+static const char *fwDisplayVersion() {
+  static char buf[16];
+  const char *dash = strchr(FW_VERSION, '-');
+  snprintf(buf, sizeof(buf), "V%s", dash ? dash + 1 : FW_VERSION);
+  return buf;
+}
+#define FW_DISPLAY_VERSION fwDisplayVersion()
 
 // Brief startup splash before the operational dashboard (operator request) —
 // shown once at boot, before WiFi/Thread/BLE bring-up starts, so there's

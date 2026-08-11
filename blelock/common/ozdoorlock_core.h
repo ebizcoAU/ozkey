@@ -346,6 +346,10 @@ CommState state = ST_ADVERTISING;
 Preferences prefs; // namespace "blelock" — shared with blelock deliberately
 
 String cfgSsid, cfgPass, cfgBrokerHost, cfgServerIp, cfgSiteId, cfgName, cfgDeviceId;
+// Broker credentials the server mints at enrollment. Persisted since the very
+// first enrollment_ack handler ("buser"/"bsecret") — and, until 1.57, NEVER
+// PRESENTED to the broker. See ensureMqtt().
+String cfgBrokerUser, cfgBrokerSecret;
 uint16_t cfgBrokerPort = 1883, cfgServerPort = 4200;
 uint32_t cfgHeartbeatS = 60;
 bool provisioned = false, enrolled = false;
@@ -940,27 +944,34 @@ void drawAdvertising() {
   gfx->setTextColor(C_WHITE);
   gfx->setCursor(172, 86); // version badge beside the logo
   gfx->println(FW_DISPLAY_VERSION);
-  // The SAME 8 hex characters now broadcast in the scan response, shown big
-  // enough to read from arm's length while holding the phone — this is the
-  // string that lets you match a row in the app's scan list to the lock in
-  // front of you. Full device_id stays below for typing MQTT topics.
+  // FULL device_id, big (operator, 2026-08-12). This used to be ozShortId()
+  // here plus a small "device_id: <full>" line underneath — two renderings of
+  // the same fact, and the one you actually needed was the unreadable one.
+  // Now: one line, the whole id, at the size you can read from arm's length.
+  //
+  // Fits: 16 chars x 6px x size 2 = 192px, from x=15 -> 207 of PANEL_W 320,
+  // on BOTH panel variants (doorlock 320x172, doorlock19 320x170).
+  //
+  // The small line's vertical space is what pays for the nudge below — the
+  // green line moved 108 -> 113 -> 121 (+5 then +8, operator, 2026-08-12) and
+  // the rows under it stay put. At size 2 the glyphs are ~16px tall, so 121
+  // runs to ~137 and clears the mac row at 140 by 3px. That is the floor: any
+  // further down needs the mac/status rows moved too.
   gfx->setTextSize(2);
   gfx->setTextColor(C_GREEN);
-  gfx->setCursor(15, 108);
-  gfx->println(ozShortId(deviceId));
+  gfx->setCursor(15, 121);
+  gfx->println(deviceId);
   gfx->setTextColor(C_WHITE);
   gfx->setTextSize(1);
-  gfx->setCursor(15, 128);
-  gfx->print("device_id: ");
-  gfx->println(deviceId);
   gfx->setCursor(15, 140);
   gfx->print("mac: ");
   gfx->println(macStr);
-  gfx->setCursor(15, 152);
-  gfx->setTextColor(C_DIM);
-  gfx->println("Open BANOI > Doorlock to pair");
-  gfx->setCursor(15, 162);
-  gfx->println("reset: tap * then 5 (left edge)");
+  // One amber status line instead of two dim instruction lines (operator,
+  // 2026-08-12). The screen says what the LOCK is doing; it is not the place
+  // to teach the app's menu path or the reset gesture.
+  gfx->setCursor(15, 153); // 152 -> 153, operator's eye at the bench
+  gfx->setTextColor(C_AMBER);
+  gfx->println("WAITING TO BE PAIRED...");
 }
 
 void drawJoining() {
@@ -1231,6 +1242,8 @@ void loadConfig() {
   cfgPass = prefs.getString("pass", "");
   cfgBrokerHost = prefs.getString("bhost", "");
   cfgBrokerPort = prefs.getUShort("bport", 1883);
+  cfgBrokerUser = prefs.getString("buser", "");   // written at enrollment since
+  cfgBrokerSecret = prefs.getString("bsecret", ""); // day one; read since 1.57
   cfgServerIp = prefs.getString("sip", "");
   cfgServerPort = prefs.getUShort("sport", 4200);
   cfgSiteId = prefs.getString("site", "lab");
@@ -1731,9 +1744,46 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       // window at all. On a production lock the BOOT button may be awkward to
       // reach; the keypad never is.
       //
-      // Safe because the window only makes the lock DISCOVERABLE. Every bond,
-      // envelope and role check still applies; nothing about access changes.
-      openBleWindow("keypad access attempt");
+      // ── 🔴 GATED TO FAILED ATTEMPTS ONLY (operator's privacy rule, 1.57) ──
+      //
+      // "Safe because the window only makes the lock DISCOVERABLE" was the
+      // justification in 1.56, and it is true about ACCESS — every bond,
+      // envelope and role check still applies. It was WRONG about PRIVACY, and
+      // that is a separate question we did not ask.
+      //
+      // A provisioned lock is otherwise DARK: startBle() runs only inside a
+      // window. So if every entry opened one, then `advertising` would mean
+      // `someone used this door in the last 60 s`, near 1:1. The ADV carries
+      // flags + service UUID + "OZLOCK" and is readable by a PASSIVE scanner
+      // from the footpath; an ACTIVE scan also returns the scan response, which
+      // since XF-94 carries 4 bytes of MAC as a STABLE per-lock id. Together
+      // that is a timestamped, per-door entry log for anyone parked outside:
+      // when the occupant leaves, when they return, when the place is empty.
+      //
+      // We would have been sealing door events away from our own server (C7,
+      // ozkey-23) while broadcasting the fact of every entry to the street.
+      //
+      // The fix is one condition, because the RECOVERY case never needed the
+      // granted path: a lock whose credentials were wiped DENIES everything,
+      // and a member standing at the door with no credential is denied too. So
+      // gating on failure keeps every use case the window exists for —
+      //   • wiped lock, owner re-pairs        -> denied  -> window opens
+      //   • member enrolment at the door      -> denied  -> window opens
+      //   • owner pairing a new phone         -> deliberate wrong PIN, which is
+      //                                          a BETTER gesture than 1.56's:
+      //                                          intentional, not incidental
+      // — and removes the one that leaked: the routine successful unlock, which
+      // is the only high-frequency event and the only one that tracks presence.
+      //
+      // Residual: a mistyped PIN still advertises. Rare, and uncorrelated with
+      // routine occupancy, so it does not rebuild the channel.
+      //
+      // This also means DP 60 is no longer worth waiting for. It buys a
+      // deliberate gesture; this buys the same privacy property today, on
+      // shipping hardware, with no manufacturer allocation (ozkey-22 §7).
+      if (v[0] != 0) {
+        openBleWindow("failed keypad attempt");
+      }
       return;
     }
     if (dpid == 5) { publishLog("battery_alarm", "MCU report"); return; }
@@ -2875,7 +2925,38 @@ void ensureMqtt() {
   mqtt.setServer(cfgBrokerHost.c_str(), cfgBrokerPort);
   mqtt.setBufferSize(1024);
   mqtt.setCallback(onMqttMessage);
-  if (mqtt.connect(deviceId.c_str())) {
+  // ── 🔴 PRESENT THE BROKER CREDENTIALS (1.57) ────────────────────────────
+  //
+  // Until 1.57 this was a bare mqtt.connect(deviceId) — client id only, no
+  // username, no password. Meanwhile the enrollment_ack handler has ALWAYS
+  // stored what the server minted (prefs "buser"/"bsecret"). So the server
+  // minted credentials, the lock persisted them, and the lock then
+  // authenticated with none of them. ozlockserv's own header called this "the
+  // wiring is there; enforcement is not" — accurate about the broker, but the
+  // DEVICE half was not wired either, and that is ours.
+  //
+  // Why this could not wait for the ACL decision: the failure is ONE-WAY. The
+  // day anyone enables ACLs on the production broker, every lock and bridge in
+  // the field stops connecting at once — a fleet-wide outage caused by a config
+  // change on a different team's box. The fix has to already BE in the field
+  // before that switch is thrown, which means an OTA rollout, which means weeks
+  // of lead time. Shipping it now costs nothing against a broker that ignores
+  // credentials and removes the trap entirely.
+  //
+  // Fallback is deliberate: a lock enrolled before the server minted secrets
+  // (or restored from an older NVS) has an empty bsecret and MUST still connect
+  // exactly as it does today. Anonymous-until-provisioned stays working.
+  const bool haveCreds = cfgBrokerUser.length() && cfgBrokerSecret.length();
+  const bool ok = haveCreds
+                      ? mqtt.connect(deviceId.c_str(), cfgBrokerUser.c_str(),
+                                     cfgBrokerSecret.c_str())
+                      : mqtt.connect(deviceId.c_str());
+  if (!haveCreds) {
+    // Not fatal today (the lab broker enforces nothing) but it is exactly the
+    // device that breaks the moment ACLs land, so say so out loud.
+    Serial.println("[MQTT] no broker credentials stored — connecting anonymously");
+  }
+  if (ok) {
     lastActivityAt = millis();
     mqtt.subscribe(topicCommand.c_str(), 1);
     if (topicCommandLegacy.length()) mqtt.subscribe(topicCommandLegacy.c_str(), 1); // S16
