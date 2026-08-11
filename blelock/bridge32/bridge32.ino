@@ -34,6 +34,7 @@
 #include <openthread/dataset.h>    // ozkey-20 §15.3 security-policy diagnostic
 #include <openthread/thread_ftd.h> // otChildInfo / otThreadGetChildInfoByIndex
                                    // (FTD-only API) — see logThreadChildren()
+#include "../common/oztime.h" // ozkey-21 T3 — OZ_TIME_FLOOR, shared with the locks
 #include "esp_coexist.h"
 #include <OThreadUDP.h>
 // ozkey-17 U2: the RECEIVE half runs on lwIP, not OThreadUDP. Not a preference —
@@ -172,7 +173,7 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.17"
+#define FW_VERSION "bridge32-1.28"
 #define FW_DISPLAY_VERSION "v1.17" // shown on-screen, doorlock.ino's badge convention
 
 // Thread network defaults — this bridge always FORMS (never joins an
@@ -295,6 +296,15 @@ String provBuf;
 // ─────────────────────────────────────────────────────────────────────────────
 // NVS
 // ─────────────────────────────────────────────────────────────────────────────
+// ozkey-21 T3 — timezone offset in MINUTES east of UTC, from the app at
+// pairing (XF-90 ask 1). Minutes, not hours: India is +330 and Nepal +345, and
+// an hours-only field silently cannot express them.
+int16_t cfgTzMin = 0;
+
+// Set from the OpenThread state-changed callback, serviced in loop() — the
+// callback runs under the OT lock and is not a safe place to transmit.
+static volatile bool g_timeBeaconDue = false;
+
 void loadConfig() {
   prefs.begin("bridge32", true);
   wifiProvisioned = prefs.getBool("prov", false);
@@ -305,6 +315,10 @@ void loadConfig() {
   cfgBrokerPort = prefs.getUShort("bport", 0);
   cfgSiteId = prefs.getString("site", "");
   ownerAppId = prefs.getString("owner", "");
+  // ozkey-21 — timezone, minutes east of UTC (Vietnam = 420). Sent by the app
+  // at pairing. Survives reboot so a bridge that comes back with no app present
+  // still shows and distributes correct local time.
+  cfgTzMin = prefs.getShort("tzmin", 0);
   prefs.end();
 }
 
@@ -318,6 +332,7 @@ void saveConfig() {
   prefs.putUShort("bport", cfgBrokerPort);
   prefs.putString("site", cfgSiteId);
   prefs.putString("owner", ownerAppId);
+  prefs.putShort("tzmin", cfgTzMin);
   prefs.end();
 }
 
@@ -362,8 +377,19 @@ void drawStatus() {
     gfx->setCursor(4, 12);
     gfx->println("OZBRIDGE");
     gfx->setTextSize(2);
-    gfx->setCursor(4, 48);
-    gfx->println("WIFI:   OK");
+    // ── WIFI: show the ADDRESS, not "OK" (operator layout, 2026-08-11) ────
+    // "OK" is not actionable. The IP is the thing you actually need when
+    // pointing a bench tool or a broker at this bridge, and its absence is a
+    // more honest failure indication than a green word.
+    gfx->setCursor(4, 44);
+    if (WiFi.status() == WL_CONNECTED) {
+      gfx->print("WIFI: ");
+      gfx->println(WiFi.localIP().toString());
+    } else {
+      gfx->setTextColor(LCD_C_RED);
+      gfx->println("WIFI: NOT CONNECTED");
+      gfx->setTextColor(LCD_C_BLACK);
+    }
     // ── THREAD ROLE, not "OK" (operator, 2026-08-11) ────────────────────
     //
     // "OK" hid the single most important fact about this device. A bridge
@@ -395,15 +421,32 @@ void drawStatus() {
           default: roleTxt = "NOT OK"; break;
         }
       }
+      if (!threadFormed) { roleTxt = "NOT CONNECTED"; roleCol = LCD_C_RED; }
       gfx->setCursor(4, 66);
       gfx->setTextColor(roleCol);
       gfx->print("THREAD: ");
       gfx->println(roleTxt);
-      gfx->setTextColor(LCD_C_BLACK); // restore for the IP line below
+      gfx->setTextColor(LCD_C_BLACK);
     }
-    gfx->setCursor(4, 84);
-    gfx->print("IP ");
-    gfx->println(WiFi.localIP().toString());
+
+    // ── The clock (operator layout, 2026-08-11) ───────────────────────────
+    //
+    // 24 chars at size2 is 288px on a 240px panel, so this line is size1. It
+    // earns its place regardless: this is the bridge that FEEDS every Thread
+    // lock its time, so "does the border router actually know what time it is"
+    // is now answerable by looking at it. Renders as dashes, never as 1970,
+    // when NTP/MQTT have not supplied a time yet — see ozFormatStamp().
+    {
+      // size 2, not 1 (operator 2026-08-11: "unreadable... too small"). The
+      // compact form drops the weekday and AM/PM to 19 chars, which is exactly
+      // what buys the bigger font: 19 x 12 = 228 px of the 240 px panel.
+      char stamp[17];
+      ozFormatStampNarrow(stamp, sizeof(stamp), ozBridgeUtc(), cfgTzMin);
+      gfx->setCursor(4, 88);
+      gfx->setTextColor(ozBridgeUtc() ? LCD_C_BLACK : LCD_C_RED);
+      gfx->println(stamp);
+      gfx->setTextColor(LCD_C_BLACK);
+    }
     // Footer: normally site + device_id; briefly the RX banner instead.
     // device_id bumped size1 -> size2 (2026-07-28, operator: unreadable on this
     // 240x135 panel). At size2 the full "ozb-98a316a7e638" is 16 chars * 12px =
@@ -417,14 +460,11 @@ void drawStatus() {
       gfx->setCursor(4, 118);
       gfx->println(lcdRxMsg);
     } else {
-      gfx->setTextSize(1);
-      gfx->setCursor(4, 100);
-      if (cfgSiteId.length()) {
-        gfx->print("site ");
-        gfx->println(cfgSiteId);
-      }
+      // device_id on the bottom line. The site line is gone: the clock took
+      // that row, and "lab" was the least useful thing on the screen (it is
+      // static, short, and never the thing you are debugging).
       gfx->setTextSize(2);
-      gfx->setCursor(4, 114);
+      gfx->setCursor(4, 112);
       gfx->println(deviceId);
     }
     return;
@@ -603,8 +643,38 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
     Serial.println("[MQTT] payload not valid JSON, dropped");
     return;
   }
+  // ── ozkey-21 T3 — accept UTC from our own server over MQTT ──────────────
+  //
+  // NTP IS NOT A DEPENDABLE TIME SOURCE ON A CUSTOMER SITE. Measured on the lab
+  // network 2026-08-11: DNS resolves pool.ntp.org fine, UDP 123 times out. A
+  // hotel or office that blocks outbound NTP would silently leave every lock
+  // with no clock, and therefore every temporary PIN unenforceable — the exact
+  // defect ozkey-21 exists to fix, reintroduced by the network.
+  //
+  // This connection, by contrast, provably works: if the bridge cannot reach
+  // our server there is no product anyway. So the server is the time source of
+  // record and NTP is the optimisation. `set_time` is also what lets the bench
+  // drive the whole chain without waiting on either.
+  //
+  // Trust: same as the beacon it feeds — the lock's monotonic-forward rule and
+  // the 400-day cap bound what any bad value can do. Broker ACLs are the real
+  // gate here and are still a pre-production blocker (ozkey-13 S8/S9).
+  const uint32_t utcIn = doc["utc"] | 0UL;
+  if (utcIn >= OZ_TIME_FLOOR) {
+    struct timeval tv = { .tv_sec = (time_t)utcIn, .tv_usec = 0 };
+    settimeofday(&tv, nullptr);
+    Serial.printf("[TIME] utc=%lu accepted from server/bench over MQTT\n",
+                  (unsigned long)utcIn);
+    // Push it straight out rather than waiting up to 24 h for the next beacon.
+    sendTimeBeacon();
+  }
+
   String target = (const char *)(doc["target"] | "");
   if (!target.length()) target = (const char *)(doc["device_id"] | "");
+
+  // A pure time message carries no target and is not a relay command — stop
+  // here rather than logging a bogus "command missing target/payload" drop.
+  if (utcIn && !target.length()) return;
 
   String fieldName = "envelope_hex";
   String valueHex = (const char *)(doc["envelope_hex"] | "");
@@ -936,6 +1006,12 @@ static void publishThreadLiveness();
 static void ozThreadStateChanged(otChangedFlags flags, void *) {
   if (flags & (OT_CHANGED_THREAD_CHILD_ADDED | OT_CHANGED_THREAD_CHILD_REMOVED)) {
     g_livenessPushDue = true;
+    // ozkey-21 — a child that just attached may be a lock that just REBOOTED,
+    // and a rebooted lock has no clock. Without this it waits up to 24 h for
+    // the next scheduled beacon while every temporary credential on it is
+    // unenforceable. The event already exists for ozkey-20 R2; reusing it costs
+    // one datagram and removes the whole window.
+    if (flags & OT_CHANGED_THREAD_CHILD_ADDED) g_timeBeaconDue = true;
     Serial.printf("[LIVENESS] child %s — pushing\n",
                   (flags & OT_CHANGED_THREAD_CHILD_ADDED) ? "ADDED" : "REMOVED");
   }
@@ -1012,8 +1088,13 @@ static void publishThreadLiveness() {
                    ",\"children\":" + String(n) + ",\"locks\":[" + locks + "]}";
   const String topic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/liveness";
   const bool ok = mqttClient.publish(topic.c_str(), payload.c_str());
-  Serial.printf("[LIVENESS] role=%s authoritative=%s %d child(ren) -> %s%s\n",
-                roleName, authoritative ? "yes" : "NO", n, topic.c_str(),
+  // ozkey-21 T3 diagnostic: utc=0 means NTP has not answered, so no beacon has
+  // gone out and every Thread lock is still clock=UNKNOWN. The [TIME] lines are
+  // one-shot at boot, which makes them useless for answering "is it working
+  // now?" — this is periodic on purpose.
+  Serial.printf("[LIVENESS] role=%s authoritative=%s %d child(ren) utc=%lu -> %s%s\n",
+                roleName, authoritative ? "yes" : "NO", n,
+                (unsigned long)ozBridgeUtc(), topic.c_str(),
                 ok ? "" : " PUBLISH FAILED");
 }
 
@@ -1174,6 +1255,14 @@ static bool pollUplinkOne() {
       Serial.printf("[UPLINK] %s: no envelope and kind='%s' — dropped\n", from, kind);
       return true;
     }
+    // ozkey-21 — the lock is telling us it has no clock. Answer immediately
+    // rather than making it wait for the daily beacon. Cheap and idempotent:
+    // a lock that already has time simply stops setting the flag.
+    if (doc["need_time"] | false) {
+      Serial.printf("[TIME] %s has no clock — beaconing on request\n", from);
+      sendTimeBeacon();
+    }
+
     if (mqttClient.connected()) {
       const String topic = "ozkie/" + cfgSiteId + "/locks/" + String(from) + "/heartbeat";
       const bool ok = mqttClient.publish(topic.c_str(), buf);
@@ -1207,6 +1296,46 @@ static bool pollUplinkOne() {
 // pure-forward) or "envelope_hex" (sealed, ozkey-13 §8 BR1) — the bridge
 // never inspects `valueHex` either way, just relays it under whichever name
 // arrived. Kept generic rather than two near-duplicate functions.
+// ─────────────────────────────────────────────────────────────────────────────
+// ozkey-21 T3 — the bridge is the mesh's time source
+//
+// Neither the doorlock nor this board has an RTC, and a Thread lock has no
+// Wi-Fi, so it can never reach NTP itself. The bridge can: it is mains-powered
+// and already on Wi-Fi. Without this, every Thread lock answers its own MCU's
+// 0x1C with "I do not know", and DP 21/23 temporary PIN and RFID windows stay
+// unenforceable — see ozkey-21 §2.3, confirmed on DoorA 2026-08-10.
+//
+// TRUST MODEL — deliberate, and weaker than ozkey-21 §3.4 rule 4 asks for.
+// Rule 4 wants time to ride the sealed-envelope path. This rides plain mesh
+// traffic instead, authenticated only by the Thread network key. The reasoning:
+// only a commissioned device can put a datagram on this mesh, and the lock's
+// monotonic-forward rule means a hostile time can only push a clock FORWARD.
+// Forward-only prematurely EXPIRES credentials — a denial of access — and can
+// never resurrect an expired one, which is the attack rule 1 exists to stop.
+// So the residual risk is DoS by an already-commissioned device, not access
+// extension. Sealing the beacon is the follow-up; it is not what gates T5.
+// ─────────────────────────────────────────────────────────────────────────────
+static bool ntpStarted = false;
+static unsigned long lastTimeBeaconAt = 0;
+// DAILY, per ozkey-21 §3.3 and the operator's call 2026-08-11. Airtime is the
+// cost that matters on a shared mesh (ozkey-20 §4.1), and locks also get a free
+// UTC stamp on every forwarded command, so the beacon only carries the locks
+// nobody talks to. See the drift caveat in ozdoorlock_core.h's MCU_TIME_PUSH_MS.
+#define OZ_TIME_BEACON_MS 86400000UL
+
+/* Our current UTC, or 0 if NTP has not answered yet. 0 means "do not stamp". */
+static uint32_t ozBridgeUtc() {
+  time_t now = time(nullptr);
+  return ((uint32_t)now >= OZ_TIME_FLOOR) ? (uint32_t)now : 0;
+}
+
+static void ozNtpBegin() {
+  if (ntpStarted || WiFi.status() != WL_CONNECTED) return;
+  ntpStarted = true;
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  Serial.println("[TIME] NTP started (UTC, no TZ — the mesh runs on UTC)");
+}
+
 static bool sendToThreadGroup(const IPAddress &group, const String &target,
                               const String &fieldName, const String &valueHex,
                               const char *label) {
@@ -1218,6 +1347,14 @@ static bool sendToThreadGroup(const IPAddress &group, const String &target,
   doc["target"] = target;
   doc[fieldName] = valueHex;
   doc["via"] = label;
+  // ozkey-21 T3 — stamp UTC on every forwarded command. This is the cheap half
+  // of time distribution: the datagram is already being sent, so a lock that
+  // gets any traffic at all stays in sync for free. The beacon below exists
+  // only for locks that receive no commands for long stretches.
+  if (ozBridgeUtc()) {
+    doc["utc"] = ozBridgeUtc();
+    doc["tz"] = cfgTzMin;
+  }
   String out;
   serializeJson(doc, out);
 
@@ -1231,6 +1368,46 @@ static bool sendToThreadGroup(const IPAddress &group, const String &target,
     return false;
   }
   Serial.printf("[UDP] >> [%s] %s\n", label, out.c_str());
+  return true;
+}
+
+/*
+ * ozkey-21 T3 — the standalone time beacon.
+ *
+ * For locks that receive no commands at all: a lock nobody unlocks remotely
+ * still has to expire its temporary PINs on schedule.
+ *
+ * Addressed to ff03::1 (realm-local all-nodes), NOT our own ff03::4f5a group —
+ * that custom group has never delivered a single packet in 18 attempts and
+ * "mcast joined" in a boot log proves nothing about delivery. `target` is "*"
+ * because this is genuinely for every lock; the lock reads `utc` before its
+ * target check for exactly that reason.
+ */
+static bool sendTimeBeacon() {
+  const uint32_t utc = ozBridgeUtc();
+  if (!utc || !threadUdpReady) return false;
+
+  JsonDocument doc;
+  doc["target"] = "*";
+  doc["kind"] = "time";
+  doc["utc"] = utc;
+  // Locks have no other way to learn the timezone — they are never paired with
+  // a phone directly on Thread, the bridge is. Carried on every beacon rather
+  // than once, so a lock that joins later still gets it without a special case.
+  doc["tz"] = cfgTzMin;
+  String out;
+  serializeJson(doc, out);
+
+  IPAddress all;
+  if (!all.fromString("ff03::1")) return false;
+  if (!threadUdp.beginPacket(all, OZ_THREAD_UDP_PORT)) return false;
+  threadUdp.write((const uint8_t *)out.c_str(), out.length());
+  if (!threadUdp.endPacket()) {
+    Serial.println("[TIME] beacon endPacket failed");
+    return false;
+  }
+  lastTimeBeaconAt = millis();
+  Serial.printf("[TIME] beacon -> ff03::1 utc=%lu\n", (unsigned long)utc);
   return true;
 }
 
@@ -1653,13 +1830,16 @@ void formThreadNetwork() {
 // "Provision payload"). Validated before anything else is applied, so a
 // bad payload never touches the Wi-Fi/NVS state left by a prior good one.
 bool validModePayload(JsonDocument &doc, String &modeOut, String &hostOut,
-                       uint16_t &portOut, String &siteOut) {
+                       uint16_t &portOut, String &siteOut, int16_t &tzOut) {
   modeOut = (const char *)(doc["mode"] | "");
   if (modeOut != "mqtt-uplink" && modeOut != "matter-bridge") return false;
 
   hostOut = (const char *)(doc["broker_host"] | "");
   portOut = (uint16_t)(doc["broker_tcp_port"] | 0);
   siteOut = (const char *)(doc["site_id"] | "");
+  // Optional and additive — a bridge provisioned by an older app simply stays
+  // at UTC, which is exactly what it did before this field existed.
+  tzOut = (int16_t)(doc["tz"] | doc["tz_offset_min"] | 0);
   if (modeOut == "mqtt-uplink" &&
       (!hostOut.length() || portOut == 0 || !siteOut.length())) {
     return false; // broker_host/broker_tcp_port/site_id are REQUIRED for mqtt-uplink
@@ -1739,7 +1919,8 @@ void applyProvision(JsonDocument &doc) {
 
   String mode, brokerHost, siteId;
   uint16_t brokerPort;
-  if (!validModePayload(doc, mode, brokerHost, brokerPort, siteId)) {
+  int16_t tzMin = 0;
+  if (!validModePayload(doc, mode, brokerHost, brokerPort, siteId, tzMin)) {
     Serial.printf("[PROV] rejected — mode missing/invalid or broker fields incomplete "
                   "(mode='%s')\n", mode.c_str());
     notifyStatus("PAYLOAD_REJECTED");
@@ -1754,8 +1935,11 @@ void applyProvision(JsonDocument &doc) {
   cfgBrokerHost = brokerHost;
   cfgBrokerPort = brokerPort;
   cfgSiteId = siteId;
+  cfgTzMin = tzMin;
   wifiProvisioned = true;
   saveConfig();
+  Serial.printf("[TIME] timezone from app: %+d min (%+.2f h)\n",
+                (int)cfgTzMin, cfgTzMin / 60.0);
 
   // Optional Thread dataset to RESTORE (see haveRestoreDataset above). All five
   // fields must be present and well-formed or we ignore the lot and fall back
@@ -1979,6 +2163,21 @@ void loop() {
   // Keep pushing for Router until we get it (ozkey-20 §15.3).
   if (threadFormed) ozRouterPromotionTick();
 
+  // ── ozkey-21 T3 — be the mesh's clock ───────────────────────────────────
+  ozNtpBegin(); // no-op until Wi-Fi is up, and once started
+  // First beacon fires as soon as NTP answers (lastTimeBeaconAt == 0), then
+  // hourly. A lock that just booted should not wait an hour to learn the time.
+  if (threadFormed && threadUdpReady &&
+      (g_timeBeaconDue || lastTimeBeaconAt == 0 ||
+       millis() - lastTimeBeaconAt > OZ_TIME_BEACON_MS)) {
+    // Clear the child-attach request ONLY if the beacon actually went out.
+    // sendTimeBeacon() aborts when the bridge has no clock of its own yet, and
+    // consuming the flag on that path would silently drop the one beacon a
+    // freshly-attached lock is waiting for — it would then sit clock-less for
+    // 24 h, which is the exact failure this flag exists to prevent.
+    if (sendTimeBeacon()) g_timeBeaconDue = false;
+  }
+
   if (threadFormed &&
       (g_livenessPushDue ||
        millis() - g_lastLivenessAt > OZ_LIVENESS_INTERVAL_MS)) {
@@ -2001,6 +2200,42 @@ void loop() {
   if (lcdRxFlashActive && millis() >= lcdRxFlashUntil) {
     lcdRxFlashActive = false;
     if (lcdOn) drawStatus();
+  }
+
+  // ozkey-21 — the clock line has to tick. This screen only ever redrew on
+  // events, which would have left a frozen timestamp looking like a hung
+  // bridge. Full-screen redraw at 1 Hz is acceptable here because the panel
+  // blanks on idle anyway (LCD_IDLE_OFF_MS), so this costs nothing in the
+  // state the bridge actually spends its life in.
+  // Redraw ONLY the clock row, never the whole screen. A fillScreen at 1 Hz
+  // flickers visibly and, on the doorlock, the equivalent mistake cost touch
+  // sensitivity outright (see tuyaWireSend()'s screenDirty note). Same lesson,
+  // applied here before it could bite.
+  static unsigned long lastClockDraw = 0;
+  if (lcdOn && !lcdRxFlashActive && millis() - lastClockDraw > 1000) {
+    lastClockDraw = millis();
+    bool allUp = (WiFi.status() == WL_CONNECTED) && threadFormed;
+    if (allUp) {
+      // No seconds on screen, so the rendered string only changes once a
+      // minute — skip the SPI write entirely when it is identical. The 1 s tick
+      // stays (it costs a strcmp) so the minute rolls over promptly.
+      char stamp[17];
+      ozFormatStampNarrow(stamp, sizeof(stamp), ozBridgeUtc());
+      // ⚠ NOT `return` — this runs inside loop(), so bailing out here would
+      // skip every remaining loop task once a second (MQTT pump, liveness
+      // sweep, factory-reset button). Guard the draw instead.
+      static char lastStamp[17] = {0};
+      if (strcmp(stamp, lastStamp) != 0) {
+        strncpy(lastStamp, stamp, sizeof(lastStamp) - 1);
+        gfx->setTextSize(2);
+        gfx->setCursor(4, 88);
+        // Opaque text (fg, bg) — self-erasing, so no fillRect and nothing to
+        // flicker. Fixed 16-char width means there is never a leftover tail.
+        gfx->setTextColor(ozBridgeUtc() ? LCD_C_BLACK : LCD_C_RED, LCD_C_WHITE);
+        gfx->println(stamp);
+        gfx->setTextColor(LCD_C_BLACK);
+      }
+    }
   }
 
   static bool wasWifiConnected = false;

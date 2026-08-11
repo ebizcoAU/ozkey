@@ -174,19 +174,38 @@ Nothing in that needs redesigning. It needs implementing.
 We would be trading a clock problem for a mesh-partitioning problem, on a
 mesh whose reconvergence behaviour has already cost us a week. Rejected.
 
-### 3.3 The crystal changes the economics
+### 3.3 The crystal changes the economics — ⚠ CORRECTED 2026-08-11
 
-The operator fitted an **external 32.768 kHz crystal** to the ESP32.
-Drift drops from the internal RC's ~±5 % to roughly **±20 ppm** — about
-**1.7 s/day** — and it keeps running across deep sleep.
+**The original claim below was wrong, and it was load-bearing.** Our PCB does
+fit an external 32.768 kHz crystal (the Waveshare dev kits do not document
+one). But fitting the part is not using it:
 
-*Figures are the standard specifications for the two oscillator types, not
-measured on our board.*
+```
+CONFIG_RTC_CLK_SRC_INT_RC=y
+# CONFIG_RTC_CLK_SRC_EXT_CRYS is not set
+```
 
-Consequence: the lock needs the time **set rarely**, not continuously. A
-daily beacon is ample, and a lock that misses several days is still accurate
-to seconds. Without the crystal this design would need constant resync and
-would fight G1. **It is what makes the feature affordable.**
+That is the Arduino ESP32 3.3.11 C6 build config. Arduino ships **precompiled**
+IDF libraries, so the RTC slow clock runs on the **internal RC** and no amount
+of soldering reaches it — selecting the crystal needs a custom IDF build. So
+the ±20 ppm / 1.7 s-per-day figure below does not describe anything we have
+ever run.
+
+What is true: the RC is recalibrated against the main crystal while awake
+(`CONFIG_RTC_CLK_CAL_CYCLES=576`), so a lock that stays awake or light-sleeps
+keeps good time, and system time survives deep sleep
+(`CONFIG_ESP_TIME_FUNCS_USE_RTC_TIMER=y`). A production lock that deep-sleeps
+for hours drifts on the RC, and **the sync cadence must then be re-derived from
+measured drift, not assumed**. Unmeasured as of 2026-08-11.
+
+The daily cadence still stands for the current bench and for any mains-adjacent
+lock; it is the deep-sleep battery case that needs the measurement.
+
+*Original text, retained because the conclusion survives and the reasoning does
+not:* the operator fitted an external 32.768 kHz crystal; drift drops from the
+internal RC's ~±5 % to roughly ±20 ppm — about 1.7 s/day — and it keeps running
+across deep sleep. Consequence: the lock needs the time set rarely, not
+continuously. A daily beacon is ample.
 
 ### 3.4 The rules
 
@@ -200,26 +219,63 @@ would fight G1. **It is what makes the feature affordable.**
 3. **Persist across reboot.** Store last-known UTC in NVS on a slow cadence
    (not every tick — NVS endurance). On boot, restore, then let the crystal
    carry it until the next beacon.
-4. **Time source must be authenticated.** A beacon is a command like any
-   other and rides the existing sealed-envelope path. An unauthenticated
-   time source is an access-extension primitive.
+4. **Time source must be authenticated — AMENDED 2026-08-11, operator-accepted.**
+   The original rule (below) required the beacon to ride the sealed-envelope
+   path. **It is not implementable as written, and it aimed at the wrong
+   threat.**
+
+   Not implementable: the sealed envelope's keys are **per-bond app↔lock**
+   keys. The bridge does not hold them — it is deliberately a relay, not an
+   authority. Sealing the beacon would mean giving the bridge crypto authority
+   over locks, contradicting the bridge32 role decision. And the app is not the
+   time source; NTP/our server is, so sealing app→lock time would protect the
+   wrong hop.
+
+   Wrong threat: rule 1 (monotonic-forward) already blocks the
+   access-*extension* attack, because extending access needs the clock to move
+   **backward**. What is left is the opposite — a forward jump that expires
+   credentials early — and monotonic-forward makes that **irreversible**: after
+   a spoofed "year 2099" every legitimate time is backwards and is refused
+   forever. One packet, permanent brick, factory reset to recover.
+
+   **The rule is therefore replaced by three concrete protections:**
+   - the Thread network key authenticates the transport (only a commissioned
+     device can inject at all);
+   - **monotonic-forward** (rule 1) blocks extension;
+   - a **400-day forward-jump cap** blocks the one-packet brick while still
+     letting a lock dormant for a year resync in a single step.
+
+   Note the credential itself is unaffected: DP 21/23's `from`/`to` window
+   already travels **inside** the sealed envelope. Only the clock *reference*
+   is unsealed, and it is not part of the passport.
+
+   *Original rule:* "Time source must be authenticated. A beacon is a command
+   like any other and rides the existing sealed-envelope path. An
+   unauthenticated time source is an access-extension primitive."
+
+5. **NTP is an optimisation, never the only source.** Measured 2026-08-11 on
+   the lab network: DNS resolves `pool.ntp.org`, **UDP 123 times out**. A site
+   that blocks NTP would leave every lock `clock=UNKNOWN` and reintroduce the
+   §2.3 defect through the network. Our own MQTT connection to the server is
+   the time source of record — if the bridge cannot reach our server, there is
+   no product anyway.
 
 ---
 
 ## 4. Work breakdown
 
-### T1 — Clock in the ESP32 *(firmware)*
+### T1 — Clock in the ESP32 *(firmware)* — ✅ BUILT + HARDWARE-VERIFIED 2026-08-11
 
 Monotonic-forward UTC, crystal-backed, NVS-persisted, `time_unknown` state.
 Accept time from (a) a sealed beacon, (b) a UTC field on any inbound
 command.
 
-### T2 — Serve time to the lock MCU *(firmware)*
+### T2 — Serve time to the lock MCU *(firmware)* — ✅ BUILT + HARDWARE-VERIFIED 2026-08-11
 
 Implement the Tuya time service the MCU expects (§2.3). **Owed regardless of
 bonds** — it is probably why PIN windows do not work.
 
-### T3 — Bridge distributes time *(firmware, bridge32)*
+### T3 — Bridge distributes time *(firmware, bridge32)* — ✅ BUILT + HARDWARE-VERIFIED 2026-08-11
 
 NTP on the bridge; stamp UTC onto every forwarded command; slow beacon to
 the lock group for locks that receive no commands. Bridge is mains-powered,
@@ -231,7 +287,20 @@ Add `expires_at` (uint32 UTC, 0 = permanent) to the bond record and to the
 NVS `bondtab` layout. **Additive — existing bonds read back 0 = permanent,
 so no migration and no behaviour change for anyone already enrolled.**
 
-### T5 — Enforce it *(firmware)*
+### T5 — Enforce it *(firmware)* — 🟢 UNBLOCKED 2026-08-11, not yet built
+
+**§8 DECIDED (operator, via XF-87 §12): DELETE the bond outright on expiry —
+do NOT park it as inactive.** His reasoning: the window was explicitly and
+knowingly granted upfront and signed into the invite, so there is nothing left
+to approve at expiry — it is a pre-authorized outcome, not a decision point.
+Parking would only make sense if someone might reinstate it, and reinstating is
+what T7 (amend-by-command) is for, *before* expiry rather than after.
+
+Both former blockers are gone: **XF-87 v2 is hardware-verified** (ftpos's
+signed-`me` MAC matches ours byte-for-byte, so the invite can carry a
+trustworthy expiry), and **the lock now has a clock** (T1/T2/T3 live in
+`doorlock-1.54` / `bridge32-1.28`). T5 is the next real work in this document.
+
 
 On expiry: drop the bond, emit `roster_changed` (reason
 `membership_expired`), bump `roster_epoch` (ozkey-19 v2 R5), update the LCD
@@ -316,3 +385,115 @@ threat model.
 
 My recommendation is **delete**, with T7 (amend-by-command) as the way to
 extend *before* expiry. Operator's call.
+
+---
+
+## 7. Status 2026-08-11 — T1/T2/T3 done, verified end to end
+
+`doorlock-1.43`, `bridge32-1.20`. Chain proven on the bench with both locks
+attached to the bridge as Thread children:
+
+```
+bench/server --MQTT--> bridge --Thread ff03::1--> lock --0x1C--> DL MCU
+   utc=1786396938        utc=1786396958        clock=known      tserved=2
+```
+
+- **T2 answers.** LockA: `[TUYA->] 55 AA 00 1C 00 08 ...`, `treq` climbing with
+  `tserved` behind it. Before 1.42 this was `tx=0` — total silence (§2.3).
+- **The unknown-time reply is a real answer**, full length with flag 0, so
+  "module present but unfed" is distinguishable from "no service". That
+  distinction is what made the rest of this debuggable.
+- **T3 multicast reached BOTH children** — LockA and DoorB both went
+  `clock=UNKNOWN` → `clock=known` off one `ff03::1` beacon.
+- **Codec is cross-checked against LockSim**, which is the other end of this
+  UART: `blelock/bench/t2_host.cpp` compiles the real `oztime.h` natively and
+  asserts the `0x1C` frame byte-for-byte against `locksim/test`'s fixture, plus
+  the monotonic rule and the 400-day cap. 16/16, no board required.
+
+### Known gaps — do not read the above as "ozkey-21 is done"
+
+1. 🔴 **No real DL MCU has ever been observed asking us for the time.** Every
+   `0x1C` in this document came from *our own* emulators (`mcu_time_probe.py`,
+   LockSim). §2.3 proves the module never answered; it does **not** prove the
+   production MCU asks. **Manufacturer question.**
+2. 🔴 **Timezone does not exist anywhere in firmware.** `grep` for
+   `tz|timezone|utc_offset` across lock and bridge returns nothing. We serve
+   UTC in `0x1C`, which is nominally *local* time. If the app writes DP 21/23
+   windows in local wall-clock, every temporary credential is wrong by the
+   offset — 7 hours in Vietnam. **Action 1, raised with ftpos.**
+3. **NTP unusable on this network** — see §3.4 rule 5. The MQTT path carries it
+   today; NTP stays in for sites that allow it.
+4. **Deep-sleep drift unmeasured** — see §3.3.
+5. T4/T5 (bond expiry field + enforcement) not started; T5 still gated on
+   ftpos's XF-87.
+
+---
+
+## 8. Tuya's actual clock architecture — and the question it forces (2026-08-11)
+
+Operator research, and it both **validates T2 and exposes a gap in what we
+know about the manufacturer's board.**
+
+### 8.1 There are two clocks, and only one of them is a calendar
+
+- **High-speed system oscillator** (16/32 MHz) — present on *both* the lock MCU
+  and the wireless module. Runs code, reads the fingerprint sensor, drives the
+  keypad, times the 5-second re-lock. **It is not a calendar** and cannot tell
+  you it is Tuesday.
+- **Real-time clock (calendar time)** — needed for temporary passwords,
+  time-limited guest access, and unlock history. Per Tuya's smart-lock MCU
+  protocol this is provided **one of two ways**:
+  1. **The module's RTC.** The module keeps calendar time, syncs from the cloud
+     or the phone whenever it connects, and keeps ticking offline — quoted drift
+     **under 1 minute per 24 h**.
+  2. **A dedicated external RTC chip** on the lock's main board — DS1302 or
+     PCF8563 with its own 32.768 kHz crystal and a **backup coin cell**, so
+     calendar time survives even a full battery pull.
+
+### 8.2 What this confirms
+
+**We are the module, so option 1 is our job — this is exactly T2.** The design
+is not a workaround for a missing Tuya feature; it is the standard
+architecture, and we had simply never implemented our half of it. §2.3's
+`tx=0` was us failing to be the module Tuya's protocol assumes.
+
+It also gives us a **drift budget with a number in it**: under 1 min/24 h is
+what a Tuya module delivers, so it is the bar our ESP32 clock should meet. Note
+§3.3 — we run on the internal RC, not the fitted crystal, so **we have not
+shown we meet it.** Still unmeasured.
+
+### 8.3 🔴 The question this forces — manufacturer
+
+Per the operator: **only high-end Tuya locks put an RTC in the MCU.** So which
+is our board?
+
+> **Does the lock MCU have a dedicated RTC chip (DS1302 / PCF8563 or similar)
+> with a backup cell — or does it depend entirely on the module for calendar
+> time?**
+
+The answer changes the severity of everything in this document:
+
+| If | Then |
+|---|---|
+| **No MCU RTC** (expected for our tier) | We are the ONLY calendar clock. Every temporary credential depends on T2/T3 working, and a lock whose clock is unknown must fail closed. This is the assumption the current firmware is built on. |
+| **MCU has its own RTC + coin cell** | The MCU keeps time across battery pulls independently. T2 still matters (it is how that RTC gets *set* and corrected), but the failure mode is far softer, and our unknown-clock handling is belt-and-braces rather than the only thing standing up. |
+
+Add to the manufacturer list alongside ozkey-22 Q0/Q1/Q2b/§7. It pairs with
+the other open unknown in §7: **no real DL MCU has ever been observed asking us
+for the time** — every `0x1C` came from our own emulators. If the board has its
+own RTC chip, it may never ask at all, and that would explain a silence we
+have so far only been able to test against ourselves.
+
+### 8.4 Timezone — RESOLVED, and the answer is counter-intuitive
+
+XF-90 §11: DP 21/23 `from`/`to` are **true UTC epoch seconds** (ftpos verified
+in their source — the admin picks local wall-clock, but it reaches the wire via
+`DateTime.millisecondsSinceEpoch`, which is always UTC-based).
+
+**So we serve UTC to the MCU and apply the timezone offset ONLY to the panel** —
+even though `0x1C` is named `GET_LOCAL_TIME`. Serving genuine local time there
+would shift every temporary credential by the offset, 7 hours in Vietnam, with
+nothing on our side able to detect it. The command's name is a trap, not a
+guide. Marked in `serveMcuTimeRequest()` so nobody "fixes" it back.
+
+Shipped in `doorlock-1.50`.

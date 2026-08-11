@@ -41,6 +41,7 @@
 #include "driver/gpio.h"
 #include "esp_sleep.h"
 #include "ozcrypto.h" // member-ceremony crypto (XF-46 §7.1) + boot self-test
+#include "oztime.h"   // ozkey-21 T1/T2 — module clock + the MCU time service
 #include <OThread.h>     // Thread transport (ported from threadcomm.ino)
 #include <OThreadUDP.h>  // F4 UDP relay (bridge32/threadcomm proven, 2026-07-25/26)
 // Receive half runs on lwIP, not OpenThread's internal UDP — see the root-cause
@@ -680,6 +681,47 @@ bool mrdyAsserted = false;
 unsigned long lastWireActivityAt = 0; // any Serial1 byte, either direction
 unsigned long lastActivityAt = 0;     // frames / MQTT rx / touch / connects
 uint32_t sleepWakeCount = 0;
+// ── ozkey-21 T1/T2 — module clock + MCU time service ────────────────────────
+// The MODULE is the time source and the lock MCU is its client. We are the
+// module. Codec and rules live in oztime.h; this is just the live state.
+OzClock ozclock;
+// ozkey-21 — timezone, minutes east of UTC. Learned from the bridge's beacon
+// (Thread) or the app at provisioning (Wi-Fi); 0 = UTC until told otherwise.
+// Persisted so a rebooted lock shows correct local time before the next beacon.
+int16_t cfgTzMin = 0;
+/*
+ * Panel repaint generation.
+ *
+ * drawStatusLine() and drawHexReadout() both skip work when their content is
+ * unchanged, which is what stops the panel flickering. That optimisation is
+ * only valid while the pixels they drew are still on the screen — and a full
+ * fillScreen() erases them. Bump this counter on every full clear; the gated
+ * drawers compare it and force one repaint when it moves.
+ *
+ * Getting this wrong blanks the entire panel and leaves only the unconditional
+ * clock line visible (observed 2026-08-11 on doorlock-1.46), because each
+ * gated drawer independently concluded it had nothing to do.
+ */
+uint32_t panelGen = 0;
+bool mcuWantsTimePush = false;   // MCU sent 0x34 sub 0x01 (subscribe)
+uint32_t mcuTimeRequests = 0;    // 0x0C/0x1C asked of us
+uint32_t mcuTimeServed = 0;      // answered WITH a real time
+uint32_t mcuTimeUnknown = 0;     // answered "I do not know" (flag byte 0)
+unsigned long lastTimePushAt = 0;
+// Push cadence once subscribed: DAILY (operator's call, 2026-08-11).
+//
+// This said hourly, which was never derived from anything — ozkey-21 §3.3
+// specifies "a daily beacon is ample" and the code contradicted its own design
+// doc. 24 h is the spec.
+//
+// ⚠ The drift budget behind "daily is ample" cited an external 32.768 kHz
+// crystal at ~20 ppm. That crystal is on our PCB but the Arduino build does
+// NOT use it — CONFIG_RTC_CLK_SRC_INT_RC=y in the precompiled IDF libs, so the
+// RTC runs on the internal RC. It is recalibrated against the main crystal
+// while awake, so a running lock is fine; a production lock that deep-sleeps
+// for hours needs this cadence re-derived from MEASURED drift, not assumed.
+#define MCU_TIME_PUSH_MS 86400000UL
+
 #define MRDY_IDLE_RELEASE_MS 10000UL  // Tuya: release after 10 s serial idle
 #define SRDY_WAIT_TIMEOUT_MS 1500UL   // answer-before-transmit guard
 #define SLEEP_IDLE_MS 30000UL         // nap after 30 s with nothing to do
@@ -779,6 +821,23 @@ String asciiOnly(const String &s) {
     if (c >= 32 && c < 127) out += c;
   }
   return out.length() ? out : String("Doorlock");
+}
+
+/*
+ * Short device_id for the panel: "ozk" + 8 hex — e.g. `ozk-acebe639` from
+ * `ozk-acebe639f8c4` (operator, 2026-08-11).
+ *
+ * 8 hex characters is 4 bytes of MAC, which is unambiguous across any fleet
+ * we will ever put on one bench or in one building, and it buys back the
+ * width the clock now needs. The FULL id still appears on the advertising
+ * screen and in every log line — this shortening is for the operational
+ * screen, where you are identifying a lock you are standing in front of, not
+ * typing an MQTT topic.
+ */
+String ozShortId(const String &id) {
+  int dash = id.indexOf('-');
+  if (dash < 0 || (int)id.length() <= dash + 1) return id;
+  return id.substring(0, dash + 1) + id.substring(dash + 1, dash + 9);
 }
 
 String isoNow() {
@@ -937,6 +996,7 @@ void drawJoining() {
 // plus door name, IP, network status. Border colour = health summary:
 // GREEN = net + MCU link up · AMBER = one leg down · RED = both down.
 void drawOperational() {
+  panelGen++; // full clear below invalidates every gated row
   // Transport-aware (2026-07-26): Wi-Fi's "connected" is WL_CONNECTED+MQTT;
   // Thread's is just having attached (threadFormed) — this pass has no
   // uplink, so there's no MQTT-equivalent "server reachable" signal for
@@ -994,6 +1054,21 @@ void drawOperational() {
 // UNLOCKED color bar moved OFF this line entirely — it's on line 2 now,
 // paired with the hex readout (see drawHexReadout()), since this line was
 // already full without it.
+/*
+ * The BLE countdown badge, on its own. It is the ONLY thing in the status row
+ * that changes every second, and redrawing the whole row for it is what made
+ * the panel strobe during the pairing window (operator, 2026-08-11) — the
+ * moment a user is most likely to be looking at it.
+ */
+void drawBleBadge() {
+  if (!bleWindowOpen()) return;
+  gfx->fillRect(256, 2, PANEL_W - 256 - 2, STATUS_H - 4, C_AMBER);
+  gfx->setTextSize(1);
+  gfx->setCursor(260, 6);
+  gfx->setTextColor(C_WHITE, C_AMBER);
+  gfx->printf("BLE %lus", (bleWindowUntil - millis()) / 1000);
+}
+
 void drawStatusLine() {
   ot_device_role_t liveRole = isThread() ? OpenThread::otGetDeviceRole() : OT_ROLE_DISABLED;
   bool threadAttached = (liveRole == OT_ROLE_CHILD || liveRole == OT_ROLE_ROUTER ||
@@ -1001,6 +1076,37 @@ void drawStatusLine() {
   bool netUp = isThread() ? threadAttached
                           : ((WiFi.status() == WL_CONNECTED) && mqtt.connected());
   uint16_t border = netUp ? C_GREEN : C_RED;
+
+  // ── DON'T REPAINT WHAT HASN'T CHANGED (operator, 2026-08-11) ────────────
+  //
+  // This row was cleared to black and rebuilt every 3 s unconditionally, which
+  // is a full-width black flash three times a minute for a line whose contents
+  // are usually identical. Everything below is a pure function of this state,
+  // so if the state matches the last paint there is nothing to draw.
+  //
+  // The BLE countdown is deliberately NOT in this signature — it changes every
+  // second and would defeat the whole gate. It has its own badge redraw.
+  static uint32_t lastSig = 0;
+  static bool haveSig = false;
+  static uint32_t seenGen = (uint32_t)-1;
+  if (seenGen != panelGen) { seenGen = panelGen; haveSig = false; } // screen was cleared
+  uint32_t sig = (uint32_t)netUp | ((uint32_t)liveRole << 1) |
+                 ((uint32_t)provisioned << 5) | ((uint32_t)mcuLinkUp() << 6) |
+                 ((uint32_t)bleWindowOpen() << 7) | ((uint32_t)isThread() << 8);
+  {
+    // Fold the variable-length text in too, so an IP or name change still
+    // repaints. Cheap additive hash — collisions only cost a missed refresh
+    // of a line that is redrawn on every real event anyway.
+    String v = (isThread() ? String("") : WiFi.localIP().toString()) +
+               (cfgName.length() ? cfgName : deviceId) + cfgRoomNo;
+    for (size_t i = 0; i < v.length(); i++) sig = sig * 31u + (uint8_t)v[i];
+  }
+  if (haveSig && sig == lastSig) {
+    drawBleBadge(); // the one part that legitimately ticks
+    return;
+  }
+  lastSig = sig;
+  haveSig = true;
 
   gfx->fillRect(2, 2, PANEL_W - 4, STATUS_H - 2, C_BLACK);
 
@@ -1042,10 +1148,10 @@ void drawStatusLine() {
     gfx->print(" P.");
     gfx->print(cfgRoomNo);
   }
-  gfx->print(" ");
-  gfx->setTextColor(C_WHITE); // same contrast fix as the hex line's name (C_GREY was unreadable)
-  String name = cfgName.length() ? cfgName : deviceId;
-  gfx->print(name.substring(0, 10));
+  // The lock's NAME used to sit here; it moved to line 2's right edge
+  // (operator, 2026-08-11) where it sits beside the clock. Line 1 is now
+  // purely transport/health, which is also what makes its change-gate
+  // effective — the name was the most frequently varying thing on it.
 
   // BLE countdown / reset hint, far right (operator spec — moved here from
   // its own row, which no longer exists).
@@ -1288,6 +1394,7 @@ void checkFactoryResetButton() {
 // ─────────────────────────────────────────────────────────────────────────────
 String lastMcuHex = ""; // last DP frame's hex bytes — read by drawHexReadout()
 
+
 void tuyaWireSend(const uint8_t *f, size_t n) {
   // §0.2 module-initiated send: raise MRDY, wait for the MCU's answering
   // SRDY (wake_sim: assumed answered), then transmit — no bytes ever hit a
@@ -1308,7 +1415,138 @@ void tuyaWireSend(const uint8_t *f, size_t n) {
   }
   Serial.printf("[TUYA->] %s\n", hex.c_str());
   lastMcuHex = hex;
-  screenDirty = true; // hex readout lives on the dashboard
+  // screenDirty REMOVED 2026-08-11. It existed to refresh the hex readout, and
+  // that readout is gone — this row shows the clock now, refreshed on its own
+  // 1 s tick. Leaving it in meant a full-screen redraw on every frame we send
+  // to the MCU, which since 1.42 includes a time reply every few seconds. That
+  // is what wrecked touch sensitivity. lastMcuHex is kept: it is still the
+  // [TUYA->] serial line's source and costs nothing.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ozkey-21 T2 — serve time to the lock MCU
+//
+// The whole service is three functions: refresh our own clock from whatever
+// source we have, answer 0x0C/0x1C on demand, and push on a slow timer once
+// subscribed. Codec and the monotonic-forward rule are in oztime.h.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/*
+ * Feed T1's clock from the system clock.
+ *
+ * TODAY the only real source is SNTP over Wi-Fi, so a WI-FI LOCK GETS TIME AND
+ * A THREAD LOCK DOES NOT. That is not an oversight in T2, it is T3's job — the
+ * bridge runs NTP and stamps UTC onto every forwarded command plus a slow
+ * beacon. Until T3 lands, a Thread lock answers 0x1C honestly with flag 0, and
+ * the [TIME] counters below make that visible instead of silent.
+ */
+/*
+ * ozkey-21 §3.4 rule 3 — persist the clock across a reboot.
+ *
+ * The battery-pull case is covered by re-provisioning (the app hands time back
+ * during commissioning). What is NOT covered is a SPONTANEOUS RESET — brownout,
+ * watchdog, crash — where the lock comes straight back up with no app present
+ * and no provisioning. Without this it would sit clock-less until the next
+ * beacon, and every temporary credential on it is unenforceable meanwhile.
+ * This board has a documented history of self-resets, so that is not a
+ * theoretical branch.
+ *
+ * WRITE CADENCE: hourly, never per tick — NVS has finite erase endurance and a
+ * clock written every second would wear the sector out. An hour-stale restored
+ * time is harmless: monotonic-forward means the first beacon corrects it
+ * upward, and being an hour behind never un-expires anything, it only delays
+ * an expiry that the next sync then applies.
+ */
+#define OZ_CLOCK_PERSIST_MS 3600000UL
+
+void ozClockPersist(bool force) {
+  static unsigned long lastWrite = 0;
+  if (!ozClockKnown(ozclock)) return;
+  if (!force && lastWrite && millis() - lastWrite < OZ_CLOCK_PERSIST_MS) return;
+  lastWrite = millis();
+  prefs.begin("blelock", false);
+  prefs.putUInt("utclast", ozClockNow(ozclock, millis()));
+  prefs.end();
+}
+
+void ozClockRestore() {
+  prefs.begin("blelock", true);
+  const uint32_t saved = prefs.getUInt("utclast", 0);
+  prefs.end();
+  if (saved < OZ_TIME_FLOOR) return;
+  // Goes through ozClockSet() like any other source, so the floor and the
+  // monotonic rule apply to our own NVS exactly as they do to the bridge.
+  if (ozClockSet(ozclock, saved, millis()))
+    Serial.printf("[TIME] clock restored from NVS: %lu (stale by up to 1 h — "
+                  "next beacon corrects it)\n", (unsigned long)saved);
+}
+
+void ozClockRefreshFromSystem() {
+  time_t sys = time(nullptr);
+  if ((uint32_t)sys < OZ_TIME_FLOOR) return;
+  // Only log transitions; this is called from loop().
+  bool wasKnown = ozClockKnown(ozclock);
+  if (ozClockSet(ozclock, (uint32_t)sys, millis()) && !wasKnown)
+    Serial.printf("[TIME] clock acquired: %lu (SNTP)\n", (unsigned long)sys);
+}
+
+void serveMcuTimeRequest(bool local) {
+  mcuTimeRequests++;
+  const uint32_t now = ozClockNow(ozclock, millis());
+  const bool have = ozClockKnown(ozclock);
+  // 0x1C is GET_LOCAL_TIME and 0x0C is GET_GMT_TIME — so the local request gets
+  // the offset applied and the GMT one never does. Until the app supplied a
+  // timezone, cfgTzMin was 0 and "local" was silently UTC; that was the honest
+  // best we could do, not a design choice.
+  //
+  // ⚠ ANSWERED — XF-90 §11 (ftpos, 2026-08-11): DP 21/23 `from`/`to` are TRUE
+  // UTC EPOCH SECONDS. They verified it in their own source rather than
+  // assuming: the admin picks a local wall-clock time, but it reaches the wire
+  // via DateTime.millisecondsSinceEpoch, which is always UTC-based.
+  //
+  // THEREFORE WE SERVE UTC HERE, TIMEZONE OFFSET DELIBERATELY NOT APPLIED —
+  // even though 0x1C is nominally GET_LOCAL_TIME. The MCU is comparing against
+  // UTC windows, so it must be given a UTC clock; handing it local time would
+  // shift every temporary PIN and RFID by the offset (7 hours in Vietnam) and
+  // would be undetectable from our side.
+  //
+  // `cfgTzMin` is for the PANEL ONLY. Do not "fix" this to use it — the naming
+  // of the Tuya command is the trap here, not the guide.
+  uint8_t out[16];
+  size_t n = ozTuyaBuildTimeReply(out, local, have, now, /*tzOffsetMin=*/0);
+  tuyaWireSend(out, n);
+  if (have) {
+    mcuTimeServed++;
+    Serial.printf("[TIME] served %s time to DL MCU: %lu (req=%lu served=%lu)\n",
+                  local ? "LOCAL" : "GMT", (unsigned long)now,
+                  (unsigned long)mcuTimeRequests, (unsigned long)mcuTimeServed);
+  } else {
+    mcuTimeUnknown++;
+    // Not a failure of this code — an honest report that nothing has told US
+    // the time either. On a Thread lock this is the expected answer until T3.
+    Serial.printf("[TIME] DL MCU asked for %s time and WE DO NOT KNOW IT "
+                  "(flag=0, req=%lu unknown=%lu) — temporal DPs unenforceable\n",
+                  local ? "LOCAL" : "GMT",
+                  (unsigned long)mcuTimeRequests, (unsigned long)mcuTimeUnknown);
+  }
+  // NO screenDirty HERE. The MCU polls for time every few seconds, and a full
+  // redraw per poll is what destroyed touch sensitivity in 1.44 (operator:
+  // "tap x10 to see screen response"). Before 1.42 the lock never transmitted
+  // at all, so tuyaWireSend()'s own screenDirty never fired on this path —
+  // answering the MCU turned a rare event into a periodic one.
+  // The 1 s clock tick in loop() already keeps this row current.
+}
+
+void serveMcuTimePush() {
+  const uint32_t now = ozClockNow(ozclock, millis());
+  const bool have = ozClockKnown(ozclock);
+  uint8_t out[20];
+  size_t n = ozTuyaBuildTimePush(out, /*local=*/false, have, now);
+  tuyaWireSend(out, n);
+  lastTimePushAt = millis();
+  if (have) mcuTimeServed++; else mcuTimeUnknown++;
+  Serial.printf("[TIME] push -> DL MCU: %s\n",
+                have ? "time sent" : "flag=0, we do not know the time");
 }
 
 // Short human line for the console + dashboard ("what did the MCU say?")
@@ -1397,7 +1635,33 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       factoryReset(); // never returns
       return;
     }
+    // ozkey-21 T2 — 0x34 sub 0x01: the MCU asks to be PUSHED time from now on.
+    // Answer immediately as well as registering: the MCU asked because it does
+    // not know the time, and making it wait a full push interval for the first
+    // answer is the same defect in slower motion.
+    if (sub == OZ_TUYA_SUB_SUBSCRIBE) {
+      mcuWantsTimePush = true;
+      Serial.println("[TIME] DL MCU subscribed to time push (0x34 sub 0x01)");
+      serveMcuTimePush();
+      return;
+    }
     Serial.printf("[TUYA<-] 0x34 sub 0x%02X — not handled\n", sub);
+    return;
+  }
+
+  // ── ozkey-21 T2 — 0x0C / 0x1C: the MCU asks us what time it is ────────────
+  //
+  // Until now this fell through to "UNCLASSIFIED" and we said nothing at all.
+  // That silence is the ozkey-21 §2.3 defect: the MCU checks DP 21/23 windows
+  // against a clock nobody ever set, so temporary PINs and RFIDs never expire.
+  //
+  // We answer even when we have no time, with the success flag clear. A module
+  // that says "I do not know" is diagnosable; a module that says nothing is
+  // indistinguishable from a broken wire, which is exactly the ambiguity that
+  // let this defect sit unnoticed.
+  if (n >= 7 && (f[3] == OZ_TUYA_GET_GMT_TIME || f[3] == OZ_TUYA_GET_LOCAL_TIME)) {
+    const bool local = (f[3] == OZ_TUYA_GET_LOCAL_TIME);
+    serveMcuTimeRequest(local);
     return;
   }
 
@@ -1919,9 +2183,54 @@ void pollThreadUdp() {
     Serial.println("[UDP] payload not valid JSON, dropped");
     return;
   }
+  // ── ozkey-21 T3 — take the time BEFORE the target check ─────────────────
+  //
+  // Two reasons this cannot sit below the target filter:
+  //   • the standalone beacon is addressed to "*", so it would be dropped as
+  //     "not for us" and no Thread lock would ever learn the time;
+  //   • a command addressed to a DIFFERENT lock still carries a perfectly good
+  //     UTC stamp, and refusing to read it would throw away free syncs.
+  //
+  // Safe to accept from any datagram because ozClockSet() is monotonic-forward
+  // and floors implausible values — see the trust-model note in bridge32.ino's
+  // T3 block. A time we already have, or an older one, changes nothing.
+  // Timezone rides with the time. Stored even when the clock value itself is
+  // refused (stale/duplicate beacon) — the offset is still current information.
+  if (doc["tz"].is<int>()) {
+    const int16_t tzNew = (int16_t)(doc["tz"] | 0);
+    if (tzNew != cfgTzMin) {
+      cfgTzMin = tzNew;
+      prefs.begin("blelock", false);
+      prefs.putShort("tzmin", cfgTzMin);
+      prefs.end();
+      Serial.printf("[TIME] timezone from bridge: %+d min\n", (int)cfgTzMin);
+      screenDirty = true;
+    }
+  }
+
+  const uint32_t utcIn = doc["utc"] | 0UL;
+  if (utcIn) {
+    const bool wasKnown = ozClockKnown(ozclock);
+    if (ozClockSet(ozclock, utcIn, millis())) {
+      if (!wasKnown) {
+        Serial.printf("[TIME] clock acquired from bridge: %lu — temporal DPs "
+                      "are now enforceable\n", (unsigned long)utcIn);
+        ozClockPersist(true); // don't lose it to a reset in the next hour
+        screenDirty = true;
+        // The MCU has been asking and getting "I do not know". Now that we
+        // know, tell it immediately rather than waiting for it to ask again —
+        // it may back off for hours after repeated unknown answers.
+        if (mcuLinkUp()) serveMcuTimePush();
+      }
+    }
+  }
+
   String target = (const char *)(doc["target"] | "");
   if (target != deviceId) { // not for us
-    Serial.printf("[UDP] not for us (target='%s' me='%s')\n", target.c_str(), deviceId.c_str());
+    // "*" is the T3 time beacon: genuinely for everyone, and its whole payload
+    // was consumed above. Not an error, so don't log it as one.
+    if (target != "*")
+      Serial.printf("[UDP] not for us (target='%s' me='%s')\n", target.c_str(), deviceId.c_str());
     return;
   }
   lastActivityAt = millis();
@@ -2582,6 +2891,47 @@ void applyProvision(JsonDocument &doc) {
     Serial.printf("[PROV] device_id mismatch (%s != %s)\n", pid.c_str(), deviceId.c_str());
     notifyStatus("ENROLL_FAIL");
     return;
+  }
+
+  // ── ozkey-21 — timezone and time from the app, BOTH transport arms ───────
+  //
+  // Read here, ABOVE the transport branch, for exactly the reason `app_id` is
+  // (XF-47 §11.5): a field parsed inside the Wi-Fi arm silently does not exist
+  // on Thread, and that class of bug does not surface until much later.
+  //
+  // WHY THE LOCK NEEDS ITS OWN COPY even though the bridge sends tz on every
+  // beacon: a WI-FI LOCK HAS NO BRIDGE. For it, the app at provisioning is the
+  // only timezone source that will ever exist. For a Thread lock this is a
+  // head start — correct local time from the first second rather than from the
+  // first beacon.
+  //
+  // `utc` likewise: at a site with NTP blocked (measured — see ozkey-21 §3.4
+  // rule 5) and a cold server, the phone in the installer's hand is the only
+  // clock in the room. Both fields are optional; an older app simply omits
+  // them and nothing changes.
+  {
+    const bool haveTz = doc["tz"].is<int>() || doc["tz_offset_min"].is<int>();
+    if (haveTz) {
+      cfgTzMin = (int16_t)(doc["tz"] | doc["tz_offset_min"] | 0);
+      prefs.begin("blelock", false);
+      prefs.putShort("tzmin", cfgTzMin);
+      prefs.end();
+      Serial.printf("[TIME] timezone from app: %+d min\n", (int)cfgTzMin);
+      screenDirty = true;
+    }
+    const uint32_t provUtc = doc["utc"] | 0UL;
+    if (provUtc >= OZ_TIME_FLOOR) {
+      // Through ozClockSet() like every other source — monotonic-forward and
+      // the 400-day cap apply to the app exactly as they do to the bridge.
+      if (ozClockSet(ozclock, provUtc, millis())) {
+        Serial.printf("[TIME] clock from app at provisioning: %lu\n",
+                      (unsigned long)provUtc);
+        ozClockPersist(true);
+        // Also set the system clock so isoNow() (log timestamps) agrees.
+        struct timeval tv = { .tv_sec = (time_t)provUtc, .tv_usec = 0 };
+        settimeofday(&tv, nullptr);
+      }
+    }
   }
 
   // ── M2: bond #0 verdict — decided HERE, before ANY state is touched ───────
@@ -3527,6 +3877,41 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
   // "admin only": bond #0 is never revocable and a member may revoke itself),
   // so they are called directly with the same value bytes the DP path fed them
   // rather than being re-gated here.
+  // ── ozkey-21/ozkey-23 — SEALED remote factory reset ─────────────────────
+  //
+  // WHY THIS EXISTS. "Remove lock from the app" published
+  // {"op":"factory_reset"} to `locks/<id>/command` — the LOCK's own MQTT topic.
+  // A Thread lock has no Wi-Fi and never subscribes to MQTT, so that message
+  // could never arrive; verified on the broker 2026-08-11 and confirmed on the
+  // bench (the lock did not reset). It works on a Wi-Fi lock, which is why it
+  // looked like a regression rather than a routing gap.
+  //
+  // WHY SEALED rather than teaching the bridge to relay a bare `op` verb:
+  // "wipe this lock" is the most destructive command we have. Unauthenticated,
+  // on a broker that today enforces NO credentials at all (ozkey-13 S8/S9 —
+  // a fabricated username still publishes), it is a one-line site-wide DoS.
+  // Remote revoke already rides the sealed envelope for exactly this reason;
+  // this is the same verb class and gets the same treatment.
+  //
+  // OWNER ONLY. `slot` is the bond the envelope authenticated against, and
+  // bond #0 is the owner. A member must never be able to factory-reset the
+  // lock they were invited to — that is an escalation from "I have access" to
+  // "nobody has access", including the owner.
+  if (strcmp(kind, "factory_reset") == 0 || strcmp(kind, "unpair") == 0) {
+    if (slot != 0) {
+      Serial.printf("[OZKIE] %s REFUSED — bond %d is not the owner\n", kind, slot);
+      notifyStatus("REVOKE_DENIED");
+      return;
+    }
+    Serial.printf("[OZKIE] %s authorised by owner — wiping\n", kind);
+    // Tell the app before we go: factoryReset() ends in a platform reset and
+    // never returns, so anything sent after it is never sent. Same ordering
+    // rule as the ozkey-22 R1 MCU reset ack.
+    notifyStatus("FACTORY_RESET");
+    factoryReset(); // never returns
+    return;
+  }
+
   if (strcmp(kind, "bond_revoke") == 0) {
     uint8_t pub[32];
     if (ozHexDecode(String((const char *)(doc["pub"] | "")), pub, sizeof(pub)) != 32) {
@@ -4306,27 +4691,56 @@ void drawHexReadout() {
   // the color bar used — so this row's black background painted directly
   // over the bar every redraw (operator-caught: "big red line... overlay
   // and disappear"). Must be HEX_TOP, not STATUS_H.
-  gfx->fillRect(0, HEX_TOP, PANEL_W, HEX_H, C_BLACK);
-
+  // FLICKER FIX 2026-08-11 (operator: "keep flickering every 3-5s"). This used
+  // to blank the whole row to black and repaint it every redraw. At a 1 s clock
+  // tick that is a visible strobe.
+  //
+  // Instead: paint the bar only when the bolt actually changes, and draw the
+  // stamp as OPAQUE text (foreground + background), so each glyph overwrites
+  // exactly its own pixels. No clear step, nothing to flicker. The stamp is
+  // fixed-width by construction, so there is never a leftover tail to erase.
   bool open = doorStatus == "UNLOCKED";
   const int barW = 40;
-  gfx->fillRect(0, HEX_TOP + 2, barW, HEX_H - 4, open ? C_GREEN : C_RED);
+  static int lastBar = -1;
+  static uint32_t barGen = (uint32_t)-1;
+  if (barGen != panelGen) { barGen = panelGen; lastBar = -1; } // screen was cleared
+  const int barState = open ? 1 : 0;
+  if (barState != lastBar) {
+    lastBar = barState;
+    gfx->fillRect(0, HEX_TOP + 2, barW, HEX_H - 4, open ? C_GREEN : C_RED);
+  }
 
-  // textSize 1 (operator, 2026-08-07: size 2 didn't fit horizontally on real
-  // hardware — "1 step smaller"). Still truncated with "..." rather than
-  // letting a long frame (list_bonds chunks are ~180 B / 540 hex chars,
-  // nowhere close to fitting at any readable size either way) run off
-  // screen invisibly. Full bytes are always in the [TUYA->] serial line
-  // regardless.
+  // ── LEFT: the clock, size 2 ────────────────────────────────────────────
+  // Narrow form (16 chars, "11/08/26 09:17AM") is what allows size 2 here:
+  // 16 x 12 = 192 px, which fits beside the door name on a 320 px panel.
+  // Same format as the bridge, deliberately — comparing a lock screen against
+  // the bridge screen should not require converting between two date formats.
+  char stamp[17];
+  ozFormatStampNarrow(stamp, sizeof(stamp), ozClockNow(ozclock, millis()), cfgTzMin);
+  gfx->setTextSize(2);
+  gfx->setCursor(barW + 6, HEX_TOP + 3);
+  gfx->setTextColor(ozClockKnown(ozclock) ? C_GREEN : C_AMBER, C_BLACK); // opaque
+  gfx->print(stamp);
+
+  // ── RIGHT: the door name (operator, 2026-08-11) ────────────────────────
+  //
+  // Moved off line 1 and changed from device_id to NAME. On a wall the useful
+  // identifier is "Front Door", not "ozk-acebe639" — the id matters when you
+  // are typing an MQTT topic, and it is still on the advertising screen and in
+  // every log line for that. An unnamed lock falls back to the short id so the
+  // field is never blank.
+  //
+  // size 1 and right-aligned: 10 chars x 6 px = 60 px, which is what is left
+  // after the 192 px clock. Padded to a fixed width so a shorter name cannot
+  // leave the tail of a longer previous one on screen — there is no fillRect
+  // on this row any more, opaque text is the only eraser.
+  String dname = cfgName.length() ? asciiOnly(cfgName) : ozShortId(deviceId);
+  if (dname.length() > 10) dname = dname.substring(0, 10);
+  while (dname.length() < 10) dname += ' ';
   gfx->setTextSize(1);
-  gfx->setCursor(barW + 6, HEX_TOP + 6);
-  gfx->setTextColor(lastMcuHex.length() ? C_AMBER : C_DIM);
-  const char *text = lastMcuHex.length() ? lastMcuHex.c_str() : "no command sent yet";
-  const size_t maxChars = 44; // more room now the name moved to line 1
-  String full = String(text);
-  bool truncated = full.length() > maxChars;
-  gfx->print(full.substring(0, maxChars));
-  if (truncated) gfx->print("...");
+  gfx->setCursor(PANEL_W - 4 - 60, HEX_TOP + 7);
+  gfx->setTextColor(C_WHITE, C_BLACK); // opaque
+  gfx->print(dname);
 }
 
 bool resetArm = false;
@@ -4463,6 +4877,15 @@ void setup() {
                       // uplink can fire, so a reboot does not silently demote
                       // this lock to unacknowledged multicast.
   ozRosterEpochLoad(); // R5 — must survive the reboot that lost the push.
+
+  // ozkey-21 — timezone survives reboot. Without this a rebooted lock shows
+  // UTC on its panel until the next daily beacon, which reads as a wrong clock
+  // rather than a missing one.
+  prefs.begin("blelock", true);
+  cfgTzMin = prefs.getShort("tzmin", 0);
+  prefs.end();
+  if (cfgTzMin) Serial.printf("[TIME] timezone restored: %+d min\n", (int)cfgTzMin);
+  ozClockRestore();
   buildTopics();
 
   // Ceremony identity (RF is up → TRNG seeded) + boot known-answer self-test.
@@ -4716,6 +5139,18 @@ void loop() {
     hb["bonds"] = ozBondCount();
     hb["mcu_link_up"] = mcuLinkUp();          // ozkey-20 §5a
     hb["uptime_s"] = (uint32_t)(millis() / 1000);
+    // ── ozkey-21 — PULL, don't sit waiting (operator, 2026-08-11) ─────────
+    //
+    // The bridge's time beacon is multicast, so it has no link-layer ACK: if
+    // it is lost, a clock-less lock waits up to 24 h for the next one with
+    // every temporary credential unenforceable meanwhile. Push alone is not
+    // self-healing.
+    //
+    // So the lock ASKS. This rides the presence beacon it already sends — no
+    // new message type, no new socket, and it inherits that beacon's retry
+    // cadence for free, which is exactly the property that was missing.
+    // The flag clears itself the moment we have a clock.
+    if (!ozClockKnown(ozclock)) hb["need_time"] = true;
     String out;
     serializeJson(hb, out);
 
@@ -4863,11 +5298,28 @@ void loop() {
   // is a lot more visible than repainting one thin row. Real state changes
   // (door open/close, BLE window open/close, a tap) still go through the
   // normal screenDirty -> drawOperational() path elsewhere in this file.
+  // ONE 1 s tick for both live rows. 1 s rather than the old 3 s because the
+  // BLE countdown and the clock both tick in seconds — and it is affordable
+  // now only because neither call repaints unconditionally any more:
+  // drawStatusLine() returns early unless its content actually changed, and
+  // drawHexReadout() writes opaque text over itself instead of clearing.
+  // At 3 s the countdown visibly stuttered; at 1 s with unconditional repaints
+  // the panel strobed. Gated 1 s is both correct and still.
   static unsigned long lastScreenTick = 0;
-  if (millis() - lastScreenTick > 3000) {
+  if (millis() - lastScreenTick > 1000) {
     lastScreenTick = millis();
-    if (state == ST_OPERATIONAL) drawStatusLine();
+    if (state == ST_OPERATIONAL) {
+      drawStatusLine();
+      drawHexReadout();
+    }
   }
+
+  // ── ozkey-21 T1/T2 — keep our clock fed, and push if the MCU subscribed ──
+  ozClockRefreshFromSystem();
+  ozClockPersist(false);
+  if (mcuWantsTimePush && ozClockKnown(ozclock) &&
+      millis() - lastTimePushAt > MCU_TIME_PUSH_MS)
+    serveMcuTimePush();
 
   // ── periodic monitor + dashboard refresh (MCU-link age ticks) ────────────
   static unsigned long lastMon = 0;
@@ -4881,7 +5333,7 @@ void loop() {
       modeInfo += cfgRoomNo.length() ? (" room=" + cfgRoomNo) : " (no room)";
     Serial.printf("[MON] %s xport=%s mode=%s wifi=%s ip=%s mqtt=%s thread=%s "
                   "udp=%s mcu=%s tx=%u rx=%u wake=%s mrdy=%s srdy=%s hb=%us "
-                  "naps=%u heap=%u\n",
+                  "naps=%u heap=%u clock=%s treq=%u tserved=%u\n",
                   st, provisioned ? cfgTransport.c_str() : "unset", modeInfo.c_str(),
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
                   WiFi.localIP().toString().c_str(),
@@ -4900,7 +5352,12 @@ void loop() {
                   mrdyAsserted ? "LOW" : "high",
                   digitalRead(SRDY_PIN) == LOW ? "LOW" : "high",
                   cfgHeartbeatS, (unsigned)sleepWakeCount,
-                  (unsigned)ESP.getFreeHeap());
+                  (unsigned)ESP.getFreeHeap(),
+                  // ozkey-21: "unknown" here means every temporary PIN/RFID
+                  // window on this lock is unenforceable. It is the headline
+                  // number, not a footnote.
+                  ozClockKnown(ozclock) ? "known" : "UNKNOWN",
+                  (unsigned)mcuTimeRequests, (unsigned)mcuTimeServed);
     if (state == ST_OPERATIONAL) screenDirty = true; // age/link refresh
   }
 
