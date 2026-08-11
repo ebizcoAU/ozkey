@@ -32,14 +32,39 @@ evidence of development.
 | C4 | Credentials (PIN/RFID) never stored on server in plaintext | **VERIFIED** | ozkey-13 §4; server holds credential metadata only |
 | C5 | Lock works offline via BLE and PIN | **VERIFIED** | PIN on MCU; BLE unlock independent of any network |
 | C6 | Lock→app channel is sealed | **VERIFIED** | ozkey-17 U1; first production use 2026-08-10 |
-| C7 | **Server stores no record of who opened which door** | ⚠️ **NOT YET TRUE** | `publishLog()` sends `{device_id, result, detail, ts}` in **plaintext** to `…/locks/<id>/log`, and `ozlockserv` subscribes to it. See §3.1. Remediation specified, not yet built. |
+| C7 | **Server stores no record of who opened which door** | ⚠️ **PARTLY TRUE — storage yes, wire no** | True of *storage*: `ozlockserv` **removed its `log` subscription 2026-07-31** (`ozlockserv/server.js:132-134`) and `GET /locks/:id/log` returns `410 Gone` (`:2436-2448`, XF-48 §9.4) — nothing on this tier consumes or records door events. Still false on the *wire*: `publishLog()` (`ozdoorlock_core.h:1836`) publishes `{device_id, mac, result, detail, ts}` in **plaintext** to `…/locks/<id>/log`, where `detail` distinguishes owner from member (`:3800`, `:4131`) and a revoke carries the bond's human label (`:3602`). Readable by anyone with broker subscribe rights. See §3.1. |
 | C8 | Sleepy End Device | ❌ **INCORRECT — corrected in 2.1** | Firmware runs `rx_on=1 ftd=1` (Full Thread Device, receiver-on). Deliberate: it is why mesh relay is ~300 ms. |
 | C9 | Multi-year battery life | ⚠️ **UNMEASURED** | No measurement exists in FTD/rx-on mode under realistic mesh traffic. Required before any volume commitment. |
 | C10 | Self-hostable relay, open source | **VERIFIED** | Source is in-repo; licences per §5 |
 
-**Open items blocking a fully truthful C7:** seal `publishLog` behind the
-ozkey-17 uplink (the sealed channel now exists and is proven), leaving only
-routing metadata in the clear per ozkey-17 §6a's metadata/content split.
+**Open item blocking a fully truthful C7 — ⚠ REMEDIATION CORRECTED 2026-08-12.**
+This previously read "seal `publishLog` behind the ozkey-17 uplink". **That fix
+is wrong for this tier, and cannot be applied platform-wide.** The uplink is
+sealed *app-to-app, opaque to the server* by construction — but `ozpmsserv`
+(`server.js:103`, subscribed `:525`) and `ozlodgeserv` (`:89`/`:95`, subscribed
+`:594`) both **actively consume** the `log` topic, because a property-management
+product legitimately needs a door-audit trail. Sealing it would not harden those
+tiers; it would break them.
+
+The tiers have different threat models and therefore different fixes
+(operator's ruling, 2026-08-12):
+
+- **OZLOCK (residential, this document): stop publishing to `topicLog`
+  entirely.** Not seal — *drop*. Nothing on this tier consumes it, so there is
+  no payload to protect and no consumer to break. `txlogAppend()` already writes
+  the transaction log to on-device LittleFS first and works offline, so the
+  owner's own record is unaffected. This is the strongest available fix and also
+  the cheapest: a tier guard, no crypto.
+- **OZPMS / OZLODGE (commercial): keep publishing, fix the broker.** The
+  exposure there is not that the server can read it — it is *meant* to. It is
+  that the lab broker enforces no credentials at all (verified live 2026-08-08:
+  fabricated username + wrong password published successfully — `ozkey-13.md:82`,
+  `ozkey-15.md §8.1`, commit `9dbf422`). That is infra (EMQX ACLs), deliberately
+  deferred per operator instruction, and tracked in those tiers' registers rather
+  than here. Secondary and cheap: stop putting the bond's human label and
+  owner/member in `detail` where a slot number would do.
+
+Firmware work for this tier: accepted, queued, not started (`ozkey-23.md` §10).
 
 ---
 
@@ -51,7 +76,11 @@ The beauty of OZLOCK is that the server is simply a message relay. It cannot rea
 
 **Precision on what "knows nothing" means** (added rev 2.1). The server is blind to *content*, not to *routing*. It necessarily knows which app is paired to which lock, because that is how it delivers anything at all — a postal service reads the envelope. It does not, and cannot, know what was inside. Claiming total ignorance would be both false and unnecessary: content-blindness is already a far stronger guarantee than any competitor offers, and it is one we can actually demonstrate.
 
-⚠️ **Known gap, rev 2.1 (see Status Register C7).** One channel does not yet meet this standard. `publishLog()` currently sends door events — `{device_id, result, detail, ts}`, where `detail` distinguishes owner from member — as **plaintext** to `ozkey/<site>/locks/<id>/log`, which the server subscribes to and records. Until that channel is sealed, the server does see that a door was opened, by which class of holder, and when. The sealed lock→app channel needed to fix this was built and hardware-verified on 2026-08-10 (ozkey-17 U1); migrating the log topic onto it is specified and outstanding. This document records the gap rather than papering over it.
+⚠️ **Known gap, rev 2.1 — ⚠ CORRECTED 2026-08-12 (see Status Register C7).** One channel does not yet meet this standard. `publishLog()` sends door events — `{device_id, mac, result, detail, ts}`, where `detail` distinguishes owner from member and a revoke carries the bond's human label — as **plaintext** to `ozkey/<site>/locks/<id>/log`.
+
+The previous wording, *"which the server subscribes to and records"*, was **stale and overstated the exposure**. `ozlockserv` removed that subscription on 2026-07-31 and `GET /locks/:id/log` now returns `410 Gone`: *"This server stores no record of which lock opened, when, or by whom"*. On this tier the server does **not** see, subscribe to, or store door events. The residual gap is **wire-level only** — the lock still broadcasts them in the clear to any broker subscriber.
+
+The fix on the residential tier is therefore **to stop publishing them at all**, not to seal them: nothing here consumes the topic, and the on-device LittleFS transaction log already preserves the owner's own record. (Sealing onto the ozkey-17 uplink — the earlier plan — would break OZPMS and OZLODGE, which do consume this topic by design. See the C7 open-item note above.) This document records the gap rather than papering over it, and now records the correction too.
 
 This is the fundamental difference between OZLOCK and every white-label platform on the market.
 
@@ -162,7 +191,7 @@ Pairing (device_id ↔ app_id)	✅ Yes	Required for message routing — the enve
 Credentials (PINs, RFID, bond secrets)	❌ No	Sovereignty – never stored, in plaintext or otherwise
 Message content	❌ No — cannot be	Sealed; the server holds no key that opens it
 Routing metadata (who→whom, size, timestamp)	✅ Yes	Delivery and abuse detection. This is the honest limit of a relay.
-Door events (opened, by owner/member, when)	⚠️ Yes, currently	**Gap — see C7.** Plaintext on the `log` topic today. To be sealed onto the ozkey-17 uplink.
+Door events (opened, by owner/member, when)	❌ No — not stored, not subscribed	**Corrected 2026-08-12.** `ozlockserv` unsubscribed 2026-07-31; `GET /locks/:id/log` returns `410 Gone`. **Residual gap is wire-level only** — still published in plaintext to the `log` topic, readable by any broker subscriber. Fix on this tier is to stop publishing it (see C7), not to seal it.
 User identity / names	❌ No	Account-less model
 
 **The standard we hold ourselves to:** the server may know that a letter was
