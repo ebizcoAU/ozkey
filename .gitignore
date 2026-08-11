@@ -15,6 +15,7 @@ nohup.out
 .env
 .env.*
 blelock/bench/ozctl_state*.json
+ozlockserv/.server_ecdh_key.json
 
 # os
 .DS_Store

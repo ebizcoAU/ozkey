@@ -50,9 +50,32 @@
  *      This is a bigger deal after ozkey-15's S8/S9 (app-to-app relay):
  *      that spec's own trust model states plainly "No authentication
  *      changes — app_id and MQTT ACLs already handle routing" — which
- *      assumes ACLs exist. They don't yet. Broker credentials ARE minted +
- *      stored + acked per-device for contract shape (`locks.broker_username`/
- *      `broker_secret`), so the wiring is there; enforcement is not.
+ *      assumes ACLs exist. They don't yet.
+ *      **CORRECTED 2026-08-12 (ozkey-23 §10.2a) — "the wiring is there" was
+ *      true of locks only, not the fleet.** Locks mint + store + ack broker
+ *      credentials (`locks.broker_username`/`broker_secret`) and firmware now
+ *      actually presents them (`doorlock-1.57`; every prior firmware minted
+ *      and stored them, then connected anonymously anyway — found and fixed
+ *      firmware-side). Bridges had NO mint at all until this same pass closed
+ *      it: `bridges.broker_username`/`broker_secret`, static per-device,
+ *      same model as locks (minted on first presence,
+ *      `handleBridgePresence()`). Apps (BANOI) have the identical gap — no
+ *      mint exists, confirmed by ftpos (`XFtposDecisions-96.md` §4/§6) — but
+ *      get a DIFFERENT model, operator's call 2026-08-12: REST-authenticated,
+ *      short-lived JWT issuance (`POST /auth/challenge` + `/auth/token`),
+ *      not a static secret. `docs/ozkey-24.md` — designed, corrected by
+ *      firmware (§9: `app_id` IS the app's X25519 public key, hex-encoded —
+ *      NOT a bearer string beside a separate identity; see
+ *      `blelock/common/ozcrypto.h:414/260`), and BUILT + live-verified
+ *      against the real DB same day. No `apps` table: the challenge/token
+ *      flow reads `locks.app_id` directly, which has been an app
+ *      public-key store since before anyone named it that. Kept as its own
+ *      doc/section precisely so it never blocked the bridge fix, which
+ *      shipped first. **Hold on enabling EMQX ACLs until all three paths —
+ *      locks, bridges, apps — are deployed**
+ *      (operator instruction 2026-08-12): enabling ACLs before every
+ *      principal can authenticate drops the whole fleet at once, instantly
+ *      (ozkey-23 §10.1a).
  *      **Configuring real ACLs is a FUTURE task, deliberately not done now**
  *      (operator instruction 2026-08-08) — noted here so it isn't
  *      rediscovered from scratch, not as something to act on yet. Also note
@@ -72,6 +95,9 @@ const mysql = require('mysql2/promise');
 const mqtt = require('mqtt');
 const os = require('os');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const jwt = require('jsonwebtoken'); // ozkey-24: app broker-auth JWT issuance
 
 /** First non-internal IPv4 of this host. Override with OZLOCK_SERVER_IP. */
 function detectLanIp() {
@@ -91,6 +117,14 @@ const CONFIG = {
   HTTP_PORT: Number(process.env.OZLOCK_HTTP_PORT) || 4200,
   SERVER_IP: process.env.OZLOCK_SERVER_IP || detectLanIp(),
   SITE_ID: 'lab', // single-tenant lab deployment (ozkey-05 §1.3)
+  // ozkey-24: HMAC secret ozlockserv signs app broker-auth JWTs with; EMQX's
+  // JWT auth plugin must hold the SAME secret to verify them. LAB DEFAULT
+  // ONLY — production must set OZLOCK_JWT_SECRET (same posture as the
+  // 'labwifi-secret' Wi-Fi password in buildProvisionPayload below: a
+  // deliberately loud placeholder, not a value anyone should ship with).
+  JWT_SIGNING_SECRET: process.env.OZLOCK_JWT_SECRET || 'lab-only-INSECURE-jwt-secret-CHANGE-IN-PRODUCTION',
+  AUTH_NONCE_TTL_MS: 60_000, // ozkey-24 §3.2: challenge nonce lifetime
+  AUTH_JWT_TTL_S: 3600, // ozkey-24 §3.2: issued JWT lifetime
   DB: {
     host: 'localhost',
     user: 'root',
@@ -290,6 +324,87 @@ function makeSecret(bytes = 16, prefix = '') {
   return prefix + crypto.randomBytes(bytes).toString('hex');
 }
 
+/** ozkey-23 §10.2a: mint-once, same shape as the lock's `handleEnroll()`
+ *  (`brokerUsername = id`, `brokerSecret = makeSecret(16, 'ozl_')`). Returns
+ *  {broker_username, broker_secret, minted: bool} — `minted` tells the
+ *  caller whether this is the first time (worth pushing/returning) or a
+ *  repeat lookup of an already-provisioned principal. */
+async function getOrMintBridgeCredentials(bridgeId) {
+  const [[row]] = await pool.query('SELECT broker_username, broker_secret FROM bridges WHERE id = ?', [
+    bridgeId,
+  ]);
+  if (row && row.broker_secret) return { ...row, minted: false };
+  const broker_username = bridgeId;
+  const broker_secret = makeSecret(16, 'ozl_');
+  await pool.query(
+    `INSERT INTO bridges (id, broker_username, broker_secret) VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE broker_username = VALUES(broker_username),
+         broker_secret = VALUES(broker_secret)`,
+    [bridgeId, broker_username, broker_secret]
+  );
+  return { broker_username, broker_secret, minted: true };
+}
+
+/* ---------------------------------------------------------------------------
+ * ozkey-24 — App broker auth: REST-authenticated JWT over a dedicated
+ * per-app X25519 identity (approved 2026-08-12: dedicated keypair, ECDH
+ * challenge, POST /apps/register, short-lived JWT).
+ * ------------------------------------------------------------------------- */
+
+/** Wire format for every X25519 public key in this flow: 64 lowercase hex
+ *  chars (32 raw bytes) — matches `locks`/`bridges` hex-secret conventions
+ *  elsewhere in this file. Converted to a Node KeyObject via JWK import
+ *  (OKP/X25519), the only clean path for RAW key bytes in Node's crypto —
+ *  SPKI/DER would need manual ASN.1 wrapping for no benefit here. */
+function x25519PublicKeyFromHex(hex) {
+  return crypto.createPublicKey({
+    key: { kty: 'OKP', crv: 'X25519', x: Buffer.from(hex, 'hex').toString('base64url') },
+    format: 'jwk',
+  });
+}
+
+// ozkey-24 §3.2/§4.3(a): the server's own LONG-TERM X25519 identity for the
+// ECDH challenge — every registered app computes the same shared secret
+// against this one static public key. Persisted to disk so it survives a
+// restart (a rotating server key would silently invalidate every app's
+// ability to prove itself, with no signal why). File holds JWK `x`/`d` only
+// — same "lab shortcut, loudly flagged" posture as JWT_SIGNING_SECRET
+// above; production should manage this via a real secrets store, not a
+// plaintext file beside the code.
+const SERVER_ECDH_KEY_PATH = path.join(__dirname, '.server_ecdh_key.json');
+let serverEcdhKeyPair = null; // set by loadOrCreateServerEcdhKeyPair() at boot
+
+function loadOrCreateServerEcdhKeyPair() {
+  if (fs.existsSync(SERVER_ECDH_KEY_PATH)) {
+    const { x, d } = JSON.parse(fs.readFileSync(SERVER_ECDH_KEY_PATH, 'utf8'));
+    return {
+      privateKey: crypto.createPrivateKey({ key: { kty: 'OKP', crv: 'X25519', x, d }, format: 'jwk' }),
+      publicKeyHex: Buffer.from(x, 'base64url').toString('hex'),
+    };
+  }
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
+  const pubJwk = publicKey.export({ format: 'jwk' });
+  const privJwk = privateKey.export({ format: 'jwk' });
+  fs.writeFileSync(
+    SERVER_ECDH_KEY_PATH,
+    JSON.stringify({ x: pubJwk.x, d: privJwk.d }),
+    { mode: 0o600 }
+  );
+  logEvent('info', `ozkey-24: generated a new server ECDH identity -> ${SERVER_ECDH_KEY_PATH}`);
+  return { privateKey, publicKeyHex: Buffer.from(pubJwk.x, 'base64url').toString('hex') };
+}
+
+// ozkey-24 §3.2: single-use, short-lived challenge nonces. In-memory by
+// design, not a DB table — a nonce that doesn't survive a restart is
+// correct behaviour (the app just requests a fresh one), and durability
+// here would only mean a stale nonce outliving a crash.
+const authNonces = new Map(); // nonce(hex) -> { appId, expiresAt }
+
+function pruneAuthNonces() {
+  const now = Date.now();
+  for (const [n, v] of authNonces) if (v.expiresAt < now) authNonces.delete(n);
+}
+
 /* ---------------------------------------------------------------------------
  * MySQL bootstrap — owner/site/lock schema (rooms-free, ozkey-05 §3)
  * ------------------------------------------------------------------------- */
@@ -469,6 +584,42 @@ async function initDatabase() {
       presence_at DATETIME NULL
     ) ENGINE=InnoDB`);
 
+  // ozkey-23 §10.1a/10.2a: bridges were structurally unauthenticatable — no
+  // column existed anywhere to hold broker credentials for one, so firmware
+  // (bridge32.ino) had nothing to present even after the lock-side bug was
+  // fixed. This table exists ONLY to close that gap (credential storage);
+  // it is deliberately not a bridge "registry" — (AZ)'s factory-reset route
+  // still needs no row, and bridge identity/liveness stay owned by
+  // bridges_presence/the Thread-liveness table, not here. A row is created
+  // the first time a bridge is seen online (handleBridgePresence()), the
+  // same "device_id IS the bearer handle" trust model locks already use.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bridges (
+      id              VARCHAR(64) PRIMARY KEY,
+      broker_username VARCHAR(64),
+      broker_secret   VARCHAR(64),
+      first_seen_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB`);
+
+  // ozkey-23 §10.1a/10.2a, XF-96 §4/§6: BANOI has the same gap bridges had —
+  // ftpos confirmed the app connects with client-id only, no username/
+  // password, because no server-side mint exists for it either.
+  // ozkey-24, CORRECTED 2026-08-12 by firmware (§9.2, verified against
+  // blelock/common/ozcrypto.h before accepting): `app_id` is not a bearer
+  // string alongside a separate X25519 identity — it IS the identity,
+  // hex-encoded. `ozBond0Evaluate()` (ozcrypto.h:414) hex-decodes `app_id`
+  // directly into the 32 raw pubkey bytes it bonds against; the bond struct
+  // says the same thing explicitly (`uint8_t pub[32]; // the member's
+  // X25519 public key == its app_id`, ozcrypto.h:260). Every lock a member
+  // has ever bonded to already trusts these exact bytes. So there is no
+  // second key to register and no `apps` table to hold one — `locks.app_id`
+  // (written by registerPairing() at `POST /pairings`, since before this
+  // file could spell "X25519") has been an app public-key store from day
+  // one, without anyone having named it that. The `apps` table and
+  // `POST /apps/register` this comment used to describe are GONE — first
+  // written, then reverted the same day, before either ran against
+  // production. Only the challenge/token/JWT flow below survived, reading
+  // `locks.app_id` directly instead of a dedicated table.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS enroll_tokens (
       token VARCHAR(64) PRIMARY KEY,
@@ -685,6 +836,9 @@ async function flushQueueForDevice(siteId, deviceId) {
         newStatus,
         job.grant_id,
       ]);
+      // ozkey-23 §5(c)/§8.4(iii): the row just crossed into 'revoked' —
+      // scrub the name now rather than waiting for the next list read.
+      if (newStatus === 'revoked') await scrubExpiredGrantNames('id = ?', [job.grant_id]);
     }
     sent++;
     logEvent(
@@ -923,6 +1077,22 @@ async function handleBridgePresence(bridgeId, payload) {
     const nowUtc = Math.floor(Date.now() / 1000);
     mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, bridgeId), { utc: nowUtc });
     logEvent('info', `Pushed utc=${nowUtc} to bridge ${bridgeId} on connect (ozkey-20 §23.1)`);
+
+    // ozkey-23 §10.2a: mint once, push once — same "v1 plaintext ack, bench
+    // only" posture handleEnroll() already uses for locks (the broker
+    // doesn't enforce credentials yet, so an unauthenticated publish is how
+    // the credential-bearing publish itself gets delivered the first time).
+    // Firmware persists to NVS and presents on future connects; we don't
+    // resend to an already-provisioned bridge.
+    const bridgeCreds = await getOrMintBridgeCredentials(bridgeId);
+    if (bridgeCreds.minted) {
+      mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, bridgeId), {
+        op: 'broker_credentials',
+        broker_username: bridgeCreds.broker_username,
+        broker_secret: bridgeCreds.broker_secret,
+      });
+      logEvent('pair', `Minted + pushed broker credentials to bridge ${bridgeId} (first sighting)`);
+    }
   }
 
   // Aggregation: re-verdict every lock behind this bridge in one pass, so
@@ -1434,6 +1604,10 @@ api.post('/pairings', async (req, res) => {
         });
     }
     await registerPairing(appId, deviceId, label, bridgeId);
+    // ozkey-23 §10.2a, XF-96 §4/§6: app broker auth is NOT minted here —
+    // it's a separate identity/auth flow (ozkey-24: POST /apps/register +
+    // /auth/challenge + /auth/token, below), independent of pairing a
+    // particular lock.
     res.json({
       ok: true,
       device_id: deviceId,
@@ -1449,6 +1623,118 @@ api.post('/pairings', async (req, res) => {
       code: err.ozCode || (err.httpStatus ? 'request_failed' : 'internal_error'),
       error: err.message,
     });
+  }
+});
+
+/* -- ozkey-24: app broker auth (REST-authenticated JWT over the app's
+ *    existing identity) --------------------------------------------------
+ * CORRECTED 2026-08-12 by firmware (§9.2, verified against
+ * blelock/common/ozcrypto.h:414/260 before accepting): `app_id` IS the
+ * X25519 public key, hex-encoded — not a bearer string alongside a
+ * separate identity. There is no registration step, because `locks.app_id`
+ * (written since before this file could spell "X25519", at every
+ * `POST /pairings`) has been an app public-key store from day one. The
+ * `apps` table and `POST /apps/register` this section used to contain are
+ * gone — first written, reverted the same day, before either touched
+ * production. */
+
+const APP_PUBKEY_RE = /^[0-9a-f]{64}$/;
+
+/** Shared by /auth/challenge and /auth/token: is this app_id known to the
+ * system at all (i.e. does it appear on at least one lock's pairing), and
+ * is it shaped like the X25519 public key it's supposed to be? ozkey-24
+ * §9.4's caveat, live: some lab-era app_id values are NOT valid hex (e.g.
+ * "admin-test-device") — reject those explicitly rather than let them
+ * reach crypto.diffieHellman() and throw. */
+async function findKnownAppPubkey(appId) {
+  if (!APP_PUBKEY_RE.test(appId)) return { ok: false, code: 'invalid_app_id' };
+  const [[row]] = await pool.query('SELECT 1 FROM locks WHERE app_id = ? LIMIT 1', [appId]);
+  if (!row) return { ok: false, code: 'app_unknown' };
+  return { ok: true };
+}
+
+/** ozkey-24 §3.2: step 1 of the challenge — issue a single-use nonce bound
+ * to this app_id. The server's own public key rides along so the app
+ * doesn't need a separate lookup to compute the ECDH shared secret. */
+api.post('/auth/challenge', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const appId = req.body && req.body.app_id ? String(req.body.app_id).trim().toLowerCase() : null;
+    if (!appId) return res.status(400).json({ ok: false, code: 'missing_fields', error: 'app_id is required' });
+
+    const known = await findKnownAppPubkey(appId);
+    if (!known.ok) {
+      const msg =
+        known.code === 'invalid_app_id'
+          ? 'app_id must be 64 hex chars — it IS the X25519 public key (ozkey-24 §9.2)'
+          : 'app_id not found on any paired lock — pair at least one lock first (POST /pairings)';
+      return res.status(known.code === 'invalid_app_id' ? 400 : 404).json({ ok: false, code: known.code, error: msg });
+    }
+
+    pruneAuthNonces();
+    const nonce = crypto.randomBytes(16).toString('hex');
+    authNonces.set(nonce, { appId, expiresAt: Date.now() + CONFIG.AUTH_NONCE_TTL_MS });
+
+    res.json({
+      ok: true,
+      nonce,
+      expires_in: CONFIG.AUTH_NONCE_TTL_MS / 1000,
+      server_pubkey: serverEcdhKeyPair.publicKeyHex,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, code: 'internal_error', error: err.message });
+  }
+});
+
+/** ozkey-24 §3.2/§4.3(a): step 2 — verify possession of the private key
+ * matching `app_id` itself via ECDH(app_priv, server_pub), HMAC'd over the
+ * nonce, and issue a short-lived JWT on success. Nonce is deleted on first
+ * use regardless of outcome — a failed proof does not get a second try at
+ * the same nonce. */
+api.post('/auth/token', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const { app_id, nonce, proof } = req.body || {};
+    const appId = app_id ? String(app_id).trim().toLowerCase() : null;
+    if (!appId || !nonce || !proof)
+      return res
+        .status(400)
+        .json({ ok: false, code: 'missing_fields', error: 'app_id, nonce and proof are required' });
+
+    const entry = authNonces.get(nonce);
+    authNonces.delete(nonce); // single-use — consumed whether or not proof verifies
+    if (!entry || entry.appId !== appId || entry.expiresAt < Date.now()) {
+      return res
+        .status(401)
+        .json({ ok: false, code: 'invalid_or_expired_nonce', error: 'request a fresh challenge' });
+    }
+
+    const known = await findKnownAppPubkey(appId);
+    if (!known.ok) return res.status(404).json({ ok: false, code: known.code, error: 'app_id no longer known' });
+
+    let proofBuf, expectedBuf;
+    try {
+      const sharedSecret = crypto.diffieHellman({
+        privateKey: serverEcdhKeyPair.privateKey,
+        publicKey: x25519PublicKeyFromHex(appId), // app_id itself, decoded — ozkey-24 §9.2
+      });
+      expectedBuf = crypto.createHmac('sha256', sharedSecret).update(nonce).digest();
+      proofBuf = Buffer.from(String(proof), 'hex');
+    } catch (_) {
+      return res.status(400).json({ ok: false, code: 'malformed_proof', error: 'proof must be hex' });
+    }
+    if (proofBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(proofBuf, expectedBuf)) {
+      return res.status(401).json({ ok: false, code: 'invalid_proof', error: 'proof did not verify' });
+    }
+
+    const token = jwt.sign({ scope: 'mqtt' }, CONFIG.JWT_SIGNING_SECRET, {
+      subject: appId,
+      expiresIn: CONFIG.AUTH_JWT_TTL_S,
+    });
+    logEvent('pair', `ozkey-24: issued MQTT JWT for app ${appId} (${CONFIG.AUTH_JWT_TTL_S}s)`);
+    res.json({ ok: true, jwt: token, expires_in: CONFIG.AUTH_JWT_TTL_S });
+  } catch (err) {
+    res.status(500).json({ ok: false, code: 'internal_error', error: err.message });
   }
 });
 
@@ -1729,6 +2015,36 @@ async function recordAudit(appId, deviceId, action, detail) {
   }
 }
 
+/** ozkey-23 §5(c), approved with amendments per firmware's §8.4 reply:
+ *  - (i) null BOTH `grants.user_name` and the matching `audit_log.detail` —
+ *    the row is never deleted (firmware's (ii): dedupe and app polling both
+ *    key off a surviving row with its `sync_status`/`grant_id` intact).
+ *  - (iii) trigger on `sync_status = 'revoked'`, not `'revoking'` (still
+ *    in-flight) — this system has no delivery ACK (ozkey-19), so "revoked"
+ *    already means "the revoke command was actually sent", the closest
+ *    thing to confirmation that exists — plus window-close (`date_to`
+ *    passed) as the second trigger, for grants nobody ever revoked.
+ *  No cron exists in this process; called lazily at the two points that
+ *  already touch a grant's lifecycle (flush-time revoke, and grant list
+ *  reads), same style as the `pending_queue.expires_at` check elsewhere. */
+async function scrubExpiredGrantNames(whereClause, whereArgs) {
+  const [rows] = await pool.query(
+    `SELECT id FROM grants
+       WHERE user_name IS NOT NULL
+         AND (sync_status = 'revoked' OR date_to < NOW())
+         AND ${whereClause}`,
+    whereArgs
+  );
+  for (const { id } of rows) {
+    await pool.query('UPDATE grants SET user_name = NULL WHERE id = ?', [id]);
+    await pool.query(
+      `UPDATE audit_log SET detail = '[redacted — grant revoked/expired, ozkey-23 §5(c)]'
+         WHERE detail LIKE CONCAT('%(grant #', ?, ')%')`,
+      [id]
+    );
+  }
+}
+
 api.delete('/locks', async (req, res) => {
   if (!guardDb(res)) return;
   const conn = await pool.getConnection();
@@ -1962,6 +2278,9 @@ api.post('/locks/:id/grants', async (req, res) => {
 api.get('/locks/:id/grants', async (req, res) => {
   if (!guardDb(res)) return;
   try {
+    // ozkey-23 §5(c): lazy sweep, same pattern as pending_queue.expires_at —
+    // catches window-close for grants nobody ever explicitly revoked.
+    await scrubExpiredGrantNames('device_id = ?', [req.params.id]);
     const [rows] = await pool.query(
       'SELECT * FROM grants WHERE device_id = ? ORDER BY id DESC LIMIT 100',
       [req.params.id]
@@ -2489,6 +2808,9 @@ api.post('/sim/heartbeat', async (req, res) => {
  * ------------------------------------------------------------------------- */
 async function boot() {
   logEvent('info', 'OZLOCKSERV booting — personal-cloud rendezvous directory (lab)');
+
+  serverEcdhKeyPair = loadOrCreateServerEcdhKeyPair();
+  logEvent('info', `ozkey-24: server ECDH identity ${serverEcdhKeyPair.publicKeyHex.slice(0, 12)}…`);
 
   let attempts = 0;
   for (;;) {
