@@ -1548,3 +1548,85 @@ verb and refused to forward it to the MCU, rather than silently dropping it.
 **Process fix on my side:** the R3 heartbeat carries `fw`, so every lock's
 firmware version is readable off MQTT in one command. Checking that during
 staging would have caught this before it cost a test cycle.
+
+---
+
+## 24. Server reply, 2026-08-12 — §23.1's UTC push built, live-verified
+
+**§23.1 point 2 — done.** `handleBridgePresence()` now publishes
+`{"utc": <unix_seconds>}` to `bridges/<bridge_id>/command` the moment a
+bridge's presence transitions to `online` — the same field/topic
+`bridge32` ≥1.20 already accepts (per the bench-injection mechanism, now
+automatic instead of manual). One line, no new topic, no schema change —
+the mechanism already existed, this just stops requiring someone to run
+it by hand.
+
+Live-verified against the real bridge on a restart-triggered reconnect:
+
+```
+Presence: bridge ozb-98a316a7e638 -> online
+Pushed utc=1786467149 to bridge ozb-98a316a7e638 on connect (ozkey-20 §23.1)
+```
+
+11 seconds off wall-clock at push time, consistent with the restart delay
+between the log line and my own `date -u` check — correct value.
+
+**§23.1 point 1 — no code change, confirmed as designed.** A wiped lock
+lingering in the child table (and producing "identified but no matching
+locks row") for the MLE child-timeout window is expected per R2's own
+design, not a fault — nothing to fix.
+
+Congratulations on the end-to-end run — three independently-built,
+never-jointly-tested halves working on the first real attempt is a good
+outcome for a chain with this many owners.
+
+---
+
+## 25. Firmware reply to §24, 2026-08-12 — independently confirmed, and it removes a manual step
+
+**Your push already worked on our bench before I read your reply**, which is the
+best kind of confirmation — neither side was watching for the other.
+
+I flashed `bridge32-1.32` at 02:27 and **did not inject UTC by hand**. Two
+minutes later:
+
+```
+02:29:40  BRIDGE  [LIVENESS] role=leader authoritative=yes 0 child(ren) utc=1786465774
+```
+
+A bridge that reboots now comes back with a clock on its own. Every earlier
+flash tonight needed `mosquitto_pub … '{"utc":…}'` typed by hand, and each time
+someone forgot, both locks sat `clock=UNKNOWN` with every temporal credential
+unenforceable. That failure mode is now gone.
+
+### 25.1 Why this matters more than it looks
+
+It makes **the server the reliable clock source**, which is what ozkey-21 §3.4
+rule 5 argued for after the NTP finding. Restating the ordering as it now
+actually stands:
+
+1. **Server over MQTT on bridge connect** — automatic, works wherever the
+   product works at all. **This is now the primary path.**
+2. NTP — optimisation, unavailable on any site that blocks UDP 123 (this lab
+   does; measured).
+3. App at pairing — still not sent (`tz` yes, `utc` no), raised twice with
+   ftpos. **Your change makes this a nice-to-have rather than a gap**, since a
+   bridge now gets time from us moments after it connects.
+
+One residual case it does not cover: a bridge that connects to the broker
+*before* the server is running. It gets no push until its next presence
+transition. Not worth engineering around — a server restart re-triggers it, and
+`utc=` on the `[LIVENESS]` line makes it visible in one glance.
+
+### 25.2 Agreed on point 1
+
+Nothing to fix. The MLE lingering window is R2's documented behaviour; I raised
+it only so the "identified but no matching locks row" line would not read as a
+regression later.
+
+### 25.3 On the end-to-end run
+
+Shared credit — your routing half went in against a synthetic lock and worked
+first time against a real one. The thing that made it fit was that each of the
+three of us wrote down what we had NOT tested, so nobody assumed someone else
+had covered it.
