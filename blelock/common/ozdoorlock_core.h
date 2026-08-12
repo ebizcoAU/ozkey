@@ -42,6 +42,7 @@
 #include "esp_sleep.h"
 #include "ozcrypto.h" // member-ceremony crypto (XF-46 §7.1) + boot self-test
 #include "oztime.h"   // ozkey-21 T1/T2 — module clock + the MCU time service
+#include "ozprofile.h" // ozkey-27 §4.5 — the DP map as DATA, shared with LockSim
 #include <OThread.h>     // Thread transport (ported from threadcomm.ino)
 #include <OThreadUDP.h>  // F4 UDP relay (bridge32/threadcomm proven, 2026-07-25/26)
 // Receive half runs on lwIP, not OpenThread's internal UDP — see the root-cause
@@ -1788,32 +1789,28 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
     }
     if (dpid == 5) { publishLog("battery_alarm", "MCU report"); return; }
 
-    // ── PROPOSED DP 60 — keypad pairing gesture (ozkey-22 §7) ──────────────
+    // ── 🔴 DP 60 HANDLER DELETED 2026-08-13 — the number was already taken ──
     //
-    // On production the keypad belongs to the DL MCU and our board has NO
-    // touch panel, so this is the only way a member standing at the door can
-    // make the lock advertise. Without it member_enroll is unreachable on real
-    // hardware — see ozdoorlock_core.h's own "M3 PREREQUISITE" note, whose
-    // reasoning is right and whose mechanism does not exist in production.
+    // This opened the BLE pairing window on an inbound DP 60, described in
+    // ozkey-22 §7 as a PLACEHOLDER pending manufacturer allocation and
+    // annotated "no shipping DL MCU sends this; only LockSim does".
     //
-    // ⚠️ THE DP NUMBER IS A PLACEHOLDER pending manufacturer allocation. No
-    // shipping DL MCU sends this; only LockSim does. Handling it now lets the
-    // ceremony be developed and tested against the real topology instead of
-    // against a dev board's incidental touch screen.
+    // The first real supplier DP list answers that request, and the answer is
+    // that the number is taken: on Smart Lock DS013-T3, **DP 60 is the door-lock
+    // ALARM channel** — an 18-value enum carrying wrong_finger, wrong_password,
+    // pry, low_battery, unclosed_time, system_lock and the rest. It is not a
+    // gesture, it is one of the most heavily used reports on the bus.
     //
-    // SECURITY: unchanged from the touch path it replaces. The gesture is
-    // still physical, still on the keypad outside the door, still in the
-    // user's hand. XF-52 §4 forbids a REMOTE verb opening this window; a
-    // keypress relayed over the in-door UART is not remote.
-    if (dpid == 60) {
-      if (!provisioned) {
-        Serial.println("[BLE] DL MCU pairing gesture ignored — lock not provisioned");
-        return;
-      }
-      Serial.println("[BLE] pairing gesture from DL MCU keypad (proposed DP 60)");
-      openBleWindow("DL MCU keypad gesture");
-      return;
-    }
+    // Left in place, a pry alarm or a low-battery report would have opened the
+    // lock's BLE window. The comment claiming only LockSim emits it was true of
+    // LockSim and false of the supplier.
+    //
+    // The capability is not lost. Since doorlock-1.57 the primary gesture is a
+    // FAILED entry attempt (see the DP 8 branch above), which is a real physical
+    // presence signal, needs no manufacturer allocation, and carries the privacy
+    // property that gating on failure was chosen for. Re-homing it onto the real
+    // catalogue — DP 60's wrong_password/wrong_card values — is ozkey-27 Q3 and
+    // is the architect's call, not a silent substitution made here.
   }
   // ── UNRECOGNISED DP — log locally, do NOT publish the payload ────────────
   //
@@ -2005,9 +2002,28 @@ void publishUnpairedAnnounce() {
 // would let an unauthenticated publisher revoke the owner's members. They are
 // BLE-`control`-only verbs, where a bond, a challenge and a counter floor all
 // have to line up first. On this path they are DROPPED, not executed.
-static bool ozDpForwardable(uint8_t dp) {
-  return dp == 1 || (dp >= 21 && dp <= 24);
-}
+// ── 🔴 REPLACED 2026-08-13 — the allow-list was built on an INVENTED map ────
+//
+// It read `dp == 1 || (dp >= 21 && dp <= 24)`. Against the real Tuya catalogue
+// those are: 1 unallocated, 21 navigation_volume, 22 unallocated, 23 auto_lock,
+// 24 auto_lock_delay. So on real hardware this permitted exactly the SETTINGS
+// DPs and blocked every credential operation — the inverse of its intent
+// (ozkey-27 §2.1).
+//
+// Now a lookup in the active device profile (`ozprofile.h`), which is generated
+// from the same `profiles/` JSON LockSim loads. The two ends of the wire can no
+// longer disagree about what a number means.
+//
+// ⚠️ NO BEHAVIOUR CHANGE AT THE DEFAULT PROFILE. `ozkie-legacy-v0` marks DP 1
+// `both` and 21-24 `down`, everything else `up`, so the downstream disposition
+// permits exactly {1,21,22,23,24} — the old expression, bit for bit. Behaviour
+// changes only when the profile is switched, which is a deliberate act.
+//
+// The reject rule below is unchanged and still the point: on this path frames
+// are NOT authenticated (the broker is anon-open, so a guest on the site Wi-Fi
+// can publish to the command topic). Blind forwarding of an unrecognised verb
+// is not a property worth keeping. 101/102 are bond verbs the MCU has no
+// concept of; they are BLE-`control`-only and are DROPPED here, not executed.
 
 // Send a parsed, already-vetted frame. Split out of forwardHexToMcu() so the M4
 // `control` path can reach the MCU with bytes it never had to re-hex.
@@ -3600,8 +3616,12 @@ static bool ozM4SelfTest() {
     for (uint8_t d : deny)  if (ozDpForwardable(d))  pass = false;
     for (uint8_t d : junk)  if (ozDpForwardable(d))  pass = false;
     ok &= pass;
-    Serial.printf("[CRYPTO] selftest dp-allow-list %s (101/102 forwardable=%d/%d)\n",
+    // Name the profile: it is what decides the allow-list now, so a PASS is
+    // only meaningful alongside which map produced it.
+    Serial.printf("[CRYPTO] selftest dp-allow-list %s under profile '%s'%s "
+                  "(101/102 forwardable=%d/%d)\n",
                   pass ? "PASS" : "FAIL — 101/102 COULD REACH THE MCU",
+                  ozProfileId(), ozProfile()->deprecated ? " [INVENTED MAP]" : "",
                   (int)ozDpForwardable(101), (int)ozDpForwardable(102));
   }
 
@@ -5090,6 +5110,15 @@ void setup() {
   delay(300);
   Serial.println("\n*** OZLOCK COMM MODULE — unified doorlock (MCU = LockSim on UART) ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
+
+  // Which supplier DP map this unit dispatches under. Printed at boot because
+  // it now decides what reaches the MCU, and because the default is our INVENTED
+  // map — a fact that should be visible on every start, not buried in a header.
+  ozProfileBegin();
+  Serial.printf("[PROFILE] %s%s (%u DPs)\n", ozProfileId(),
+                ozProfile()->deprecated ? " — INVENTED MAP, collides with the real"
+                                          " Tuya catalogue (ozkey-27 §2.1)" : "",
+                (unsigned)ozProfile()->count);
 
   // WHY DID WE JUST BOOT? Never logged until 2026-08-05, and its absence cost a
   // whole bench session: the board was resetting itself about every 10 minutes,

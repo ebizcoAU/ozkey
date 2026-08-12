@@ -355,6 +355,44 @@ test("DP 42 and 76 mean the same in both products — the catalogue-is-standard 
   assert.equal(video.byDp.get(76)!.name, "unlock_ble");
 });
 
+// ── firmware parity ─────────────────────────────────────────────────────────
+//
+// The firmware's dispatch gate (blelock/common/ozprofile.h) replaced a
+// hardcoded `dp == 1 || (dp >= 21 && dp <= 24)` with a profile lookup. That is
+// only a safe refactor if the legacy profile reproduces the old allow-list
+// EXACTLY — and the doorlock asserts it on every boot (ozM4SelfTest). Assert
+// the same thing here, so the two ends cannot drift apart silently.
+
+test("legacy profile reproduces the old ozDpForwardable() allow-list exactly", () => {
+  const legacyP = loadProfile("ozkie-legacy-v0");
+  const forwardable = (dp: number) => dispositionFor(legacyP, dp, "down").action === "handle";
+
+  for (const dp of [1, 21, 22, 23, 24]) {
+    assert.ok(forwardable(dp), `DP ${dp} must still be forwardable`);
+  }
+  // 101/102 are bond verbs the MCU has no concept of; forwarding one would let
+  // an unauthenticated publisher revoke the owner's members.
+  for (const dp of [101, 102]) {
+    assert.ok(!forwardable(dp), `DP ${dp} must NEVER reach the MCU`);
+  }
+  // 2/5/8/60 exist in the legacy profile but are report-only, so a downstream
+  // write of them is refused on direction — which is how the profile reproduces
+  // an allow-list that never mentioned direction at all.
+  for (const dp of [0, 2, 5, 8, 20, 25, 60, 100, 103, 200, 255]) {
+    assert.ok(!forwardable(dp), `DP ${dp} must not be forwardable`);
+  }
+});
+
+test("under the REAL profile the old allow-list would have been inverted", () => {
+  const real = loadProfile("tuya-ds013-t3");
+  const forwardable = (dp: number) => dispositionFor(real, dp, "down").action === "handle";
+  // The settings DPs the old constant happened to permit...
+  for (const dp of [21, 23, 24]) assert.ok(forwardable(dp), `DP ${dp} is a real setting`);
+  // ...while every credential write it was written to permit is blocked.
+  for (const dp of [13, 16, 17]) assert.ok(!forwardable(dp), `DP ${dp} must be blocked`);
+  assert.equal(real.byDp.get(22), undefined, "DP 22 is not allocated at all");
+});
+
 console.log("\ntwo loaders, one truth\n");
 
 // The browser cannot read `profiles/` off disk, so profileRegistry.ts imports
