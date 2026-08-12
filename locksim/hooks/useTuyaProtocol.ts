@@ -11,6 +11,7 @@ import {
   type ByteArray,
   type TuyaFrame,
 } from "@/lib/tuya";
+import type { ResolvedProfile } from "@/lib/profile";
 
 export interface SerialLogEntry {
   id: number;
@@ -34,6 +35,14 @@ interface UseTuyaProtocolOptions {
   wireReady: boolean;
   /** Route a non-hex JSON payload (MQTT onboarding) to the provisioning parser. */
   onMqttPayload: (raw: string) => void;
+  /**
+   * Device profile the console interprets DPs under (`ozkey-27 §4.5`).
+   *
+   * The same bytes mean different things per supplier, and the console used to
+   * assert one interpretation as fact. Held in a ref so switching profiles
+   * re-labels FUTURE frames without tearing down the serial link.
+   */
+  profile: ResolvedProfile;
 }
 
 /**
@@ -75,6 +84,7 @@ export function useTuyaProtocol({
   sendToWire,
   wireReady,
   onMqttPayload,
+  profile,
 }: UseTuyaProtocolOptions) {
   const [rxLog, setRxLog] = useState<SerialLogEntry[]>([]);
   const [txLog, setTxLog] = useState<SerialLogEntry[]>([]);
@@ -86,6 +96,8 @@ export function useTuyaProtocol({
   modeRef.current = mode;
   const sendToWireRef = useRef(sendToWire);
   sendToWireRef.current = sendToWire;
+  const profileRef = useRef(profile);
+  profileRef.current = profile;
   const wireReadyRef = useRef(wireReady);
   wireReadyRef.current = wireReady;
   const onMqttPayloadRef = useRef(onMqttPayload);
@@ -122,7 +134,7 @@ export function useTuyaProtocol({
   const receiveBytes = useCallback((bytes: ByteArray) => {
     const result = parseFrame(bytes);
     if (result.ok) {
-      setRxLog((log) => push(log, makeEntry(toHexString(bytes), annotateFrame(result.frame))));
+      setRxLog((log) => push(log, makeEntry(toHexString(bytes), annotateFrame(result.frame, profileRef.current))));
       onFrameRef.current(result.frame);
     } else {
       setRxLog((log) =>

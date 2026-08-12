@@ -10,6 +10,8 @@
  */
 
 /** JS equivalent of uint8_t — every element must stay within 0x00–0xFF. */
+import { enumName, type ResolvedProfile } from "./profile";
+
 export type Byte = number;
 export type ByteArray = Byte[];
 
@@ -435,6 +437,12 @@ function fmtUnix(ts: number): string {
   return new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19) + " UTC";
 }
 
+/**
+ * Fallback names for the INVENTED map, kept only so a frame still reads when no
+ * profile is supplied. The authoritative naming now comes from the active
+ * device profile — see `annotateDp`'s `profile` argument and `profileRegistry`.
+ * Every name in here is fiction (`ozkey-27 §2.1`); do not add to it.
+ */
 const DP_NAMES: Record<number, string> = {
   [DpId.UNLOCK_CHANNEL]: "Unlock Channel",
   [DpId.RFID_CARD]: "RFID Card",
@@ -447,7 +455,52 @@ const DP_NAMES: Record<number, string> = {
   [DpId.DELETE_RFID]: "Delete RFID",
 };
 
-function annotateDp(dp: TuyaDataPoint): string {
+/**
+ * Describe a DP the way the ACTIVE PROFILE describes it.
+ *
+ * This is the point of the whole profile layer made visible: the same bytes
+ * mean different things under different profiles, and until now the console
+ * asserted one interpretation as if it were fact. Under `tuya-ds013-t3` a
+ * DP 21 write is `navigation_volume`; under `ozkie-legacy-v0` it is our
+ * invented "Add Temporary PIN". Both are shown for what they are.
+ */
+function profileAnnotation(dp: TuyaDataPoint, profile: ResolvedProfile): string | null {
+  const entry = profile.byDp.get(dp.dpId);
+  if (!entry) {
+    return `DPID ${dp.dpId} — NOT IN PROFILE ${profile.profile_id} (rejected, never forwarded)`;
+  }
+
+  const verb = entry.verb ? ` -> ${entry.verb}` : "";
+  const head = `DP ${entry.dp} ${entry.name}${verb}`;
+
+  if (entry.status === "reserved" || entry.status === "unknown") {
+    // The honest answer: we know the DP exists and we cannot encode it.
+    return `${head} — ${entry.status.toUpperCase()}: ${entry.blocked_by ?? "payload layout not supplied"}`;
+  }
+
+  let value: string;
+  if (entry.enum) {
+    value = enumName(entry, dp.value) ?? `UNKNOWN ENUM ${dp.value}`;
+  } else if (Number.isNaN(dp.value)) {
+    value = toHexString(dp.raw);
+  } else {
+    value = String(dp.value);
+    if (entry.range && (dp.value < entry.range[0] || dp.value > entry.range[1])) {
+      value += ` (OUT OF RANGE ${entry.range[0]}..${entry.range[1]})`;
+    }
+    if (entry.unit) value += ` ${entry.unit}`;
+  }
+
+  const kind = entry.access_kind ? `, kind: ${entry.access_kind}` : "";
+  const fiction = entry.status === "fiction" ? "  ⚠ FICTION" : "";
+  return `${head} = ${value}${kind}${fiction}`;
+}
+
+function annotateDp(dp: TuyaDataPoint, profile?: ResolvedProfile): string {
+  if (profile) {
+    const fromProfile = profileAnnotation(dp, profile);
+    if (fromProfile) return fromProfile;
+  }
   const name = DP_NAMES[dp.dpId] ?? `DPID ${dp.dpId}`;
   switch (dp.dpId) {
     case DpId.ADD_TEMP_PIN:
@@ -480,7 +533,7 @@ function annotateDp(dp: TuyaDataPoint): string {
 }
 
 /** Build "Parsed Incoming Hex -> ..." annotation lines for a decoded frame. */
-export function annotateFrame(frame: TuyaFrame): string[] {
+export function annotateFrame(frame: TuyaFrame, profile?: ResolvedProfile): string[] {
   if (frame.command === TuyaCommand.HEARTBEAT) {
     return ["Parsed Incoming Hex -> Action: Heartbeat Ping"];
   }
@@ -528,7 +581,7 @@ export function annotateFrame(frame: TuyaFrame): string[] {
   if (frame.dataPoints.length === 0) {
     return ["Parsed Incoming Hex -> DP_REPORT with no decodable data points"];
   }
-  return frame.dataPoints.map((dp) => `Parsed Incoming Hex -> ${annotateDp(dp)}`);
+  return frame.dataPoints.map((dp) => `Parsed Incoming Hex -> ${annotateDp(dp, profile)}`);
 }
 
 /** Reference frame: remote unlock request (DP 1, BOOL, value 0x01) with valid checksum. */

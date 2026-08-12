@@ -22,6 +22,7 @@ import {
   type ProductProfile,
 } from "../lib/profile";
 import { loadProfile, listProducts, loadCatalogue, loadProduct } from "../lib/profileLoad";
+import { PROFILES, getProfile, DEFAULT_PROFILE_ID } from "../lib/profileRegistry";
 
 let passed = 0;
 let failed = 0;
@@ -352,6 +353,32 @@ test("DP 42 and 76 mean the same in both products — the catalogue-is-standard 
   assert.equal(video.byDp.get(42)!.name, ds013.byDp.get(42)!.name);
   assert.equal(video.byDp.get(76)!.name, ds013.byDp.get(76)!.name);
   assert.equal(video.byDp.get(76)!.name, "unlock_ble");
+});
+
+console.log("\ntwo loaders, one truth\n");
+
+// The browser cannot read `profiles/` off disk, so profileRegistry.ts imports
+// the same JSON statically. Two code paths to the same data is exactly how the
+// fiction survived in the first place — so pin that they agree.
+test("the browser registry resolves identically to the filesystem loader", () => {
+  for (const fromBrowser of PROFILES) {
+    const fromDisk = loadProfile(fromBrowser.profile_id);
+    assert.deepEqual(
+      fromBrowser.entries.map((e) => [e.dp, e.name, e.status, e.verb]),
+      fromDisk.entries.map((e) => [e.dp, e.name, e.status, e.verb]),
+      `${fromBrowser.profile_id} differs between the two loaders`
+    );
+    assert.deepEqual(fromBrowser.in_lock, fromDisk.in_lock);
+  }
+});
+
+test("the registry strips $comment too — in_lock must hold only real DPIDs", () => {
+  const keys = Object.keys(getProfile("ozkie-legacy-v0").in_lock).sort();
+  assert.deepEqual(keys, ["101", "102", "103"]);
+});
+
+test("the default profile is the legacy fiction, deliberately", () => {
+  assert.equal(DEFAULT_PROFILE_ID, "ozkie-legacy-v0");
 });
 
 // ── summary ─────────────────────────────────────────────────────────────────

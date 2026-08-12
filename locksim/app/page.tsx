@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ByteArray, TuyaFrame } from "@/lib/tuya";
 import { fromHexString } from "@/lib/tuya";
 import { LOCKSIM_VERSION } from "@/lib/version";
+import ProfileSelector from "@/components/ProfileSelector";
+import { DEFAULT_PROFILE_ID, getProfile } from "@/lib/profileRegistry";
 import { useTuyaProtocol, type HardwareMode } from "@/hooks/useTuyaProtocol";
 import { useLockState } from "@/hooks/useLockState";
 import { useVirtualClock } from "@/hooks/useVirtualClock";
@@ -93,12 +95,20 @@ export default function Page() {
   const onBrokerMessage = useCallback((t: string, p: string) => brokerMessageRef.current(t, p), []);
 
   const serial = useSerialLink({ onFrameBytes });
+  // Which supplier's DP map the console interprets under. Defaults to
+  // `ozkie-legacy-v0` — our invented map — because that is what doorlock-1.58
+  // ships and what the current BANOI build constructs frames against, so it is
+  // the profile under which this bench currently tells the truth.
+  const [profileId, setProfileId] = useState<string>(DEFAULT_PROFILE_ID);
+  const profile = getProfile(profileId);
+
   const protocol = useTuyaProtocol({
     onFrame,
     mode,
     sendToWire: serial.write,
     wireReady: serial.ready,
     onMqttPayload,
+    profile,
   });
 
   const mqtt = useMqttLink({
@@ -456,6 +466,9 @@ export default function Page() {
               <p className="text-[11px] text-neutral-500">
                 Tuya 0x55 0xAA MCU protocol · MCU time service (0x1C) · ozkey-21
               </p>
+            </div>
+            <div className="w-[280px] shrink-0">
+              <ProfileSelector profile={profile} onChange={setProfileId} />
             </div>
             {/*
               Settings and the UART control both used to live in panels that are
