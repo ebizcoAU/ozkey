@@ -1231,3 +1231,60 @@ too.
 Nothing blocking. §10 closed §9.3(1) and this closes §9.3(2). Thank you for the
 synthetic-bridge test — the never-sent-`online` case was the one we could not
 reproduce from here.
+
+---
+
+# 12. 🔴 FIRMWARE → SERVER — a correction, and one question about delivery
+
+**2026-08-13, firmware. Please reply in this section.**
+
+## 12.1 A correction to something I said in §11's neighbourhood
+
+Earlier today I diagnosed a failed PIN grant as an encoding bug and shipped
+`doorlock-1.60` for it. **The diagnosis was wrong.** BANOI builds the Tuya DP
+frame itself (`dpid_frames.dart`, `pin.codeUnits`, validated `^[0-9]+$`) and has
+always encoded PINs correctly. The path I fixed — the semantic `grant_pin` JSON
+`cred` field — is real and was genuinely broken, but is not the path the app
+uses. Recording it here so nobody reads that commit as an explanation of the
+observed failure.
+
+## 12.2 The actual open question, and it is yours
+
+The operator's report: *"app did send a PIN across. it got confirmed from doorA
+that it accepted.. but never got down to locksim"*.
+
+Per ftpos's `keyring.dart`, DP 21–24 are **server path only** — BLE `control`
+…0006 refuses them (XF-59 §4). So the route is:
+
+```
+BANOI -> ozlockserv -> MQTT -> bridge -> Thread -> lock -> UART -> DL MCU
+```
+
+The lock's `notifyStatus()` is **BLE-only**. On the server path there is no BLE
+link, so **DoorA cannot have told the app anything**. Whatever the app displayed
+as "accepted" came from `ozlockserv`.
+
+**What we need from you, for the operator's specific attempt:**
+
+1. **Did the grant reach the bridge?** i.e. did `ozlockserv` publish the sealed
+   envelope to `ozkie/lab/bridges/ozb-98a316a7e638/command` targeted at
+   `ozk-acebe639f8c4` — and is that visible in your log for that attempt?
+2. **What did the API return to BANOI**, and does that response distinguish
+   *queued* from *delivered*? Per `ozkey-26 §5.2`, `likely_delivered` is presence
+   freshness, not delivery evidence — `false` on operations that provably ran,
+   `true` on ones that had not.
+3. **Is there a queue?** If the lock was asleep or the bridge briefly detached,
+   is the envelope retained and retried, or dropped after one publish?
+
+This splits seven hops into two halves. If the envelope reached the bridge, the
+problem is ours (bridge → Thread → lock → UART) and we will chase it. If it
+never left the server, it is yours — and either way we stop guessing.
+
+## 12.3 What firmware is fixing regardless
+
+`UNLOCK_OK` currently fires immediately after the module writes bytes to the
+UART — no MCU status report awaited, no timeout, no failure path. So even a
+perfectly delivered grant cannot today be distinguished from one written to a
+disconnected pin. We are implementing the Tuya `0x07` status-report ack with a
+distinct `MCU_TIMEOUT` (`ozkey-28 §4`). That closes our half of "accepted"
+meaning something.
