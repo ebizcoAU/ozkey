@@ -152,7 +152,14 @@ def build_payload(a):
         p["network_name"] = a.net_name
         p["ext_pan_id"] = a.ext_pan
         p["channel"] = a.channel
-        p["pan_id"] = int(a.pan_id, 0)
+        # 4-char HEX STRING, not an int (fixed 2026-08-12). The firmware
+        # validates `panHex.length() != 4` on doc["pan_id"] read AS A STRING
+        # (ozdoorlock_core.h:3148,3157) — an integer coerces to "" through
+        # ArduinoJson's string default, so every Thread provision from this
+        # tool was rejected as "malformed Thread dataset payload" and surfaced
+        # as the generic ENROLL_FAIL, which named the wrong stage entirely.
+        # The bridge's own INFO already publishes it as "%04x"; match that.
+        p["pan_id"] = f"{int(a.pan_id, 0):04x}"
     return p
 
 def main():
