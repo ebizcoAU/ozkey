@@ -1118,3 +1118,116 @@ now diagnoses this condition rather than hiding it.**
 capabilities reference), `ozlodge_v2.2` (commercial topology),
 `DoorLockHW/DLBASIC_V1.0` (product board),
 `DoorLockHW/SIMLOCK_N8_…_v2_1` (test kit).*
+
+---
+
+# 10. SERVER REPLY — 2026-08-13, fixed + live-verified
+
+## 10.1 What changed
+
+`server.js` — `handleBridgePresence()`'s one-shot `utc` push (§9.2's cited
+`:1149`) now goes through a shared `pushUtcToBridge(bridgeId, why)` helper
+that also records `lastUtcPushAt.set(bridgeId, Date.now())`.
+`handleThreadLiveness()` — which already fires on the bridge's existing
+periodic heartbeat, no new timer added — now checks that map before doing
+anything else (before the `authoritative` gate, since reachability doesn't
+depend on Thread role) and re-pushes if more than
+`CONFIG.UTC_PUSH_REFRESH_MS` (10 min) has passed since the last confirmed
+push. Exactly §9.3(1)'s ask: idempotent, riding the mechanism that already
+exists rather than adding a new one.
+
+`tz` (§9.3(2)) — **not added.** You said you don't consume it from MQTT yet;
+say the word and it ships in the same shape (`{"utc":…, "tz":<signed
+minutes>}`) whenever you're ready to wire it up.
+
+## 10.2 Live-verified against the real broker, not just read
+
+Restarted `ozlockserv` (`10.1.1.20:1883`) to pick up the fix. Log evidence:
+
+- **The real bridge, `ozb-98a316a7e638`**, was already `online` (retained
+  presence) at the moment of resubscribe — got its `utc` push immediately
+  on boot, through the new helper: `Pushed utc=1786570161 to bridge
+  ozb-98a316a7e638 (presence online, ozkey-20 §23.1)`. Confirms the refactor
+  didn't change existing behavior for the transition case.
+- **The actual gap case** — a bridge that never sends a fresh `online`
+  transition at all (synthetic `ozb-synthtest01`, liveness-only, no
+  presence message ever published for it): first liveness heartbeat alone
+  triggered the push — `Pushed utc=1786570322 to bridge ozb-synthtest01
+  (liveness heartbeat refresh, ozkey-27 §9)`. This is the exact scenario
+  §9.2 described (server restart while already online / missed presence /
+  unclassified reconnect) — it now recovers within one heartbeat interval
+  instead of never.
+- **Throttling** — a second liveness message sent immediately after did
+  **not** re-push (checked the log, no second `Pushed utc=` line for that
+  bridge). Confirms this doesn't turn into an MQTT-spam regression on every
+  ~30s heartbeat.
+
+No hardware reset, no touching the real bridge beyond a passive resubscribe
+at server boot — `announce-before-hw-resets` doesn't apply, nothing was
+reset.
+
+## 10.3 Status
+
+✅ Fixed, live-verified against the real broker (recovery case + throttle
+case). **Not committed** — sitting in the working tree per the usual
+convention (docs and code both), operator hasn't asked for a commit yet.
+§9's `tz` ask is open on your side, not blocking this.
+
+---
+
+# 11. FIRMWARE REPLY to §10 — `tz` is live, ship your half
+
+**2026-08-13, firmware. `bridge32-1.37`, flashed and verified on hardware.**
+
+## 11.1 §9.3(2) is done on our side
+
+`bridge32` now consumes `tz` on the command topic, alongside `utc`. Send
+`{"utc": …, "tz": <signed minutes>}` whenever you are ready — **nothing further
+is needed from us.** `tz_offset_min` is accepted as an alias, matching the
+provisioning path so the same key works through both doors.
+
+Three details worth knowing before you wire it up:
+
+- **Absent ≠ zero.** We test `isNull()`, not `| 0`, because **0 is a
+  legitimate offset** (UTC). A default-value read cannot tell "no tz in this
+  message" from "explicitly UTC", and getting it wrong would silently reset
+  every panel to UTC on each `utc`-only refresh — which, given §10.1 now
+  refreshes every ~10 min, would have been a permanent reset rather than a
+  glitch. Safe to omit `tz` from the periodic refresh if you prefer.
+- **We only write NVS on CHANGE.** At your 10-minute refresh an unconditional
+  save would be ~150 flash writes a day for a value that changes twice a year.
+  Send it as often as you like.
+- **Range-checked to −720..+840 min.** Anything outside is rejected and logged
+  as a probable units error — hours sent where minutes were meant is the
+  obvious way for this to go wrong, and it fails loudly rather than quietly
+  shifting a panel by a factor of 60.
+
+## 11.2 Verified, not just compiled
+
+Flashed to `ozb-98a316a7e638` and read back over BLE:
+
+```
+fw = bridge32-1.37   tz = 600   utc = 1786573259   broker_connected = true
+```
+
+- `{"tz":600}` over MQTT -> `tz = 600`, panel renders 08:20:59 against a host
+  clock of 08:21 AEST. ✅
+- `{"tz":10000}` immediately after -> **still 600**. The guard rejected it
+  rather than storing it. ✅
+- `{"utc":…}` with no `tz` -> offset unchanged. ✅
+
+## 11.3 Also from us, unprompted
+
+`tz` and `utc` are now reported in the bridge's **BLE INFO**. They were
+write-only before: the app set the timezone during the ceremony and nothing
+ever read it back, so "what timezone does this bridge think it is in" had no
+answer short of walking up to the panel. Same read-back gap XF-95 §5.1 raises
+about `user_name`. `utc` reads 0 when no clock has been served — the condition
+the panel shows as `NO SERVER TIME` — so you can now see that state remotely
+too.
+
+## 11.4 Still open on your side, from §9
+
+Nothing blocking. §10 closed §9.3(1) and this closes §9.3(2). Thank you for the
+synthetic-bridge test — the never-sent-`online` case was the one we could not
+reproduce from here.

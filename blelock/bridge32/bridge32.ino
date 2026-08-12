@@ -179,7 +179,7 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.36"
+#define FW_VERSION "bridge32-1.37"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -711,6 +711,18 @@ void refreshInfo() {
   doc["thread_formed"] = threadFormed;
   doc["broker_connected"] = mqttClient.connected();
   doc["last_status"] = lastStatus;
+  // 1.37 — the bridge's own clock state, readable without the LCD.
+  //
+  // `tz` was previously write-only: the app set it during the ceremony and
+  // nothing ever reported it back, so "what timezone does this bridge think it
+  // is in" had no answer short of reading the panel. That is the same
+  // read-back gap XF-95 §5.1 raises about `user_name`, and it made a wrong
+  // offset undiagnosable remotely.
+  //
+  // `utc` is 0 when no clock has been served yet — the condition the panel
+  // shows as NO SERVER TIME, exposed here so the server and app can see it too.
+  doc["tz"] = cfgTzMin;
+  doc["utc"] = ozBridgeUtc();
 
   if (threadFormed) {
     // CRASH FIX (2026-07-26, live bench): thread.getExtendedPanId()/getNetworkKey()
@@ -791,6 +803,53 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
                   (unsigned long)utcIn);
     // Push it straight out rather than waiting up to 24 h for the next beacon.
     sendTimeBeacon();
+  }
+
+  // ── 1.37 — accept `tz` on this topic too (ozkey-27 §9.3(2)) ──────────────
+  //
+  // Until now the timezone reached this bridge through exactly one door: the
+  // BLE provisioning ceremony (validModePayload -> cfgTzMin -> NVS). There was
+  // no way to correct it afterwards — not for DST, not for a site that moves,
+  // not for a value the app got wrong — short of re-running the whole ceremony
+  // on a mounted, working bridge. Server team has the publish side ready and
+  // was waiting on this half.
+  //
+  // PANEL-ONLY, and that is not an implementation detail. We serve UTC to the
+  // MCU and apply the offset only for display (ozkey-21 §8.4): DP 21/23
+  // from/to are true UTC epochs, so serving genuine local time to the MCU would
+  // shift every temporary credential by the offset — 7 h in Vietnam, 10 h here
+  // — with nothing on our side able to detect it. The command 0x1C is named
+  // GET_LOCAL_TIME, which is a trap, not a guide. Do not "fix" this.
+  //
+  // Accepts `tz_offset_min` as an alias, matching validModePayload() so the
+  // same key works on both doors in.
+  {
+    JsonVariantConst tzv = doc["tz"];
+    if (tzv.isNull()) tzv = doc["tz_offset_min"];
+    // isNull() rather than `| 0`: 0 is a LEGITIMATE offset (UTC), so a default
+    // cannot distinguish "absent" from "explicitly UTC". Getting that wrong
+    // would silently reset the panel to UTC on every utc-only refresh.
+    if (!tzv.isNull() && tzv.is<int>()) {
+      const int tzIn = tzv.as<int>();
+      // Real-world offsets span UTC-12:00 to UTC+14:00. Anything outside that
+      // is a unit error — most likely HOURS sent where MINUTES were meant,
+      // which is the failure mode worth catching by name.
+      if (tzIn < -720 || tzIn > 840) {
+        Serial.printf("[TIME] tz=%d REJECTED — outside -720..+840 min "
+                      "(hours sent as minutes?)\n", tzIn);
+      } else if ((int16_t)tzIn != cfgTzMin) {
+        cfgTzMin = (int16_t)tzIn;
+        // Only on CHANGE. The server refreshes utc every ~10 min and tz rides
+        // along, so an unconditional putShort() would be ~150 NVS writes a day
+        // for a value that changes twice a year at most.
+        saveConfig();
+        Serial.printf("[TIME] tz=%+d min (%+.2f h) accepted over MQTT, saved\n",
+                      cfgTzMin, cfgTzMin / 60.0);
+        // Locks render their own panels from this, so push it now rather than
+        // letting them sit up to 24 h on the old offset.
+        sendTimeBeacon();
+      }
+    }
   }
 
   // ── XF-91/92 — REMOTE FACTORY RESET OF THE BRIDGE ITSELF ────────────────
