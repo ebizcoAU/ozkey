@@ -173,7 +173,7 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.33"
+#define FW_VERSION "bridge32-1.34"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -728,6 +728,36 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
       if (!bridgeOwnershipCheck(reqApp)) {
         Serial.printf("[RESET] REFUSED over MQTT (app_id '%s')\n",
                       reqApp.length() ? reqApp.c_str() : "(absent)");
+        // ── SAY NO OUT LOUD (ozkey-25 §3, 2026-08-12) ────────────────────
+        //
+        // bridgeOwnershipCheck() already called notifyStatus("BRIDGE_DENIED")
+        // — but notifyStatus() is a BLE characteristic notify, and during an
+        // MQTT reset there is no BLE client connected. The refusal was being
+        // computed and then announced down a transport nobody was listening
+        // on, so a real denial and a message the bridge never received were
+        // wire-identical: both silence. The server could only ever call that
+        // `unknown`.
+        //
+        // ⚠ NOT RETAINED, deliberately — server team's ozkey-25 §3 proposed
+        // reusing this topic retained. This topic's retained value is the
+        // bridge's LIVENESS STATE OF RECORD (see the LWT + clear-on-connect
+        // dance at :1625-1638, whose own comment warns that a stale retained
+        // value "would call a live bridge dead"). A refusal is an EVENT, not a
+        // state: retaining it would overwrite liveness, and every later reader
+        // would see a denied reset as the bridge's current condition. The
+        // server's waiter is connected and live for its 5 s window, so a
+        // non-retained publish reaches it and leaves no residue.
+        //
+        // `state:"online"` because we are still running with the mesh intact —
+        // only a SUCCESSFUL reset goes offline. id/role included so it parses
+        // through the same handleBridgePresence() path as every other message
+        // on this topic.
+        if (mqttClient.connected()) {
+          const String t = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/presence";
+          const String denied = String("{\"state\":\"online\",\"id\":\"") + deviceId +
+                                "\",\"role\":\"bridge\",\"reason\":\"factory_reset_denied\"}";
+          mqttClient.publish(t.c_str(), denied.c_str(), false /*NOT retained*/);
+        }
         return;
       }
       Serial.println("[RESET] remote factory_reset accepted over MQTT");
