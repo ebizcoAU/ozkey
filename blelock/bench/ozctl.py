@@ -311,17 +311,30 @@ def mqtt_publish_envelope(broker, site, device_id, envelope_bytes):
 # pairing_secret=01..20 hex, device_id="ozk-a4cf12879da7",
 # issuer="aa"*32, label="Ba Ngoai", nonce="42"*16, expires=1789000000
 # -> mac e7780baea8feef5674c0ffecd1b83f35dfd9198db50cea6d0735c7a43d268aac (MATCH).
-def invite_mac(pairing_secret, device_id, issuer_app_id, role, label, nonce_hex, expires):
+def invite_mac(pairing_secret, device_id, issuer_app_id, role, label, nonce_hex,
+               expires, version=1, membership_expires=0):
+    """Mirrors ozInviteMac() in ozcrypto.h. The HKDF info string stays
+    "ozkey/invite-v1" at BOTH versions — it is a frozen crypto label, not a
+    version number, and changing it would silently invalidate every v1 invite.
+
+    v2 appends the SIGNED membership expiry to the canonical string. That is
+    the whole point of v2 (XF-87): `me` used to ride outside the MAC as
+    advisory app-to-app metadata, so the lock could not trust it. It can now.
+    """
     salt = (device_id + issuer_app_id).encode()
     key = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
                info=b"ozkey/invite-v1").derive(pairing_secret)
-    canonical = f"1|{device_id}|{issuer_app_id}|{role}|{label}|{nonce_hex}|{expires}"
+    canonical = (f"{version}|{device_id}|{issuer_app_id}|{role}|{label}"
+                 f"|{nonce_hex}|{expires}")
+    if version >= 2:
+        canonical += f"|{membership_expires}"
     h = hmac.HMAC(key, hashes.SHA256())
     h.update(canonical.encode())
     return h.finalize().hex()
 
 
-def build_invite(st, device_id, lock_pub_hex, label, role="member", ttl=600):
+def build_invite(st, device_id, lock_pub_hex, label, role="member", ttl=600,
+                 membership_expires=0):
     """Mints an OZINV1 invite AS bond #0 — same pairing secret `control` uses,
     no BLE write. If `st` is not actually bond #0 on this lock, the mac simply
     won't match what the lock recomputes, and enroll will report MEMBER_FAIL."""
@@ -330,9 +343,16 @@ def build_invite(st, device_id, lock_pub_hex, label, role="member", ttl=600):
         X25519PublicKey.from_public_bytes(bytes.fromhex(lock_pub_hex)))
     nonce_hex = secrets.token_bytes(16).hex()
     expires = int(time.time()) + ttl
-    mac = invite_mac(secret, device_id, issuer_app_id, role, label, nonce_hex, expires)
-    obj = {"v": 1, "d": device_id, "i": issuer_app_id, "r": role,
+    # ozkey-21 T4/T5: `me` is the MEMBERSHIP expiry (how long the bond lives),
+    # distinct from `e` which is only how long the QR stays redeemable. Passing
+    # membership_expires mints a v2 invite whose `me` is inside the MAC.
+    version = 2 if membership_expires else 1
+    mac = invite_mac(secret, device_id, issuer_app_id, role, label, nonce_hex,
+                     expires, version, membership_expires)
+    obj = {"v": version, "d": device_id, "i": issuer_app_id, "r": role,
            "l": label, "n": nonce_hex, "e": expires, "m": mac}
+    if version >= 2:
+        obj["me"] = membership_expires
     payload = base64.urlsafe_b64encode(json.dumps(obj, separators=(",", ":")).encode()).decode()
     return INVITE_PREFIX + payload
 

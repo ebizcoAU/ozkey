@@ -234,8 +234,25 @@ static const uint8_t OZ_ROLE_MEMBER = 1;
 
 #define OZ_BOND_MAX   16
 #define OZ_LABEL_MAX  32  // bytes, UTF-8, NUL-terminated (labels live ON the lock)
-#define OZ_BOND_REC   80  // on-NVS record stride; 6 bytes spare for v2 fields
-#define OZ_BONDTAB_SZ (OZ_BOND_REC * OZ_BOND_MAX)
+
+// ── RECORD STRIDE — grew 80 -> 88 for ozkey-21 T4 (expires_at) ───────────────
+//
+// The old stride said "6 bytes spare for v2 fields"; U0's txReserved took all
+// six (offset 74..79), so the 80-byte record was FULL. T4 needs 4 more, so the
+// stride grows and OZ_BONDTAB_SZ with it.
+//
+// 🔴 THAT IS A MIGRATION, NOT A RECOMPILE. ozBondsLoad() gates on an EXACT
+// length match, so a lock upgraded in the field would have read its 1280-byte
+// blob as "no table" and silently come up with NO BONDS — no owner, no members,
+// unrecoverable without a factory reset and a re-pair. Every deployed lock,
+// on the OTA that shipped it. ozBondsLoad() below therefore reads BOTH strides.
+//
+// Layout v2 (88): 0 present | 1 role | 2..9 floor | 10..41 pub | 42..73 label
+//                 74..79 txReserved | 80..83 expiresAt | 84..87 spare(v3)
+#define OZ_BOND_REC    88
+#define OZ_BOND_REC_V1 80  // pre-T4 stride — read-only, for the upgrade path
+#define OZ_BONDTAB_SZ    (OZ_BOND_REC    * OZ_BOND_MAX)
+#define OZ_BONDTAB_SZ_V1 (OZ_BOND_REC_V1 * OZ_BOND_MAX)
 
 // ozkey-17 U0: 48-bit big-endian, for the outbound counter below. Six bytes,
 // not eight, because that is exactly what OZ_BOND_REC left spare — and growing
@@ -259,6 +276,16 @@ struct OzBond {
   uint64_t floor;              // counter_floor — anti-replay, M4 moves it
   uint8_t  pub[32];            // the member's X25519 public key == its app_id
   char     label[OZ_LABEL_MAX];
+
+  // ── ozkey-21 T4: membership expiry ────────────────────────────────────────
+  // UTC seconds. 0 = PERMANENT, and 0 is what every pre-T4 bond reads back as,
+  // which is why this is additive: nobody already enrolled changes behaviour.
+  //
+  // Set from the invite's `me` field, which is SIGNED inside the invite MAC at
+  // v2 (XF-87). We have verified that value since v2 shipped and then thrown it
+  // away — see ozkey-21 §9, where a membership that expired at 12:38 opened the
+  // door at 12:39 on real hardware. This is the field that was missing.
+  uint32_t expiresAt;
 
   // ── ozkey-17 U0: lock->app send counter ────────────────────────────────────
   // `floor` protects traffic coming IN. Sealing traffic going OUT (U1's uplink,
@@ -318,7 +345,13 @@ static void ozBondsSave() {
     ozPutU64BE(g_bonds[i].floor, r + 2);
     memcpy(r + 10, g_bonds[i].pub, 32);
     memcpy(r + 42, g_bonds[i].label, OZ_LABEL_MAX);
-    ozPutU48BE(g_bonds[i].txReserved, r + 74); // U0 — the 6 spare bytes
+    ozPutU48BE(g_bonds[i].txReserved, r + 74); // U0 — the old 6 spare bytes
+    // T4: expiresAt, big-endian like every other integer in this record.
+    // 84..87 stay zeroed by the calloc above, reserved for v3.
+    r[80] = (uint8_t)(g_bonds[i].expiresAt >> 24);
+    r[81] = (uint8_t)(g_bonds[i].expiresAt >> 16);
+    r[82] = (uint8_t)(g_bonds[i].expiresAt >> 8);
+    r[83] = (uint8_t)(g_bonds[i].expiresAt);
   }
   prefs.begin("blelock", false);
   prefs.putBytes("bondtab", buf, OZ_BONDTAB_SZ);
@@ -345,13 +378,20 @@ static void ozBondsLoad() {
   memset(g_bonds, 0, sizeof(g_bonds));
 
   prefs.begin("blelock", true);
-  const bool haveTab = (prefs.getBytesLength("bondtab") == OZ_BONDTAB_SZ);
-  if (haveTab) {
-    uint8_t *buf = (uint8_t *)malloc(OZ_BONDTAB_SZ);
+  // T4 MIGRATION: accept BOTH strides. The v1 blob (1280 B) predates
+  // expires_at; reading it with the v2 stride would walk off the end of every
+  // record after the first and produce garbage bonds, and REJECTING it (the
+  // old exact-match behaviour) would silently drop the owner on upgrade.
+  const size_t tabLen = prefs.getBytesLength("bondtab");
+  const bool   isV2   = (tabLen == OZ_BONDTAB_SZ);
+  const bool   isV1   = (tabLen == OZ_BONDTAB_SZ_V1);
+  if (isV2 || isV1) {
+    const size_t stride = isV2 ? OZ_BOND_REC : OZ_BOND_REC_V1;
+    uint8_t *buf = (uint8_t *)malloc(tabLen);
     if (buf) {
-      prefs.getBytes("bondtab", buf, OZ_BONDTAB_SZ);
+      prefs.getBytes("bondtab", buf, tabLen);
       for (int i = 0; i < OZ_BOND_MAX; i++) {
-        const uint8_t *r = buf + i * OZ_BOND_REC;
+        const uint8_t *r = buf + i * stride;
         g_bonds[i].present = (r[0] == 1);
         g_bonds[i].role    = r[1];
         g_bonds[i].floor   = ozGetU64BE(r + 2);
@@ -364,13 +404,30 @@ static void ozBondsLoad() {
         // ozBondsSave(), which starts the counter at 0 — exactly right.
         g_bonds[i].txReserved = ozGetU48BE(r + 74);
         g_bonds[i].txCounter  = g_bonds[i].txReserved;
+        // T4: a v1 record has no expiry to read. 0 = permanent, which is the
+        // correct reading of a bond enrolled before expiry existed — it was
+        // granted without a limit and we do not get to invent one now.
+        g_bonds[i].expiresAt =
+            isV2 ? ((uint32_t)r[80] << 24 | (uint32_t)r[81] << 16 |
+                    (uint32_t)r[82] << 8  | (uint32_t)r[83])
+                 : 0u;
       }
       free(buf);
     }
     prefs.end();
-    Serial.printf("[BOND] table loaded — %d bond(s)\n", ozBondCount());
+    Serial.printf("[BOND] table loaded (v%d) — %d bond(s)\n", isV2 ? 2 : 1,
+                  ozBondCount());
+    if (isV1) {
+      // Rewrite at the new stride immediately, so this only happens once and a
+      // later save cannot be the first thing to touch the format.
+      Serial.println("[BOND] migrating bond table v1 -> v2 (T4 expires_at)");
+      ozBondsSave();
+    }
     return;
   }
+  if (tabLen) // present but neither stride — do not guess at a layout
+    Serial.printf("[BOND] bondtab has unexpected length %u — ignored\n",
+                  (unsigned)tabLen);
 
   // No table yet: migrate the M2 singleton if this lock already has an owner.
   const bool haveM2 = (prefs.getBytesLength("b0pub") == 32);

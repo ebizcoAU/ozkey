@@ -497,3 +497,174 @@ nothing on our side able to detect it. The command's name is a trap, not a
 guide. Marked in `serveMcuTimeRequest()` so nobody "fixes" it back.
 
 Shipped in `doorlock-1.50`.
+
+---
+
+# 9. 🔴 §2.3 IS NO LONGER AN INFERENCE — an expired member opened the door, 2026-08-12
+
+**Demonstrated end to end on shipping firmware with the real app**, at the
+operator's bench. Until now §2.3 rested on reading the code and on a
+`mcu_time_probe` test of the *MCU clock*. This is the whole ceremony, live.
+
+## 9.1 Method
+
+- `doorlock-1.57`, `bridge32-1.34`, lock `ozk-acebe639f8c4` on the Thread mesh.
+- BANOI (bond #0) minted a membership invite with an expiry of **12:38**.
+- A second identity redeemed it and became a member — `bonds` went to 2.
+- We watched the lock's relayed heartbeat across the expiry boundary, then the
+  operator attempted an unlock **as the invited member** at 12:39.
+
+## 9.2 What the lock did at expiry: nothing
+
+```
+12:37:06  roster_epoch=1  bonds=2  uptime=2605     <- before
+12:38:06  roster_epoch=1  bonds=2  uptime=2665     <- AT expiry
+12:39:06  roster_epoch=1  bonds=2  uptime=2725     <- door opened here
+12:40:06  roster_epoch=1  bonds=2  uptime=2785
+```
+
+Zero command/revoke traffic on the bridge topic across the whole window.
+
+## 9.3 What the member did at 12:39
+
+**Opened the door.** Operator's words: *"oh! I could open the door"*.
+
+## 9.4 So the finding is exact
+
+**A membership that expired at 12:38 still granted physical entry at 12:39, and
+would have done so indefinitely.** The bond is not weakened, not parked, not
+flagged — it is simply unchanged, because there is nothing to change:
+
+- `OzBond` is `{present, role, floor, pub, label}` + the U0 tx counter. **No
+  time field exists to store an expiry in** (§2.2, T4 unbuilt).
+- Nothing anywhere compares a bond against the clock (T5 unbuilt).
+
+The invite's signed `me` **was** verified — XF-87 v2 puts it inside the MAC and
+that is hardware-proven byte-for-byte against ftpos. The lock validated it,
+then had nowhere to put it. **We authenticate an expiry we then discard.**
+
+That is worse than not carrying the field at all, because every layer above —
+the app's UI, the invite QR, the operator's mental model — presents a
+time-limited grant that the lock will never honour.
+
+## 9.5 Status change
+
+§2.3 was already marked CONFIRMED for temp PIN/RFID via the MCU clock. **This
+extends it to BOND MEMBERSHIP and proves it end to end**, with the real app
+minting and a real member entering.
+
+**T4 + T5 are no longer "unblocked, not yet built" — they are the fix for a
+demonstrated live security defect.** Both blockers named in T5 are long gone
+(the lock has had UTC since T2/T3, hardware-verified 2026-08-11), and the
+design decision is already made (§8: delete the bond outright on expiry,
+operator's ruling via XF-87 §12).
+
+Recommend building T4 + T5 next, ahead of everything else currently queued for
+firmware.
+
+---
+
+# 10. 🟢 T4 + T5 BUILT AND VERIFIED — `doorlock-1.58`, 2026-08-12
+
+**The defect §9 demonstrated is closed.** Same bench, same hardware, same
+ceremony, opposite outcome.
+
+## 10.1 The matched pair
+
+> **12:39, `doorlock-1.57`** — operator: *"oh! I could open the door"*
+> **13:06, `doorlock-1.58`** — operator: *"can't get in"*
+
+Roster side, DoorA (`ozk-acebe639f8c4`), membership expiring 13:05:
+
+```
+13:03:41  roster_epoch=5  bonds=2
+13:05:59  roster_epoch=6  bonds=1     <- swept at the expiry
+```
+
+Compare §9's `1.57` run, where `bonds=2 roster_epoch=1` held flat for nine
+minutes across the same event.
+
+## 10.2 What shipped
+
+**T4 — the field.** `OzBond.expiresAt` (uint32 UTC, 0 = permanent), set from
+the invite's signed `me`.
+
+⚠️ **This required a bond-table MIGRATION, which was the riskiest part of the
+change.** `OZ_BOND_REC` was 80 bytes and FULL — U0's `txReserved` had already
+taken the "6 bytes spare for v2 fields". The stride had to grow to 88, and
+`ozBondsLoad()` gated on an EXACT length match. Shipping that naively would
+have made every deployed lock read its 1280-byte table as *"no table"* and come
+up **with no owner and no members**, on the OTA that delivered the fix.
+`ozBondsLoad()` now reads both strides and rewrites v1→v2 once on boot.
+Verified: DoorA kept bond #0 across the flash.
+
+**T5 — enforcement.** `ozBondExpirySweep()` deletes expired bonds outright
+(§8's ruling), reusing `ozBondRevoke()` + `ozNotifyRosterChanged()` so an
+expired bond is indistinguishable, to every layer above, from a revoked one.
+
+Three safety rules, written as rules rather than left implicit:
+1. **Never expire bond #0** — the loop starts at slot 1. A lock that expired
+   its own owner is unrecoverable without a factory reset.
+2. **Never expire while the clock is unknown.** A late clock only *delays* an
+   expiry; it can never un-expire anything.
+3. **`0` = permanent** — what every pre-T4 bond and every v1 record reads back
+   as. Nobody already enrolled changes behaviour.
+
+**Two call sites, deliberately.** A 15 s timer makes expiry *observable*
+(roster notify + bond count move with nobody at the door), and a sweep **on the
+command path**, because a timer alone leaves a window where an expired member
+is still served — *"we would have removed you 14 seconds from now"* is not an
+access control. `ozControlOpen()` resolves the slot BEFORE dispatch, so the
+slot handed to dispatch may be the bond the sweep just deleted; re-checking
+`present` is what makes the expired member's own unlock fail rather than
+execute against a cleared slot.
+
+**Bonus guard:** an already-expired invite is now refused at enrolment
+(`MEMBER_EXPIRED`) rather than creating a bond the sweep retracts seconds
+later.
+
+## 10.3 Test matrix
+
+| Case | Evidence | |
+|---|---|---|
+| Expired member denied at the door | DoorA 13:06 | ✅ |
+| Expiry removes the bond | `bonds 2→1`, `epoch 5→6` | ✅ |
+| **Permanent member survives** | see §10.4 | ✅ |
+| **Bond #0 never expires** | owner present throughout, both locks | ✅ |
+| **Already-expired invite refused** | `MEMBER_EXPIRED` at enrol | ✅ |
+| **v1→v2 migration keeps the owner** | DoorA kept bond #0 across the OTA | ✅ |
+| v1→v2 migration keeps *members* | not directly observed — same code path | ⚠️ |
+
+## 10.4 The observation that proves two things at once
+
+Three invites were minted onto DoorB in one BLE window — A permanent (`me=0`),
+B already-expired, C expiring in 90 s:
+
+```
+A permanent        -> MEMBER_OK
+B already-expired  -> MEMBER_EXPIRED
+C expires now+90s  -> MEMBER_OK
+
+13:14:18  roster_epoch=2  bonds=3     <- owner + A + C
+13:15:18  roster_epoch=3  bonds=2     <- C expired, removed
+13:16:18  roster_epoch=3  bonds=2     <- A SURVIVES, stable
+```
+
+A and C sat in the same bond table through the same sweep. Exactly one bond
+removed, exactly one epoch bump. **So expiry fires AND does not touch permanent
+bonds** — the failure mode that would have silently deleted every member on
+every lock — in a single observation.
+
+## 10.5 Still open
+
+- **T5's clock-unknown window.** An invite enrolled while the clock is unknown
+  is accepted (the enrol-time check can't evaluate it) and swept once time
+  arrives. Correct, but it means an app that retries on roster change could
+  churn. Not observed on the bench; flagged rather than fixed.
+- **T7 (amend-by-command)** — extending or shortening an existing member
+  without a new QR. The re-invite path already honours a new signed `me`, which
+  covers most of it.
+- **Temp PIN/RFID expiry (the OTHER half of §2.3)** is unaffected by this: that
+  credential lives on the DL MCU, and whether it self-expires on the `from`/`to`
+  we pass in DP 21/23 is still §8.3's question for the manufacturer. **Bond
+  expiry is entirely ESP32 and needed nobody** (operator, 2026-08-12).

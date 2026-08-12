@@ -3407,17 +3407,31 @@ void handleMemberEnroll(JsonDocument &doc) {
   // enforcing it would be theatre. MEMBER_EXPIRED is reserved and NEVER
   // emitted. The nonce is the hard guarantee; DPID 102 is the kill switch.
   //
-  // XF-87/ozkey-21: at v2 `me` is now SIGNED, so it is trustworthy the moment
-  // we have a clock and somewhere to store it — T1 (clock) and T4 (bond
-  // expires_at). Until then we log it and do nothing, and the log says so
-  // rather than implying enforcement that does not exist.
+  // XF-87/ozkey-21: at v2 `me` is SIGNED, so it is trustworthy — and as of
+  // T4/T5 (1.58) we now have both halves it was waiting on: a clock (T1/T2/T3)
+  // and a field to keep it in (OzBond.expiresAt). It is STORED and ENFORCED
+  // from here; ozBondExpirySweep() deletes the bond when it comes due.
   Serial.printf("[MEMBER] invite v%d VERIFIED label='%s' qr_expires=%u", ver,
                 label.c_str(), (unsigned)expires);
   if (ver >= 2)
     Serial.printf(" membership_expires=%u%s", (unsigned)memExp,
-                  memExp ? " (SIGNED, not yet enforced — ozkey-21 T4/T5)"
-                         : " (permanent)");
-  Serial.println(" (expiry not enforced)");
+                  memExp ? " (SIGNED, ENFORCED)" : " (permanent)");
+  Serial.println();
+
+  // A membership that is ALREADY past its expiry must never enrol. Without this
+  // an old QR would mint a bond that the sweep then removes seconds later —
+  // brief real access, and a confusing "member appeared then vanished" for the
+  // owner. Refuse up front instead. Only checkable when the clock is known;
+  // with no clock we fall through and the sweep catches it once time arrives.
+  if (memExp && ozClockKnown(ozclock)) {
+    const uint32_t nowUtc = ozClockNow(ozclock, millis());
+    if (nowUtc && nowUtc >= memExp) {
+      Serial.printf("[MEMBER] invite membership already expired (%u <= %u) — refused\n",
+                    (unsigned)memExp, (unsigned)nowUtc);
+      notifyStatus("MEMBER_EXPIRED");
+      return;
+    }
+  }
 
   uint8_t nonce[16];
   ozFromHex(nonceHx.c_str(), nonce, 16);
@@ -3473,6 +3487,11 @@ void handleMemberEnroll(JsonDocument &doc) {
     memcpy(g_bonds[slot].pub, memberPub, 32);
   }
   copyLabelUtf8(label.c_str(), g_bonds[slot].label, OZ_LABEL_MAX);
+  // T4: keep the signed `me`. Applies on the re-invite path too — a re-issued
+  // QR carrying a NEW window is how an owner extends or shortens an existing
+  // member, and it is signed, so honouring it is the correct behaviour. v1
+  // invites carry no `me`, so memExp is 0 = permanent, unchanged from before.
+  g_bonds[slot].expiresAt = memExp;
   ozBondsSave();
   ozNonceBurn(nonce, memberPub); // ONLY on success — XF-47 §"Nonce replay cache"
 
@@ -3687,6 +3706,77 @@ static void handleBondRevoke(int senderSlot, const uint8_t *v, size_t vlen) {
   // corruption. The lock knows; it should say so rather than wait to be asked
   // by whoever next happens to stand in front of it.
   ozNotifyRosterChanged("bond_revoked");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ozkey-21 T5 — MEMBERSHIP EXPIRY IS ENFORCED HERE
+//
+// Until 1.58 nothing in this firmware compared a bond against the clock. The
+// invite's `me` was signed (XF-87 v2), verified by us, and then discarded,
+// because there was no field to keep it in. ozkey-21 §9 recorded the result on
+// real hardware: a membership that expired at 12:38 opened the door at 12:39,
+// and would have done so forever.
+//
+// The operator's ruling (§8, via XF-87 §12) is to DELETE the bond outright
+// rather than park it inactive: the window was granted knowingly and signed
+// into the invite, so expiry is a pre-authorised outcome, not a decision that
+// needs review. Reinstating early is what T7 (amend-by-command) is for.
+//
+// Reuses ozBondRevoke() + ozNotifyRosterChanged() deliberately — a bond that
+// disappears on expiry should be indistinguishable, to every layer above, from
+// one an admin revoked. A second removal path would be a second thing to keep
+// correct.
+//
+// 🔴 THREE SAFETY RULES, each of which would be a serious bug to get wrong:
+//
+//  1. NEVER expire bond #0. The owner has no expiry and must never acquire one
+//     — a lock that expired its own owner is unrecoverable without a factory
+//     reset. Enforced here even though no invite can set it, because "no path
+//     reaches this" is exactly the assumption that stops being true later.
+//
+//  2. NEVER expire while the clock is unknown. ozClockKnown() gates the whole
+//     sweep. A lock that boots with no time would otherwise read now=0, and
+//     `0 >= expiresAt` is false so nothing would happen — but relying on that
+//     arithmetic accident is not a safety property. Say it out loud instead.
+//     Being an hour stale is harmless in the other direction: a late clock only
+//     DELAYS an expiry, it never un-expires anything (see ozClockPersist).
+//
+//  3. expiresAt == 0 means PERMANENT, and that is what every pre-T4 bond and
+//     every v1 NVS record reads back as. Nobody already enrolled is affected.
+//
+// Cadence: cheap (16 slots, integer compares) but not free — it touches NVS
+// only when something actually expires. Called on a timer AND before dispatch,
+// so a member cannot beat the sweep by unlocking between ticks.
+// ─────────────────────────────────────────────────────────────────────────────
+#define OZ_EXPIRY_SWEEP_MS 15000UL
+
+static void ozBondExpirySweep() {
+  if (!ozClockKnown(ozclock)) return;            // rule 2
+  const uint32_t now = ozClockNow(ozclock, millis());
+  if (now == 0) return;
+
+  int expired = 0;
+  char lastLabel[OZ_LABEL_MAX] = {0};
+  for (int i = 1; i < OZ_BOND_MAX; i++) {        // rule 1 — start at 1, never 0
+    if (!g_bonds[i].present) continue;
+    const uint32_t exp = g_bonds[i].expiresAt;
+    if (exp == 0) continue;                      // rule 3 — permanent
+    if (now < exp) continue;
+    copyLabelUtf8(g_bonds[i].label, lastLabel, sizeof(lastLabel));
+    Serial.printf("[EXPIRY] bond %d ('%s') expired at %u, now %u — deleting\n",
+                  i, lastLabel, (unsigned)exp, (unsigned)now);
+    ozBondRevoke(i); // memsets the slot and commits NVS, same as a revoke
+    publishLog("bond_expired", lastLabel);
+    expired++;
+  }
+  if (expired) {
+    screenDirty = true;
+    // One notify for the sweep, not one per bond: an app resyncing on the epoch
+    // wants to know the roster moved, and it re-reads the whole roster anyway.
+    ozNotifyRosterChanged("bond_expired");
+    Serial.printf("[EXPIRY] %d bond(s) removed, %d remain\n", expired,
+                  ozBondCount());
+  }
 }
 
 // DPID 102 — invite_cancel. Value = the 16-byte invite nonce. Kills a QR that
@@ -4283,6 +4373,25 @@ static OzCtlOpen ozControlOpen(const uint8_t *buf, size_t n, int *outSlot,
 // (MQTT — see the block comment above).
 static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
                                         uint64_t counter, bool hasChallenge) {
+  // ── ozkey-21 T5: expiry is checked ON THE COMMAND PATH, not only on a timer.
+  //
+  // The 15 s sweep alone would leave a window in which an expired member could
+  // still be served — small, but this is the verb that opens a door, and "we
+  // would have removed you 14 seconds from now" is not an access control. Sweep
+  // first, then confirm the caller's own bond survived it.
+  //
+  // ozControlOpen() resolved `slot` by matching the sender's pubkey BEFORE this
+  // ran, so the slot it handed us may be the very bond the sweep just deleted.
+  // Re-checking `present` is what makes an expired member's own unlock fail
+  // rather than execute against a memset slot.
+  ozBondExpirySweep();
+  if (slot < 0 || slot >= OZ_BOND_MAX || !g_bonds[slot].present) {
+    Serial.printf("[CTL] bond %d no longer present (expired or revoked) — denied\n",
+                  slot);
+    notifyStatus("UNLOCK_DENIED");
+    return;
+  }
+
   const size_t need = (hasChallenge ? 16u : 0u) + 11u; // 11 = smallest legal DP frame
   if (ptLen < need) {
     Serial.printf("[CTL] plaintext is %u B — too short for %s\n",
@@ -5521,6 +5630,19 @@ void loop() {
   if (mcuWantsTimePush && ozClockKnown(ozclock) &&
       millis() - lastTimePushAt > MCU_TIME_PUSH_MS)
     serveMcuTimePush();
+
+  // ozkey-21 T5: expire memberships on a timer as well as on the command path.
+  // The timer is what makes an expiry OBSERVABLE — the roster_changed notify
+  // and the heartbeat's bond count move on their own, so an admin's app learns
+  // the member is gone without anyone touching the door. Without it, a bond
+  // would linger in the roster until the next command happened to sweep it.
+  {
+    static unsigned long lastExpirySweep = 0;
+    if (millis() - lastExpirySweep > OZ_EXPIRY_SWEEP_MS) {
+      lastExpirySweep = millis();
+      ozBondExpirySweep();
+    }
+  }
 
   // ── periodic monitor + dashboard refresh (MCU-link age ticks) ────────────
   static unsigned long lastMon = 0;
