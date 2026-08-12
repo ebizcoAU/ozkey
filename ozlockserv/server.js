@@ -125,6 +125,12 @@ const CONFIG = {
   JWT_SIGNING_SECRET: process.env.OZLOCK_JWT_SECRET || 'lab-only-INSECURE-jwt-secret-CHANGE-IN-PRODUCTION',
   AUTH_NONCE_TTL_MS: 60_000, // ozkey-24 §3.2: challenge nonce lifetime
   AUTH_JWT_TTL_S: 3600, // ozkey-24 §3.2: issued JWT lifetime
+  // ozkey-P2: how long POST /bridges/:id/reset waits for the bridge's own
+  // presence signal before giving up and reporting 'unknown'. factoryReset()
+  // is called synchronously right after the presence publish in firmware —
+  // no async delay on the bridge's side — so this is round-trip + broker
+  // latency budget, not a real processing wait.
+  BRIDGE_RESET_TIMEOUT_MS: 5000,
   DB: {
     host: 'localhost',
     user: 'root',
@@ -1049,6 +1055,47 @@ async function handleLockPresence(deviceId, payload) {
  * of `locks`. A bridge going offline is the aggregation trigger (R6
  * "mandatory") — every Thread lock behind it gets re-verdicted in one pass
  * rather than waiting for each lock's own next signal. */
+// ozkey-P2 (courier rule, XF-84 — "the server knows it sent the message; it
+// does not know the bridge executed it"): POST /bridges/:id/reset used to
+// return ok:true the instant the MQTT publish succeeded, which reports the
+// SERVER's success, not the BRIDGE's. bridge32's only wire-level signal for
+// a successful reset is publishing `{"state":"offline","reason":
+// "factory_reset"}` to its own presence topic immediately before wiping
+// (bridge32.ino ~733-740, confirmed by reading the firmware — a DENIED
+// reset, by contrast, only Serial.printf()s and returns; nothing is
+// published, so denial cannot be distinguished from silence on the wire —
+// see the route below). This map lets a pending REST request wait on that
+// one real signal instead of guessing from the publish alone.
+const pendingBridgeResets = new Map(); // bridgeId -> Set<(verdict) => void>
+
+function waitForBridgeResetVerdict(bridgeId, timeoutMs) {
+  return new Promise((resolve) => {
+    const settle = (verdict, cause) => {
+      clearTimeout(timer);
+      const set = pendingBridgeResets.get(bridgeId);
+      if (set) {
+        set.delete(settle);
+        if (!set.size) pendingBridgeResets.delete(bridgeId);
+      }
+      resolve({ verdict, cause });
+    };
+    // `cause` distinguishes "we waited the full budget and heard nothing"
+    // from "the bridge went offline for an unrelated/ambiguous reason and
+    // we stopped waiting early" — both resolve 'unknown', but conflating
+    // the two in a log line would be exactly the kind of imprecision this
+    // fix exists to remove.
+    const timer = setTimeout(() => settle('unknown', 'timeout'), timeoutMs);
+    if (!pendingBridgeResets.has(bridgeId)) pendingBridgeResets.set(bridgeId, new Set());
+    pendingBridgeResets.get(bridgeId).add(settle);
+  });
+}
+
+function notifyBridgeResetWaiters(bridgeId, verdict, cause) {
+  const set = pendingBridgeResets.get(bridgeId);
+  if (!set) return;
+  for (const settle of Array.from(set)) settle(verdict, cause);
+}
+
 async function handleBridgePresence(bridgeId, payload) {
   let obj;
   try {
@@ -1064,6 +1111,31 @@ async function handleBridgePresence(bridgeId, payload) {
     [bridgeId, state]
   );
   logEvent('info', `Presence: bridge ${bridgeId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}`);
+
+  // ozkey-P2: resolve any REST call currently waiting on this bridge's reset
+  // outcome. `reason==='factory_reset'` is the one positive signal that
+  // exists; going offline for any OTHER reason while a reset is pending
+  // (dropped connection, unrelated reboot, ...) is genuinely ambiguous —
+  // could be mid-reset, could be nothing to do with it — so it resolves as
+  // 'unknown' immediately rather than making the caller wait out the full
+  // timeout for a state that already can't get more informative.
+  // ozkey-25 §5.2/§5.3: firmware's `bridge32-1.34` adds a real denial
+  // signal — {"state":"online",...,"reason":"factory_reset_denied"},
+  // deliberately NOT retained (a refusal is an event, not a liveness
+  // state; see their reply for why retaining it would be a bug). That's
+  // why this checks `reason` on BOTH online and offline, not just offline
+  // as before — the denial arrives on the opposite state from a confirm.
+  if (pendingBridgeResets.has(bridgeId)) {
+    if (state === 'offline' && obj.reason === 'factory_reset') {
+      notifyBridgeResetWaiters(bridgeId, 'reset_confirmed', 'presence_confirmed');
+    } else if (state === 'online' && obj.reason === 'factory_reset_denied') {
+      notifyBridgeResetWaiters(bridgeId, 'reset_denied', 'presence_denied');
+    } else if (state === 'offline') {
+      notifyBridgeResetWaiters(bridgeId, 'unknown', 'offline_unrelated_reason');
+    }
+    // else: online with no matching reason (e.g. a routine reconnect) —
+    // not informative either way, keep waiting for the real timeout.
+  }
 
   // ozkey-20 §23.1 (2026-08-12, firmware's live-test finding): UDP 123 is
   // blocked on this network (see the NTP memory note), so a freshly
@@ -2028,10 +2100,16 @@ async function recordAudit(appId, deviceId, action, detail) {
  *  already touch a grant's lifecycle (flush-time revoke, and grant list
  *  reads), same style as the `pending_queue.expires_at` check elsewhere. */
 async function scrubExpiredGrantNames(whereClause, whereArgs) {
+  // ozkey-23 §11, CORRECTED 2026-08-12 (firmware, live on the bench):
+  // `date_to` is a UTC ISO string; MySQL's `NOW()` returns the server's
+  // LOCAL time. On a UTC+10 host, `date_to < NOW()` was true up to 10h
+  // before the grant actually expired — any window shorter than the
+  // server's UTC offset was born expired. `UTC_TIMESTAMP()` is UTC
+  // regardless of session/server timezone; that's the whole fix.
   const [rows] = await pool.query(
     `SELECT id FROM grants
        WHERE user_name IS NOT NULL
-         AND (sync_status = 'revoked' OR date_to < NOW())
+         AND (sync_status = 'revoked' OR date_to < UTC_TIMESTAMP())
          AND ${whereClause}`,
     whereArgs
   );
@@ -2128,17 +2206,24 @@ api.delete('/locks/:id', async (req, res) => {
         });
         transportOk = attempted;
       }
-      // XF-91 (AW) / XF-92 — likely_delivered read false unconditionally for
-      // every Thread lock, because it was derived from a Wi-Fi heartbeat
-      // heuristic Thread locks never populate. Fold into ozkey-20 R5/R6's
-      // observed presence instead of inventing a second reachability notion,
-      // per both docs' explicit preference. `presence`/`presence_reason` are
-      // returned alongside so the app can render `unknown` distinctly from a
-      // real negative (XF-92 §7's ask), rather than collapsing both into one
-      // boolean the way this field alone still has to.
+      // XF-91 (AW) / XF-92 §7 / ozkey-25 §5.5 — CORRECTED 2026-08-12.
+      // The `lock.presence === 'online'` boolean collapsed presence's own
+      // 'unknown' state into `false`, which this comment used to concede as
+      // a known limitation ("this field alone still has to"). Firmware then
+      // caught it producing a real FALSE NEGATIVE on hardware: two locks
+      // that had genuinely wiped (confirmed by direct BLE INFO read —
+      // name:"", transport reverted to the wifi NVS default) both reported
+      // `likely_delivered:false`, because Thread liveness happened to read
+      // "0 reported, 0 updated" — i.e. "we don't know" — at request time,
+      // and `false` said "we know it didn't." Now three states instead of
+      // two: `null` for genuinely unknown, distinct from a real negative.
       likelyDelivered = lock.bridge_id
-        ? lock.presence === 'online'
-        : likelyOnline(lock.last_seen_at, lock.heartbeat_s);
+        ? lock.presence === 'unknown'
+          ? null
+          : lock.presence === 'online'
+        : lock.last_seen_at == null
+          ? null // never contacted the server at all — no data, not a negative
+          : likelyOnline(lock.last_seen_at, lock.heartbeat_s);
     }
     await conn.beginTransaction();
     await purgeLockRows(conn, 'device_id = ?', [id]);
@@ -2625,9 +2710,9 @@ api.post('/locks/:id/invite-cancel', (req, res) =>
   handleBondVerb(req, res, 'invite-cancel', 'Invite cancel')
 );
 
-/** XF-93 (AZ) — remote bridge factory reset. No `bridges` table exists
- * (ozkey-20 §10.2, confirmed again in XF-93 §6), so this is pure publish —
- * nothing to read or write in the DB besides the audit trail. Deliberately
+/** XF-93 (AZ) — remote bridge factory reset. `bridges` (ozkey-23 §10.2a)
+ * exists now, but only for broker credentials — this route still reads and
+ * writes nothing there; the audit trail is the only DB write. Deliberately
  * UNSEALED, matching firmware's own design (`bridge32.ino`, XF-93 §5): the
  * bridge holds no per-bond keys (a relay, not a crypto authority), so
  * `app_id` is checked bridge-side by `bridgeOwnershipCheck()`, not
@@ -2635,6 +2720,24 @@ api.post('/locks/:id/invite-cancel', (req, res) =>
  * letting the app publish directly, per XF-93 §7.3's reasoning: the handset
  * must never hold broker publish credentials, full stop — that outweighs
  * the convenience of a direct publish for an unsealed command.
+ *
+ * ozkey-P2, CORRECTED 2026-08-12 (courier rule, XF-84 — "the server knows
+ * it sent the message; it does not know the bridge executed it"): this used
+ * to return `ok:true` the moment the MQTT publish succeeded, which reports
+ * the SERVER's success (the publish left) as if it were the BRIDGE's
+ * (the reset happened) — exactly the class of bug XF-84 and this session's
+ * `likely_delivered` fix (AW) both exist to stop. Now waits on the one real
+ * signal that exists (`waitForBridgeResetVerdict()`, wired through
+ * `handleBridgePresence()` above) instead of trusting the publish alone.
+ *
+ * `BRIDGE_DENIED` cannot be surfaced here — not a shortcut, a firmware gap,
+ * confirmed by reading `bridge32.ino` (~718-730): a denied reset only
+ * `Serial.printf()`s and `return`s; nothing is published over MQTT. A
+ * denied reset and a reset the bridge never received are, on the wire,
+ * IDENTICAL — both silence. Both correctly resolve to `unknown` here; they
+ * cannot currently be told apart without a firmware change (bridge32
+ * publishing something on refusal). Flagging rather than faking a
+ * `BRIDGE_DENIED` verdict this server cannot actually detect.
  */
 api.post('/bridges/:id/reset', async (req, res) => {
   try {
@@ -2645,13 +2748,37 @@ api.post('/bridges/:id/reset', async (req, res) => {
         .status(400)
         .json({ ok: false, code: 'missing_fields', error: 'app_id is required' });
     }
+
     const transportOk = mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, bridgeId), {
       op: 'factory_reset',
       app_id,
     });
     await recordAudit(app_id, bridgeId, 'bridge-reset', `factory reset requested for bridge ${bridgeId}`);
-    logEvent('key', `Bridge reset requested for "${bridgeId}" (transport_ok=${transportOk})`);
-    res.json({ ok: true, bridge_id: bridgeId, transport_ok: transportOk });
+
+    if (!transportOk) {
+      // Never reached the broker — genuinely nothing happened, not "unknown
+      // whether something happened". Distinct from the timeout case below.
+      logEvent('warn', `Bridge reset for "${bridgeId}" — MQTT publish failed (broker offline)`);
+      return res.json({
+        ok: true,
+        bridge_id: bridgeId,
+        verdict: 'unknown',
+        cause: 'mqtt_publish_failed',
+        transport_ok: false,
+      });
+    }
+
+    const { verdict, cause } = await waitForBridgeResetVerdict(bridgeId, CONFIG.BRIDGE_RESET_TIMEOUT_MS);
+    const causeNote =
+      cause === 'timeout'
+        ? ` (no factory_reset presence signal within ${CONFIG.BRIDGE_RESET_TIMEOUT_MS}ms)`
+        : cause === 'offline_unrelated_reason'
+          ? ' (bridge went offline for an unrelated/ambiguous reason before confirming)'
+          : cause === 'presence_denied'
+            ? ' (bridge32-1.34: bridgeOwnershipCheck() refused the app_id)'
+            : '';
+    logEvent('key', `Bridge reset for "${bridgeId}" -> ${verdict}${causeNote}`);
+    res.json({ ok: true, bridge_id: bridgeId, verdict, cause, transport_ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }

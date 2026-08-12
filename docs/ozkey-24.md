@@ -367,3 +367,90 @@ against the live server and DB. All passed:
   exist; the lab pass is not evidence for production.
 - Bridges (§6) and locks-row flash status (§9.6) — no change, still
   firmware's own tracking.
+
+---
+
+# 11. 🔴 FORMAL FINDING — `POST /pairings` returns Wi-Fi credentials in plaintext, unauthenticated
+
+**Raised:** operator, 2026-08-12. **Real security exposure, addressed as
+part of this doc's own REST-auth work** — not a new, separate mechanism.
+
+## 11.1 What was checked, and the exact scope
+
+Read `buildProvisionPayload()` (`ozlockserv/server.js:1598-1615`) directly
+before writing this, to scope it precisely rather than assume:
+
+```js
+function buildProvisionPayload(appId, deviceId) {
+  return {
+    v: 1, mode: 'ozkey-cloud',
+    ssid: 'OZKEY-LAB', password: 'labwifi-secret',
+    broker_host: ..., broker_tcp_port: ..., ...
+    app_id: appId, device_id: deviceId, heartbeat_s: ...,
+  };
+}
+```
+
+**Scoped to Wi-Fi credentials only.** The Thread mesh's `network_key` is a
+*different*, separate payload the app assembles itself directly from the
+bridge's own BLE INFO characteristic (`ozkey-26 §1.5/§3.2`) — this server
+function and this finding do not touch that value. `ssid`/`password` here
+are the real exposure.
+
+This is returned in `provision_payload` on `POST /pairings`
+(`server.js:~1636`), which requires only `app_id` + `device_id` in the
+request body — both freely supplied strings, **never verified against
+anything**. Trust-model v2 (`ozkey-05`) made this deliberate for the
+pairing *record* itself (bearer `app_id`, first-writer-wins, no server-side
+authorization). It was never a deliberate decision to also hand out the
+Wi-Fi password to anyone who can make the same unauthenticated call — that
+consequence rode along with the design, unexamined until now.
+
+## 11.2 Why this is real, not theoretical, on this deployment shape
+
+`POST /pairings` accepts **any** `device_id` string, including ones that
+were never enrolled and belong to no one yet. So the exposure is not
+"an attacker needs to already know a real pairing" — a request with a
+fabricated `app_id`/`device_id` pair still gets a valid `provision_payload`
+back, `ssid`/`password` included, because the function that builds it
+doesn't check whether the pairing is real, is expected, or belongs to the
+caller. Anyone who can reach the REST API at all — currently bounded to
+this LAN, per the header's own "REST is unauthenticated" lab-simplification
+note, but that boundary is infrastructure, not this endpoint's own
+protection — gets the network password for the asking.
+
+## 11.3 Why this belongs inside the ozkey-24 work, not a separate fix
+
+The REST-authenticated identity proof this doc already builds (§3: register
+a public key once, prove possession via an ECDH challenge, receive a
+short-lived token) is exactly the primitive needed here — an app proving
+*"I am `app_id` X"* before the server hands it anything sensitive.
+Building a second, parallel auth mechanism just for `/pairings` would be
+redundant with what's already being designed for MQTT broker auth. The
+natural shape: require the same proof-of-possession (or the JWT §3.2
+issues) before `provision_payload` is included in the response — the pairing
+record itself can likely stay as-is (trust-model v2's bearer model), it's
+specifically the **credential payload riding inside it** that needs the
+gate.
+
+## 11.4 Not fixed today — sequencing, not avoidance
+
+`ozkey-24`'s challenge/token flow exists server-side but nothing app-side
+calls it yet (`XFtposDecisions-97.md §5`: *"app broker auth, blocked on
+server REST auth... we will bring you a concrete shape"*). Gating
+`/pairings` on a flow the app can't yet perform would break pairing
+entirely, not secure it. This finding is filed now, with the remediation
+shape decided, so it ships as part of the same rollout rather than being
+rediscovered later as a second, disconnected fix. **Not asking for
+sign-off to defer it** — flagging for the operator to confirm this
+sequencing is acceptable, given "real security exposure" language warrants
+checking rather than assuming.
+
+## 11.5 Status
+
+🔴 OPEN, real exposure, currently bounded by the same LAN-only boundary
+that makes the whole REST API unauthenticated in this lab deployment —
+that boundary is not a mitigation this endpoint owns. Remediation shape
+decided (§11.3); implementation sequenced behind the app wiring its half
+of `ozkey-24`'s auth flow, tracked as this doc's own follow-through, not a
+separate item to lose track of.

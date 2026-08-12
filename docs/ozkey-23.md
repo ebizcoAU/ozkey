@@ -477,3 +477,74 @@ into "enable ACLs". We have shipped our half.
 - ✅ Your `docs/ozlock.md` correction verified accurate on both halves; the edit
   is yours unless you hand it to us
 - ✅ C9/P5/L7 accepted as G1, unchanged, firmware bench work
+
+---
+
+# 11. 🔴 FIRMWARE→SERVER BUG, found during the 2026-08-12 end-to-end run: `date_to` is UTC, `NOW()` is not
+
+**Found by:** firmware team, on the bench, while exercising §5(c). **This is a
+server bug and it is not cosmetic.**
+
+## 11.1 The finding
+
+`scrubExpiredGrantNames()` selects on:
+
+```sql
+WHERE user_name IS NOT NULL AND (sync_status = 'revoked' OR date_to < NOW())
+```
+
+`date_to` is a **`VARCHAR(50)` holding a UTC ISO string** (`server.js:509-510`),
+e.g. `2026-08-12T02:48:01Z`. **`NOW()` returns MySQL's *local* time.** This
+bench host is **UTC+10**, so the comparison is `02:48:01Z < 11:51 local` →
+true. The grant is "expired" the instant it is written.
+
+## 11.2 Controlled test — the boundary is exactly the timezone offset
+
+Four grants, same lock, same code path, varying only the window length:
+
+| Window from now (UTC) | `user_name` after immediate read-back |
+|---|---|
+| +1 h  | `None` — scrubbed |
+| **+2 h**  | **`None` — scrubbed** |
+| **+12 h** | **`'PLUS12H'` — survives** |
+| +23 h | `'NameCheck'` — survives |
+
+The cutoff sits at **+10 h**, which is this machine's UTC offset. Not a
+coincidence, and it will move with the deployment's timezone — a UTC server
+would hide this entirely, which is exactly why it is worth fixing now rather
+than discovering it in a different region.
+
+## 11.3 Why this is more than a privacy-feature misfire
+
+Scrubbing a name early is benign. **The comparison is the problem**, and the
+same shape of comparison decides real access questions:
+
+- **Any temp credential with a window shorter than the server's UTC offset is
+  born expired** as far as this predicate is concerned. A 1-hour guest PIN on a
+  UTC+10 host is already in the past.
+- It silently cost us debugging time on the bench: a grant we had just issued
+  read back with `user_name: None`, which we first mis-diagnosed as an
+  over-aggressive §5(c) implementation. It is not — §5(c) is implemented exactly
+  as agreed. The *predicate feeding it* is wrong.
+
+This sits squarely in `ozkey-21`'s territory. Note the asymmetry worth
+preserving: **the lock side is already UTC-correct** — we serve the MCU UTC and
+keep the offset panel-only, deliberately (ozkey-21 §8.4). The server is the side
+mixing zones.
+
+## 11.4 Suggested fix — server's call on which
+
+1. `UTC_TIMESTAMP()` instead of `NOW()` in that predicate — one-word change,
+   correct as long as `date_to` really is always UTC.
+2. Better: stop comparing a `VARCHAR` to a time function at all. Store
+   `date_from`/`date_to` as `DATETIME` (or epoch ints) and convert at the API
+   edge. The current column type is what allows a string/datetime coercion to
+   silently do the wrong thing rather than error.
+
+We'd take (2) if the migration is cheap, since (1) leaves a `VARCHAR`-vs-time
+comparison in place that the next person will also have to reason about.
+
+## 11.5 Also worth auditing
+
+Any other `date_to`/`date_from` comparison against `NOW()`, and anything
+gating on `expires_at`, for the same mix. We only checked this one predicate.
