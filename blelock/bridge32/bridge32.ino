@@ -36,6 +36,12 @@
                                    // (FTD-only API) — see logThreadChildren()
 #include "../common/oztime.h" // ozkey-21 T3 — OZ_TIME_FLOOR, shared with the locks
 #include "esp_coexist.h"
+
+// How long "no clock yet" is NORMAL rather than a fault. At boot the bridge has
+// no RTC, so a blank clock is expected until Wi-Fi associates and the broker
+// connects. Showing that in red from the first frame is what made users read a
+// healthy bridge as broken — amber until this elapses, red after.
+#define OZ_TIME_GRACE_MS 60000UL
 #include <OThreadUDP.h>
 // ozkey-17 U2: the RECEIVE half runs on lwIP, not OThreadUDP. Not a preference —
 // esp_openthread_netif_glue pushes inbound Thread packets up into lwIP, so an
@@ -173,7 +179,7 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.34"
+#define FW_VERSION "bridge32-1.36"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -375,6 +381,89 @@ void factoryReset() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 1.35 — WHICH clock source won, and a guard so the loser cannot undo it
+//
+// The bug this fixes was reported as "the datetime on the LCD is a red dash
+// line", and the panel could not explain itself: it showed WIFI and THREAD —
+// the two transports that are NOT the time source — and said nothing about the
+// broker, which IS. So a bridge sitting healthily on Wi-Fi with a blocked NTP
+// and no server push looked identical to a broken one.
+//
+// Underneath that was a real defect. TWO writers shared one clock with no
+// arbitration:
+//   • `configTime()` starts the SNTP daemon, which keeps correcting FOREVER.
+//   • the server's `utc` over MQTT called settimeofday() with no guard beyond
+//     the floor.
+// So NTP could step the clock BACKWARDS over a value the server had already
+// set, even though ozkey-21 §3.4 makes the server the source of record. The
+// doorlock has exactly this protection (oztime.h ozTimeAccept: refuses
+// backwards, below-floor and absurd jumps); the bridge — which FEEDS the
+// doorlock its time — had none of it.
+//
+// The rule now:
+//   server (MQTT) is authoritative. NTP fills the gap until the server speaks,
+//   and once it has, SNTP is STOPPED so it can never contradict it.
+//
+// `OzTimeSource` itself is declared up with the includes: Arduino generates
+// function prototypes and inserts them ahead of everything else in the sketch,
+// so a type used in a signature must exist before that insertion point.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE clock row. Singular, deliberately.
+//
+// 🔴 1.36 — there used to be TWO renderers for this one row at y=88, and they
+// disagreed about the timezone:
+//   • drawStatus()          -> ozFormatStampNarrow(..., utc, cfgTzMin)  LOCAL
+//   • the 1 s ticker in loop() -> ozFormatStampNarrow(..., utc)         UTC
+// The ticker simply omitted the argument and picked up the default of 0. So the
+// panel alternated between local time and UTC roughly once a second, reported
+// from the bench as "the bridge is jumping between 2 timing systems". The
+// timezone the app assigns during the ceremony was never the problem.
+//
+// Patching the second call site would have left the duplication that caused it,
+// so both callers now come here instead. If a third thing ever needs to draw
+// the clock, it calls this too.
+//
+// `force` is for the full-screen redraw, which has just fillScreen()'d the row
+// away — the cached-string skip below would otherwise leave it blank.
+// ─────────────────────────────────────────────────────────────────────────────
+#define OZ_CLOCK_ROW_CHARS 16 // 4px margin + 16 * 12px = 196px, clear of the tag at x=202
+static char g_lastClockRow[OZ_CLOCK_ROW_CHARS + 8] = {0};
+
+static void drawClockRow(bool force) {
+  char row[OZ_CLOCK_ROW_CHARS + 8];
+  uint16_t col;
+  const uint32_t utcNow = ozBridgeUtc();
+
+  if (utcNow) {
+    ozFormatStampNarrow(row, sizeof(row), utcNow, cfgTzMin);
+    col = LCD_C_BLACK;
+  } else if (millis() < OZ_TIME_GRACE_MS) {
+    snprintf(row, sizeof(row), "CLOCK: SYNCING");
+    col = LCD_C_AMBER;
+  } else {
+    // Name the cause rather than printing dashes. Kept within
+    // OZ_CLOCK_ROW_CHARS so it cannot run into the source tag.
+    snprintf(row, sizeof(row), mqttClient.connected() ? "NO SERVER TIME" : "NO BROKER");
+    col = LCD_C_RED;
+  }
+
+  if (!force && strcmp(row, g_lastClockRow) == 0) return;
+  strncpy(g_lastClockRow, row, sizeof(g_lastClockRow) - 1);
+
+  // Opaque text (fg, bg) — self-erasing, so no fillRect and nothing to flicker.
+  // Padded to a fixed width so a shorter string never leaves a tail behind.
+  gfx->setTextSize(2);
+  gfx->setCursor(4, 88);
+  gfx->setTextColor(col, LCD_C_WHITE);
+  gfx->print(row);
+  for (size_t i = strlen(row); i < OZ_CLOCK_ROW_CHARS; i++) gfx->print(' ');
+
+  gfx->setTextColor(LCD_C_BLACK);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // LCD status (bench aid — see the header comment near the pin defines)
 // ─────────────────────────────────────────────────────────────────────────────
 void drawStatus() {
@@ -442,10 +531,27 @@ void drawStatus() {
         }
       }
       if (!threadFormed) { roleTxt = "NOT CONNECTED"; roleCol = LCD_C_RED; }
+      // ── 1.35: THREAD and BROKER share this row ────────────────────────────
+      //
+      // The panel used to show WIFI and THREAD and nothing else — the two
+      // transports that are NOT the time source — while the clock it feeds
+      // every lock comes over MQTT. A bridge with Wi-Fi up, NTP blocked and no
+      // broker looked exactly like a healthy one with a broken clock, which is
+      // precisely the "no network / clock is wrong" confusion this fixes.
+      //
+      // `broker_connected` already existed at the BLE INFO endpoint; it simply
+      // never reached the screen. Abbreviated to TH:/MQ: because the full words
+      // do not fit beside each other at size2 on 240 px, and losing a row to
+      // gain this fact would cost the clock its place.
       gfx->setCursor(4, 66);
       gfx->setTextColor(roleCol);
-      gfx->print("THREAD: ");
-      gfx->println(roleTxt);
+      gfx->print("TH:");
+      gfx->print(threadFormed ? roleTxt : "DOWN");
+      const bool mqUp = mqttClient.connected();
+      gfx->setTextColor(LCD_C_BLACK);
+      gfx->print(" MQ:");
+      gfx->setTextColor(mqUp ? LCD_C_BLACK : LCD_C_RED);
+      gfx->println(mqUp ? "UP" : "DOWN");
       gfx->setTextColor(LCD_C_BLACK);
     }
 
@@ -460,12 +566,10 @@ void drawStatus() {
       // size 2, not 1 (operator 2026-08-11: "unreadable... too small"). The
       // compact form drops the weekday and AM/PM to 19 chars, which is exactly
       // what buys the bigger font: 19 x 12 = 228 px of the 240 px panel.
-      char stamp[17];
-      ozFormatStampNarrow(stamp, sizeof(stamp), ozBridgeUtc(), cfgTzMin);
-      gfx->setCursor(4, 88);
-      gfx->setTextColor(ozBridgeUtc() ? LCD_C_BLACK : LCD_C_RED);
-      gfx->println(stamp);
-      gfx->setTextColor(LCD_C_BLACK);
+      // ONE renderer for this row — see drawClockRow(). force=true because
+      // fillScreen() above has just wiped it, so the cached-string skip
+      // inside would otherwise leave the row blank.
+      drawClockRow(true);
     }
     // Footer: normally site + device_id; briefly the RX banner instead.
     // device_id bumped size1 -> size2 (2026-07-28, operator: unreadable on this
@@ -1419,8 +1523,35 @@ static bool pollUplinkOne() {
 // So the residual risk is DoS by an already-commissioned device, not access
 // extension. Sealing the beacon is the follow-up; it is not what gates T5.
 // ─────────────────────────────────────────────────────────────────────────────
-static bool ntpStarted = false;
 static unsigned long lastTimeBeaconAt = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 1.36 — NTP REMOVED. ONE time source, not two.
+//
+// The bridge used to run TWO clock writers side by side: the SNTP daemon
+// started by configTime(), and the server's `utc` over MQTT. They never
+// arbitrated, so NTP could silently step over a value the server had set.
+//
+// The first fix attempted here was to arbitrate between them — a source enum, a
+// priority rule, esp_sntp_stop(). The system architect's call, and he is right:
+// that adds machinery to manage a second source we do not need. NTP was never
+// dependable here anyway — UDP 123 is blocked on this network (measured
+// 2026-08-11) and on any hotel or office that filters outbound, which is the
+// exact deployment this product targets. It contributed nothing but a second
+// writer and the need to referee it.
+//
+// So the server is the only clock, which it already was in practice:
+//   • ozlockserv pushes `utc` on the bridge's command topic (server.js:1150)
+//   • the bridge stamps it onto every forwarded command, and beacons it daily
+//   • the locks apply their own monotonic guard to whatever arrives
+// If the bridge cannot reach our server there is no product anyway, so a
+// fallback clock buys nothing and costs a class of bug.
+//
+// Deleted with it: ozNtpBegin(), ntpStarted, the OzTimeSource enum, the
+// arbitration function, the SNTP-stop, and the panel's source tag — none of
+// which had a purpose once there was one source.
+// ─────────────────────────────────────────────────────────────────────────────
+
 // DAILY, per ozkey-21 §3.3 and the operator's call 2026-08-11. Airtime is the
 // cost that matters on a shared mesh (ozkey-20 §4.1), and locks also get a free
 // UTC stamp on every forwarded command, so the beacon only carries the locks
@@ -1433,12 +1564,6 @@ static uint32_t ozBridgeUtc() {
   return ((uint32_t)now >= OZ_TIME_FLOOR) ? (uint32_t)now : 0;
 }
 
-static void ozNtpBegin() {
-  if (ntpStarted || WiFi.status() != WL_CONNECTED) return;
-  ntpStarted = true;
-  configTime(0, 0, "pool.ntp.org", "time.google.com");
-  Serial.println("[TIME] NTP started (UTC, no TZ — the mesh runs on UTC)");
-}
 
 static bool sendToThreadGroup(const IPAddress &group, const String &target,
                               const String &fieldName, const String &valueHex,
@@ -2294,7 +2419,6 @@ void loop() {
   if (threadFormed) ozRouterPromotionTick();
 
   // ── ozkey-21 T3 — be the mesh's clock ───────────────────────────────────
-  ozNtpBegin(); // no-op until Wi-Fi is up, and once started
   // First beacon fires as soon as NTP answers (lastTimeBeaconAt == 0), then
   // hourly. A lock that just booted should not wait an hour to learn the time.
   if (threadFormed && threadUdpReady &&
@@ -2346,25 +2470,10 @@ void loop() {
     lastClockDraw = millis();
     bool allUp = (WiFi.status() == WL_CONNECTED) && threadFormed;
     if (allUp) {
-      // No seconds on screen, so the rendered string only changes once a
-      // minute — skip the SPI write entirely when it is identical. The 1 s tick
-      // stays (it costs a strcmp) so the minute rolls over promptly.
-      char stamp[17];
-      ozFormatStampNarrow(stamp, sizeof(stamp), ozBridgeUtc());
-      // ⚠ NOT `return` — this runs inside loop(), so bailing out here would
-      // skip every remaining loop task once a second (MQTT pump, liveness
-      // sweep, factory-reset button). Guard the draw instead.
-      static char lastStamp[17] = {0};
-      if (strcmp(stamp, lastStamp) != 0) {
-        strncpy(lastStamp, stamp, sizeof(lastStamp) - 1);
-        gfx->setTextSize(2);
-        gfx->setCursor(4, 88);
-        // Opaque text (fg, bg) — self-erasing, so no fillRect and nothing to
-        // flicker. Fixed 16-char width means there is never a leftover tail.
-        gfx->setTextColor(ozBridgeUtc() ? LCD_C_BLACK : LCD_C_RED, LCD_C_WHITE);
-        gfx->println(stamp);
-        gfx->setTextColor(LCD_C_BLACK);
-      }
+      // Same renderer as the full redraw. This used to be a SECOND copy that
+      // omitted cfgTzMin, so the panel alternated between local time and UTC
+      // once a second — 'jumping between 2 timing systems' at the bench.
+      drawClockRow(false);
     }
   }
 
