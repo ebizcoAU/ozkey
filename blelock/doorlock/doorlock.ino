@@ -195,7 +195,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //       the epoch is what lets an app notice a missed change with no push
 //       having succeeded.  NOT ON THE BENCH BOARD YET — DoorA runs 1.31, so
 //       R1 can be measured in isolation before R5 is added.
-#define FW_VERSION "doorlock-1.59"
+#define FW_VERSION "doorlock-1.60"
 
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ────────
 //

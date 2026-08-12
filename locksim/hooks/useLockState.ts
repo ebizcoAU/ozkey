@@ -755,8 +755,25 @@ export function useLockState({
           case DpId.ADD_TEMP_PIN:
           case DpId.ADD_TEMP_RFID: {
             const parsed = parseTempCredential(dp.dpId, dp.raw);
-            if (!parsed) break;
             const kind = dp.dpId === DpId.ADD_TEMP_PIN ? "PIN" : "RFID";
+            if (!parsed) {
+              // 🔴 This used to be a bare `break`. A credential the MCU could
+              // not decode vanished with NO log, no event, nothing on screen —
+              // and the module had already told the app UNLOCK_OK, because it
+              // never waits for us. So a PIN could be "issued" successfully and
+              // simply not exist, with no evidence anywhere in the system.
+              //
+              // That is exactly what happened: the module hex-decoded the PIN
+              // digits (fixed in doorlock-1.60), sending 48 29 15 for "482915".
+              // It cost a bench session to find something the MCU knew
+              // instantly. A real MCU rejects loudly; so does this one now.
+              setLastEvent(`TEMP ${kind} REJECTED — UNDECODABLE PAYLOAD`);
+              pushEvent(
+                `MCU: ${kind} grant DISCARDED — payload ${toHexString(dp.raw)} ` +
+                  `is not [slot 2B][${kind === "PIN" ? "ASCII digits" : "UID bytes"}][from 4B][to 4B]`
+              );
+              break;
+            }
             persistCredentials(
               upsertCredential(credentialsRef.current, {
                 kind,

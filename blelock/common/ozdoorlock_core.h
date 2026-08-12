@@ -4034,15 +4034,54 @@ static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen) {
 // layout ozctl.py's dp_grant() mirrors and the MCU already parses. Returns the
 // value length, or 0 if any field is missing/oversized (0 is never valid: a
 // grant always carries at least a slot and a window).
-static size_t ozSemGrantValue(JsonDocument &doc, uint8_t *out, size_t cap) {
+// ── 🔴 1.60 — `cred` ENCODING IS PER-KIND. It used to be hex for both. ──────
+//
+// This silently broke every PIN grant ever issued, and did it in the most
+// expensive possible way: the lock said UNLOCK_OK and the MCU threw the frame
+// away without a word.
+//
+// The old code ran ozHexDecode() on `cred` unconditionally. For an RFID UID
+// that is right — a UID *is* hex, so "7B3F91D2" -> 7B 3F 91 D2 round-trips. For
+// a PIN it is a disaster: the app sends the digits the user was shown,
+// "482915", which ozHexDecode reads as HEX and turns into three bytes
+// 48 29 15. The MCU decodes a PIN as ASCII, gets "H)<0x15>", fails its
+// all-digits check and discards it. Reproduced end to end against LockSim's own
+// parser before writing this fix.
+//
+// The supplier settles which side was wrong: DS013-T3 §16/§18 specify password
+// data as 密码数据传输字符的ASCII码 — ASCII. So the wire carries ASCII digits
+// for a PIN, and the hex-decode was our defect.
+//
+// Branching on the VERB, not on the content: "482915" is valid hex *and* valid
+// decimal, so sniffing the string could never disambiguate. grant_pin means
+// ASCII, grant_rfid means hex, and there is nothing to guess.
+static size_t ozSemGrantValue(JsonDocument &doc, bool isPin, uint8_t *out, size_t cap) {
   const uint32_t slotNo = doc["slot"] | 0xFFFFFFFFu;
   const uint32_t from   = doc["from"] | 0u;
   const uint32_t to     = doc["to"]   | 0u;
   if (slotNo > 0xFFFF) return 0;
 
   uint8_t cred[72];
-  const size_t clen =
-      ozHexDecode(String((const char *)(doc["cred"] | "")), cred, sizeof(cred));
+  size_t clen = 0;
+  const char *credStr = doc["cred"] | "";
+
+  if (isPin) {
+    // ASCII digits, verbatim. Rejecting a non-digit here rather than passing it
+    // on is deliberate: the MCU would drop it silently, which is exactly the
+    // failure mode this whole change exists to remove.
+    const size_t n = strlen(credStr);
+    if (n == 0 || n > sizeof(cred)) return 0;
+    for (size_t i = 0; i < n; i++) {
+      if (credStr[i] < '0' || credStr[i] > '9') {
+        Serial.printf("[OZKIE] grant_pin: `cred` must be ASCII DIGITS, got '%s'\n", credStr);
+        return 0;
+      }
+      cred[i] = (uint8_t)credStr[i];
+    }
+    clen = n;
+  } else {
+    clen = ozHexDecode(String(credStr), cred, sizeof(cred));
+  }
   if (clen == 0 || 2 + clen + 8 > cap) return 0;
 
   size_t n = 0;
@@ -4270,7 +4309,7 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
   } else if (strcmp(kind, "grant_pin") == 0 || strcmp(kind, "grant_rfid") == 0) {
     dp = (strcmp(kind, "grant_pin") == 0) ? 21 : 23;
     type = 0x00 /* RAW */;
-    vlen = ozSemGrantValue(doc, val, sizeof(val));
+    vlen = ozSemGrantValue(doc, strcmp(kind, "grant_pin") == 0, val, sizeof(val));
     if (vlen == 0) {
       Serial.printf("[OZKIE] %s: bad or missing slot/cred/from/to\n", kind);
       notifyStatus("UNLOCK_DENIED");
