@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ByteArray, TuyaFrame } from "@/lib/tuya";
 import { fromHexString } from "@/lib/tuya";
+import { LOCKSIM_VERSION } from "@/lib/version";
 import { useTuyaProtocol, type HardwareMode } from "@/hooks/useTuyaProtocol";
 import { useLockState } from "@/hooks/useLockState";
 import { useVirtualClock } from "@/hooks/useVirtualClock";
@@ -447,7 +448,10 @@ export default function Page() {
           <header className="flex items-start justify-between gap-3">
             <div>
               <h1 className="text-lg font-bold tracking-tight text-neutral-100">
-                LockSim <span className="text-sky-500">·</span> Hardware Testbed
+                LockSim <span className="text-sky-500">·</span> Hardware Testbed{" "}
+                <span className="align-middle text-[11px] font-semibold tracking-normal text-sky-500">
+                  {LOCKSIM_VERSION}
+                </span>
               </h1>
               <p className="text-[11px] text-neutral-500">
                 Tuya 0x55 0xAA MCU protocol · MCU time service (0x1C) · ozkey-21

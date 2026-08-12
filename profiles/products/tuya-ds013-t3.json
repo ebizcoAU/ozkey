@@ -1,0 +1,71 @@
+{
+  "$comment": "Smart Lock DS013-T3 — the first real supplier DP list we have held. Selects from tuya-lock-catalogue.json. See ozkey-27 §2.",
+  "profile_id": "tuya-ds013-t3",
+  "rev": 1,
+  "catalogue": "tuya-lock-catalogue",
+  "supplier": {
+    "product": "Smart Lock DS013-T3",
+    "pid": "vr4iiuqtyh0q4nix",
+    "category": "smart_lock",
+    "module": "T3-U (Beken BK7236)"
+  },
+  "source": {
+    "doc": "docs/DPSuppliers/protocol_vr4iiuqtyh0q4nix_20260811.pdf",
+    "generated": "2026-08-11",
+    "title": "涂鸦云低功耗通用串口接入协议"
+  },
+
+  "cmd": {
+    "$comment": "🔴 UNRESOLVED — ozkey-27 §2.2 / Q1. The PDF body describes the LOW-POWER variant; the PDF's own final 功能协议 table and the T3 module doc both name the GENERAL variant. Two of three signals say general, which is what we already implement. Do not build against either until the supplier answers.",
+    "variant": "unresolved",
+    "candidates": {
+      "general": {
+        "dp_issue": 6,
+        "dp_report": 7,
+        "time_local": 28,
+        "time_gmt": 12
+      },
+      "lowpower": {
+        "dp_issue": 9,
+        "dp_report_realtime": 5,
+        "dp_report_record": 8,
+        "time_local": 6,
+        "time_gmt": 16,
+        "pw_pull_single": 17,
+        "pw_pull_multi": 19,
+        "pw_verify": 18
+      }
+    }
+  },
+
+  "link": {
+    "$comment": "The MCU's handshake CONVENTION only. GPIO numbers are board config, not supplier config — ozkey-27 §8.4.",
+    "srdy": { "assert": "low", "style": "unconfirmed" },
+    "mrdy": { "assert": "low", "style": "unconfirmed" },
+    "topology": "unresolved",
+    "topology_note": "SIMLOCK v2.1 says N8-master/DL-MCU-slave; operator specifies CO-MASTER. ozkey-27 §8.3 / Q14."
+  },
+
+  "features": {
+    "offline_record_buffer": 20,
+    "offline_record_note": "MCU buffers up to 20 door records when offline and replays them backdated, oldest overwritten, each with a time-basis flag (0 none / 1 device-local / 2 GMT). Events arrive out of order and may duplicate — dedupe on msg_id, order on occurred_at. ozkey-27 §2.4.",
+    "credential_expiry_on_mcu": true,
+    "credential_expiry_note": "The 0x13 multi-group password service carries per-credential effective+expiry datetime in GMT, use-count (0 unlimited / 1 one-shot) and status. Full set is re-sent every time (全量下发) and the lock replaces its state. This answers ozkey-21 §8.3 for this supplier. Requires GMT — confirms ozkey-21 §8.4.",
+    "time_basis": "gmt"
+  },
+
+  "selects": [
+    9, 10, 11,
+    13, 14, 15, 16, 17, 18, 19,
+    21, 23, 24,
+    42, 45, 47,
+    52, 53, 54,
+    60, 61, 63, 64, 69,
+    72, 73, 74, 76,
+    86, 87, 88, 89,
+    98, 156
+  ],
+
+  "overrides": [],
+  "extra": []
+}

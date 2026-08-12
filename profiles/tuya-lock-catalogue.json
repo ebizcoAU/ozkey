@@ -1,0 +1,408 @@
+{
+  "$comment": "Standard Tuya smart-lock DP catalogue. Add a DP here ONCE; products select from it. Names are Tuya's, verbatim. See profiles/README.md and ozkey-27 §3.",
+  "catalogue_id": "tuya-lock-catalogue",
+  "rev": 1,
+  "sources": [
+    "docs/DPSuppliers/protocol_vr4iiuqtyh0q4nix_20260811.pdf (Smart Lock DS013-T3, PID vr4iiuqtyh0q4nix, 2026-08-11)",
+    "docs/DPSuppliers/T3_Final_Customer_Version_EN.docx (T3-U module, Video Lock category)"
+  ],
+  "entries": [
+    {
+      "dp": 9,
+      "name": "remote_no_pw_unlock_setting",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "lock.settings.set",
+      "field": "remote_no_pw_unlock",
+      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied"
+    },
+    {
+      "dp": 10,
+      "name": "remote_unlock",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "lock.unlock",
+      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied. NOTE: this is the real remote-unlock DP; our fiction used DP 1 BOOL."
+    },
+    {
+      "dp": 11,
+      "name": "connection_mode",
+      "type": "enum",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "lock.settings.set",
+      "field": "conn_mode",
+      "enum": { "0": "keep", "1": "sleep", "2": "lock_keep", "3": "lock_sleep" }
+    },
+    {
+      "dp": 13,
+      "name": "bulk_unlock_method_add",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "cred.put",
+      "field": "rfid|fingerprint",
+      "codec": "bulk_method_v1",
+      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied"
+    },
+    {
+      "dp": 14,
+      "name": "bulk_unlock_method_delete",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "cred.delete",
+      "field": "rfid|fingerprint",
+      "codec": "bulk_method_v1",
+      "blocked_by": "ozkey-27 Q2"
+    },
+    {
+      "dp": 15,
+      "name": "bulk_unlock_method_modify",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "cred.put",
+      "codec": "bulk_method_v1",
+      "blocked_by": "ozkey-27 Q2"
+    },
+    {
+      "dp": 16,
+      "name": "bulk_password_add",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "cred.put",
+      "field": "pin",
+      "codec": "bulk_pw_v1",
+      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied. This is the real add-PIN DP; our fiction used DP 21."
+    },
+    {
+      "dp": 17,
+      "name": "bulk_password_delete",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "cred.delete",
+      "field": "pin",
+      "codec": "bulk_pw_v1",
+      "blocked_by": "ozkey-27 Q2"
+    },
+    {
+      "dp": 18,
+      "name": "bulk_password_modify",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "cred.put",
+      "field": "pin",
+      "codec": "bulk_pw_v1",
+      "blocked_by": "ozkey-27 Q2"
+    },
+    {
+      "dp": 19,
+      "name": "bulk_unlock_method_sync",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "cred.sync",
+      "codec": "bulk_method_v1",
+      "blocked_by": "ozkey-27 Q2. Supplier doc: mutually exclusive with synch_method."
+    },
+    {
+      "dp": 21,
+      "name": "navigation_volume",
+      "type": "enum",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "lock.settings.set",
+      "field": "volume",
+      "enum": { "0": "mute", "1": "low", "2": "normal", "3": "high" },
+      "$comment": "🔴 OUR FICTION USED DP 21 FOR add_temp_pin. See ozkey-27 §2.1."
+    },
+    {
+      "dp": 23,
+      "name": "auto_lock",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "lock.settings.set",
+      "field": "autolock",
+      "$comment": "🔴 OUR FICTION USED DP 23 FOR add_temp_rfid."
+    },
+    {
+      "dp": 24,
+      "name": "auto_lock_delay",
+      "type": "value",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "lock.settings.set",
+      "field": "autolock_delay",
+      "range": [5, 1800],
+      "unit": "s",
+      "$comment": "🔴 OUR FICTION USED DP 24 FOR delete_rfid."
+    },
+    {
+      "dp": 42,
+      "name": "ble_switch",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "lock.settings.set",
+      "field": "ble_enabled",
+      "$comment": "Cross-confirmed in BOTH supplier documents — evidence the catalogue is standard."
+    },
+    {
+      "dp": 45,
+      "name": "battery_percentage",
+      "type": "value",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.battery",
+      "field": "percent",
+      "range": [-1, 100],
+      "$comment": "-1 = not yet read. Reported on every re-join."
+    },
+    {
+      "dp": 47,
+      "name": "bolt_state",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.bolt",
+      "field": "locked"
+    },
+    {
+      "dp": 52,
+      "name": "opened_from_inside",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.inside_open"
+    },
+    {
+      "dp": 53,
+      "name": "doorbell",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.doorbell"
+    },
+    {
+      "dp": 54,
+      "name": "device_info",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "device.info",
+      "blocked_by": "ozkey-27 Q2"
+    },
+    {
+      "dp": 60,
+      "name": "alarm",
+      "type": "enum",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.alarm",
+      "field": "type",
+      "enum": {
+        "0": "wrong_finger",
+        "1": "wrong_password",
+        "2": "wrong_card",
+        "3": "wrong_face",
+        "4": "tongue_bad",
+        "5": "tongue_not_out",
+        "6": "unclosed_time",
+        "7": "unlock_attempt",
+        "8": "key_in",
+        "9": "too_hot",
+        "10": "low_battery",
+        "11": "wrong_finger_vein",
+        "12": "wrong_hand",
+        "13": "stay_alarm",
+        "14": "pry",
+        "15": "network_error",
+        "16": "network_recovery",
+        "17": "system_lock"
+      },
+      "$comment": "🔴 OUR FICTION USED DP 60 AS A PAIRING GESTURE and opens the BLE window on it. Delete that handler — ozkey-27 §2.1(2)."
+    },
+    {
+      "dp": 61,
+      "name": "unlock_password",
+      "type": "value",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "cred_id",
+      "access_kind": "pin",
+      "range": [0, 65535]
+    },
+    {
+      "dp": 63,
+      "name": "unlock_fingerprint",
+      "type": "value",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "cred_id",
+      "access_kind": "fingerprint",
+      "range": [0, 65535]
+    },
+    {
+      "dp": 64,
+      "name": "unlock_card",
+      "type": "value",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "cred_id",
+      "access_kind": "rfid",
+      "range": [0, 65535]
+    },
+    {
+      "dp": 69,
+      "name": "unlock_temporary",
+      "type": "value",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "cred_id",
+      "access_kind": "temp_pin",
+      "range": [0, 65535]
+    },
+    {
+      "dp": 72,
+      "name": "unlock_remote",
+      "type": "value",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "cred_id",
+      "access_kind": "remote",
+      "range": [0, 999]
+    },
+    {
+      "dp": 73,
+      "name": "unlock_remote_voice",
+      "type": "value",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "cred_id",
+      "access_kind": "remote_voice",
+      "range": [0, 999]
+    },
+    {
+      "dp": 74,
+      "name": "unlock_combination_record",
+      "type": "raw",
+      "dir": "both",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "event.access",
+      "blocked_by": "ozkey-27 Q2"
+    },
+    {
+      "dp": 76,
+      "name": "unlock_ble",
+      "type": "value",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "cred_id",
+      "access_kind": "ble",
+      "range": [0, 99999],
+      "$comment": "Cross-confirmed in BOTH supplier documents. T3 module doc: 'To enable Bluetooth lock control when the device is offline, select DP76 - unlock_ble.'"
+    },
+    {
+      "dp": 86,
+      "name": "offline_password_params",
+      "type": "string",
+      "dir": "both",
+      "max_len": 255,
+      "status": "reserved",
+      "verb": "cred.put",
+      "field": "offline_pin",
+      "blocked_by": "ozkey-27 Q2"
+    },
+    {
+      "dp": 87,
+      "name": "offline_password_clear_single_report",
+      "type": "raw",
+      "dir": "up",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "event.cred_cleared",
+      "blocked_by": "ozkey-27 Q2"
+    },
+    {
+      "dp": 88,
+      "name": "offline_password_clear_all_report",
+      "type": "raw",
+      "dir": "up",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "event.cred_cleared",
+      "blocked_by": "ozkey-27 Q2"
+    },
+    {
+      "dp": 89,
+      "name": "offline_password_unlock_report",
+      "type": "raw",
+      "dir": "up",
+      "max_len": 128,
+      "status": "reserved",
+      "verb": "event.access",
+      "blocked_by": "ozkey-27 Q2"
+    },
+    {
+      "dp": 98,
+      "name": "hijack_alarm",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.duress",
+      "$comment": "DURESS. Must NOT be collapsed into event.alarm — it needs its own escalation path. ozkey-28 §3.4."
+    },
+    {
+      "dp": 149,
+      "name": "reserved_do_not_select",
+      "type": "raw",
+      "dir": "both",
+      "status": "unknown",
+      "$comment": "T3 module doc §3.1: 'Do not select DP149.' Reason not given."
+    },
+    {
+      "dp": 156,
+      "name": "wifi_connection_strategy",
+      "type": "enum",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "lock.settings.set",
+      "field": "wifi_strategy",
+      "enum": { "0": "wifi_dtm20", "1": "wifi_dtm10" },
+      "$comment": "DTIM knob. The T3 module's 150-200uA keep-alive figure is quoted @ DTIM10."
+    },
+    {
+      "dp": 212,
+      "name": "initiative_message",
+      "type": "raw",
+      "dir": "both",
+      "status": "unknown",
+      "$comment": "Proactive message push, IPC skill required. Video Lock only. T3 doc: do not select if audio/video entries should be hidden."
+    }
+  ]
+}

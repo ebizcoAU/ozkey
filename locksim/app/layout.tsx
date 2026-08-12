@@ -1,8 +1,11 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { LOCKSIM_VERSION } from "@/lib/version";
 
 export const metadata: Metadata = {
-  title: "LockSim — Smart Door Lock Hardware Testbed",
+  // Same derived constant as the on-screen badge — with several LockSim tabs
+  // open on the bench, the version needs to be readable from the tab strip.
+  title: `LockSim ${LOCKSIM_VERSION} — Smart Door Lock Hardware Testbed`,
   description:
     "Hardware-accurate smart door lock simulator: Tuya 0x55 0xAA MCU serial protocol over a simulated 4-wire UART (3.3V TTL) bus.",
 };
