@@ -8,3 +8,6 @@ next-env.d.ts
 npm-debug.log*
 .env*
 !.env.example
+
+# verification builds (npm run build:check) — never shares .next with a live dev server
+.next-check/
