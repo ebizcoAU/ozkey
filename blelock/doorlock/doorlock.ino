@@ -208,7 +208,16 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //       resets on connect success, on Wi-Fi coming up, and on sleep wake.
 //       Unchanged against a reachable broker. Found while chasing the
 //       operator's "panel takes 5-10 s to answer a touch".
-#define FW_VERSION "doorlock-1.66"
+// 1.67: the pairing screen stopped lying about whether it is discoverable
+//       (operator, 2026-08-14). drawAdvertising() printed "ADVERTISING..."
+//       unconditionally, so once the 2-minute post-boot grace lapsed the panel
+//       kept claiming the lock was pairable for the rest of its life. The
+//       redraw was never broken — the grace-lapse handler and openBleWindow()
+//       both set screenDirty — the text simply never consulted
+//       bleAdvertisingAllowed(). Now: AMBER "ADVERTISING..." when you can pair,
+//       WHITE "NOT ADVERTISING" when you cannot, matching the operational
+//       screen's amber-means-live-and-time-limited convention.
+#define FW_VERSION "doorlock-1.69"
 
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ────────
 //

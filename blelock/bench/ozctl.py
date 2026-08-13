@@ -445,6 +445,13 @@ async def run(args):
             frame = FRAME_CANCEL(bytes.fromhex(args.arg))
         elif args.cmd == "list_bonds":
             frame = FRAME_LIST_BONDS()
+        elif args.cmd == "set_name":
+            # OZKIE semantic JSON, not a Tuya DP frame — doorlock-1.69. The
+            # lock's sealed dispatch parses the envelope tail as JSON and reads
+            # `kind`, so the "frame" slot carries the verb directly. Owner only.
+            if not args.arg:
+                raise SystemExit("set_name needs a name: ozctl.py set_name 'Front Door'")
+            frame = json.dumps({"kind": "set_name", "name": args.arg}).encode()
         else:
             raise SystemExit(f"unknown command {args.cmd}")
 
@@ -468,7 +475,7 @@ async def run(args):
                 log("RESULT", s or "NO ANSWER — neither a bond list nor LIST_DENIED (defect)")
             return
 
-        s = await lk.await_status(["UNLOCK_", "REVOKE_"])
+        s = await lk.await_status(["UNLOCK_", "REVOKE_", "SETTING_"])
         log("RESULT", s or "NO STATUS — the lock never answered (this is a defect)")
 
 
@@ -504,7 +511,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["keys", "info", "probe", "unlock",
                                     "revoke", "cancel", "invite", "enroll",
-                                    "list_bonds", "mqtt-grant", "mqtt-delete"])
+                                    "list_bonds", "mqtt-grant", "mqtt-delete",
+                                    "set_name"])
     ap.add_argument("arg", nargs="?", default="",
                     help="revoke/cancel: hex arg. invite: label. enroll: OZINV1:... "
                          "mqtt-grant/mqtt-delete: slot number (default 1)")

@@ -1035,7 +1035,30 @@ void drawAdvertising() {
   gfx->println("OZLOCK COMM MODULE (doorlock)");
   gfx->setCursor(15, 28);
   gfx->print("BLE: ");
-  gfx->print(bleClientConnected ? "APP CONNECTED" : "ADVERTISING...");
+  // ── SAY WHICH IT IS (operator, 2026-08-14) ───────────────────────────────
+  // This line printed "ADVERTISING..." unconditionally, so when the post-boot
+  // grace lapsed the panel went on claiming the lock was discoverable — for
+  // the entire rest of its life. The redraw was never the problem: the
+  // grace-lapse handler already sets screenDirty (:6141) and openBleWindow()
+  // sets it again (:1506). The screen repainted faithfully, with text that
+  // could not be wrong because it never looked.
+  //
+  // A lock that says ADVERTISING while dark is worse than one that says
+  // nothing: the installer stands there waiting for a phone to find it.
+  //
+  // Colour carries the state as well as the words (operator's spec): AMBER =
+  // you can pair right now, WHITE = you cannot, press BOOT. Amber is the
+  // "notice this, it is live and time-limited" colour used by the BLE badge
+  // on the operational screen, so the two screens agree.
+  if (bleClientConnected) {
+    gfx->print("APP CONNECTED");
+  } else if (bleAdvertisingAllowed()) {
+    gfx->print("ADVERTISING...");
+  } else {
+    gfx->setTextColor(C_WHITE);
+    gfx->print("NOT ADVERTISING");
+    gfx->setTextColor(C_AMBER); // restore for the rest of this screen
+  }
   gfx->setTextSize(3);
   gfx->setTextColor(C_WHITE);
   gfx->setCursor(52, 70);
@@ -4490,6 +4513,50 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
     return;
   }
 
+  // ── set_name — the lock learns what the user called it (operator, 2026-08-14)
+  //
+  // WHY THIS HAD TO EXIST. cfgName was writable from exactly two places: the
+  // BLE provision payload, and enrollment_ack's `label` — and the latter only
+  // filled an EMPTY name and only exists over MQTT. So:
+  //   • an app that does not send `name` at pairing left the lock permanently
+  //     nameless, and the panel fell back to the device id forever;
+  //   • renaming the lock in the app afterwards never reached the lock at all;
+  //   • a THREAD lock has no MQTT, so it had no naming path whatsoever.
+  // The operator's report was "it still shows device_id instead of the doorlock
+  // name after pairing" — the panel was right, it had nothing else to show.
+  //
+  // Sealed like every other settings verb, so it works on all three transports
+  // (BLE control, MQTT envelope_hex, Thread UDP) through this one dispatch.
+  //
+  // OWNER ONLY. The displayed name is what a person at the door reads to decide
+  // which lock they are standing at, so it is a trust surface: a member who
+  // could rename it could make one door impersonate another. Naming is cheap to
+  // do through the owner and not worth the ambiguity.
+  if (strcmp(kind, "set_name") == 0) {
+    if (slot != 0) {
+      Serial.printf("[OZKIE] set_name REFUSED — bond %d is not the owner\n", slot);
+      notifyStatus("SETTING_DENIED");
+      return;
+    }
+    // asciiOnly() because the panel font has no glyphs beyond ASCII and a
+    // multi-byte name would render as mojibake on the one screen this exists
+    // to serve. Clamped so a hostile or careless name cannot fill NVS.
+    String n = asciiOnly(String((const char *)(doc["name"] | "")));
+    n.trim();
+    if (n.length() > 24) n = n.substring(0, 24);
+    if (!n.length()) {
+      Serial.println("[OZKIE] set_name: empty name — refused");
+      notifyStatus("SETTING_DENIED");
+      return;
+    }
+    cfgName = n;
+    saveConfig();
+    Serial.printf("[OZKIE] set_name -> '%s' (persisted)\n", cfgName.c_str());
+    screenDirty = true; // the whole point: the panel changes now, not at reboot
+    notifyStatus("SETTING_OK");
+    return;
+  }
+
   if (strcmp(kind, "bond_revoke") == 0) {
     uint8_t pub[32];
     if (ozHexDecode(String((const char *)(doc["pub"] | "")), pub, sizeof(pub)) != 32) {
@@ -6172,10 +6239,17 @@ void loop() {
     String modeInfo = cfgMode;
     if (isLocalMode())
       modeInfo += cfgRoomNo.length() ? (" room=" + cfgRoomNo) : " (no room)";
-    Serial.printf("[MON] %s xport=%s mode=%s wifi=%s ip=%s mqtt=%s thread=%s "
+    // name= added 2026-08-14. The panel renders cfgName and falls back to the
+    // device id when it is empty — so "the screen shows an id" is ambiguous
+    // between "the name never arrived" and "the panel prefers the id". Nothing
+    // printed cfgName anywhere, so the two could not be told apart from
+    // outside. Quoted, because an empty name and a name of spaces look
+    // identical unquoted, and the empty case is the one that matters.
+    Serial.printf("[MON] %s name='%s' xport=%s mode=%s wifi=%s ip=%s mqtt=%s thread=%s "
                   "udp=%s mcu=%s tx=%u rx=%u wake=%s mrdy=%s srdy=%s hb=%us "
                   "naps=%u heap=%u clock=%s treq=%u tserved=%u\n",
-                  st, provisioned ? cfgTransport.c_str() : "unset", modeInfo.c_str(),
+                  st, cfgName.c_str(),
+                  provisioned ? cfgTransport.c_str() : "unset", modeInfo.c_str(),
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
                   WiFi.localIP().toString().c_str(),
                   mqtt.connected() ? "up" : "down",

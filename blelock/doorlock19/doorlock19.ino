@@ -202,7 +202,10 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 //       doorlock.ino's changelog for the full entry. The fix is entirely in
 //       common/ozdoorlock_core.h, so it lands on both boards; only this
 //       version string is per-sketch.
-#define FW_VERSION "doorlock-1.66"
+// 1.67: pairing screen now says NOT ADVERTISING when it isn't — see
+//       doorlock.ino's changelog. Change is in common/ozdoorlock_core.h, so it
+//       lands on both panels; only this version string is per-sketch.
+#define FW_VERSION "doorlock-1.69"
 
 // ── DERIVED, not a second literal (2026-08-12) — see doorlock.ino for the
 // full reasoning. The warning above ("Change both, every time") described the
