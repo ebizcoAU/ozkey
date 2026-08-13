@@ -131,6 +131,15 @@ const CONFIG = {
   // no async delay on the bridge's side — so this is round-trip + broker
   // latency budget, not a real processing wait.
   BRIDGE_RESET_TIMEOUT_MS: 5000,
+  // ozkey-27 §9 (firmware, 2026-08-13): the ozkey-20 §23.1 utc push below
+  // fired only on the presence 'online' transition — a server restart while
+  // a bridge was already online, a missed presence message, or a reconnect
+  // not classified as fresh 'online' all permanently lose that bridge's
+  // time source (no NTP fallback since bridge32-1.36). This is how often
+  // handleThreadLiveness()'s already-existing heartbeat is allowed to
+  // re-push utc to a given bridge — riding the mechanism that already
+  // exists rather than adding a new timer.
+  UTC_PUSH_REFRESH_MS: 10 * 60 * 1000,
   DB: {
     host: 'localhost',
     user: 'root',
@@ -660,11 +669,8 @@ async function initDatabase() {
       id INT AUTO_INCREMENT PRIMARY KEY,
       device_id VARCHAR(64),
       site_id VARCHAR(50),
-      user_name VARCHAR(255),
       type ENUM('pin','rfid','fingerprint'),
       slot_number INT,
-      date_from VARCHAR(50),
-      date_to VARCHAR(50),
       sync_status VARCHAR(50) DEFAULT 'pending',
       issued_by VARCHAR(50) DEFAULT 'owner',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -681,6 +687,27 @@ async function initDatabase() {
     [CONFIG.DB.database]
   );
   if (hasRawValue) await pool.query('ALTER TABLE grants DROP COLUMN raw_value');
+
+  // ozkey-29 cutover, executed 2026-08-13 (operator: "the residential server
+  // retains nothing beyond the pairing relationship" — same irreversible-on-
+  // purpose posture as S3 above, same table, next column over). `user_name`
+  // was never the server's to hold — the lock never receives it either
+  // (ozkey-29 §11.1, verified against ozdoorlock_core.h), so there was no
+  // path where storing it server-side did anything but create the
+  // transaction log the Sovereign Edge paper commits to never having.
+  // `date_from`/`date_to` are dropped alongside it — confirmed redundant,
+  // never read back by any server logic (XF-95 §2); the lock already
+  // receives and enforces its own copy inside the sealed credential
+  // envelope. Queue expiry (where it exists) uses `pending_queue.expires_at`,
+  // untouched by this.
+  for (const col of ['user_name', 'date_from', 'date_to']) {
+    const [[{ hasCol }]] = await pool.query(
+      `SELECT COUNT(*) AS hasCol FROM information_schema.columns
+        WHERE table_schema = ? AND table_name = 'grants' AND column_name = ?`,
+      [CONFIG.DB.database, col]
+    );
+    if (hasCol) await pool.query(`ALTER TABLE grants DROP COLUMN ${col}`);
+  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pending_queue (
@@ -842,9 +869,6 @@ async function flushQueueForDevice(siteId, deviceId) {
         newStatus,
         job.grant_id,
       ]);
-      // ozkey-23 §5(c)/§8.4(iii): the row just crossed into 'revoked' —
-      // scrub the name now rather than waiting for the next list read.
-      if (newStatus === 'revoked') await scrubExpiredGrantNames('id = ?', [job.grant_id]);
     }
     sent++;
     logEvent(
@@ -1068,6 +1092,18 @@ async function handleLockPresence(deviceId, payload) {
 // one real signal instead of guessing from the publish alone.
 const pendingBridgeResets = new Map(); // bridgeId -> Set<(verdict) => void>
 
+// ozkey-27 §9: last time we successfully published `utc` to a given bridge
+// (ms, Date.now()), so the liveness heartbeat can tell "recently confirmed"
+// from "stale" without a new timer.
+const lastUtcPushAt = new Map(); // bridgeId -> ms
+
+function pushUtcToBridge(bridgeId, why) {
+  const nowUtc = Math.floor(Date.now() / 1000);
+  mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, bridgeId), { utc: nowUtc });
+  lastUtcPushAt.set(bridgeId, Date.now());
+  logEvent('info', `Pushed utc=${nowUtc} to bridge ${bridgeId} (${why})`);
+}
+
 function waitForBridgeResetVerdict(bridgeId, timeoutMs) {
   return new Promise((resolve) => {
     const settle = (verdict, cause) => {
@@ -1146,9 +1182,7 @@ async function handleBridgePresence(bridgeId, payload) {
   // waiting to be asked, same "use the mechanism that already exists"
   // discipline as everything else in this document.
   if (state === 'online') {
-    const nowUtc = Math.floor(Date.now() / 1000);
-    mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, bridgeId), { utc: nowUtc });
-    logEvent('info', `Pushed utc=${nowUtc} to bridge ${bridgeId} on connect (ozkey-20 §23.1)`);
+    pushUtcToBridge(bridgeId, 'presence online, ozkey-20 §23.1');
 
     // ozkey-23 §10.2a: mint once, push once — same "v1 plaintext ack, bench
     // only" posture handleEnroll() already uses for locks (the broker
@@ -1190,6 +1224,15 @@ async function handleThreadLiveness(bridgeId, payload) {
   } catch (_) {
     logEvent('warn', `Non-JSON payload on bridges/${bridgeId}/liveness: "${payload.slice(0, 60)}"`);
     return;
+  }
+
+  // ozkey-27 §9: this heartbeat proves the bridge is reachable regardless of
+  // Thread role, so it's the right place to keep `utc` fresh — checked
+  // before the `authoritative` gate below, which is about Thread mesh data
+  // only and has nothing to do with clock delivery.
+  const lastPush = lastUtcPushAt.get(bridgeId) || 0;
+  if (Date.now() - lastPush > CONFIG.UTC_PUSH_REFRESH_MS) {
+    pushUtcToBridge(bridgeId, 'liveness heartbeat refresh, ozkey-27 §9');
   }
 
   // §15.3 (2026-08-11, firmware's live finding): the bridge can be a Thread
@@ -1653,7 +1696,7 @@ async function registerPairing(appId, deviceId, label, bridgeId) {
         ? ` via bridge ${bridgeId} (Thread — no self-enroll, see ozkey-11 §3)`
         : ' — awaiting doorlock contact')
   );
-  await recordAudit(appId, deviceId, 'pair', `registered pairing (label "${label || 'New Doorlock'}")`);
+  await recordAudit(appId, deviceId, 'pair', 'registered pairing');
 }
 
 /* -- Pairing registration (trust-model v2, XF-42 §13.2) ---------------------- */
@@ -2087,41 +2130,14 @@ async function recordAudit(appId, deviceId, action, detail) {
   }
 }
 
-/** ozkey-23 §5(c), approved with amendments per firmware's §8.4 reply:
- *  - (i) null BOTH `grants.user_name` and the matching `audit_log.detail` —
- *    the row is never deleted (firmware's (ii): dedupe and app polling both
- *    key off a surviving row with its `sync_status`/`grant_id` intact).
- *  - (iii) trigger on `sync_status = 'revoked'`, not `'revoking'` (still
- *    in-flight) — this system has no delivery ACK (ozkey-19), so "revoked"
- *    already means "the revoke command was actually sent", the closest
- *    thing to confirmation that exists — plus window-close (`date_to`
- *    passed) as the second trigger, for grants nobody ever revoked.
- *  No cron exists in this process; called lazily at the two points that
- *  already touch a grant's lifecycle (flush-time revoke, and grant list
- *  reads), same style as the `pending_queue.expires_at` check elsewhere. */
-async function scrubExpiredGrantNames(whereClause, whereArgs) {
-  // ozkey-23 §11, CORRECTED 2026-08-12 (firmware, live on the bench):
-  // `date_to` is a UTC ISO string; MySQL's `NOW()` returns the server's
-  // LOCAL time. On a UTC+10 host, `date_to < NOW()` was true up to 10h
-  // before the grant actually expired — any window shorter than the
-  // server's UTC offset was born expired. `UTC_TIMESTAMP()` is UTC
-  // regardless of session/server timezone; that's the whole fix.
-  const [rows] = await pool.query(
-    `SELECT id FROM grants
-       WHERE user_name IS NOT NULL
-         AND (sync_status = 'revoked' OR date_to < UTC_TIMESTAMP())
-         AND ${whereClause}`,
-    whereArgs
-  );
-  for (const { id } of rows) {
-    await pool.query('UPDATE grants SET user_name = NULL WHERE id = ?', [id]);
-    await pool.query(
-      `UPDATE audit_log SET detail = '[redacted — grant revoked/expired, ozkey-23 §5(c)]'
-         WHERE detail LIKE CONCAT('%(grant #', ?, ')%')`,
-      [id]
-    );
-  }
-}
+// ozkey-23 §5(c)'s scrubExpiredGrantNames() lived here — removed 2026-08-13
+// (ozkey-29, operator instruction). It nulled `grants.user_name` post hoc,
+// on revoke/expiry. There is no longer a `user_name` column to null (see
+// the ozkey-29 cutover near the `grants` CREATE TABLE above) and
+// `recordAudit()` no longer writes identity into `audit_log.detail` in the
+// first place (§5.2/§12 below) — nothing left to redact after the fact.
+// A scrub-on-schedule was already the wrong shape per ozkey-29 §1 ("policy
+// sitting on top of retained access"); not writing it is the actual fix.
 
 api.delete('/locks', async (req, res) => {
   if (!guardDb(res)) return;
@@ -2264,24 +2280,25 @@ api.post('/locks/:id/grants', async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const deviceId = req.params.id;
-    const {
-      user_name,
-      type = 'pin',
-      envelope_hex,
-      slot_number = 1,
-      date_from,
-      date_to,
-    } = req.body || {};
+    // ozkey-29 cutover, 2026-08-13: `user_name`/`date_from`/`date_to` are no
+    // longer accepted into server storage — see the `grants` schema note
+    // above. A caller may still send them (older app builds do); they are
+    // silently ignored rather than rejected, same accept-both posture S3/S4
+    // used during their own cutover window. `date_from`/`date_to` were
+    // structurally redundant regardless (XF-95 §2) — the lock already
+    // receives and enforces its own copy inside the sealed credential
+    // envelope.
+    const { type = 'pin', envelope_hex, slot_number = 1 } = req.body || {};
 
     // S4 cutover (ozkey-13 §10 phase 4, XF-69), executed 2026-08-08: the app
     // seals the DP frame client-side (A1-A5, ftpos shipped) — `raw_value` is
     // no longer accepted at all, not just deprioritized. The server relays
     // envelope_hex opaque, never builds or sees the PIN/RFID.
-    if (!user_name || !envelope_hex) {
+    if (!envelope_hex) {
       return res.status(400).json({
         ok: false,
         code: 'missing_fields',
-        error: 'user_name and envelope_hex are required',
+        error: 'envelope_hex is required',
       });
     }
     if (type === 'fingerprint') {
@@ -2307,16 +2324,13 @@ api.post('/locks/:id/grants', async (req, res) => {
         .status(404)
         .json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
 
-    const from = date_from || new Date().toISOString();
-    const to = date_to || new Date(Date.now() + 24 * 3600 * 1000).toISOString();
-
     await conn.beginTransaction();
     // S3 cutover: grants has no raw_value column anymore — the server
     // genuinely cannot know the PIN/RFID for a row it stores, structurally.
     const [grantResult] = await conn.query(
-      `INSERT INTO grants (device_id, site_id, user_name, type, slot_number, date_from, date_to, sync_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
-      [deviceId, lock.site_id, user_name, type, slot_number, from, to]
+      `INSERT INTO grants (device_id, site_id, type, slot_number, sync_status)
+       VALUES (?, ?, ?, ?, 'pending')`,
+      [deviceId, lock.site_id, type, slot_number]
     );
     const grantId = grantResult.insertId;
     const [queueResult] = await conn.query(
@@ -2328,15 +2342,10 @@ api.post('/locks/:id/grants', async (req, res) => {
 
     logEvent(
       'key',
-      `Granted ${type.toUpperCase()} to "${user_name}" -> "${lock.label}" slot ${slot_number} ` +
+      `Granted ${type.toUpperCase()} slot ${slot_number} on ${deviceId} ` +
         `(grant #${grantId}, queue #${queueResult.insertId}, sealed) — awaiting wake`
     );
-    await recordAudit(
-      lock.app_id,
-      deviceId,
-      'grant',
-      `grant ${type.toUpperCase()} slot ${slot_number} to "${user_name}" (grant #${grantId})`
-    );
+    await recordAudit(lock.app_id, deviceId, 'grant', `grant ${type.toUpperCase()} slot ${slot_number}`);
 
     flushQueueForDevice(lock.site_id, deviceId).catch(() => {});
 
@@ -2363,9 +2372,6 @@ api.post('/locks/:id/grants', async (req, res) => {
 api.get('/locks/:id/grants', async (req, res) => {
   if (!guardDb(res)) return;
   try {
-    // ozkey-23 §5(c): lazy sweep, same pattern as pending_queue.expires_at —
-    // catches window-close for grants nobody ever explicitly revoked.
-    await scrubExpiredGrantNames('device_id = ?', [req.params.id]);
     const [rows] = await pool.query(
       'SELECT * FROM grants WHERE device_id = ? ORDER BY id DESC LIMIT 100',
       [req.params.id]
@@ -2594,7 +2600,7 @@ api.post('/locks/:id/unlock', async (req, res) => {
         `(queue #${queueResult.insertId}, expires ${windowMs / 1000}s` +
         `${assisted ? ', needs a keypad touch' : ''}, ${sealed ? 'sealed' : 'legacy'})`
     );
-    await recordAudit(lock.app_id, deviceId, 'unlock', `remote unlock "${lock.label}"`);
+    await recordAudit(lock.app_id, deviceId, 'unlock', 'remote unlock');
     const sent = await flushQueueForDevice(lock.site_id, deviceId);
 
     res.json({
@@ -2688,7 +2694,7 @@ async function handleBondVerb(req, res, actionType, label) {
       'key',
       `${label} queued for "${lock.label}" (queue #${queueResult.insertId}, expires 7d)`
     );
-    await recordAudit(lock.app_id, deviceId, actionType, `${label} "${lock.label}"`);
+    await recordAudit(lock.app_id, deviceId, actionType, label);
     const sent = await flushQueueForDevice(lock.site_id, deviceId);
 
     res.json({
@@ -2753,7 +2759,7 @@ api.post('/bridges/:id/reset', async (req, res) => {
       op: 'factory_reset',
       app_id,
     });
-    await recordAudit(app_id, bridgeId, 'bridge-reset', `factory reset requested for bridge ${bridgeId}`);
+    await recordAudit(app_id, bridgeId, 'bridge-reset', 'factory reset requested');
 
     if (!transportOk) {
       // Never reached the broker — genuinely nothing happened, not "unknown
@@ -2840,15 +2846,10 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
 
     logEvent(
       'key',
-      `Revoking ${grant.type.toUpperCase()} for "${grant.user_name}" on ${deviceId} slot ${grant.slot_number} ` +
+      `Revoking ${grant.type.toUpperCase()} on ${deviceId} slot ${grant.slot_number} ` +
         `(grant #${grantId}, queue #${queueResult.insertId}, sealed) — awaiting wake`
     );
-    await recordAudit(
-      null,
-      deviceId,
-      'revoke',
-      `revoke ${grant.type.toUpperCase()} slot ${grant.slot_number} for "${grant.user_name}" (grant #${grantId})`
-    );
+    await recordAudit(null, deviceId, 'revoke', `revoke ${grant.type.toUpperCase()} slot ${grant.slot_number}`);
 
     flushQueueForDevice(grant.site_id, deviceId).catch(() => {});
 

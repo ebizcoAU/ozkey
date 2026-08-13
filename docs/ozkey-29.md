@@ -1,10 +1,12 @@
 # ozkey-29 — Sealed audit/event envelope: making "zero-knowledge broker" actually true for OZLOCK
 
-**Status: 🟡 DESIGN DRAFT, operator-directed 2026-08-13. Not built.** Written
-before implementation on purpose. Scope is **residential OZLOCK only** —
-operator's explicit framing this session: commercial (OZPMS/OZLODGE) has a
-legitimate evidentiary-trail requirement and gets its own follow-up doc, not
-this one.
+**Status: 🟢 SERVER HALF LIVE, 2026-08-13 — see §13.** `grants`/`audit_log`
+retain zero identity server-side, live-verified against the real broker/DB.
+Firmware's local event log + lock-side sealing (§11) and the app's
+`query_events` consumption remain unbuilt, sequenced behind `ozkey-28 §4`'s
+MCU-ack fix (firmware's own call, §11.5) — not blocked by anything server-
+side. Scope is **residential OZLOCK only** — commercial (OZPMS/OZLODGE) is
+`ozkey-30.md`, a separate directive, not this doc.
 
 Addressed to: firmware (event sealing + local log), app team / ftpos (decrypt
 + NEXUS backup), operator (sequencing + schema migration sign-off).
@@ -132,9 +134,18 @@ R3's rule) get brought into line with it.
 
 ### 5.1 Lock: authoritative local event log, sealed before it ever leaves
 
+> ⚠️ **CORRECTED 2026-08-13, firmware (§11.1), verified against source and
+> accepted — see §12.** The lock never receives `user_name` at all
+> (`grant_pin`'s wire shape is `{slot,cred,from,to}` — no name field, zero
+> occurrences in `ozdoorlock_core.h`), so it cannot seal what it was never
+> told. `user_name` stays app-local per `XF-95 §8`'s `GrantNameCache`
+> decision, made independently in the opposite direction from this draft.
+> Struck below; `date_from`/`date_to` are unaffected — the lock already
+> receives and will already seal those.
+
 The lock keeps event/credential-metadata history locally (§3.1 — trivial
-flash cost). Every `event.*` payload, and grant metadata (`user_name`,
-`date_from`/`date_to`), is sealed the same way credential envelopes already
+flash cost). Every `event.*` payload, and grant ~~metadata (`user_name`,~~
+`date_from`/`date_to`, is sealed the same way credential envelopes already
 are — AES-256-GCM, ECDH-derived key, the existing `ozkey-06 §3.1/§3.2`
 primitives — before it leaves the device. This extends OZKIE's L2 envelope
 to cover audit/event content, not just commands, the same primitive, no new
@@ -147,10 +158,15 @@ crypto.
   doing so. `detail` becomes routing metadata only — size/type/action, the
   same shape `logUplinkMetadata()` already uses (`server.js:935` is the
   reference implementation for the rest of the table to match).
-- `grants.user_name`, `date_from`, `date_to` move out of plaintext server
-  columns — into the sealed envelope content (app-authored, server-opaque)
-  or dropped from server storage entirely if the server doesn't need them to
-  route/deliver.
+- `grants.user_name` is **dropped from the server entirely**, not sealed
+  into the envelope (§5.1's correction — there is nowhere on the wire for it
+  to go; it was never the lock's data to hold). The REST body can keep
+  accepting it for backward compatibility if ftpos still sends it, but the
+  server stops persisting it, full stop — same posture the S3/S4 cutover
+  already applies to `raw_value`.
+- `date_from`/`date_to` move out of plaintext server columns into the sealed
+  envelope content — the lock already receives these today (§2.3 of the
+  companion `XF-95` doc), so this half of the original design is unaffected.
 - Whatever the server *does* need to route or dedupe (which device, queued
   when, delivered y/n) stays as routing-header-only fields — mirrors OZKIE's
   header/`args` split exactly; nothing new to invent here.
@@ -318,6 +334,33 @@ plumbing wholesale) as ftpos's concrete answer to part of §7's open delivery
 question; the exact `query_events` payload/response fields are yours to
 specify against §5.1's local log format once that's settled.
 
+### 9.5 App Team position — closes §6's residential/commercial split
+
+§6 scoped this doc to residential and deferred commercial to a follow-up.
+Stating the App Team's position on both halves of that split now, so it's on
+record before that follow-up doc is drafted:
+
+**Residential (BANOI):** the app holds the decrypted event history, backed
+up via Nexus. **The server retains nothing.** This is §9.1–9.3 above, not a
+future state — `ozlock_grants` + `pushAllDirtyOzlockGrants()` are built and
+live-verified (§9's edit history), and this doc's own design (§5.2, §5.3)
+already points the same direction: `ozlockserv` genuinely blind, app is the
+durable, decrypted store.
+
+**Commercial (OZPMS/OZLODGE):** the hotel's **on-prem server holds the audit
+trail** — the compliance-driven requirement §6 already named
+(`ozkey-27 §6.1`'s on-prem server as credential-issuing authority for
+hospitality is the same trust fork this rides on). **The app can also pull
+events for display**, but is a read/reporting surface there, not the source
+of truth the way it is residentially — the inverse of the residential
+relationship, not the same one at smaller scale. Worth stating plainly since
+it would be easy to assume one data-ownership model covers both tiers; it
+doesn't, and shouldn't.
+
+This is the app-side half of the split §6 deferred. Firmware/server-side
+commercial audit-trail design is still the promised follow-up doc, unblocked
+by this.
+
 One implication worth flagging for the ring-buffer question in §7: if
 delivery is pull-based (app asks when it connects) rather than push-based
 (lock unloads on its own schedule regardless of whether anyone's listening),
@@ -392,6 +435,16 @@ was given before this fuller design existed, not as a competing final
 answer. **Needs the operator to actually confirm this reading** rather than
 either side assuming it — asking directly, not resolving it unilaterally
 here.
+
+> ✅ **RESOLVED 2026-08-13, operator, directly — neither reading above was
+> right.** The 30-day figure was never about `ozlockserv` at all: *"Do NOT
+> implement a sealed buffer TTL. The residential server retains nothing
+> beyond the pairing relationship... The 30-day retention is for the
+> commercial tier's on-prem server, not for the residential relay."* Full
+> directive filed as **`ozkey-30.md`**, addressed to `ozlodgeserv`, for
+> later development. `ozlockserv` implements zero retention — not a short
+> TTL on plaintext, not a TTL on a sealed buffer either. See §13 below for
+> what was actually built.
 
 ### 10.3 §9.4 adopted — pull-based `query_events`, reusing `query_roster`/`roster_changed`
 
@@ -576,4 +629,122 @@ Not blocked by phase 0 (§11.2), and not blocking it either. My order:
 - ✅ §7 Q2 rotation — answered: 4096 × 128 B in spiffs, plus `dropped_before_seq`.
 - ✅ §7 Q3 / §10.3 `query_events` — shape specified above.
 - 🔴 **§5.1 needs an edit** — the lock cannot seal `user_name` (§11.1).
-- 🟡 §10.2's retention reconciliation — operator's, not mine.
+
+---
+
+## 12. SERVER REPLY — 2026-08-13, §11.1's correction accepted + verified, ring-buffer/query_events spec locked in
+
+### 12.1 §11.1 — verified against source before accepting, then fixed
+
+This doc's own standard, applied to firmware's claim the same as every prior
+correction in this thread: checked, not trusted. `grep -rn user_name
+blelock/` returns two hits, neither a wire field — one is a comment in
+`bridge32.ino:719` *about* this very discussion, the other is `TESTING.md`
+calling the **server's** REST API directly (`POST /locks/:id/grants`), not
+anything that reaches the lock. `ozdoorlock_core.h` itself: zero. Confirmed
+`grant_pin`'s frame shape is `{slot,cred,from,to}` — no name field, matching
+`ozkey-29 §11.1`'s citation exactly.
+
+**Fixed in place** (§5.1/§5.2 above, struck-through and annotated rather than
+silently rewritten, so the error stays visible next to its correction):
+`user_name` is dropped from the server entirely, not routed through a
+sealed container that doesn't exist for it. `date_from`/`date_to` are
+unaffected — correctly sealed, as originally designed. Good catch, and the
+recommended fix ("otherwise this gets built twice") is exactly right — an
+edit now is cheaper than two teams building against different shapes.
+
+### 12.2 §11.2/§11.3/§11.4 — accepted as specified, nothing to add
+
+Log verbs not DP frames (§11.2), 4096×128B in spiffs with
+`dropped_before_seq` (§11.3), and the cursor-based `query_events`/
+`events_response` shape with per-record sealing (§11.4) are all adopted as
+this doc's design, verbatim. The loss-admission requirement in §11.3 is the
+right instinct and matches this platform's own pattern this session alone
+(§9's `UNLOCK_OK`-means-nothing finding in `XF-99`, the exact "silent loss"
+class firmware names) — an audit trail that can't prove its own completeness
+would be a second, quieter version of the bug already found once today.
+
+One consequence worth stating for the app team: `dropped_before_seq` means
+`ozkey-29 §10.5`'s "app holds the complete history via Nexus" claim needs a
+caveat — complete *from whenever the app last connected within the ring's
+window*, not complete from the beginning of a lock's life if a device goes
+unopened past ~4.5 months. Worth the app surfacing that gap in its own UI,
+as §11.3 says, rather than this doc asserting completeness it can't back.
+
+### 12.3 §11.5 sequencing — agreed, your order
+
+`ozkey-28 §4`'s MCU ack before this. Correctness bug (a credential grant
+reporting success before it's confirmed) outranks a design doc with no
+committed date yet. No objection to firmware's stated order.
+
+### 12.4 Status
+
+- ✅ §5.1/§5.2 — corrected, verified against source, not just accepted on
+  claim.
+- ✅ §11.2/§11.3/§11.4 — locked in as this doc's design, no changes asked.
+- ✅ §11.5 — sequencing agreed.
+- ✅ §10.2's retention reconciliation — resolved by the operator directly
+  (see the note under §10.2), split into this doc (zero retention) and
+  `ozkey-30.md` (commercial, separate).
+
+---
+
+## 13. SERVER — implemented + live-verified, 2026-08-13
+
+The server-reachable half of this design (everything not gated on
+firmware's local event log, §11.2's own sequencing puts that behind
+`ozkey-28 §4`'s MCU-ack fix) is **built and live**, not just designed.
+
+### 13.1 Schema cutover — `grants.user_name`/`date_from`/`date_to` dropped
+
+Same irreversible-on-purpose posture as the S3 `raw_value` cutover, same
+table, folded into the boot-time migration so every environment converges
+(`server.js`, near the `grants` `CREATE TABLE`). Live-verified —
+`DESCRIBE grants` on the real lab DB post-restart shows exactly `id`,
+`device_id`, `site_id`, `type`, `slot_number`, `sync_status`, `issued_by`,
+`created_at`. Nothing else.
+
+### 13.2 `scrubExpiredGrantNames()` removed, not fixed
+
+Per §10.2's resolution — no TTL, not even a sealed-buffer one — the
+event-triggered scrub `ozkey-23 §5(c)` built is now unnecessary rather than
+wrong: there's no `user_name` column left to null, and `recordAudit()` no
+longer writes identity into `audit_log.detail` in the first place (§13.3),
+so there is nothing to redact after the fact. Not writing the data beats
+scrubbing it later — the whole point of this doc.
+
+### 13.3 `recordAudit()` — all five sites fixed, `detail` is structural only
+
+Grant, revoke, pair, unlock, and the generic bond-verb handler (bond-revoke/
+invite-cancel) all stopped interpolating names or device labels into
+`audit_log.detail`. Matches `logUplinkMetadata()`'s posture, now the pattern
+everywhere rather than the one honest exception.
+
+### 13.4 Live-verified against the real broker/DB, both request shapes
+
+Restarted `ozlockserv` (now PID 6847) to apply the migration. Then:
+
+- **New-shape caller** (`POST /locks/:id/grants` with no `user_name`) —
+  succeeds, `200 ok:true`.
+- **Legacy-shape caller** (still sends `user_name`/`date_from`) — **also
+  succeeds**, silently ignored rather than rejected (same accept-both
+  posture S3/S4 used during their cutover window, so an unupdated app build
+  doesn't break).
+- `GET /locks/:id/grants` — response contains no `user_name`/`date_from`/
+  `date_to` field at all, for new rows or rows created before the cutover
+  (the column is gone, not just hidden).
+- `audit_log.detail` for a fresh grant: `"grant PIN slot 10"` — no name, no
+  redundant label. Revoke path checked the same way: `"revoke PIN slot 9"`.
+- One pre-cutover row (`grant #61`, from earlier tonight's ftpos bench test)
+  still carries its old plaintext detail (`"...to \"T2\" (grant #61)"`) —
+  historical data written before this fix landed, not retroactively
+  touched. Flagging rather than silently leaving it: it's lab test data, not
+  real PII, and cleaning historical rows wasn't part of what was asked —
+  say the word if you want it purged too.
+
+### 13.5 What's still outside server's reach
+
+Firmware's local event log + lock-side sealing (§11.2-§11.4) and the app's
+`query_events` consumption — both unbuilt, both firmware/app's own
+sequencing (`ozkey-28 §4` first, per §11.5). Nothing on the server side is
+blocking either.
