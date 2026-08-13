@@ -205,7 +205,12 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 // 1.67: pairing screen now says NOT ADVERTISING when it isn't — see
 //       doorlock.ino's changelog. Change is in common/ozdoorlock_core.h, so it
 //       lands on both panels; only this version string is per-sketch.
-#define FW_VERSION "doorlock-1.69"
+// 1.70: any keypad key opens the pairing window (was '#' only), and the touch
+//       path grows the instruments for the "10-20 s before it responds" report
+//       — see doorlock.ino's changelog. All of it is in
+//       common/ozdoorlock_core.h, so it lands on both panels; only this version
+//       string is per-sketch.
+#define FW_VERSION "doorlock-1.72"
 
 // ── DERIVED, not a second literal (2026-08-12) — see doorlock.ino for the
 // full reasoning. The warning above ("Change both, every time") described the
@@ -237,7 +242,18 @@ void drawSplash() {
   gfx->print(FW_VERSION);
   gfx->setCursor(40, 120);
   gfx->print("Waveshare ESP32-C6 1.9\"");
-  delay(1200);
+  // 1.71: the delay(1200) here is GONE. Measured 2026-08-14, it was 1236 ms of
+  // a 2330 ms setup() — more than half the window in which this board cannot
+  // see a touch at all, because touch is only polled from loop() and loop()
+  // does not run until setup() returns. The operator's report was "after it is
+  // powered up it stuck for a while before become responsive"; this was over
+  // half of that, spent on purpose, to look at a logo.
+  //
+  // Nothing is lost: the splash stays on screen anyway. setup() continues for
+  // another ~1.1 s of real work (LittleFS, OpenThread, crypto self-tests) with
+  // this frame still displayed, and the dashboard replaces it when loop()
+  // paints. The delay never made the splash visible — it only made the lock
+  // deaf while it was.
 }
 
 // No RST/INT pin on this board — pure I2C polling. Init sequence matches

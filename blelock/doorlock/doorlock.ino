@@ -217,7 +217,19 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //       bleAdvertisingAllowed(). Now: AMBER "ADVERTISING..." when you can pair,
 //       WHITE "NOT ADVERTISING" when you cannot, matching the operational
 //       screen's amber-means-live-and-time-limited convention.
-#define FW_VERSION "doorlock-1.69"
+// 1.70: ANY keypad key opens the pairing window, not just '#' (operator,
+//       2026-08-14) — reverses the 2026-08-11 '#'-only rule; the amber '#'
+//       highlight goes with it, because a key that looks different but behaves
+//       the same is the 1.67 lying-screen bug in another costume. Plus the
+//       instruments for the operator's "10-20 s before the panel responds":
+//       touchRead() now samples a tap on its FIRST down poll instead of its
+//       second (a single-poll tap used to be discarded in total silence), and
+//       the three previously-invisible ways a tap could vanish — I2C NACK, a
+//       controller reporting count=0, and our own two-sample rule — all print
+//       on change. setup() is now timed stage by stage, because the panel is
+//       deaf until setup() returns and nothing had ever measured how long that
+//       is. See common/ozdoorlock_core.h for the full reasoning.
+#define FW_VERSION "doorlock-1.72"
 
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ────────
 //

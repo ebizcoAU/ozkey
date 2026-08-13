@@ -5441,10 +5441,68 @@ static bool touchReadRegs(uint8_t *buf) {
 int lastTapX = 0, lastTapY = 0;
 uint8_t tapSamples = 0;
 
+// 1.70 — THREE WAYS A TAP USED TO VANISH WITHOUT A TRACE
+//
+// The operator reported taps taking 10-20 s to register after power-up, on both
+// boards. [MON]'s cadence (measured 2026-08-14: 10.003-10.016 s against a 10 s
+// tick) proves the loop is NOT starved — touch is polled at ~65 Hz — so the
+// taps were being lost inside this function or before it, and every one of the
+// three ways that can happen was SILENT:
+//
+//   1. touchReadRegs() returns false (I2C NACK). A controller that has gone to
+//      sleep, or a bus glitch, looked exactly like a finger that was never
+//      there. This is the one that would confirm or kill the auto-sleep theory,
+//      and it printed nothing at all.
+//   2. The controller reports count=0 forever. Same silence.
+//   3. OUR OWN two-sample rule threw the tap away — see below.
+//
+// [[silent-failures-rule]]: a diagnostic you cannot read is not a diagnostic.
+// All three now speak, on CHANGE only so an idle panel stays quiet.
 bool touchRead(int &tx, int &ty) {
   uint8_t buf[7];
-  if (!touchReadRegs(buf)) return false;
+
+  // (1) Does the digitizer answer at all?
+  static bool lastRegsOk = true;
+  const bool regsOk = touchReadRegs(buf);
+  if (regsOk != lastRegsOk) {
+    lastRegsOk = regsOk;
+    Serial.printf("[TOUCH] i2c %s\n",
+                  regsOk ? "answering again"
+                         : "NO ACK — controller not responding (asleep? bus?)");
+  }
+  if (!regsOk) return false;
+
+  // (2) What is it actually reporting? Edge-triggered: two lines per tap.
   uint8_t count = buf[2];
+  static uint8_t lastCount = 0xFF;
+  if (count != lastCount) {
+    lastCount = count;
+    Serial.printf("[TOUCH] count=%u\n", count);
+  }
+
+  // (2b) …and a 5 s heartbeat, because edge-triggered ALONE is unreadable.
+  //
+  // 1.70 printed only on change, so the single most important failure state —
+  // the controller ACKing happily while reporting count=0 through a real
+  // finger press — produced NO output whatsoever. A 90 s capture during the
+  // operator's "3-5 s to respond" was therefore empty, and empty could mean
+  // either "no taps happened" or "every tap was invisible". That is the same
+  // silent-instrument trap as [[serial-capture-dead-use-ble]], rebuilt by hand.
+  //
+  // With a heartbeat, silence has exactly one meaning: this function is not
+  // running. Anything else prints a live count and the poll rate, so a capture
+  // is interpretable without knowing precisely when a finger landed.
+  static unsigned long lastTouchBeat = 0;
+  static uint32_t pollsSinceBeat = 0;
+  pollsSinceBeat++;
+  if (millis() - lastTouchBeat > 5000) {
+    lastTouchBeat = millis();
+    Serial.printf("[TOUCH] alive: count=%u polls=%lu in 5s (%lu Hz) down=%d\n",
+                  count, (unsigned long)pollsSinceBeat,
+                  (unsigned long)(pollsSinceBeat / 5), touchWasDown ? 1 : 0);
+    pollsSinceBeat = 0;
+  }
+
   bool down = (count > 0 && count <= 5);
   if (down) {
     lastActivityAt = millis();
@@ -5452,15 +5510,25 @@ bool touchRead(int &tx, int &ty) {
     // instant the visitor's finger lands — the wake, Wi-Fi reassociation and
     // broker dial that follow all happen inside the window they just opened.
     lastTouchAt = lastActivityAt;
-    if (touchWasDown) {
-      int rawX = ((buf[3] & 0x0F) << 8) | buf[4];
-      int rawY = ((buf[5] & 0x0F) << 8) | buf[6];
-      int x, y;
-      mapTouchRaw(rawX, rawY, x, y); // board-specific transform + clamp
-      lastTapX = x;
-      lastTapY = y;
-      if (tapSamples < 255) tapSamples++;
-    }
+    // (3) SAMPLE ON THE FIRST DOWN POLL, not the second.
+    //
+    // This read used to sit behind `if (touchWasDown)`, so the first poll that
+    // saw a finger only armed the flag and discarded its coordinates. A tap had
+    // to span TWO consecutive polls to exist at all; one that spanned a single
+    // poll fell out of the `n == 0` return below having logged nothing.
+    //
+    // At 65 Hz a human finger clears two polls easily, so this is not the whole
+    // story — but it is a pure amplifier of anything upstream that makes the
+    // controller report only intermittently. If the digitizer emits exactly one
+    // frame on waking, the old code guaranteed that frame was thrown away, and
+    // the user's real tap became the SECOND one they made.
+    int rawX = ((buf[3] & 0x0F) << 8) | buf[4];
+    int rawY = ((buf[5] & 0x0F) << 8) | buf[6];
+    int x, y;
+    mapTouchRaw(rawX, rawY, x, y); // board-specific transform + clamp
+    lastTapX = x;
+    lastTapY = y;
+    if (tapSamples < 255) tapSamples++;
     touchWasDown = true;
     return false;
   }
@@ -5468,7 +5536,14 @@ bool touchRead(int &tx, int &ty) {
   touchWasDown = false;
   uint8_t n = tapSamples;
   tapSamples = 0;
-  if (n == 0) return false;
+  if (n == 0) {
+    // Unreachable via the path above now that one down poll always samples —
+    // kept as a live assertion rather than deleted. If this ever prints again
+    // it means a touch-down was seen with no usable coordinate read, which is a
+    // driver fault worth knowing about, not a user tapping too fast.
+    Serial.println("[TOUCH] down->up with NO samples — tap discarded");
+    return false;
+  }
   tx = lastTapX;
   ty = lastTapY;
   return true;
@@ -5516,13 +5591,14 @@ void drawKeypad() {
     for (int c = 0; c < 4; c++) {
       int x = c * KEY_W, y = KP_TOP + r * KEY_H;
       bool lit = litActive && r == litKeyR && c == litKeyC;
-      // '#' is the pairing key (2026-08-11) — it opens the BLE window, and no
-      // other key does. A designated key nobody can pick out is the same as no
-      // key, so it gets its own colour: amber, matching the amber BLE badge on
-      // the status line so the two read as the same feature.
-      const bool isPairKey = (KP_KEYS[r][c] == '#');
-      gfx->fillRect(x + 2, y + 2, KEY_W - 4, KEY_H - 4,
-                    lit ? C_GREEN : (isPairKey ? C_AMBER : C_BLUE));
+      // 1.70: the amber '#' is GONE, and that is not cosmetic. It existed to
+      // say "this key, and only this key, opens the pairing window" — true from
+      // 2026-08-11 until this version, false the moment any key started opening
+      // it. A key coloured differently from its neighbours is a claim that it
+      // does something different; leaving it would be the same class of defect
+      // as 1.67's ADVERTISING screen, which went on saying a thing that had
+      // stopped being true. All keys behave alike, so all keys look alike.
+      gfx->fillRect(x + 2, y + 2, KEY_W - 4, KEY_H - 4, lit ? C_GREEN : C_BLUE);
       gfx->drawRect(x, y, KEY_W, KEY_H, C_GREY);
       gfx->setTextColor(lit ? C_BLACK : C_WHITE);
       gfx->setTextSize(3);
@@ -5655,9 +5731,51 @@ void enterKeepAliveSleep() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Setup / loop
 // ─────────────────────────────────────────────────────────────────────────────
+
+// 1.70 — HOW LONG IS THE DEAD ZONE AFTER POWER-UP? (operator, 2026-08-14:
+// "after it is powered up it stuck for a while before become responsive")
+//
+// The panel cannot respond during setup() at all: touch is polled from loop(),
+// and loop() does not run until setup() returns. So "unresponsive after boot"
+// is not a touch bug — it is however long setup() takes, and NOTHING measured
+// that. The stages here are not equally cheap (a 1.2 s splash delay, a
+// LittleFS mount that may format, two X25519 self-tests, an OpenThread bring-up,
+// a BLE stack allocation), and guessing which one dominates is exactly the kind
+// of theory that has cost this project sessions. Print the number instead.
+static unsigned long g_bootT0 = 0;
+static unsigned long g_bootLast = 0;
+static void bootMark(const char *stage) {
+  const unsigned long now = millis();
+  Serial.printf("[BOOT+%lums] %s (+%lu)\n", now - g_bootT0, stage,
+                now - g_bootLast);
+  g_bootLast = now;
+}
+
 void setup() {
   Serial.begin(115200);
+  // 🔴 1.72 — NEVER LET A LOG LINE BLOCK THE DOOR.
+  //
+  // On this board Serial is the native USB CDC. When the port is enumerated by
+  // a host but nothing is DRAINING it — a lock plugged into a laptop or a
+  // charger with no terminal open, which is the bench's normal state — the TX
+  // FIFO fills and Serial.print() blocks until someone reads. Every one of this
+  // firmware's jobs runs on the loop task, so a blocked print freezes touch,
+  // the panel, the MCU wire pump and the factory-reset button, exactly like the
+  // 1.66 MQTT dial did.
+  //
+  // Measured 2026-08-14, first boot after flashing, with no reader attached:
+  // worst single loop iteration was 20271 ms on DoorA, 8149 ms on LockC,
+  // 6021 ms on DoorB — and all three ended the instant a reader attached. That
+  // is the operator's "10-20 s before a key registers", and it is also why
+  // every previous measurement looked healthy: those were taken with a capture
+  // running, i.e. with the buffer being drained.
+  //
+  // Timeout 0 = drop when full, never wait. Diagnostics are worth having, but
+  // not at the price of the lock stopping. A dropped log line costs a line; a
+  // blocked one costs the door.
+  Serial.setTxTimeoutMs(0);
   delay(300);
+  g_bootT0 = g_bootLast = millis();
   Serial.println("\n*** OZLOCK COMM MODULE — unified doorlock (MCU = LockSim on UART) ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
 
@@ -5688,6 +5806,7 @@ void setup() {
   // Tuya MCU bus → LockSim Mode B (raw 55 AA frames, wire-tested 2026-07-19)
   Serial1.begin(9600, SERIAL_8N1, TUYA_RX_PIN, TUYA_TX_PIN);
   Serial.println("[TUYA] Serial1 up @ 9600 8N1 GPIO16(TX)/GPIO17(RX)");
+  bootMark("banner + profile + tuya wire");
 
   // §0.2 wake lines — MRDY idles HIGH (also satisfies the GPIO8 strap)
   pinMode(SRDY_PIN, INPUT_PULLUP);
@@ -5701,15 +5820,19 @@ void setup() {
   txlogCount1 = txlogCountLines("/txlog.1");
   ozEvtSeqRestore(); // ozkey-29 §11.4 — resume the audit cursor across reboots
   Serial.printf("[FS] txlog %u event(s) buffered\n", (unsigned)txlogTotal());
+  bootMark("LittleFS mount + txlog scan");
 
   pinMode(LCD_BL, OUTPUT);
   digitalWrite(LCD_BL, LCD_BL_ON);
   gfx->begin();
   gfx->setRotation(LCD_ROTATION);
   gfx->fillScreen(C_BLACK);
+  bootMark("LCD begin + fillScreen");
   drawSplash();
+  bootMark("splash (includes its own delay)");
 
   touchInit();
+  bootMark("touch controller init");
   pinMode(USER_BUTTON, INPUT_PULLUP); // hold 5s -> factory reset, touch-independent
 
   // ROOT-CAUSE FIX (2026-07-28) — the ozkey-10 §1 fix, which had only ever
@@ -5726,6 +5849,7 @@ void setup() {
   // is safe for the Wi-Fi-transport case too.
   OpenThread::begin(false);
   Serial.printf("[THREAD] early begin() otStarted=%d\n", (int)(bool)thread);
+  bootMark("OpenThread early begin()");
 
   WiFi.mode(WIFI_STA);
   WiFi.onEvent(
@@ -5738,6 +5862,7 @@ void setup() {
   String machex = macStr; machex.replace(":", ""); machex.toLowerCase();
   deviceId = "ozk-" + machex;
   Serial.printf("[ID] device_id=%s mac=%s\n", deviceId.c_str(), macStr.c_str());
+  bootMark("WiFi.mode(STA) + MAC");
 
   loadConfig();
   ozUplinkLoadPeer(); // ozkey-19 v2 R2 — restore the unicast target BEFORE any
@@ -5754,10 +5879,12 @@ void setup() {
   if (cfgTzMin) Serial.printf("[TIME] timezone restored: %+d min\n", (int)cfgTzMin);
   ozClockRestore();
   buildTopics();
+  bootMark("config + peer + epoch + clock restore");
 
   // Ceremony identity (RF is up → TRNG seeded) + boot known-answer self-test.
   ozLockKeyInit();
   Serial.printf("[CRYPTO] info.pub=%s\n", ozLockPubHex().c_str());
+  bootMark("lock keypair init");
   // M2: ownership state, printed every boot. This line is the Ask 6 factory-reset
   // evidence — after a reset both info.pub AND this must change (pub re-minted,
   // owner back to "none"), since prefs.clear() wipes the whole "blelock"
@@ -5775,8 +5902,10 @@ void setup() {
     Serial.printf("[BOND] member %d: label='%s' floor=%llu pub=%.16s…\n", i,
                   g_bonds[i].label, (unsigned long long)g_bonds[i].floor, h);
   }
+  bootMark("bond load + enumerate");
   ozCryptoSelfTest();
   ozM4SelfTest();
+  bootMark("crypto + M4 self-tests");
 
   if (provisioned && isThread()) {
     // Thread resume (ported from threadcomm.ino): relies entirely on
@@ -5819,9 +5948,51 @@ void setup() {
                 cfgHeartbeatS, SRDY_PIN, MRDY_PIN);
   lastActivityAt = millis();
   screenDirty = true;
+  bootMark("transport start");
+  // THE number the operator asked about: until this line prints, the panel is
+  // deaf — no touch poll has run even once.
+  Serial.printf("[BOOT] setup() done in %lu ms — loop() starts now, panel is "
+                "live from here\n",
+                millis() - g_bootT0);
 }
 
+// 1.71 — WORST-ITERATION TIMER (the instrument that should have come first)
+//
+// Everything this firmware does runs on the loop task, so any single blocking
+// call makes the panel deaf for exactly as long as it blocks. Two operator
+// reports — "5-10 s for the panel to answer a touch" and "10-20 s before a key
+// registers" — have outlived several theories because nothing ever measured
+// the one number that matters.
+//
+// 🔴 WHY [MON] WAS THE WRONG METER, and I used it as one on 2026-08-14:
+// [MON]'s own `lastMon = millis()` is stamped BEFORE its print and before the
+// drawOperational() repaint it triggers, so a stall AFTER the tick does not
+// push the next tick out. Measuring [MON] at 10.003-10.016 s therefore proves
+// only that nothing blocks for longer than the interval itself. A 2 s repaint
+// every 10 s is completely invisible to it — and the repaint runs in precisely
+// that blind spot. This timer has no such hole: it measures top-of-loop to
+// top-of-loop, so whatever ran in between is inside the number.
+#define OZ_LOOP_LAG_WARN_MS 250UL
+unsigned long g_loopMaxMs = 0;    // worst iteration since the last [MON]
+const char *g_loopMaxWhat = "?";  // coarse attribution, set by the slow paths
+static unsigned long g_loopLastTop = 0;
+
 void loop() {
+  {
+    const unsigned long top = millis();
+    if (g_loopLastTop) {
+      const unsigned long dt = top - g_loopLastTop;
+      if (dt > g_loopMaxMs) g_loopMaxMs = dt;
+      // Printed the moment it happens, not just aggregated: an operator standing
+      // at the bench watching a dead panel needs the console to say so WHILE it
+      // is dead, not 10 s later in a summary.
+      if (dt > OZ_LOOP_LAG_WARN_MS)
+        Serial.printf("[LAG] loop iteration took %lu ms (last slow path: %s)\n",
+                      dt, g_loopMaxWhat);
+    }
+    g_loopLastTop = top;
+  }
+
   checkFactoryResetButton();
 
   // XF-52 (R): close the window on expiry — but never mid-session. A client
@@ -6121,7 +6292,7 @@ void loop() {
         forwardHexToMcu(payload);
       }
 
-      // ── BLE window: '#' ONLY, not any tap (operator, 2026-08-11) ───────
+      // ── BLE window: ANY key (operator, 2026-08-14) ─────────────────────
       //
       // WHY THIS PANEL IS NOT BENCH SCAFFOLDING — corrected after the operator
       // pointed it out: this board is intended to work as a SELF-CONTAINED
@@ -6129,23 +6300,37 @@ void loop() {
       // LCD keypad is the product's real keypad, not a stand-in. So there are
       // two legitimate pairing gestures, not one deprecated and one real:
       //
-      //   • self-contained lock  -> '#' here
+      //   • self-contained lock  -> the LCD keypad here
       //   • lock with a DL MCU   -> the DL MCU's keypad -> DP 60 (ozkey-22 §7)
       //
-      // WHY '#' AND NOT ANY TAP: any tap re-armed a 60 s advertising window,
-      // so a sleeve brushing the panel — or a user pressing digits for any
-      // reason at all — left the lock discoverable and connectable
-      // indefinitely. The window is a physical-presence CLAIM (XF-52 §4); it
-      // should cost a deliberate act, not an accident.
+      // 🔴 THIS REVERSES THE 2026-08-11 DECISION, deliberately and on the
+      // operator's instruction ("allow touching any key on the lcd will turn on
+      // BLE, not just the '#' key"). The reversed rule and its reasoning are
+      // kept here because the trade-off did not disappear, it was overruled:
       //
-      // '#' is free: '*' arms factory reset and '5' confirms it, and '#' reads
-      // as "enter/confirm" in the same idiom. The other keys still register as
-      // touches for assisted-unlock presence above — that is unchanged, and it
-      // SHOULD be any tap, because there the tap is proving a human is at the
-      // door, not requesting anything.
-      if (provisioned && k == '#') {
-        Serial.println("[BLE] '#' pressed — pairing window requested");
-        openBleWindow("keypad '#'");
+      //   2026-08-11, '#' only — "any tap re-arms a 60 s advertising window, so
+      //   a sleeve brushing the panel leaves the lock discoverable. The window
+      //   is a physical-presence CLAIM (XF-52 §4); it should cost a deliberate
+      //   act, not an accident."
+      //
+      // What changed is evidence about the other failure: the operator found
+      // the panel taking 10-20 s to respond after power-up, and a user who taps
+      // a key and gets nothing has no way to tell "this is the wrong key" from
+      // "this lock is broken". A designated key only works if the user knows
+      // which one, and at a door nobody does. Making every key work removes an
+      // entire class of "the lock ignored me" that we cannot otherwise
+      // distinguish from a real fault.
+      //
+      // The accidental-advertising cost is REAL and unmitigated by this change.
+      // What bounds it: the window is still 60 s and still self-closes, it is
+      // still local-radio only, and pairing still requires the bond ceremony —
+      // an open window is discoverability, not access. If accidental windows
+      // become a nuisance in the field, the fix is a deliberate gesture (two
+      // taps, or a long press), NOT a return to a secret key.
+      if (provisioned) {
+        Serial.printf("[BLE] key '%c' pressed — pairing window requested\n",
+                      k ? k : '?');
+        openBleWindow("keypad");
       }
 
       if (resetArm) {
@@ -6273,15 +6458,33 @@ void loop() {
                   // number, not a footnote.
                   ozClockKnown(ozclock) ? "known" : "UNKNOWN",
                   (unsigned)mcuTimeRequests, (unsigned)mcuTimeServed);
+    // The worst iteration in the last 10 s, then reset. A healthy lock reads
+    // ~15-30 ms (the delay(15) plus a poll pass). Anything in the hundreds is
+    // the panel being deaf for that long, and loopmax is the only number that
+    // has ever been able to say so — see the timer at the top of loop().
+    Serial.printf("[MON] loopmax=%lu ms (worst iteration since last MON, was: %s)\n",
+                  g_loopMaxMs, g_loopMaxWhat);
+    g_loopMaxMs = 0;
+    g_loopMaxWhat = "-";
     if (state == ST_OPERATIONAL) screenDirty = true; // age/link refresh
   }
 
   // ── screen ────────────────────────────────────────────────────────────────
+  // TIMED, and it is the prime suspect: a full drawOperational() is a
+  // fillScreen() plus a keypad redraw over SPI, and [MON] sets screenDirty
+  // every 10 s — inside [MON]'s own measurement blind spot (see the worst-
+  // iteration timer at the top of loop()). If the panel is deaf for seconds at
+  // a time on a 10 s rhythm, this is where it would be hiding.
   if (screenDirty) {
     screenDirty = false;
+    const unsigned long t0 = millis();
     if (state == ST_ADVERTISING) drawAdvertising();
     else if (state == ST_JOINING) drawJoining();
     else drawOperational();
+    const unsigned long dt = millis() - t0;
+    g_loopMaxWhat = "screen repaint";
+    if (dt > OZ_LOOP_LAG_WARN_MS)
+      Serial.printf("[LAG] screen repaint took %lu ms\n", dt);
   }
 
   // ── §0.2/§0.3 keep-alive nap (Wi-Fi transport, honest mode only; bench
