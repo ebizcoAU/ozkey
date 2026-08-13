@@ -198,7 +198,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 // "FW_DISPLAY_VERSION was stuck at V1.21 through the 1.22/1.23 bumps").
 // Editing one file's version string and flashing the other is the failure
 // mode. Change both, every time.
-#define FW_VERSION "doorlock-1.60"
+#define FW_VERSION "doorlock-1.61"
 
 // ── DERIVED, not a second literal (2026-08-12) — see doorlock.ino for the
 // full reasoning. The warning above ("Change both, every time") described the

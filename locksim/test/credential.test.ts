@@ -20,7 +20,16 @@
  */
 
 import assert from "node:assert/strict";
-import { parseTempCredential, DpId, toHexString, type ByteArray } from "../lib/tuya";
+import {
+  parseTempCredential,
+  buildFrame,
+  buildDpPayload,
+  parseFrame,
+  DpId,
+  DpType,
+  toHexString,
+  type ByteArray,
+} from "../lib/tuya";
 
 let passed = 0;
 let failed = 0;
@@ -102,6 +111,38 @@ test("the from/to window survives unchanged — expiry depends on it", () => {
   assert.equal(p?.start, FROM);
   assert.equal(p?.end, TO);
   assert.ok(p!.end > p!.start, "a window that ends before it starts is born expired");
+});
+
+// ── the MCU ack (ozkey-28 §4 / doorlock-1.61) ───────────────────────────────
+//
+// The module now BLOCKS on an echo before reporting success, so the exact frame
+// LockSim sends has to satisfy the firmware's matcher:
+//     g_ackWaitDp && (f[3]==0x06 || f[3]==0x07) && n>=11 && f[6]==g_ackWaitDp
+// Two codebases, one contract, no compiler between them — so assert it here.
+
+console.log("\nMCU acknowledgement\n");
+
+for (const [label, dpId] of [
+  ["add PIN", DpId.ADD_TEMP_PIN],
+  ["add RFID", DpId.ADD_TEMP_RFID],
+  ["delete PIN", DpId.DELETE_PIN],
+  ["delete RFID", DpId.DELETE_RFID],
+] as const) {
+  test(`the ${label} ack satisfies the firmware matcher`, () => {
+    const f = buildFrame(0x06, buildDpPayload(dpId, DpType.RAW, [0x00, 0x03]));
+    assert.ok(f[3] === 0x06 || f[3] === 0x07, "cmd must be a DP report");
+    assert.ok(f.length >= 11, `frame must be >= 11 bytes, got ${f.length}`);
+    assert.equal(f[6], dpId, "dpid must echo the DP the module wrote");
+    assert.ok(parseFrame(f).ok, "and it must be a structurally valid frame");
+  });
+}
+
+test("an ack for a DIFFERENT dp must not satisfy the matcher", () => {
+  // Guards against a lazy "any inbound frame counts" implementation — the whole
+  // point is that the module learns THIS credential landed, not that the MCU is
+  // merely alive.
+  const f = buildFrame(0x06, buildDpPayload(DpId.ADD_TEMP_RFID, DpType.RAW, [0, 3]));
+  assert.notEqual(f[6], DpId.ADD_TEMP_PIN);
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

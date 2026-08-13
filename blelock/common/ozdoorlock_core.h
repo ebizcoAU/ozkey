@@ -1446,6 +1446,62 @@ void checkFactoryResetButton() {
 String lastMcuHex = ""; // last DP frame's hex bytes — read by drawHexReadout()
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 1.61 — WAIT FOR THE MCU BEFORE CLAIMING SUCCESS (ozkey-28 §4)
+//
+// Until now the module answered UNLOCK_OK the instant it had written bytes to
+// the UART:
+//
+//     forwardFrameToMcu(frame, flen);
+//     publishLog("granted", ...);
+//     notifyStatus("UNLOCK_OK");      // <- nothing in between
+//
+// No status report awaited, no timeout, no failure path. So "accepted" meant
+// *"your envelope authenticated and I put bytes on a wire"* — it could not
+// distinguish a stored credential from one written to a disconnected pin, and
+// the operator hit exactly that: the app was told a PIN was issued while the
+// MCU never received a decodable one. LockSim's own source predicted it: "an
+// ESP32 that has no timeout logic at all looks identical to one that does".
+//
+// The ack is the MCU ECHOING THE DP back. That is the most likely real
+// behaviour (a Tuya MCU answers a DP write with a status report for that DP)
+// and, importantly, it is the shape we can support without knowing the
+// supplier's exact reply format — still blocked on ozkey-27 Q2. When the real
+// contract arrives this narrows; it does not have to be redesigned.
+//
+// NEGATIVE ACK IS DELIBERATELY ABSENT. A rejected credential simply produces no
+// echo, and we time out. Inventing an error code the real MCU may not send
+// would be fiction of exactly the kind ozkey-27 §2.1 is about — absence of
+// confirmation is honestly "we do not know", which is the whole point.
+//
+// UNLOCK (DP 1) IS EXCLUDED. Its proof is the bolt moving and it is
+// latency-critical — doorlock-1.8 spent effort shaving 230 ms off this path.
+// Everything else is a credential operation, is not latency-critical, and is
+// precisely where proof matters.
+// ─────────────────────────────────────────────────────────────────────────────
+static uint8_t g_ackWaitDp = 0;   // 0 = not waiting
+static bool    g_ackSeen   = false;
+
+#define OZ_MCU_ACK_TIMEOUT_MS 1500UL
+
+/** True if the MCU echoed `dp` within the window. Pumps the UART inline. */
+static bool ozAwaitMcuAck(uint8_t dp) {
+  g_ackWaitDp = dp;
+  g_ackSeen = false;
+  const unsigned long t0 = millis();
+  while (millis() - t0 < OZ_MCU_ACK_TIMEOUT_MS) {
+    tuyaWirePump(); // drives handleMcuFrame(), which sets g_ackSeen
+    if (g_ackSeen) break;
+    delay(2);
+  }
+  const bool ok = g_ackSeen;
+  g_ackWaitDp = 0;
+  Serial.printf("[MCU-ACK] DP %u %s after %lu ms\n", dp,
+                ok ? "CONFIRMED" : "NO ANSWER — credential NOT stored",
+                millis() - t0);
+  return ok;
+}
+
 void tuyaWireSend(const uint8_t *f, size_t n) {
   // §0.2 module-initiated send: raise MRDY, wait for the MCU's answering
   // SRDY (wake_sim: assumed answered), then transmit — no bytes ever hit a
@@ -1630,6 +1686,17 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
   uint8_t sum = 0;
   for (size_t i = 0; i + 1 < n; i++) sum += f[i];
   if (sum != f[n - 1]) { Serial.println("[TUYA<-] bad checksum — dropped"); return; }
+
+  // 1.61 — is this the echo we are blocked on? Checked BEFORE any other
+  // classification, and deliberately without a direction test: an inbound DP 21
+  // is "down"-only in the profile and would be refused for forwarding, which is
+  // correct — but as an ACKNOWLEDGEMENT of the write we just made it is exactly
+  // what we asked for. Setting the flag does not consume the frame; it falls
+  // through to normal handling below.
+  if (g_ackWaitDp && n >= 7 && (f[3] == 0x06 || f[3] == 0x07) && n >= 11 &&
+      f[6] == g_ackWaitDp) {
+    g_ackSeen = true;
+  }
 
   mcuRxFrames++;
   lastMcuFrameAt = millis();
@@ -4358,6 +4425,19 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
                 slot, g_bonds[slot].label,
                 g_bonds[slot].role == OZ_ROLE_ADMIN ? "admin" : "member");
   forwardFrameToMcu(frame, flen);
+
+  // 1.61 — a CREDENTIAL operation must be confirmed by the MCU before we call
+  // it a success. An unlock is exempt: its proof is the bolt, and it is the one
+  // latency-critical verb here (see ozAwaitMcuAck's header).
+  if (dp != 1 && !ozAwaitMcuAck(dp)) {
+    // Distinct from UNLOCK_DENIED, which means "I refused you". This means "I
+    // accepted you and cannot confirm the lock stored it" — a different thing
+    // for an app to show a user, and previously indistinguishable from success.
+    publishLog("mcu_timeout", "OZKIE credential — MCU did not confirm");
+    notifyStatus("MCU_TIMEOUT");
+    return;
+  }
+
   publishLog("granted", slot == 0
                             ? (dp == 1 ? "OZKIE unlock (owner)" : "OZKIE credential (owner)")
                             : "OZKIE unlock (member)");

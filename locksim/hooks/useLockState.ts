@@ -785,6 +785,18 @@ export function useLockState({
               })
             );
             setLastEvent(`TEMP ${kind} STORED — SLOT ${parsed.slot}`);
+            // 🔴 ACK the module (ozkey-28 §4 / doorlock-1.61). Until now the MCU
+            // stored the credential and said NOTHING back, so the module
+            // answered UNLOCK_OK purely on the strength of having written bytes
+            // to a serial port — indistinguishable from writing to a crashed
+            // MCU or a disconnected pin, both of which have now happened on
+            // this bench. Echoing the DP is the confirmation the module waits
+            // for; no echo means no success, which is the honest default.
+            transmitRef.current(
+              TuyaCommand.DP_REPORT,
+              buildDpPayload(dp.dpId, DpType.RAW, [(parsed.slot >> 8) & 0xff, parsed.slot & 0xff]),
+              `ACK -> module: ${kind} stored in slot ${parsed.slot}`
+            );
             break;
           }
           case DpId.DELETE_PIN:
@@ -794,6 +806,13 @@ export function useLockState({
             const kind = dp.dpId === DpId.DELETE_PIN ? "PIN" : "RFID";
             persistCredentials(deleteCredential(credentialsRef.current, kind, slot));
             setLastEvent(`${kind} SLOT ${slot} WIPED`);
+            // Same ack contract as the add path — a revoke the module cannot
+            // confirm is a credential that may still open the door.
+            transmitRef.current(
+              TuyaCommand.DP_REPORT,
+              buildDpPayload(dp.dpId, DpType.RAW, [(slot >> 8) & 0xff, slot & 0xff]),
+              `ACK -> module: ${kind} slot ${slot} wiped`
+            );
             break;
           }
         }
