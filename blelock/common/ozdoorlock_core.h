@@ -82,6 +82,7 @@ static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
                                         uint64_t counter, bool hasChallenge);
 static size_t ozHexDecode(const String &hex, uint8_t *out, size_t cap);
 static bool ozDpForwardable(uint8_t dp);
+static void ozReportOutcome(int slot, const char *code, const String &detail);
 static bool ozM4SelfTest();
 static bool ozTuyaFrameOk(const uint8_t *f, size_t n);
 static bool touchReadRegs(uint8_t *buf);
@@ -2527,7 +2528,8 @@ void pollThreadUdp() {
     const size_t n = ozHexDecode(String(envHex), ebuf, sizeof(ebuf));
     if (n == 0) {
       Serial.println("[UDP] envelope_hex is not valid hex — denied");
-      notifyStatus("UNLOCK_DENIED");
+      ozReportOutcome(-1, "ENVELOPE_BAD_HEX",
+                      String("thread relay, ") + (unsigned)strlen(envHex) + " chars");
       return;
     }
     int slot = -1;
@@ -2539,7 +2541,15 @@ void pollThreadUdp() {
     // Delivered whole in one UDP datagram — no "still arriving" case, same
     // reasoning as F2's MQTT entry point.
     if (r != OZCTL_OPENED) {
-      notifyStatus("UNLOCK_DENIED");
+      // 🔴 THE HOLE THAT COST TWO BENCH RUNS. This is a sealed envelope that
+      // arrived intact and could not be opened under ANY bond — wrong key,
+      // failed MAC, or a truncated body. On the Thread path notifyStatus() goes
+      // nowhere, so it was indistinguishable from the datagram never arriving.
+      // Now it says so, addressed to the owner, with the size and which failure
+      // mode ozControlOpen reported.
+      ozReportOutcome(-1, "ENVELOPE_NOT_OPENED",
+                      String("thread relay, ") + (unsigned)n + " B, r=" + (int)r +
+                          " (no bond could decrypt it)");
       return;
     }
     ozControlVerifyAndDispatch(slot, pt, ptLen, counter, false /*hasChallenge*/);
@@ -2810,6 +2820,10 @@ static void ozUplinkRetryTick() {
 // has. Returns true only if it actually went out — a caller that needs to know
 // whether the app can possibly have heard must check, because "sealed fine but
 // nothing carried it" is the normal state of a Thread lock whose bridge is down.
+// Plaintext outcome code for the NEXT uplink only, cleared after use. See
+// ozReportOutcome() for why this is on the wrapper and not inside the seal.
+static const char *g_uplinkCode = nullptr;
+
 static bool ozUplinkSend(int slot, const String &json) {
   if (slot < 0 || slot >= OZ_BOND_MAX || !g_bonds[slot].present) return false;
 
@@ -2886,6 +2900,19 @@ static bool ozUplinkSend(int slot, const String &json) {
   doc["from"] = deviceId;      // which lock — the bridge routes on this
   if (extHex[0]) doc["ext"] = extHex; // Thread identity, for the bridge's join
   doc["to"] = appIdHex;        // which app — already public, it is an MQTT topic segment today
+  // 🔴 1.64 — the outcome CODE travels in the clear, the detail does not.
+  //
+  // Four grants failed today and the only thing anyone could observe was a
+  // sealed 154-byte blob. I spent three rounds inferring which failure it was
+  // from its LENGTH, and got it wrong at least once — exactly the guessing this
+  // project keeps paying for. A diagnostic you cannot read is not a diagnostic.
+  //
+  // This is header-class metadata, not content: it says WHICH STAGE failed, never
+  // whose credential or what value. ozkey-27 §4.4 R3 already accepts the same
+  // trade for `verb` — relays may read the routing header so they can route,
+  // rate-limit and alert; `args` stay sealed. An operator watching MQTT can now
+  // see MCU_TIMEOUT vs ENVELOPE_NOT_OPENED without holding any key.
+  if (g_uplinkCode) { doc["code"] = g_uplinkCode; g_uplinkCode = nullptr; }
   doc["envelope_hex"] = hex;   // the only part with anything in it
   String out;
   serializeJson(doc, out);
@@ -2932,10 +2959,21 @@ static bool ozUplinkSend(int slot, const String &json) {
 static void ozReportOutcome(int slot, const char *code, const String &detail) {
   notifyStatus(code);
   if (bleClientConnected) return;
+  // An envelope we could not OPEN has no identified sender, so there is no
+  // obvious key to answer with — which is precisely the case that stayed
+  // invisible and cost us two bench runs. Fall back to bond #0: the owner is
+  // who cares that a command arrived this lock could not process, and the
+  // notice carries a code and a byte count, never content. Better a report
+  // addressed to the owner than no report at all.
   if (slot < 0 || slot >= OZ_BOND_MAX || !g_bonds[slot].present) {
-    Serial.printf("[OUTCOME] %s — no bond to seal an uplink to; STAYS INVISIBLE "
-                  "off-device (%s)\n", code, detail.c_str());
-    return;
+    if (g_bonds[0].present) {
+      Serial.printf("[OUTCOME] %s — sender unidentified, reporting to owner (bond 0)\n", code);
+      slot = 0;
+    } else {
+      Serial.printf("[OUTCOME] %s — no bond at all; STAYS INVISIBLE off-device (%s)\n",
+                    code, detail.c_str());
+      return;
+    }
   }
   JsonDocument d;
   d["kind"] = "command_outcome";
@@ -2946,6 +2984,7 @@ static void ozReportOutcome(int slot, const char *code, const String &detail) {
   String out;
   serializeJson(d, out);
   Serial.printf("[OUTCOME] %s -> uplink (bond %d): %s\n", code, slot, detail.c_str());
+  g_uplinkCode = code; // surfaced in the plaintext wrapper — see ozUplinkSend()
   ozUplinkSend(slot, out);
 }
 static void ozUplinkBroadcastAdmins(const String &json) {
@@ -4662,6 +4701,61 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
 static OzCtlOpen ozControlOpen(const uint8_t *buf, size_t n, int *outSlot,
                                 uint8_t *pt, size_t ptCap, size_t *outPtLen,
                                 uint64_t *outCounter) {
+  // ── 🔴 1.65 — BARE ENVELOPE (the server path). ROOT CAUSE OF A FULL DAY. ──
+  //
+  // This function was written for the BLE `control` characteristic, where the
+  // app writes `appIdHex(64 ASCII) ‖ envelope` — the prefix is how we learn
+  // WHICH bond to derive the key from. The length gate below therefore demands
+  // 64 + OZ_ENV_MIN bytes.
+  //
+  // Nothing on the SERVER path ever carries that prefix. `Keyring._seal()`
+  // returns the bare envelope; the app prepends the app_id only at the BLE
+  // write site; `ozlockserv` relays `envelope_hex` verbatim. So a sealed
+  // command arriving over MQTT/Thread is ~62 bytes, fails `n < 101` on the
+  // first line, and is refused before a single crypto operation runs.
+  //
+  // Every remote grant this lock has ever been sent failed here. It was
+  // invisible because the refusal went to notifyStatus(), which is BLE-only,
+  // on a path that by definition has no BLE client (fixed in 1.63/1.64 — that
+  // is how we finally read the reason instead of inferring it from blob sizes).
+  //
+  // WHY TRY-ALL-BONDS RATHER THAN ADD A PREFIX OR A FIELD. Requiring the server
+  // or the app to send the app_id would work, but it means a contract change
+  // agreed across three teams to carry a value the lock can simply discover.
+  // There are at most OZ_BOND_MAX bonds; AES-GCM's tag makes a wrong key fail
+  // safely and unambiguously, so "try each" is a search, not a weakening — the
+  // authentication is identical either way. It also fixes every sealed verb on
+  // every remote transport at once, with no app release and no server release.
+  //
+  // The two forms cannot be confused: a bare envelope begins with OZ_ENV_VER
+  // (0x02), which is not a printable character and therefore can never be the
+  // first byte of a 64-char ASCII hex app_id.
+  if (n >= OZ_ENV_MIN && buf[0] == OZ_ENV_VER) {
+    char selfHex[65];
+    for (int i = 0; i < OZ_BOND_MAX; i++) {
+      if (!g_bonds[i].present) continue;
+      ozHex(g_bonds[i].pub, 32, selfHex);
+      uint8_t ps2[32], k2[32];
+      const bool have = ozBondSecret(i, ps2) &&
+                        ozEnvKey(ps2, 32, deviceId, String(selfHex), true, k2);
+      memset(ps2, 0, sizeof(ps2));
+      if (!have) { memset(k2, 0, sizeof(k2)); continue; }
+      uint64_t c2 = 0;
+      const int len2 = ozEnvOpen(k2, deviceId, buf, n, pt, ptCap, &c2);
+      memset(k2, 0, sizeof(k2));
+      if (len2 > 0) {
+        *outSlot = i;
+        *outPtLen = (size_t)len2;
+        *outCounter = c2;
+        Serial.printf("[CTL] bare envelope opened under bond %d (%.16s…)\n", i, selfHex);
+        return OZCTL_OPENED;
+      }
+    }
+    Serial.printf("[CTL] bare envelope (%u B) opened by NO bond of %d\n",
+                  (unsigned)n, ozBondCount());
+    return OZCTL_FAILED_DEFINITE;
+  }
+
   if (n < 64 + OZ_ENV_MIN) return OZCTL_FAILED_DEFINITE;
 
   char appIdHex[65];
