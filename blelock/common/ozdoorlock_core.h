@@ -808,6 +808,36 @@ void markDoorUnlocked() {
 bool fsUp = false;
 uint32_t txlogCount0 = 0, txlogCount1 = 0; // lines in /txlog.0 + /txlog.1
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ozkey-29 §11.3/§11.4 — SEQUENCE, AND ADMITTING LOSS
+//
+// The ring above already existed and already survives the network being down;
+// ozkey-29 does not need a second one (§11.3 proposed 4096 records before I had
+// read this — 10,000 is already 2.4x that, so the sizing question is closed).
+// What it lacked is the two properties an AUDIT log needs that an operational
+// one does not:
+//
+//   1. A monotonic `seq` per record, so `query_events` can be a cursor rather
+//      than "send me everything" — and so a replayed request is idempotent
+//      (ozkey-27 §4.4 R1).
+//   2. An honest statement of what was DROPPED. Rotation deletes /txlog.1
+//      outright. Until now that happened silently, so an app pulling history
+//      could not tell a complete record from one with a 5,000-event hole in it.
+//      The Sovereign Edge claim rests on the APP holding the complete history
+//      (ozkey-29 §10.5); a log that quietly forgets cannot support that, and
+//      silent loss is the exact failure class this project keeps rediscovering
+//      — a credential dropped on a bare `break`, UNLOCK_OK with no ack.
+//
+// `seq` is recovered from the last line of /txlog.0 at boot rather than being
+// counted in NVS. NVS has a write-endurance budget and door events are the
+// highest-frequency thing this device does; the number is already durably in
+// the log, so storing it twice would be both redundant and the more fragile of
+// the two copies. `dropped_before_seq` DOES go to NVS — it changes once per
+// 5,000 events, which is no wear at all.
+// ─────────────────────────────────────────────────────────────────────────────
+uint32_t g_evtSeq = 0;            // last seq WRITTEN. Next record is g_evtSeq+1.
+uint32_t g_evtDroppedBefore = 0;  // records < this are gone forever. 0 = none.
+
 // 10,000-event transaction buffer: JSONL ring across /txlog.0 (live) and
 // /txlog.1 (previous). Rotate at 5,000 lines each. Every event is captured
 // even with the network down — the upstream MQTT publish is best-effort.
@@ -824,6 +854,26 @@ uint32_t txlogCountLines(const char *path) {
 void txlogAppend(const char *result, const char *detail) {
   if (!fsUp) return;
   if (txlogCount0 >= TXLOG_ROTATE_LINES) {
+    // Rotation DESTROYS /txlog.1. Record what the app can therefore never see
+    // again, before the evidence of it is deleted along with the file.
+    if (txlogCount1) {
+      // What SURVIVES this rotation is /txlog.0's records — they become the new
+      // /txlog.1. So the oldest still-readable seq is (head - count0 + 1), and
+      // everything below it has just been deleted with the old /txlog.1.
+      //
+      // My first version subtracted txlogCount1 as well, which named the start
+      // of the file being DESTROYED rather than the start of what remains — it
+      // would have advertised 5,000 records as available immediately after
+      // erasing them. An audit log that under-reports its own loss is worse
+      // than one that keeps no log at all, because it is believed.
+      g_evtDroppedBefore =
+          (g_evtSeq > txlogCount0) ? (g_evtSeq - txlogCount0 + 1) : 1;
+      prefs.begin("blelock", false);
+      prefs.putUInt("evtdrop", g_evtDroppedBefore);
+      prefs.end();
+      Serial.printf("[EVT] rotation dropped %lu records; history now starts at seq %lu\n",
+                    (unsigned long)txlogCount1, (unsigned long)g_evtDroppedBefore);
+    }
     LittleFS.remove("/txlog.1");
     LittleFS.rename("/txlog.0", "/txlog.1");
     txlogCount1 = txlogCount0;
@@ -832,6 +882,7 @@ void txlogAppend(const char *result, const char *detail) {
   File f = LittleFS.open("/txlog.0", "a");
   if (!f) return;
   JsonDocument doc;
+  doc["seq"] = ++g_evtSeq;
   String ts = isoNow();
   if (ts.length()) doc["ts"] = ts; else doc["up_ms"] = millis();
   doc["result"] = result;
@@ -840,6 +891,39 @@ void txlogAppend(const char *result, const char *detail) {
   f.print('\n');
   f.close();
   txlogCount0++;
+}
+
+/**
+ * Recover `g_evtSeq` from the last record on flash. Called once at boot.
+ *
+ * Reading the tail rather than trusting a counter: the log IS the record, so a
+ * second copy in NVS could only ever disagree with it, and would be the copy
+ * that lied. A fresh or unreadable log restarts at 0, which is honest — the app
+ * sees seq numbers below anything it holds and can tell the lock was wiped.
+ */
+static void ozEvtSeqRestore() {
+  if (!fsUp) return;
+  prefs.begin("blelock", true);
+  g_evtDroppedBefore = prefs.getUInt("evtdrop", 0);
+  prefs.end();
+
+  const char *path = LittleFS.exists("/txlog.0") ? "/txlog.0" : "/txlog.1";
+  if (!LittleFS.exists(path)) return;
+  File f = LittleFS.open(path, "r");
+  if (!f) return;
+  // Walk back to the start of the final line rather than parsing 5,000 records.
+  const size_t sz = f.size();
+  size_t back = sz > 256 ? 256 : sz;
+  f.seek(sz - back);
+  String tail = f.readString();
+  f.close();
+  int nl = tail.lastIndexOf('\n', tail.length() - 2);
+  String last = nl >= 0 ? tail.substring(nl + 1) : tail;
+  JsonDocument doc;
+  if (deserializeJson(doc, last) == DeserializationError::Ok)
+    g_evtSeq = doc["seq"] | 0u;
+  Serial.printf("[EVT] log resumed at seq %lu (dropped_before=%lu)\n",
+                (unsigned long)g_evtSeq, (unsigned long)g_evtDroppedBefore);
 }
 
 uint32_t txlogTotal() { return txlogCount0 + txlogCount1; }
@@ -2686,6 +2770,7 @@ static bool ozThreadUdpSend(const String &payload) {
   return sent;
 }
 
+
 // Called from loop(). Cheap when idle. Only ever active on the BOOTSTRAP path —
 // a unicast send arms nothing, because the MAC is already retrying it.
 static void ozUplinkRetryTick() {
@@ -2825,6 +2910,44 @@ static bool ozUplinkSend(int slot, const String &json) {
 // Members are deliberately not told: a member learning that OTHER bonds changed
 // is not something the access model ever promises, and it would leak the roster
 // to anyone holding a temporary invite.
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 1.62 — REPORT A REFUSAL, NOT JUST A SUCCESS (ozkey-27 §12)
+//
+// `notifyStatus()` is BLE-only. A Thread lock also has no MQTT, so
+// `publishLog()` never leaves it either (ozkey-26 §5). The consequence, found
+// the hard way today: a command that arrives over the SERVER path and is
+// REFUSED produces no signal anywhere. From outside, "the lock rejected your
+// grant as a replay" and "the datagram never arrived" are the same observation
+// — silence — and we spent an afternoon unable to tell them apart.
+//
+// The uplink already exists for successes (ozkey-17 U1). Failures ride the same
+// path, sealed to the same bond, so the relay stays blind and no new mechanism
+// is invented.
+//
+// Only sent when NO BLE client is attached: with one, notifyStatus() has
+// already answered and a second copy would be noise. And only when the bond is
+// known — an envelope we could not open under any bond cannot be sealed back to
+// anyone, which is a real remaining hole and is called out in ozkey-27 §12.
+// ─────────────────────────────────────────────────────────────────────────────
+static void ozReportOutcome(int slot, const char *code, const String &detail) {
+  notifyStatus(code);
+  if (bleClientConnected) return;
+  if (slot < 0 || slot >= OZ_BOND_MAX || !g_bonds[slot].present) {
+    Serial.printf("[OUTCOME] %s — no bond to seal an uplink to; STAYS INVISIBLE "
+                  "off-device (%s)\n", code, detail.c_str());
+    return;
+  }
+  JsonDocument d;
+  d["kind"] = "command_outcome";
+  d["code"] = code;
+  if (detail.length()) d["detail"] = detail;
+  const String ts = isoNow();
+  if (ts.length()) d["ts"] = ts;
+  String out;
+  serializeJson(d, out);
+  Serial.printf("[OUTCOME] %s -> uplink (bond %d): %s\n", code, slot, detail.c_str());
+  ozUplinkSend(slot, out);
+}
 static void ozUplinkBroadcastAdmins(const String &json) {
   for (int i = 0; i < OZ_BOND_MAX; i++)
     if (g_bonds[i].present && g_bonds[i].role == OZ_ROLE_ADMIN)
@@ -4307,6 +4430,81 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
   // answered" and infer who administers which door and when — traffic
   // analysis, without decrypting anything. The app can decrypt, so it
   // correlates perfectly well from inside; no middle hop needs it.
+  // ── ozkey-29 §11.4 — query_events: pull the sealed audit backlog ──────────
+  //
+  // Deliberately shaped as a CURSOR, not "send me everything": an app that has
+  // been away for a month must not need one 10,000-record response, and a
+  // repeated request with the same `since_seq` must return the same records
+  // (ozkey-27 §4.4 R1 — idempotent verbs, so a lost reply is free to retry).
+  //
+  // `dropped_before_seq` is the honest half and the reason this verb exists at
+  // all rather than the app just reading a log. Rotation destroys 5,000 records
+  // at a time; without this the app cannot distinguish a complete history from
+  // one with a hole, and ozkey-29's whole claim is that the APP holds the
+  // complete history (§10.5). A log that quietly forgets cannot back that
+  // claim, so we state the gap rather than paper over it.
+  //
+  // The response rides the existing sealed notify path — same envelope every
+  // other reply uses — so the relay stays blind to content (ozkey-27 §4.4 R3)
+  // without any new crypto. That is §5.1's "sealed before it ever leaves".
+  if (strcmp(kind, "query_events") == 0) {
+    if (!ozQueryRateOk(slot)) { notifyStatus("QUERY_THROTTLED"); return; }
+    if (g_bonds[slot].role != OZ_ROLE_ADMIN) {
+      Serial.printf("[OZKIE] query_events is admin-only — bond %d denied\n", slot);
+      notifyStatus("QUERY_DENIED");
+      return;
+    }
+    const uint32_t sinceSeq = doc["since_seq"] | 0u;
+    JsonDocument rsp;
+    rsp["kind"] = "events_response";
+    rsp["msg_id"] = (const char *)(doc["msg_id"] | "");
+    rsp["seq_to"] = g_evtSeq;
+    // Present ONLY when records are genuinely gone. Absent means "the history
+    // you are reading is complete from since_seq" — a positive statement the
+    // app can rely on, which is only safe because rotation records the truth.
+    if (g_evtDroppedBefore) rsp["dropped_before_seq"] = g_evtDroppedBefore;
+
+    JsonArray arr = rsp["events"].to<JsonArray>();
+    uint32_t first = 0, last = 0;
+    bool truncated = false;
+    if (fsUp) {
+      for (const char *path : {"/txlog.1", "/txlog.0"}) {
+        if (truncated || !LittleFS.exists(path)) continue;
+        File f = LittleFS.open(path, "r");
+        if (!f) continue;
+        while (f.available()) {
+          String line = f.readStringUntil('\n');
+          if (!line.length()) continue;
+          JsonDocument rec;
+          if (deserializeJson(rec, line) != DeserializationError::Ok) continue;
+          const uint32_t sq = rec["seq"] | 0u;
+          if (sq <= sinceSeq) continue; // already delivered — the cursor
+          // Budget-bounded, same discipline as query_roster: a BLE notify has a
+          // finite MTU and an oversized reply is worse than a short one the app
+          // can simply ask again from.
+          if (measureJson(rsp) > OZ_QUERY_PLAINTEXT_BUDGET) { truncated = true; break; }
+          arr.add(rec);
+          if (!first) first = sq;
+          last = sq;
+        }
+        f.close();
+      }
+    }
+    if (first) rsp["seq_from"] = first;
+    if (last) rsp["seq_to"] = last;   // what THIS response actually carries
+    if (truncated) rsp["more"] = true; // ask again with since_seq = seq_to
+    rsp["seq_head"] = g_evtSeq;        // how far the lock has got overall
+
+    Serial.printf("[EVT] query_events since=%lu -> %u records (%lu..%lu)%s\n",
+                  (unsigned long)sinceSeq, arr.size(),
+                  (unsigned long)first, (unsigned long)last,
+                  truncated ? " MORE" : "");
+    String out;
+    serializeJson(rsp, out);
+    ozNotifyChunked(out);
+    return;
+  }
+
   if (strcmp(kind, "query_roster") == 0 || strcmp(kind, "query_bond_state") == 0) {
     if (!ozQueryRateOk(slot)) { notifyStatus("QUERY_THROTTLED"); return; }
     if (g_bonds[slot].role != OZ_ROLE_ADMIN) {
@@ -4434,7 +4632,8 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
     // accepted you and cannot confirm the lock stored it" — a different thing
     // for an app to show a user, and previously indistinguishable from success.
     publishLog("mcu_timeout", "OZKIE credential — MCU did not confirm");
-    notifyStatus("MCU_TIMEOUT");
+    ozReportOutcome(slot, "MCU_TIMEOUT",
+                    String("DP ") + dp + " written, MCU did not echo");
     return;
   }
 
@@ -4561,7 +4760,16 @@ static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
     Serial.printf("[CTL] counter %llu is not above bond %d's floor %llu — replay\n",
                   (unsigned long long)counter, slot,
                   (unsigned long long)g_bonds[slot].floor);
-    notifyStatus("UNLOCK_DENIED");
+    // Carry BOTH numbers. A replay refusal is indistinguishable from a lost
+    // datagram unless the sender can see that its counter is behind — and if
+    // the app has been reinstalled its counter legitimately restarts below a
+    // floor the lock still remembers, which is a recoverable condition nobody
+    // can diagnose from silence.
+    char why[80];
+    snprintf(why, sizeof(why), "counter %llu <= bond %d floor %llu (replay)",
+             (unsigned long long)counter, slot,
+             (unsigned long long)g_bonds[slot].floor);
+    ozReportOutcome(slot, "COUNTER_REPLAY", why);
     return;
   }
 
@@ -5268,6 +5476,7 @@ void setup() {
   Serial.printf("[FS] LittleFS %s\n", fsUp ? "mounted" : "FAILED — txlog disabled");
   txlogCount0 = txlogCountLines("/txlog.0");
   txlogCount1 = txlogCountLines("/txlog.1");
+  ozEvtSeqRestore(); // ozkey-29 §11.4 — resume the audit cursor across reboots
   Serial.printf("[FS] txlog %u event(s) buffered\n", (unsigned)txlogTotal());
 
   pinMode(LCD_BL, OUTPUT);
