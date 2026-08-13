@@ -198,7 +198,11 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 // "FW_DISPLAY_VERSION was stuck at V1.21 through the 1.22/1.23 bumps").
 // Editing one file's version string and flashing the other is the failure
 // mode. Change both, every time.
-#define FW_VERSION "doorlock-1.65"
+// 1.66: ensureMqtt() no longer blocks the main loop for up to ~18 s — see
+//       doorlock.ino's changelog for the full entry. The fix is entirely in
+//       common/ozdoorlock_core.h, so it lands on both boards; only this
+//       version string is per-sketch.
+#define FW_VERSION "doorlock-1.66"
 
 // ── DERIVED, not a second literal (2026-08-12) — see doorlock.ino for the
 // full reasoning. The warning above ("Change both, every time") described the

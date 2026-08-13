@@ -195,7 +195,20 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //       the epoch is what lets an app notice a missed change with no push
 //       having succeeded.  NOT ON THE BENCH BOARD YET — DoorA runs 1.31, so
 //       R1 can be measured in isolation before R5 is added.
-#define FW_VERSION "doorlock-1.65"
+// 1.66: ensureMqtt() no longer stops the door for 18 seconds at a time.
+//       Everything the lock does runs on the loop task, so a blocking broker
+//       dial freezes touch, the screen, the MCU wire pump AND the factory-
+//       reset gesture. The budget was TCP connect (3 s, NetworkClient's
+//       WIFI_CLIENT_DEF_CONN_TIMEOUT_MS) + CONNACK wait (15 s, PubSubClient's
+//       MQTT_SOCKET_TIMEOUT), re-entered every 4 s — so a Wi-Fi lock with an
+//       unreachable broker was unresponsive ~18 s out of every 22, with no
+//       physical way out because the reset button is polled in that same loop.
+//       Now: both phases bounded (2 s + 2 s), retry backs off 4 s -> 60 s, and
+//       the stall duration is printed so it can never hide again. Backoff
+//       resets on connect success, on Wi-Fi coming up, and on sleep wake.
+//       Unchanged against a reachable broker. Found while chasing the
+//       operator's "panel takes 5-10 s to answer a touch".
+#define FW_VERSION "doorlock-1.66"
 
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ────────
 //

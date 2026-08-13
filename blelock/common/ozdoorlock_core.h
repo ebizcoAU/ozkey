@@ -657,9 +657,23 @@ static volatile bool ctlNewBytes = false;
 static portMUX_TYPE ctlMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Networking
+// ── Blocking budget for a broker dial (2026-08-13) ──────────────────────────
+// Every one of these is time the MAIN LOOP is stopped dead — see ensureMqtt().
+// TCP connect is bounded by NetworkClient's own default (3000 ms,
+// WIFI_CLIENT_DEF_CONN_TIMEOUT_MS); we tighten it, and tighten PubSubClient's
+// CONNACK wait from its 15 s default (MQTT_SOCKET_TIMEOUT) to match.
+#define OZ_MQTT_TCP_TIMEOUT_MS 2000UL
+#define OZ_MQTT_CONNACK_TIMEOUT_S 2
+#define OZ_MQTT_RETRY_MIN_MS 4000UL
+#define OZ_MQTT_RETRY_MAX_MS 60000UL
 WiFiClient wifiTcp;
 PubSubClient mqtt(wifiTcp);
 unsigned long lastHeartbeat = 0, lastMqttAttempt = 0, wifiJoinStart = 0;
+// ── MQTT reconnect backoff (2026-08-13) ─────────────────────────────────────
+// A flat 4 s retry against an unreachable broker meant the lock re-entered a
+// BLOCKING connect every 4 s, forever. See ensureMqtt() for the full reasoning
+// — this is the interval, and it doubles on each failure instead.
+unsigned long mqttRetryMs = OZ_MQTT_RETRY_MIN_MS;
 unsigned long lastThreadBeaconAt = 0; // ozkey-20 R3 — Thread presence beacon
 unsigned long lastEnrollSent = 0;
 uint8_t enrollAttempts = 0;
@@ -3160,16 +3174,44 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   forwardHexToMcu(String(hex));
 }
 
+// 🔴 THIS FUNCTION BLOCKS THE MAIN LOOP. Everything the lock does — touch
+// polling, screen repaint, tuyaWirePump(), and checkFactoryResetButton() —
+// runs on this same task, so every millisecond spent inside mqtt.connect() is
+// a millisecond the door is unresponsive to the person standing at it.
+//
+// Until 1.66 the budget was: TCP connect (3 s, NetworkClient default) +
+// CONNACK wait (15 s, PubSubClient's MQTT_SOCKET_TIMEOUT) — up to ~18 s dead,
+// re-entered every 4 s. A Wi-Fi lock whose broker was unreachable was a brick
+// for roughly 18 s out of every 22, INCLUDING the factory-reset gesture that
+// is the only physical way out of a bad config. The operator saw this as a
+// panel that ignored touches for 5-10 s.
+//
+// Three changes, none of which alter behaviour against a reachable broker:
+//   1. bound both phases (2 s + 2 s) — worst case ~4 s, not ~18 s;
+//   2. back off 4 s -> 60 s so a broker that is DOWN is dialled rarely
+//      rather than relentlessly;
+//   3. say how long the stall actually was, because a blocking call nobody
+//      measures is how this survived since the MQTT path was written.
+//
+// The honest fix is a non-blocking connect on its own task; PubSubClient's API
+// is synchronous, so that is a bigger change than this one. This caps the
+// damage — it does not make the loop hard-real-time.
 void ensureMqtt() {
   if (mqtt.connected()) { mqtt.loop(); return; }
   if (WiFi.status() != WL_CONNECTED) return;
-  if (millis() - lastMqttAttempt < 4000) return;
+  if (millis() - lastMqttAttempt < mqttRetryMs) return;
   lastMqttAttempt = millis();
   if (state == ST_JOINING) { joinLine2 = "Server: connecting..."; screenDirty = true; notifyStatus("BROKER_JOINING"); }
   Serial.printf("[MQTT] connecting %s:%u as %s\n", cfgBrokerHost.c_str(), cfgBrokerPort, deviceId.c_str());
   mqtt.setServer(cfgBrokerHost.c_str(), cfgBrokerPort);
   mqtt.setBufferSize(1024);
   mqtt.setCallback(onMqttMessage);
+  // Both timeouts set on EVERY attempt, not once at boot: PubSubClient and
+  // NetworkClient each own their value, and a reconnect after a WiFi bounce
+  // can hand us a fresh socket. Cheap, and it cannot silently revert.
+  wifiTcp.setConnectionTimeout(OZ_MQTT_TCP_TIMEOUT_MS);
+  mqtt.setSocketTimeout(OZ_MQTT_CONNACK_TIMEOUT_S);
+  const unsigned long dialStart = millis();
   // ── 🔴 PRESENT THE BROKER CREDENTIALS (1.57) ────────────────────────────
   //
   // Until 1.57 this was a bare mqtt.connect(deviceId) — client id only, no
@@ -3201,7 +3243,14 @@ void ensureMqtt() {
     // device that breaks the moment ACLs land, so say so out loud.
     Serial.println("[MQTT] no broker credentials stored — connecting anonymously");
   }
+  // The number that matters for the DOOR is not whether the connect succeeded,
+  // it is how long the person outside could not make the panel respond.
+  const unsigned long dialMs = millis() - dialStart;
+  if (dialMs > 250)
+    Serial.printf("[MQTT] dial blocked the main loop for %lums (ok=%d)\n",
+                  dialMs, ok ? 1 : 0);
   if (ok) {
+    mqttRetryMs = OZ_MQTT_RETRY_MIN_MS; // reachable — dial promptly next time
     lastActivityAt = millis();
     mqtt.subscribe(topicCommand.c_str(), 1);
     if (topicCommandLegacy.length()) mqtt.subscribe(topicCommandLegacy.c_str(), 1); // S16
@@ -3222,10 +3271,19 @@ void ensureMqtt() {
     } else {
       publishHeartbeat(); // flush any queued grants fast after reconnect
     }
-  } else if (state == ST_JOINING) {
-    notifyStatus("BROKER_FAIL");
-    joinLine2 = "Server: KHONG TOI DUOC";
-    screenDirty = true;
+  } else {
+    // Backoff doubles on EVERY failure, not just during ST_JOINING — an
+    // operational lock that loses its broker is exactly the one that must not
+    // spend the rest of its life re-entering a blocking connect.
+    mqttRetryMs *= 2;
+    if (mqttRetryMs > OZ_MQTT_RETRY_MAX_MS) mqttRetryMs = OZ_MQTT_RETRY_MAX_MS;
+    Serial.printf("[MQTT] connect failed (rc=%d) — next attempt in %lus\n",
+                  mqtt.state(), mqttRetryMs / 1000);
+    if (state == ST_JOINING) {
+      notifyStatus("BROKER_FAIL");
+      joinLine2 = "Server: KHONG TOI DUOC";
+      screenDirty = true;
+    }
   }
 }
 
@@ -5521,6 +5579,10 @@ void enterKeepAliveSleep() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
   lastMqttAttempt = 0; // dial the broker on the next loop pass
+  // ...and dial it NOW, not on whatever backoff the pre-nap failures had grown
+  // to. Waking from sleep is a fresh network situation: the radio was off, so
+  // the last failure said nothing about whether the broker is reachable today.
+  mqttRetryMs = OZ_MQTT_RETRY_MIN_MS;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5757,6 +5819,11 @@ void loop() {
       }
       screenDirty = true; // dashboard NET indicator
       Serial.printf("[WiFi] up, IP %s\n", WiFi.localIP().toString().c_str());
+      // Fresh link, fresh chance: earlier broker failures were very likely
+      // "no network" wearing a broker failure's clothes, so do not make the
+      // lock serve out a 60 s backoff it earned while it had no IP at all.
+      mqttRetryMs = OZ_MQTT_RETRY_MIN_MS;
+      lastMqttAttempt = 0;
     }
   }
   if (!isThread() && state == ST_JOINING && ws != WL_CONNECTED && provisioned &&
