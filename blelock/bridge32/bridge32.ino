@@ -179,7 +179,7 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.37"
+#define FW_VERSION "bridge32-1.38"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -211,6 +211,14 @@ enum BridgeState { ST_ADVERTISING, ST_WIFI_JOINING, ST_THREAD_FORMING, ST_OPERAT
 BridgeState state = ST_ADVERTISING;
 
 Preferences prefs; // namespace "bridge32"
+
+// 1.38 clock persistence — declared here because the MQTT handler uses them
+// well before their definitions further down. See the block above
+// ozBridgeClockPersist() for why a bridge that forgets its clock strands every
+// Thread lock behind it.
+static bool g_utcFromServer = false; // has ozlockserv pushed utc THIS boot?
+static void ozBridgeClockPersist(bool force);
+static void ozBridgeClockRestore();
 String cfgSsid, cfgPass;
 String cfgMode, cfgBrokerHost, cfgSiteId; // F1: parsed from provision JSON
 uint16_t cfgBrokerPort = 0;
@@ -799,8 +807,15 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   if (utcIn >= OZ_TIME_FLOOR) {
     struct timeval tv = { .tv_sec = (time_t)utcIn, .tv_usec = 0 };
     settimeofday(&tv, nullptr);
-    Serial.printf("[TIME] utc=%lu accepted from server/bench over MQTT\n",
-                  (unsigned long)utcIn);
+    const bool firstReal = !g_utcFromServer;
+    g_utcFromServer = true; // a REAL source spoke — see the provenance note
+    Serial.printf("[TIME] utc=%lu accepted from server/bench over MQTT%s\n",
+                  (unsigned long)utcIn,
+                  firstReal ? " (first real sync this boot)" : "");
+    // Force the write on the first genuine sync rather than waiting out the
+    // hourly throttle: a reboot in the next hour would otherwise fall back to
+    // whatever stale value we booted with.
+    ozBridgeClockPersist(firstReal);
     // Push it straight out rather than waiting up to 24 h for the next beacon.
     sendTimeBeacon();
   }
@@ -1617,10 +1632,68 @@ static unsigned long lastTimeBeaconAt = 0;
 // nobody talks to. See the drift caveat in ozdoorlock_core.h's MCU_TIME_PUSH_MS.
 #define OZ_TIME_BEACON_MS 86400000UL
 
-/* Our current UTC, or 0 if NTP has not answered yet. 0 means "do not stamp". */
+/* Our current UTC, or 0 if nothing has set it yet. 0 means "do not stamp". */
 static uint32_t ozBridgeUtc() {
   time_t now = time(nullptr);
   return ((uint32_t)now >= OZ_TIME_FLOOR) ? (uint32_t)now : 0;
+}
+
+// ── 1.38 — THE BRIDGE KEEPS ITS CLOCK ACROSS A REBOOT ───────────────────────
+//
+// Until now the bridge stored nothing: ozBridgeUtc() returned 0 until the
+// server pushed `utc`, and 0 means "do not stamp" and "do not beacon". So a
+// bridge that rebooted while ozlockserv was unreachable left EVERY THREAD LOCK
+// BEHIND IT WITH NO TIME SOURCE AT ALL — the locks' only supply is this
+// bridge's beacon.
+//
+// The standing rationale was "if the bridge cannot reach our server there is no
+// product anyway". That is true of remote unlock and grants. It is NOT true of
+// the case that matters here: temporary PINs already stored on a lock keep
+// working through a server outage — that is the point of storing them — and
+// local expiry enforcement is exactly what needs a clock. A server outage is
+// therefore the moment a lock is MOST dependent on its own clock, and it was
+// also the one moment we guaranteed it could not have one.
+//
+// Same shape as the lock's proven pair (ozdoorlock_core.h ozClockPersist/
+// ozClockRestore): write at most hourly to spare flash endurance, restore
+// through the same floor check on boot.
+#define OZ_BRIDGE_CLOCK_PERSIST_MS 3600000UL
+
+// 🔴 PROVENANCE, and it is NOT optional decoration.
+//
+// doorlock-1.74 distinguishes a clock a real source gave it (`clock=live`) from
+// one restored out of NVS (`clock=NVS-only`), and keeps ASKING while it only
+// has the latter. That distinction is the entire fix for the battery-change
+// case. If this bridge restored a stale clock and then beaconed it as though it
+// were a fresh server sync, every lock downstream would mark itself `live` on
+// the strength of our guess and stop asking — silently undoing that work and
+// making the fleet's clocks look trustworthy precisely when they are not.
+//
+// So the beacon says where its time came from, and a restored value is labelled
+// as such. Locks apply it (better than nothing) but keep asking for a real one.
+static void ozBridgeClockPersist(bool force) {
+  static unsigned long lastWrite = 0;
+  const uint32_t now = ozBridgeUtc();
+  if (!now) return;
+  if (!force && lastWrite && millis() - lastWrite < OZ_BRIDGE_CLOCK_PERSIST_MS)
+    return;
+  lastWrite = millis();
+  prefs.begin("bridge32", false);
+  prefs.putUInt("utclast", now);
+  prefs.end();
+}
+
+static void ozBridgeClockRestore() {
+  prefs.begin("bridge32", true);
+  const uint32_t saved = prefs.getUInt("utclast", 0);
+  prefs.end();
+  if (saved < OZ_TIME_FLOOR) return;
+  struct timeval tv = { .tv_sec = (time_t)saved, .tv_usec = 0 };
+  settimeofday(&tv, nullptr);
+  Serial.printf("[TIME] clock restored from NVS: %lu — a GUESS (stale by up to "
+                "1 h plus however long we were off). Locks are told utc_src=nvs "
+                "so they keep asking for a real one.\n",
+                (unsigned long)saved);
 }
 
 
@@ -1679,6 +1752,10 @@ static bool sendTimeBeacon() {
   doc["target"] = "*";
   doc["kind"] = "time";
   doc["utc"] = utc;
+  // 1.38: "server" = ozlockserv pushed this to us; "nvs" = we restored it and
+  // have not heard from the server since booting. doorlock-1.74 treats the
+  // latter as NOT a confirmation and keeps its need_time flag raised.
+  doc["utc_src"] = g_utcFromServer ? "server" : "nvs";
   // Locks have no other way to learn the timezone — they are never paired with
   // a phone directly on Thread, the bridge is. Carried on every beacon rather
   // than once, so a lock that joins later still gets it without a special case.
@@ -2379,6 +2456,11 @@ void setup() {
   Serial.println("\n*** OZBRIDGE Thread border router bootstrap ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
 
+  // 1.38: before anything else that might stamp or beacon. A restored clock is
+  // a guess, but a guess beats 0 — 0 means every Thread lock behind this bridge
+  // gets no time at all until ozlockserv is reachable again.
+  ozBridgeClockRestore();
+
   // EVENT-LOOP RACE FIX (2026-07-27, live bench): OThread.cpp's worker task
   // calls esp_event_loop_create_default() with a strict `!= ESP_OK` check —
   // it does NOT tolerate ESP_ERR_INVALID_STATE ("already created"), unlike
@@ -2459,6 +2541,10 @@ void setup() {
 
 void loop() {
   checkFactoryResetButton();
+
+  // 1.38: keep the on-flash copy fresh. Self-throttled to hourly inside, so
+  // calling it every iteration costs a millis() compare.
+  ozBridgeClockPersist(false);
 
   // ── ozkey-20 R2 — periodic liveness sweep ──────────────────────────────
   //

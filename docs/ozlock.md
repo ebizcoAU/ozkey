@@ -21,6 +21,7 @@ evidence of development.
 |---|---|---|---|
 | 2.0 | 2026-08-08 | Initial "pure relay" specification | Vince Phan |
 | 2.1 | 2026-08-10 | Status register added. Three claims corrected against the live implementation: plaintext `log` topic (§3.1), Sleepy End Device / battery (§1), internal contradiction on log storage (§3) | ozkey firmware review |
+| 2.2 | 2026-08-14 | **Transport Reference Model added (§3A)** — how bytes actually move, as distinct from what the server may read. Records the BLE path as first-class, the bridge-publishes-for-Thread-locks fact, the REST/MQTT boundary, measured end-to-end latencies, and the clock-distribution asymmetry (Wi-Fi locks currently have no time source) | ozkey firmware |
 
 ### Claim verification status
 
@@ -207,6 +208,107 @@ Server role	Relays envelope_hex verbatim, never decrypts, never parses
 Lock verification	Opens envelope with its stored bond key, checks counter, executes frame
 App verification	Opens lock→app envelopes for logs, confirms integrity
 The server never holds the keys. It cannot read the payload even if it wanted to. A subpoena, a breach, or a rogue employee yields nothing but meaningless ciphertext.
+
+3A. Transport Reference Model (added rev 2.2, 2026-08-14)
+The diagram in §3 answers *what the server may read*. This section answers *how
+bytes actually move*, which is a different question and has been re-derived from
+scratch in enough design discussions to be worth writing down once. Everything
+below was measured on the bench on 2026-08-14 unless marked otherwise.
+
+The three paths
+
+```
+THREAD LOCK  (OZLOCK Premium)
+  Tuya DL MCU --UART--> ESP32 module --Thread/802.15.4--> BRIDGE --MQTT--> broker --> ozlockserv --REST--> BANOI
+                             ^
+                             '------------------ BLE (direct, no server, no network) -----------------'
+
+WI-FI LOCK   (OZLOCK Economy)
+  Tuya DL MCU --UART--> ESP32 module --------Wi-Fi/MQTT--------> broker --> ozlockserv --REST--> BANOI
+                             ^
+                             '------------------ BLE (direct, no server, no network) -----------------'
+```
+
+Seven things this model makes explicit that the encryption diagram does not
+
+1. **The last hop is REST, not MQTT.** The app speaks HTTP to `ozlockserv`
+   (`/locks/:id/unlock`, `/locks/:id/settings`, `/auth/token`). Only *devices*
+   speak MQTT. Confusing the two leads to proposals that route app traffic
+   through the broker, which is not how any of this works.
+
+2. **The broker and `ozlockserv` are separate systems.** Mosquitto is a dumb
+   pipe; `ozlockserv` is the directory, queue and REST surface that bridges the
+   MQTT world to the app's world. "The server" in casual conversation almost
+   always means `ozlockserv`.
+
+3. **A Thread lock has no MQTT session of its own — the bridge publishes on its
+   behalf.** This is the single most misleading part of the wire. A message on
+   `ozkie/<site>/locks/<lock-id>/heartbeat` is *named for the lock* but was
+   published by the **bridge**, which republished the lock's Thread presence
+   beacon verbatim. The lock itself has never held an MQTT connection. This is
+   why Thread locks reported no liveness at all until ozkey-20 R3, and why
+   MQTT-shaped code paths silently do nothing for the primary topology.
+
+4. **BLE is first-class, not a fallback.** It carries provisioning, unlock at
+   the door, member enrolment, bond revoke and rename, and it is the only path
+   that works with **no server and no network**. A provisioned lock is
+   deliberately not discoverable except during a 60 s window opened by a
+   physical gesture (XF-52), so "the app cannot see the lock" is usually the
+   design working, not a fault.
+
+5. **The sealed envelope is end-to-end app-to-lock; every hop between is a
+   courier.** `ozlockserv` queues `envelope_hex` without parsing it and the
+   bridge relays it without decoding it. This is why the server needed *no*
+   knowledge of the `set_name` verb to carry it — only a route. It is the
+   mechanism behind claims C1/C2 in the status register.
+
+6. **The lock is a co-processor, not the whole lock.** Our ESP32 sits beside a
+   Tuya DL MCU on a UART. Keypad, RFID and the physical bolt belong to the MCU;
+   we own radio, crypto, bonds and policy. Credential writes cross that UART as
+   DP frames.
+
+7. **Transport is inferred from the provision payload's shape, not declared.**
+   `network_key` empty + `ssid` present means permanently Wi-Fi. The app never
+   states what kind of lock it is commissioning.
+
+Measured end-to-end latency, 2026-08-14
+
+| Path | Measured |
+|---|---|
+| Remote command: app REST -> queue -> broker -> bridge -> Thread UDP -> applied on lock | **~1 s** (`set_name`, POST 20:52:22 -> applied 20:52:23) |
+| BLE command at the door | sub-second, no server involved |
+| Lock state change -> visible in cloud (heartbeat reconciliation) | within one `heartbeat_s` interval (60 s bench) |
+
+Clock distribution — an asymmetry this model exposes
+
+The three roles get time by completely different means, which is invisible
+unless the transports are drawn out:
+
+| Role | Time source | Worst-case staleness |
+|---|---|---|
+| **Bridge** | `ozlockserv` pushes `utc` on the bridge's command topic — on connect, then every 10 min | ~10 min. NTP was deliberately **removed** (bridge32-1.36): two unarbitrated writers, and UDP 123 is blocked on this network and on most hotel/office networks |
+| **Thread lock** | The bridge's time beacon — daily, plus opportunistically whenever a child attaches | Up to 24 h if a multicast beacon is lost |
+| **Wi-Fi lock** | ⚠️ **Nothing.** Its only sync was SNTP, which cannot answer here | Unbounded — runs on an NVS snapshot |
+
+Two consequences worth carrying into any design discussion:
+
+- **A restored clock is a guess, not a synchronisation.** `doorlock-1.74` now
+  distinguishes them (`clock=live` / `NVS-only` / `UNKNOWN`) and asks for the
+  time until a real source answers. Before that, a lock that booted from a stale
+  snapshot believed it knew the time and never asked. The severe case is a
+  **battery change**: NVS is flash, so a unit that sat in a box for weeks boots
+  believing it is weeks ago — and temporary-credential expiry is judged against
+  that clock, failing *permissive*.
+- **The bridge does not persist its clock.** Bridge reboot while `ozlockserv` is
+  unreachable leaves every Thread lock behind it with no time source at all. The
+  standing rationale is "no server, no product", but that is not true here:
+  stored PINs keep working offline, which is precisely when local expiry needs a
+  clock. **Open — operator decision.**
+
+Status of this model: paths, latencies and the bridge-republish behaviour are
+hardware-verified. The Wi-Fi clock gap is verified and **open** — the fix
+(a site-wide retained `ozkie/<site>/time` topic) is specified in `ozkey-32` §9
+and not yet built.
 
 4. What This Means for the Owner
 Promise	How It's Kept

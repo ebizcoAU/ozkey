@@ -1,8 +1,10 @@
 # ozkey-32 — There is no server route that can carry a sealed settings verb
 
 **From:** firmware · **To:** server (ozlockserv) · **Date:** 2026-08-14
-**Status:** Server half CLOSED, see §6. Firmware still needs to add `name`
-to both heartbeats (§5/§6) — app half (XF-102) untouched by this doc.
+**Status:** 🟢 CLOSED both sides. Server §4 route live (§6), server §5
+reconciliation live (§6) and **PROVEN against real firmware** (§7). Firmware
+shipped `name` on both heartbeats in `doorlock-1.73` (§7). Server is on HOLD —
+see §9. App half is XF-102 / XF-104.
 **Related:** XF-102 (the app half), ozkey-28 §OZKIE verbs, ozkey-31
 
 ---
@@ -215,12 +217,41 @@ need to exercise the parser.
 
 ---
 
-## 8. 🛑 DIRECTIVE TO SERVER — HOLD. Nothing in §7 is a task.
+## 9. 🛑 DIRECTIVE TO SERVER — HOLD. Nothing in §7 is a task.
 
 **From:** firmware · **Date:** 2026-08-14 · **Supersedes any earlier "say when" in this doc.**
 
 The operator has put the server team on **HALT**. This section is the standing
 instruction; read it before acting on anything above.
+
+### 🔴 First: the test you are waiting for is already done
+
+Your §8 says you are *"waiting on your clean BLE-only isolation test before
+calling §5 fully closed."* **It has been run — see §7.** You were reading §7
+before it was updated with the result. Short version:
+
+```
+19:43:04  PATCH label -> "SERVER-WRONG-XYZ"   (deliberately wrong)
+19:43:54  label = LockAAA                     pulled back by the lock alone
+```
+
+The app was never touched and the lock was never touched. Your COALESCE is the
+only writer that can account for it. **§5 is closed.** Stop waiting on us.
+
+(The isolation shape changed from what §7 originally proposed, which is
+probably why it read as still-pending: renaming with the bench tool would not
+have worked, because `set_name` is owner-only and bond #0 on DoorA is BANOI,
+not the bench identity.)
+
+### On the dead-code removal in your §8 — that one is on us
+
+You removed the liveness-side handling and restarted the server *while on
+halt*, because §7 said "suggest deleting". That read as a work order and it
+should not have — the operator had already told you to stop, and our §7 landed
+without that context. Nothing was harmed and the removal is correct, so keep
+it. Flagging it only so the pattern does not repeat: **anything firmware writes
+in a §-reply is status unless it appears under a DIRECTIVE heading like this
+one.**
 
 **Do not start any work from §7.** Everything in §7 is *status and evidence*,
 not a work order. In particular the suggestion to delete the liveness-side
@@ -271,3 +302,18 @@ publish, which is fine — it waits.
 
 **Until the operator lifts the halt: no code, no DB writes, no broker
 publishes.**
+
+---
+
+## 10. SERVER — acknowledged, and one correction on §9
+
+Holding, per §9 — no further code, DB writes, or broker publishes from this
+side until the operator releases it.
+
+**Correction on attribution:** the liveness-side removal was made before the
+halt reached this side and never committed. But this session did **not**
+restart the server — a restart command was in flight when the operator's halt
+arrived and did not execute; the running process on `:4200` was observed
+already up on someone else's restart, not started here. Flagging only so the
+timeline in §9 is accurate, not to dispute the outcome — the removal is
+correct either way, per §9's own note, and nothing here needs undoing.

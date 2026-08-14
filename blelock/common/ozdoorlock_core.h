@@ -130,7 +130,7 @@ void openBleWindow(const char *gesture);
 void pollThreadUdp();
 void publishEnroll();
 void publishHeartbeat();
-void publishLog(const char *result, const char *detail);
+void publishLog(const char *result, const char *detail, int actorSlot = -1);
 void publishUnpairedAnnounce();
 void saveConfig();
 void setup();
@@ -138,7 +138,11 @@ void startBle();
 void threadUdpBegin();
 void tuyaWirePump();
 void tuyaWireSend(const uint8_t *f, size_t n);
-void txlogAppend(const char *result, const char *detail);
+void txlogAppend(const char *result, const char *detail, int actorSlot = -1);
+static void ozEvtPush(const char *verb, const char *result, const char *detail,
+                      int actorSlot, uint32_t seq); // realtime push, defined below
+extern bool g_clockLive;   // 1.74 clock provenance — defined with the clock code
+static bool ozUplinkSend(int slot, const String &json); // defined below ozEvtPush's caller
 
 // ── Pins, palette, TUYA UART pins, SRDY/MRDY, `bus`/`gfx` — all board-specific,
 // defined by the per-board .ino before #include "../common/ozdoorlock_core.h" ──
@@ -868,7 +872,42 @@ uint32_t txlogCountLines(const char *path) {
   return n;
 }
 
-void txlogAppend(const char *result, const char *detail) {
+// ── ozkey-29 §11.2 / ozkey-28 §3.4 — records are OZKIE `event.*` VERBS ──────
+//
+// The log used to store {seq, ts, result, detail} — free text. Not DP frames,
+// so it never had the catalogue-dependence trap §11.2 warns about, but not a
+// schema either: the app could render it only as a string, and could not
+// filter, group or reason about it. §11.2's requirement is a STABLE verb, and
+// the point of that stability is that it survives phase 0, when every source DP
+// number changes (our DP 8 is invented; a real access event arrives on
+// 61/63/64/69/72/73/76 by credential class). Translating at the boundary means
+// the log never learns a DP number at all.
+//
+// The mapping below is deliberately total: every existing publishLog() call
+// site is accounted for, and anything unrecognised becomes `event.device`
+// rather than being dropped or silently mislabelled. An audit log that
+// discards what it does not understand is the same silent-loss failure
+// dropped_before_seq exists to prevent, one level down.
+static const char *ozEvtVerbFor(const char *result) {
+  if (!result) return "event.device";
+  // Access outcomes — the MCU's DP 8 today, the 61/63/64/... family after
+  // phase 0. Same verb either way, which is the entire point.
+  if (!strcmp(result, "granted") || !strcmp(result, "denied") ||
+      !strcmp(result, "expired"))
+    return "event.access";
+  if (!strcmp(result, "battery_alarm")) return "event.battery";
+  // Roster changes are in-lock facts, not door events, but they belong in the
+  // audit trail: "who was allowed to open this door, and when did that change"
+  // is exactly the question an owner asks of a log.
+  if (!strcmp(result, "bond_revoked") || !strcmp(result, "bond_expired") ||
+      !strcmp(result, "invite_cancelled") || !strcmp(result, "bonds_listed"))
+    return "event.roster";
+  // mcu_timeout / dp_unclassified are health, not access. Kept because they are
+  // how a lock reports that it could NOT do what it was asked — see ozkey-28 §4.
+  return "event.device";
+}
+
+void txlogAppend(const char *result, const char *detail, int actorSlot) {
   if (!fsUp) return;
   if (txlogCount0 >= TXLOG_ROTATE_LINES) {
     // Rotation DESTROYS /txlog.1. Record what the app can therefore never see
@@ -900,14 +939,27 @@ void txlogAppend(const char *result, const char *detail) {
   if (!f) return;
   JsonDocument doc;
   doc["seq"] = ++g_evtSeq;
+  doc["kind"] = ozEvtVerbFor(result);   // §11.2 — the stable verb, not a DP
   String ts = isoNow();
   if (ts.length()) doc["ts"] = ts; else doc["up_ms"] = millis();
+  // ozkey-28 §3.4 asks event.access to carry a time_basis so the app never
+  // treats a guessed clock as authoritative. We have exactly that distinction
+  // now (1.74 g_clockLive), so state it rather than let the app infer it from
+  // whether `ts` happens to be present: 2 = a real sync, 1 = device-local
+  // guess restored from NVS, 0 = no clock at all.
+  doc["time_basis"] = !ozClockKnown(ozclock) ? 0 : (g_clockLive ? 2 : 1);
   doc["result"] = result;
   doc["detail"] = detail;
   serializeJson(doc, f);
   f.print('\n');
   f.close();
   txlogCount0++;
+
+  // Written to flash FIRST, then pushed. If the radio is down the record still
+  // exists and the app collects it later via query_events; if we pushed first
+  // and then failed to persist, the owner would see a notification for an event
+  // with no audit trail behind it.
+  ozEvtPush(doc["kind"], result, detail, actorSlot, g_evtSeq);
 }
 
 /**
@@ -1722,7 +1774,7 @@ void ozClockPersist(bool force) {
 //
 // So: track PROVENANCE, not just presence. g_clockLive is true only once a real
 // source has spoken THIS BOOT.
-bool g_clockLive = false;
+bool g_clockLive = false; // declared extern up top for txlogAppend/ozEvtPush
 
 // Harvest `utc`/`tz` out of any inbound message, from any transport.
 //
@@ -1757,6 +1809,35 @@ void ozHarvestTime(JsonDocument &doc, const char *from) {
   const bool wasKnown = ozClockKnown(ozclock);
   const bool wasLive = g_clockLive;
   if (!ozClockSet(ozclock, utcIn, millis())) return;
+
+  // ── 1.75 — IS THE SENDER PASSING ON A SYNC, OR ITS OWN GUESS? ────────────
+  //
+  // bridge32-1.38 persists its clock across a reboot, which closes a real hole:
+  // a bridge that rebooted while ozlockserv was unreachable used to leave every
+  // Thread lock behind it with NO time source at all, since this beacon is
+  // their only supply.
+  //
+  // But it means the bridge can now beacon a time it RESTORED rather than one
+  // the server gave it. If we treated that as a confirmation, every lock
+  // downstream would flip to clock=live on the strength of the bridge's guess
+  // and stop asking — which is exactly the failure 1.74 exists to prevent,
+  // reintroduced one hop upstream where it is harder to see.
+  //
+  // So the beacon states its provenance and we believe only "server".
+  // ABSENT = trusted: a bridge32-1.37 or earlier only ever sent real syncs, so
+  // omitting the field must keep meaning what it always meant.
+  const char *src = doc["utc_src"] | "server";
+  if (strcmp(src, "nvs") == 0) {
+    // Applied anyway — a stale clock beats no clock, and ozClockSet()'s
+    // monotonic-forward rule means it can only ever move us forward. We simply
+    // do not call it a sync, so need_time stays raised and the next real source
+    // still gets asked for.
+    if (!wasKnown)
+      Serial.printf("[TIME] %s passed on a RESTORED clock (utc_src=nvs): %lu — "
+                    "applied, still asking for a real sync\n",
+                    from, (unsigned long)utcIn);
+    return;
+  }
 
   // A real source spoke. This is what stops need_time being asked forever, and
   // it is deliberately set even when the clock was already "known" — that is the
@@ -2158,8 +2239,8 @@ void tuyaWirePump() {
 // ─────────────────────────────────────────────────────────────────────────────
 // MQTT wire (blelock-identical topics; ozlockserv/ozkeyserv untouched)
 // ─────────────────────────────────────────────────────────────────────────────
-void publishLog(const char *result, const char *detail) {
-  txlogAppend(result, detail); // transaction buffer first — works offline
+void publishLog(const char *result, const char *detail, int actorSlot) {
+  txlogAppend(result, detail, actorSlot); // transaction buffer first — works offline
   if (!mqtt.connected()) return;
   JsonDocument doc;
   doc["device_id"] = deviceId;
@@ -2935,6 +3016,64 @@ static void ozUplinkRetryTick() {
   }
 }
 
+// ── REAL-TIME EVENT PUSH — the owner learns NOW, not next time they visit ───
+// (operator, 2026-08-15: "I am the doorlock owner, I need to know who open my
+//  door in realtime ... guest who got invited thru digital passport, open the
+//  door, I should know — that is a beauty of network doorlock.")
+//
+// The BLE pull (query_events) answers "what happened while I was away". It
+// cannot answer "someone is at my door right now", because it requires the
+// owner to be standing at the lock. So every real event is ALSO pushed the
+// moment it happens, over whatever uplink this lock has — MQTT for Wi-Fi,
+// Thread UDP via the bridge otherwise.
+//
+// Sealed to bond #0 with the lock->app key, so ozlockserv relays a notification
+// it cannot read. That is the difference between this and every competitor: the
+// owner gets the push, the cloud gets ciphertext.
+//
+// COMPACT ON PURPOSE. This rides a 152-byte-class datagram on a shared mesh
+// (ozkey-20 §4.1 — airtime is the cost that matters), and it is a notification,
+// not the record. The record is the log; if the owner wants detail they pull it.
+//
+// 🔴 WHAT WE HONESTLY KNOW ABOUT *WHO*. When the unlock came through us we have
+// the bond slot, so "owner" / "member" is a fact. When it came from the MCU —
+// a PIN or card typed at the keypad — DP 8 carries a result byte and NOTHING
+// ELSE: no credential id, no slot. So we say `actor:"keypad"`, which is true,
+// rather than guessing. The real supplier catalogue does carry `cred_id` on
+// 61/63/64/69/72/73/76 (ozkey-28 §3.4), so "which guest's PIN" becomes
+// answerable at phase 0 — and not before. Claiming it now would be inventing
+// evidence about who entered someone's home.
+static void ozEvtPush(const char *verb, const char *result, const char *detail,
+                      int actorSlot, uint32_t seq) {
+  // event.device is health noise (mcu_timeout, dp_unclassified) — real, kept in
+  // the log, but not something to buzz a phone about at 3am.
+  if (!strcmp(verb, "event.device")) return;
+  if (!ozBond0Present()) return; // nobody to tell
+
+  JsonDocument ev;
+  ev["kind"] = verb;
+  ev["seq"] = seq;
+  ev["result"] = result;
+  ev["actor"] = (actorSlot == 0)   ? "owner"
+                : (actorSlot > 0)  ? "member"
+                                   : "keypad"; // MCU-sourced: identity unknown
+  if (actorSlot > 0) ev["bond"] = actorSlot;
+  if (detail && *detail) ev["method"] = detail;
+  const uint32_t now = ozClockNow(ozclock, millis());
+  if (now) ev["at"] = now;
+  // Same three-state honesty as the log record: 2 = real sync, 1 = restored
+  // guess, 0 = no clock. An owner deciding whether an entry at "3am" matters
+  // should know whether the lock actually knew what time it was.
+  ev["time_basis"] = !ozClockKnown(ozclock) ? 0 : (g_clockLive ? 2 : 1);
+
+  String out;
+  serializeJson(ev, out);
+  const bool sent = ozUplinkSend(0, out);
+  Serial.printf("[EVT] push %s seq=%lu actor=%s -> %s\n", verb,
+                (unsigned long)seq, (const char *)ev["actor"],
+                sent ? "uplink" : "NO UPLINK (buffered in log only)");
+}
+
 // Seal [json] to the bond in [slot] and emit it on whatever transport this lock
 // has. Returns true only if it actually went out — a caller that needs to know
 // whether the app can possibly have heard must check, because "sealed fine but
@@ -2942,6 +3081,58 @@ static void ozUplinkRetryTick() {
 // Plaintext outcome code for the NEXT uplink only, cleared after use. See
 // ozReportOutcome() for why this is on the wrapper and not inside the seal.
 static const char *g_uplinkCode = nullptr;
+
+// ── ozkey-29 §5.1 — SEAL IT BEFORE IT LEAVES, over BLE (the PULL half) ──────
+//
+// 🔴 This replaces a FALSE CLAIM IN OUR OWN COMMENT. query_events' header
+// asserted the response "rides the existing sealed notify path ... That is
+// §5.1's 'sealed before it ever leaves'." It did not. It called
+// ozNotifyChunked(), which does chrMember->setValue() on the raw string — the
+// complete door history, in clear, over the air, to any passive BLE scanner in
+// range. That is precisely the data ozkey-29 exists to protect. Documented as
+// fixed and shipped unfixed is worse than a known gap, because nobody re-checks.
+//
+// Same derivation as ozUplinkSend() — lock->app key, per-bond monotonic TX
+// counter, ozEnvSeal — reused rather than reinvented, because two crypto paths
+// is how the two ends drift apart. Only the carrier differs: chrMember, because
+// the app pulls history at the door and a Thread lock has no MQTT session.
+//
+// Returns false if it could not seal. The caller MUST NOT fall back to
+// plaintext: failing closed is the entire point.
+static bool ozNotifySealedTo(int slot, const String &json) {
+  if (slot < 0 || slot >= OZ_BOND_MAX || !g_bonds[slot].present) return false;
+  char appIdHex[65];
+  ozHex(g_bonds[slot].pub, 32, appIdHex);
+  uint8_t ps[32], key[32];
+  const bool haveKey = ozBondSecret(slot, ps) &&
+      ozEnvKey(ps, 32, deviceId, String(appIdHex), false /*lock->app*/, key);
+  memset(ps, 0, sizeof(ps));
+  if (!haveKey) {
+    Serial.printf("[EVT] no lock->app key for bond %d — NOT sending\n", slot);
+    memset(key, 0, sizeof(key));
+    return false;
+  }
+  const uint64_t counter = ozBondNextTx(slot);
+  if (counter == 0) { memset(key, 0, sizeof(key)); return false; }
+  uint8_t env[OZ_CTL_MAX];
+  const int elen = ozEnvSeal(key, deviceId, counter,
+                             (const uint8_t *)json.c_str(), json.length(),
+                             env, sizeof(env), nullptr);
+  memset(key, 0, sizeof(key));
+  if (elen < 0) {
+    Serial.printf("[EVT] seal failed (%u B) — NOT sending\n", (unsigned)json.length());
+    return false;
+  }
+  String hex; hex.reserve((size_t)elen * 2 + 16);
+  hex = "{\"sealed\":\"";
+  char b[3];
+  for (int i = 0; i < elen; i++) { snprintf(b, sizeof(b), "%02x", env[i]); hex += b; }
+  hex += "\"}";
+  Serial.printf("[EVT] sealed %u B -> %d B envelope (bond %d, ctr %llu)\n",
+                (unsigned)json.length(), elen, slot, (unsigned long long)counter);
+  ozNotifyChunked(hex);
+  return true;
+}
 
 static bool ozUplinkSend(int slot, const String &json) {
   if (slot < 0 || slot >= OZ_BOND_MAX || !g_bonds[slot].present) return false;
@@ -4409,7 +4600,8 @@ static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen) {
   // explicitly since their app code has to match it.
   publishLog("granted", slot == 0
                              ? (dp == 1 ? "BLE unlock (owner)" : "credential (owner)")
-                             : "BLE unlock (member)");
+                             : "BLE unlock (member)",
+             slot);
   notifyStatus("UNLOCK_OK");
 }
 
@@ -4717,9 +4909,12 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
   // complete history (§10.5). A log that quietly forgets cannot back that
   // claim, so we state the gap rather than paper over it.
   //
-  // The response rides the existing sealed notify path — same envelope every
-  // other reply uses — so the relay stays blind to content (ozkey-27 §4.4 R3)
-  // without any new crypto. That is §5.1's "sealed before it ever leaves".
+  // 🔴 CORRECTED 2026-08-15. This comment used to claim the response "rides the
+  // existing sealed notify path ... That is §5.1's 'sealed before it ever
+  // leaves'." IT DID NOT — it called ozNotifyChunked() on the raw JSON, putting
+  // the entire door history in clear over BLE. It now genuinely seals, via
+  // ozNotifySealedTo(); see that function's header for why the claim being
+  // WRITTEN DOWN made it worse than an open gap.
   if (strcmp(kind, "query_events") == 0) {
     if (!ozQueryRateOk(slot)) { notifyStatus("QUERY_THROTTLED"); return; }
     if (g_bonds[slot].role != OZ_ROLE_ADMIN) {
@@ -4774,7 +4969,14 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
                   truncated ? " MORE" : "");
     String out;
     serializeJson(rsp, out);
-    ozNotifyChunked(out);
+    // Fails CLOSED: if it cannot be sealed it is not sent. An audit history is
+    // exactly the payload where "send it anyway, unencrypted" is the wrong
+    // fallback — the app can retry, a leaked history cannot be recalled.
+    if (!ozNotifySealedTo(slot, out)) {
+      Serial.println("[EVT] events_response could NOT be sealed — refusing to "
+                     "send it in the clear");
+      notifyStatus("QUERY_DENIED");
+    }
     return;
   }
 
@@ -4912,7 +5114,8 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
 
   publishLog("granted", slot == 0
                             ? (dp == 1 ? "OZKIE unlock (owner)" : "OZKIE credential (owner)")
-                            : "OZKIE unlock (member)");
+                            : "OZKIE unlock (member)",
+             slot);
   notifyStatus("UNLOCK_OK");
 }
 
