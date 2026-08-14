@@ -68,6 +68,7 @@ bool isLocalMode();
 bool isThread();
 bool mcuLinkUp();
 bool srdyAsserted();
+void serveMcuTimePush(); // 1.74: ozHarvestTime() calls it long before its body
 bool touchRead(int &tx, int &ty);
 char keyAt(int tx, int ty, int &r, int &c);
 void drawKeypad();
@@ -680,6 +681,7 @@ uint8_t enrollAttempts = 0;
 unsigned long lastUnpairedAnnounce = 0;
 String topicCommand, topicEnroll, topicHeartbeat, topicLog, topicPairConfirm;
 String topicUplink; // ozkey-17 U1 — sealed lock->app content, opaque to the server
+String topicTime;   // ozkey-33 — site-wide RETAINED {"utc","tz"}, read-only to us
 String topicCommandLegacy; // S16 — pre-rename root, subscribed during migration only
 #define TOPIC_UNPAIRED "hotel/locks/unpaired/heartbeat"
 
@@ -1698,6 +1700,84 @@ void ozClockPersist(bool force) {
   prefs.end();
 }
 
+// 🔴 1.74 — "I HAVE A CLOCK" AND "MY CLOCK IS RIGHT" ARE DIFFERENT CLAIMS.
+//
+// ozClockRestore() below loads a snapshot written at most hourly
+// (OZ_CLOCK_PERSIST_MS), and after it runs ozClockKnown() returns TRUE. The
+// presence beacon only asks for time when the clock is UNKNOWN, so a lock that
+// booted with a stale snapshot believed it knew the time and NEVER ASKED — it
+// waited for the bridge's next multicast, up to 24 h away (OZ_TIME_BEACON_MS).
+//
+// The operator hit the mild version of this on the bench ("the time is slower,
+// 5-20 min, due to reset"). The severe version is a BATTERY CHANGE: NVS is
+// flash, so a unit that sat in a box for two weeks boots, restores a two-week-
+// old timestamp, marks the clock known, and never asks. Temporary credential
+// expiry is enforced against that clock (see ozBondExpirySweep's rule 2), and a
+// lock that thinks it is two weeks ago keeps honouring PINs that expired two
+// weeks ago — failing PERMISSIVE, which is the wrong direction.
+//
+// The old reasoning ("an hour behind only delays an expiry, it never un-expires
+// anything") is sound at one hour and stops being sound at two weeks. Same
+// class as the membership-expiry hole found 2026-08-12.
+//
+// So: track PROVENANCE, not just presence. g_clockLive is true only once a real
+// source has spoken THIS BOOT.
+bool g_clockLive = false;
+
+// Harvest `utc`/`tz` out of any inbound message, from any transport.
+//
+// Was Thread-only until 1.74, which left Wi-Fi locks with NO time source at all:
+// their only sync was configTime(..., "pool.ntp.org") and this lab blocks UDP
+// 123, so NTP never answers ([[ntp-is-not-a-dependable-time-source]]). A Wi-Fi
+// lock therefore ran on whatever NVS happened to hold, forever.
+//
+// The trust argument is the one already written for the Thread path and is
+// unchanged: ozClockSet() is monotonic-forward and floors implausible values, so
+// a time we already have, or an older one, changes nothing — which is what makes
+// it safe to accept from ANY message rather than only an addressed one. A
+// command meant for a different lock still carries a perfectly good UTC stamp,
+// and refusing to read it would throw away free syncs.
+void ozHarvestTime(JsonDocument &doc, const char *from) {
+  // Timezone rides with the time. Stored even when the clock value itself is
+  // refused (stale/duplicate beacon) — the offset is still current information.
+  if (doc["tz"].is<int>()) {
+    const int16_t tzNew = (int16_t)(doc["tz"] | 0);
+    if (tzNew != cfgTzMin) {
+      cfgTzMin = tzNew;
+      prefs.begin("blelock", false);
+      prefs.putShort("tzmin", cfgTzMin);
+      prefs.end();
+      Serial.printf("[TIME] timezone from %s: %+d min\n", from, (int)cfgTzMin);
+      screenDirty = true;
+    }
+  }
+
+  const uint32_t utcIn = doc["utc"] | 0UL;
+  if (!utcIn) return;
+  const bool wasKnown = ozClockKnown(ozclock);
+  const bool wasLive = g_clockLive;
+  if (!ozClockSet(ozclock, utcIn, millis())) return;
+
+  // A real source spoke. This is what stops need_time being asked forever, and
+  // it is deliberately set even when the clock was already "known" — that is the
+  // whole point: known-from-NVS is exactly the state we are trying to leave.
+  g_clockLive = true;
+  if (!wasLive) {
+    Serial.printf("[TIME] clock CONFIRMED by %s: %lu%s\n", from,
+                  (unsigned long)utcIn,
+                  wasKnown ? " (replaces the NVS snapshot)" : "");
+    ozClockPersist(true); // don't lose it to a reset in the next hour
+    screenDirty = true;
+  }
+  if (!wasKnown) {
+    Serial.println("[TIME] temporal DPs are now enforceable");
+    // The MCU has been asking and getting "I do not know". Now that we know,
+    // tell it immediately rather than waiting for it to ask again — it may back
+    // off for hours after repeated unknown answers.
+    if (mcuLinkUp()) serveMcuTimePush();
+  }
+}
+
 void ozClockRestore() {
   prefs.begin("blelock", true);
   const uint32_t saved = prefs.getUInt("utclast", 0);
@@ -1705,9 +1785,12 @@ void ozClockRestore() {
   if (saved < OZ_TIME_FLOOR) return;
   // Goes through ozClockSet() like any other source, so the floor and the
   // monotonic rule apply to our own NVS exactly as they do to the bridge.
+  // NOTE: deliberately does NOT set g_clockLive — a snapshot is a starting
+  // guess, not a synchronisation. See the block above.
   if (ozClockSet(ozclock, saved, millis()))
-    Serial.printf("[TIME] clock restored from NVS: %lu (stale by up to 1 h — "
-                  "next beacon corrects it)\n", (unsigned long)saved);
+    Serial.printf("[TIME] clock restored from NVS: %lu — a GUESS, not a sync; "
+                  "asking for the real time until something answers\n",
+                  (unsigned long)saved);
 }
 
 void ozClockRefreshFromSystem() {
@@ -1715,8 +1798,14 @@ void ozClockRefreshFromSystem() {
   if ((uint32_t)sys < OZ_TIME_FLOOR) return;
   // Only log transitions; this is called from loop().
   bool wasKnown = ozClockKnown(ozclock);
-  if (ozClockSet(ozclock, (uint32_t)sys, millis()) && !wasKnown)
-    Serial.printf("[TIME] clock acquired: %lu (SNTP)\n", (unsigned long)sys);
+  if (ozClockSet(ozclock, (uint32_t)sys, millis())) {
+    // SNTP answering is a REAL sync, so it confirms the clock (1.74). Rare in
+    // this lab — UDP 123 is blocked — but this is the path that works in the
+    // field, and it should not be the one source that leaves need_time stuck on.
+    g_clockLive = true;
+    if (!wasKnown)
+      Serial.printf("[TIME] clock acquired: %lu (SNTP)\n", (unsigned long)sys);
+  }
 }
 
 void serveMcuTimeRequest(bool local) {
@@ -2099,6 +2188,26 @@ void publishHeartbeat() {
   // never reported liveness. Not fixed here; that is ozkey-20 R3 and it needs
   // the uplink path, not this one.
   doc["roster_epoch"] = g_rosterEpoch;
+  // ── ozkey-32 §5 Option A — THE LOCK IS AUTHORITATIVE FOR ITS OWN NAME ─────
+  // (operator, 2026-08-14)
+  //
+  // Once `set_name` can be driven from two directions — BLE while standing at
+  // the lock, and remotely once the server route lands — `locks.label` in the
+  // server's database and the lock's own `cfgName` can silently disagree. The
+  // BLE path is the one that makes this unavoidable rather than unlikely: it
+  // works with no connectivity at all, so the server cannot even observe that a
+  // rename happened.
+  //
+  // Reporting the name here makes the server's row a CACHE that reconciles
+  // against the device, which is the same shape as roster_epoch, bonds and
+  // transport already use. The alternative (server authoritative, re-push on
+  // divergence) loses every offline rename and would have the cloud overwrite
+  // what the user just typed at the door.
+  //
+  // Empty is meaningful and is sent as empty, not omitted: "this lock has never
+  // been named" is a real state the server should be able to see and fix, and
+  // it is exactly the state DoorA has been in all along.
+  doc["name"] = cfgName;
   // On EVERY heartbeat, not just enroll. A transport change does not always
   // re-enroll (a re-provision of an already-enrolled lock does not), and this is
   // the only message a lock in service sends unprompted — so it is the only
@@ -2512,34 +2621,7 @@ void pollThreadUdp() {
   // T3 block. A time we already have, or an older one, changes nothing.
   // Timezone rides with the time. Stored even when the clock value itself is
   // refused (stale/duplicate beacon) — the offset is still current information.
-  if (doc["tz"].is<int>()) {
-    const int16_t tzNew = (int16_t)(doc["tz"] | 0);
-    if (tzNew != cfgTzMin) {
-      cfgTzMin = tzNew;
-      prefs.begin("blelock", false);
-      prefs.putShort("tzmin", cfgTzMin);
-      prefs.end();
-      Serial.printf("[TIME] timezone from bridge: %+d min\n", (int)cfgTzMin);
-      screenDirty = true;
-    }
-  }
-
-  const uint32_t utcIn = doc["utc"] | 0UL;
-  if (utcIn) {
-    const bool wasKnown = ozClockKnown(ozclock);
-    if (ozClockSet(ozclock, utcIn, millis())) {
-      if (!wasKnown) {
-        Serial.printf("[TIME] clock acquired from bridge: %lu — temporal DPs "
-                      "are now enforceable\n", (unsigned long)utcIn);
-        ozClockPersist(true); // don't lose it to a reset in the next hour
-        screenDirty = true;
-        // The MCU has been asking and getting "I do not know". Now that we
-        // know, tell it immediately rather than waiting for it to ask again —
-        // it may back off for hours after repeated unknown answers.
-        if (mcuLinkUp()) serveMcuTimePush();
-      }
-    }
-  }
+  ozHarvestTime(doc, "bridge");
 
   String target = (const char *)(doc["target"] | "");
   if (target != deviceId) { // not for us
@@ -3060,6 +3142,22 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   JsonDocument doc;
   if (deserializeJson(doc, body) != DeserializationError::Ok) return;
 
+  // 1.74 — BEFORE any dispatch, and regardless of what this message is for.
+  //
+  // A Wi-Fi lock already wakes every 60-600 s, reconnects and resubscribes
+  // (enterKeepAliveSleep) — so the broker is an authoritative clock it is
+  // ALREADY talking to on every wake, and until now we threw that away and
+  // relied on NTP, which this lab blocks. Harvesting here means a retained
+  // `utc` on a shared time topic reaches the lock within milliseconds of every
+  // reconnect: no polling, no request/response, no extra round trip, and it
+  // works on the very first wake after a battery change. Operator's call,
+  // 2026-08-14 — "why cant we make use of time".
+  //
+  // Server side of this is ozkey-33: a RETAINED {"utc":…,"tz":…} on
+  // ozkie/<site>/time. It must not be the command topic — a retained message
+  // there would be redelivered as a replayed command on every reconnect.
+  ozHarvestTime(doc, "server");
+
   const char *op = doc["op"] | (const char *)nullptr;
   if (op && (strcmp(op, "factory_reset") == 0 || strcmp(op, "unpair") == 0)) {
     Serial.println("[MQTT<-] factory_reset (unpaired by app/server)");
@@ -3088,6 +3186,11 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     buildTopics();
     mqtt.subscribe(topicCommand.c_str(), 1);
     if (topicCommandLegacy.length()) mqtt.subscribe(topicCommandLegacy.c_str(), 1); // S16
+    // ozkey-33: RETAINED, so subscribing is itself the request — the broker
+    // delivers the current time within ms, on every wake, with no round trip.
+    if (topicTime.length()) mqtt.subscribe(topicTime.c_str(), 1);
+    // ozkey-33: retained, so this delivers a clock within ms of every wake.
+    if (topicTime.length()) mqtt.subscribe(topicTime.c_str(), 1);
     Serial.printf("[PAIR] assigned room %s (site %s)\n", cfgRoomNo.c_str(),
                   cfgSiteId.c_str());
     notifyStatus("ENROLLED");
@@ -3277,6 +3380,11 @@ void ensureMqtt() {
     lastActivityAt = millis();
     mqtt.subscribe(topicCommand.c_str(), 1);
     if (topicCommandLegacy.length()) mqtt.subscribe(topicCommandLegacy.c_str(), 1); // S16
+    // ozkey-33: RETAINED, so subscribing is itself the request — the broker
+    // delivers the current time within ms, on every wake, with no round trip.
+    if (topicTime.length()) mqtt.subscribe(topicTime.c_str(), 1);
+    // ozkey-33: retained, so this delivers a clock within ms of every wake.
+    if (topicTime.length()) mqtt.subscribe(topicTime.c_str(), 1);
     if (isLocalMode() && !enrolled) mqtt.subscribe(topicPairConfirm.c_str(), 1);
     Serial.println("[MQTT] connected + subscribed command topic");
     if (state == ST_JOINING) {
@@ -3392,6 +3500,7 @@ void applyProvision(JsonDocument &doc) {
       // Through ozClockSet() like every other source — monotonic-forward and
       // the 400-day cap apply to the app exactly as they do to the bridge.
       if (ozClockSet(ozclock, provUtc, millis())) {
+        g_clockLive = true; // 1.74 — the app is a real source, not a snapshot
         Serial.printf("[TIME] clock from app at provisioning: %lu\n",
                       (unsigned long)provUtc);
         ozClockPersist(true);
@@ -5419,6 +5528,17 @@ void buildTopics() {
   // server must never parse. Splitting them at the topic level means the rule is
   // enforced by routing rather than by everyone remembering it.
   topicUplink = base + "uplink";
+  // ozkey-33 — SITE-WIDE, RETAINED time. Not under this lock's own subtree on
+  // purpose: one retained message serves every Wi-Fi lock on the site, and a
+  // retained payload must never sit on a `command` topic (the broker would
+  // redeliver it as a replayed command on every reconnect).
+  //
+  // This is what makes the 1.74 MQTT clock work actually run. A Wi-Fi lock
+  // already reconnects and resubscribes on every keep-alive wake (60-600 s), and
+  // a retained message is delivered the instant a client subscribes — so the
+  // lock gets an authoritative clock within milliseconds of every wake, with no
+  // request, no round trip, and no NTP (which this network blocks).
+  topicTime = "ozkie/" + cfgSiteId + "/time";
   topicPairConfirm = "hotel/locks/" + deviceId.substring(4) + "/pair/confirm";
 }
 
@@ -6185,6 +6305,14 @@ void loop() {
     hb["kind"] = "presence";
     hb["fw"] = FW_VERSION;
     hb["roster_epoch"] = g_rosterEpoch;
+    // ozkey-32 §5 Option A — see publishHeartbeat() for the full reasoning.
+    // It matters MORE on this path than on MQTT: a Thread lock has no MQTT
+    // session, so this beacon is the only unprompted thing it ever says. And
+    // `set_name` is the only naming path a Thread lock has ever had, driven
+    // over BLE — i.e. the rename and the reporting of it travel by completely
+    // different routes, and without this field the server can never learn that
+    // one happened.
+    hb["name"] = cfgName;
     hb["bonds"] = ozBondCount();
     hb["mcu_link_up"] = mcuLinkUp();          // ozkey-20 §5a
     hb["uptime_s"] = (uint32_t)(millis() / 1000);
@@ -6199,7 +6327,12 @@ void loop() {
     // new message type, no new socket, and it inherits that beacon's retry
     // cadence for free, which is exactly the property that was missing.
     // The flag clears itself the moment we have a clock.
-    if (!ozClockKnown(ozclock)) hb["need_time"] = true;
+    // 1.74: ask while the clock is UNKNOWN **or merely RESTORED** — see
+    // g_clockLive. The old test was ozClockKnown() alone, so a lock that booted
+    // from an NVS snapshot never asked at all and sat on a stale clock until the
+    // bridge's next 24 h multicast. Now it asks every beacon (60 s) until a real
+    // source answers, and stops the moment one does.
+    if (!ozClockKnown(ozclock) || !g_clockLive) hb["need_time"] = true;
     String out;
     serializeJson(hb, out);
 
@@ -6456,7 +6589,12 @@ void loop() {
                   // ozkey-21: "unknown" here means every temporary PIN/RFID
                   // window on this lock is unenforceable. It is the headline
                   // number, not a footnote.
-                  ozClockKnown(ozclock) ? "known" : "UNKNOWN",
+                  // 1.74: three states, not two. "NVS-only" is the one that
+                  // used to be indistinguishable from "known" and is exactly
+                  // the state in which every temporary credential window is
+                  // being judged against a guess.
+                  !ozClockKnown(ozclock) ? "UNKNOWN"
+                                         : (g_clockLive ? "live" : "NVS-only"),
                   (unsigned)mcuTimeRequests, (unsigned)mcuTimeServed);
     // The worst iteration in the last 10 s, then reset. A healthy lock reads
     // ~15-30 ms (the delay(15) plus a poll pass). Anything in the hundreds is

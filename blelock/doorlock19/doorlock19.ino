@@ -210,7 +210,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 //       — see doorlock.ino's changelog. All of it is in
 //       common/ozdoorlock_core.h, so it lands on both panels; only this version
 //       string is per-sketch.
-#define FW_VERSION "doorlock-1.72"
+#define FW_VERSION "doorlock-1.74"
 
 // ── DERIVED, not a second literal (2026-08-12) — see doorlock.ino for the
 // full reasoning. The warning above ("Change both, every time") described the
