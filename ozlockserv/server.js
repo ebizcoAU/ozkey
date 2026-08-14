@@ -226,6 +226,13 @@ const CONFIG = {
   // subscribes to its OWN topic (blelock/bridge32/bridge32.ino:489), then
   // demuxes onto the mesh by `target`. ozkey-11 §3.
   topicBridgeCommand: (site, bridgeId) => `ozkie/${site}/bridges/${bridgeId}/command`,
+  // ozkey-33: site-wide retained clock, for Wi-Fi-direct locks — they have
+  // no bridge to relay ozkey-27 §9's `utc` push and NTP is blocked on this
+  // network. Deliberately NOT under `.../command`: a retained payload on a
+  // command topic is redelivered as a replayed action on every reconnect,
+  // where here the whole point is that a lock waking up gets the retained
+  // value immediately, for free, on subscription alone.
+  topicTime: (site) => `ozkie/${site}/time`,
   ENROLL_TOKEN_TTL_MS: 10 * 60 * 1000, // ozkey-05 §7.5
   DEFAULT_HEARTBEAT_S: 60,
 };
@@ -791,16 +798,44 @@ async function initDatabase() {
  * ------------------------------------------------------------------------- */
 let mqttClient = null;
 
-function mqttPublish(topic, payload) {
+function mqttPublish(topic, payload, opts = {}) {
   if (!mqttClient || !mqttClient.connected) {
     logEvent('warn', `MQTT offline — dropped publish to ${topic}`);
     return false;
   }
   mqttClient.publish(topic, typeof payload === 'string' ? payload : JSON.stringify(payload), {
     qos: 1,
+    retain: !!opts.retain,
   });
   return true;
 }
+
+// ozkey-33: refresh cadence for the retained time topic — same period as
+// the existing bridge `utc` push (CONFIG.UTC_PUSH_REFRESH_MS) so there is
+// one clock-freshness budget across both paths, not two to keep in sync.
+let timeRefreshTimer = null;
+
+function publishRetainedTime(why) {
+  const nowUtc = Math.floor(Date.now() / 1000);
+  // Signed minutes east of UTC. `Date.getTimezoneOffset()` returns minutes
+  // WEST of UTC (Node's local zone, i.e. this host's) — negate it to match
+  // the sign convention firmware asked for.
+  const tzMinutes = -new Date().getTimezoneOffset();
+  const ok = mqttPublish(
+    CONFIG.topicTime(CONFIG.SITE_ID),
+    { utc: nowUtc, tz: tzMinutes },
+    { retain: true }
+  );
+  if (ok) logEvent('info', `Published retained time (utc=${nowUtc}, tz=${tzMinutes}) to ${CONFIG.topicTime(CONFIG.SITE_ID)} (${why})`);
+}
+
+// ozkey-31 §2: deviceId -> the most recently PUBLISHED, not-yet-confirmed
+// grant-key command for that device. The uplink's plaintext outcome code
+// carries no grant_id to correlate against directly, but the lock processes
+// credential commands synchronously and one at a time (ozAwaitMcuAck blocks
+// before any reply), so "this device's most recent unconfirmed grant" is
+// what a fresh outcome code is answering, not a guess dressed up as one.
+const lastGrantSentByDevice = new Map(); // deviceId -> { grantId, queueId }
 
 /** Drain queued actions for a device; expired unlock-style rows are skipped. */
 async function flushQueueForDevice(siteId, deviceId) {
@@ -864,11 +899,20 @@ async function flushQueueForDevice(siteId, deviceId) {
 
     await pool.query("UPDATE pending_queue SET status = 'sent' WHERE id = ?", [job.id]);
     if (job.grant_id) {
-      const newStatus = job.action_type === 'revoke-key' ? 'revoked' : 'synced';
-      await pool.query('UPDATE grants SET sync_status = ? WHERE id = ?', [
-        newStatus,
-        job.grant_id,
-      ]);
+      if (job.action_type === 'revoke-key') {
+        await pool.query("UPDATE grants SET sync_status = 'revoked' WHERE id = ?", [
+          job.grant_id,
+        ]);
+      } else {
+        // ozkey-31 §2: a publish is evidence the SERVER sent something, not
+        // that the lock stored it — the exact gap that let four failed
+        // remote grants sit recorded as 'synced' this week while
+        // ozControlOpen rejected every one of them. Stay 'pending' and
+        // remember which grant this device's next uplink outcome code
+        // (handleUplinkOutcome, below) should be attributed to; 'failed' is
+        // the only state a publish can ever earn on its own now.
+        lastGrantSentByDevice.set(deviceId, { grantId: job.grant_id, queueId: job.id });
+      }
     }
     sent++;
     logEvent(
@@ -957,6 +1001,46 @@ async function logUplinkMetadata(fromDeviceId, payloadBuf, payloadStr) {
   }
   logEvent('info', `Uplink from ${fromDeviceId} to ${to || '(unresolved)'}: ${size}B (content sealed, not read)`);
   await recordAudit(to, fromDeviceId, 'uplink', `size=${size}B`);
+}
+
+/** ozkey-31 §2. The uplink wrapper's `code` field is plaintext by design
+ * (ozdoorlock_core.h ~2903, "1.64 — the outcome CODE travels in the clear,
+ * the detail does not") specifically so a relay that never opens the
+ * envelope can still see WHICH STAGE failed. As of doorlock-1.65 every code
+ * the lock emits this way — ENVELOPE_BAD_HEX, ENVELOPE_NOT_OPENED,
+ * MCU_TIMEOUT, COUNTER_REPLAY — is a refusal; success (`UNLOCK_OK`) only
+ * ever rides BLE's notifyStatus(), which this server never sees. So this
+ * treats ANY non-empty `code` as bad news rather than matching a fixed
+ * whitelist — a whitelist is one more place a new refusal string firmware
+ * adds later walks straight past unnoticed, the exact bug class this doc is
+ * about. If firmware ever starts sending a positive confirmation on this
+ * same field, this function needs to stop treating `code` as failure-only.
+ */
+async function handleUplinkOutcome(fromDeviceId, payloadStr) {
+  let obj;
+  try {
+    obj = JSON.parse(payloadStr);
+  } catch (_) {
+    return; // logUplinkMetadata already warned about non-JSON uplinks
+  }
+  if (typeof obj.code !== 'string' || !obj.code) return;
+
+  const pending = lastGrantSentByDevice.get(fromDeviceId);
+  if (!pending) {
+    logEvent(
+      'warn',
+      `${fromDeviceId} reported outcome ${obj.code} — no pending grant on record to attribute it to`
+    );
+    return;
+  }
+  lastGrantSentByDevice.delete(fromDeviceId);
+
+  await pool.query("UPDATE grants SET sync_status = 'failed' WHERE id = ?", [pending.grantId]);
+  logEvent(
+    'warn',
+    `Grant #${pending.grantId} (queue #${pending.queueId}) on ${fromDeviceId} FAILED — lock reported ${obj.code}`
+  );
+  await recordAudit(null, fromDeviceId, 'grant_failed', `grant #${pending.grantId}: ${obj.code}`);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1283,6 +1367,14 @@ async function handleThreadLiveness(bridgeId, payload) {
     // nothing landed anywhere. Found live 2026-08-11 when firmware's real,
     // correctly-identified traffic produced this exact misleading line
     // against an empty `locks` table.
+    // ozkey-32 §7 (firmware, 2026-08-14): this entry is bridge32's own
+    // Thread-neighbour-table view, never the lock's `name` — a bridged
+    // lock's heartbeat topic already carries `name` via the bridge's
+    // verbatim beacon republish (the `kind === 'heartbeat'` handler
+    // above), so reconciling here too would be a second copy of the same
+    // fact with its own chance to go stale. An earlier version of this
+    // code read `entry.name` here; removed on firmware's confirmation it
+    // will never be sent.
     const [result] = await pool.query('UPDATE locks SET thread_age_s = ? WHERE id = ?', [
       ageS,
       entry.id,
@@ -1375,6 +1467,18 @@ function initMqtt() {
           );
       }
     );
+
+    // ozkey-33: publish immediately so a cold start (or a reconnect) never
+    // leaves the retained topic stale, then keep it fresh on the same
+    // cadence as the bridge `utc` push. Clear any timer from a prior
+    // `connect` (a broker reconnect fires this handler again) so repeated
+    // reconnects don't stack intervals.
+    publishRetainedTime('MQTT connect');
+    if (timeRefreshTimer) clearInterval(timeRefreshTimer);
+    timeRefreshTimer = setInterval(
+      () => publishRetainedTime('periodic refresh'),
+      CONFIG.UTC_PUSH_REFRESH_MS
+    );
   });
 
   mqttClient.on('reconnect', () => logEvent('warn', 'MQTT reconnecting...'));
@@ -1405,6 +1509,7 @@ function initMqtt() {
         const um = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/locks\/([^/]+)\/uplink$/);
         if (um) {
           await logUplinkMetadata(um[2], payloadBuf, payload);
+          await handleUplinkOutcome(um[2], payload);
           return;
         }
         // ozkey-20 R1: retained LWT presence, lock or bridge. Pure metadata
@@ -1478,6 +1583,14 @@ function initMqtt() {
         // untouched, doesn't clobber a last-known value to NULL.
         const mcuLinkUp = typeof obj.mcu_link_up === 'boolean' ? (obj.mcu_link_up ? 1 : 0) : null;
         const mcuLastFrameS = Number.isFinite(obj.mcu_last_frame_s) ? obj.mcu_last_frame_s : null;
+        // ozkey-32 §5, operator's call 2026-08-14: the lock is authoritative
+        // for its own name (it can be renamed over BLE with no connectivity,
+        // which the server would never see any other way), `locks.label` is
+        // a cache. Not on the wire yet — firmware ships it on request — same
+        // opportunistic COALESCE discipline as fw/transport/battery_pct etc.
+        // above: absent leaves the column untouched, doesn't clobber a
+        // last-known label to NULL.
+        const name = typeof obj.name === 'string' && obj.name.length ? obj.name.slice(0, 255) : null;
         await pool.query(
           `UPDATE locks
               SET last_seen_at    = NOW(),
@@ -1490,9 +1603,10 @@ function initMqtt() {
                   last_mech_at    = CASE WHEN ? IS NOT NULL THEN NOW() ELSE last_mech_at END,
                   roster_epoch    = COALESCE(?, roster_epoch),
                   mcu_link_up     = COALESCE(?, mcu_link_up),
-                  mcu_last_frame_s = COALESCE(?, mcu_last_frame_s)
+                  mcu_last_frame_s = COALESCE(?, mcu_last_frame_s),
+                  label           = COALESCE(?, label)
             WHERE id = ?`,
-          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, deviceId]
+          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, name, deviceId]
         );
         // ozkey-20 R5/R6: a heartbeat is direct proof of reachability for a
         // Wi-Fi-direct lock (no bridge_id) — set presence straight to
@@ -2715,6 +2829,12 @@ api.post('/locks/:id/bond-revoke', (req, res) => handleBondVerb(req, res, 'bond-
 api.post('/locks/:id/invite-cancel', (req, res) =>
   handleBondVerb(req, res, 'invite-cancel', 'Invite cancel')
 );
+// ozkey-32 §4: a generic sealed-settings route (set_name is the first verb
+// to need it, more of ozkey-28's settings verbs will follow) — server
+// relays envelope_hex opaquely and never needs to know which settings verb
+// is inside, so this is handleBondVerb with a new action_type, not a new
+// mechanism.
+api.post('/locks/:id/settings', (req, res) => handleBondVerb(req, res, 'settings', 'Settings'));
 
 /** XF-93 (AZ) — remote bridge factory reset. `bridges` (ozkey-23 §10.2a)
  * exists now, but only for broker credentials — this route still reads and

@@ -1,8 +1,8 @@
 # ozkey-31 — Commissioning identity: what the lock declares, what the app states, and what the server must stop assuming
 
 **Author:** firmware, 2026-08-13
-**Status:** 🔴 OPEN. §2 and §3 are server work that can start immediately and
-depend on nothing in §5. §5–§7 are the firmware/contract change.
+**Status:** §2 and §3 — server half CLOSED, see §9/§10 below. §5–§7 remain
+🔴 OPEN, firmware/contract work.
 **App half:** `XFtposDecisions-100.md` (raised same day).
 **Corrects:** `ozkey-30 §6` — see §4.
 
@@ -155,3 +155,69 @@ Independently of all of the above, `doorlock-1.66` bounds the blocking MQTT
 dial (~18 s worst case → ~4 s, exponential backoff). That was today's
 unresponsive-panel bug and is fixed, though **not yet verified on hardware** —
 verification needs a Wi-Fi lock pointed at a blackholed broker.
+
+---
+
+## 9. SERVER — §2 implemented + live-verified, 2026-08-14
+
+Read `ozReportOutcome()`/`ozUplinkSend()` in `ozdoorlock_core.h` directly
+before writing anything server-side, to get the actual wire shape rather than
+assuming one. Confirmed: as of `doorlock-1.65` the plaintext `code` field on
+the uplink wrapper is **refusal-only** — `ENVELOPE_BAD_HEX`,
+`ENVELOPE_NOT_OPENED`, `MCU_TIMEOUT`, `COUNTER_REPLAY`. `UNLOCK_OK` never
+rides this channel; it only ever goes to `notifyStatus()`, which is
+BLE-`chrStatus`-only and the server never sees it under any transport. So
+there is no wire evidence available today for a positive "lock confirmed"
+signal — `delivered` is implemented as a real state grants can reach, but
+nothing sets it yet, honestly, because nothing on the wire earns it. If a
+positive confirmation code is ever added to this same field, `ozlockserv`
+needs a matching change — flagging that now so it isn't a second silent gap
+later.
+
+**Built in `ozlockserv/server.js`:**
+- `flushQueueForDevice()` no longer writes `sync_status = 'synced'` the
+  instant a `grant-key` job publishes. It stays `pending` and the server
+  records which grant this device's next uplink outcome code should be
+  attributed to (`lastGrantSentByDevice`, in-memory — correlation only, not a
+  durability claim).
+- New `handleUplinkOutcome()`, wired into the existing `SUB_UPLINK` handler
+  alongside `logUplinkMetadata()`. Treats **any** non-empty `code` as a
+  failure rather than matching a fixed whitelist of the four strings above —
+  a whitelist is exactly one more place a refusal code you add later walks
+  past unnoticed, which is the class of bug this whole doc is about. Marks
+  the correlated grant `sync_status = 'failed'`, logs a `warn`-level event
+  (visible on `/events`, i.e. surfaced to a human, not just a log line), and
+  writes an `audit_log` row (`grant_failed`, device + grant id + code — no
+  PIN/RFID content, matching `ozkey-29`'s zero-plaintext posture).
+- `revoke-key` jobs are untouched — still flip to `revoked` on publish. Same
+  underlying "publish ≠ confirmation" gap exists there too, but revoke wasn't
+  in this ask and `grants.sync_status === 'revoked'` already gates a 409 on
+  re-revoke elsewhere in the code (`api.post('/locks/:id/grants/:gid/revoke'`
+  area) — changing that needs its own look, not a drive-by inside this fix.
+  Flagging it here rather than silently leaving it for someone to
+  rediscover the hard way.
+
+**Live-verified against the real broker/DB** (synthetic lock
+`ozk-synthtest01`, cleaned up after): a grant published normally now stays
+`pending`, not `synced`. A synthetic `MCU_TIMEOUT` uplink flipped it to
+`failed`, produced a `warn` event on `/events`, and an `audit_log` row
+readable via the grants list API. A second outcome code with no pending
+grant on record correctly warned ("no pending grant on record to attribute
+it to") instead of misattributing to a stale one. Server restarted, PID
+7114, bound `:4200`, real bridge/lock traffic (`ozb-98a316a7e638`,
+`ozk-acebe639f8c4`) continued unaffected through the restart.
+
+---
+
+## 10. SERVER — §3 answered: no server-side dataset escrow
+
+**Operator's decision:** do **not** store the Thread mesh dataset
+(`network_key` etc.) on `ozlockserv`. The app is the durable store. This
+closes §3's open question in favor of the sovereignty side of the tension you
+flagged, not the recovery side — a lost/wiped phone with no other admin
+device in the house does mean re-pairing every lock, and that is an accepted
+tradeoff, not an oversight. `ozlockserv` stores no dataset for any
+lock/bridge today (confirmed — nothing in the schema holds it), and nothing
+changes that. If this needs revisiting later (e.g. a client-side-encrypted
+escrow blob, the middle path you floated), that is a fresh decision, not a
+default to drift into.
