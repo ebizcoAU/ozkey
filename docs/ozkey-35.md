@@ -182,7 +182,7 @@ nobody has demonstrated it, regardless of what any other document says.
 | 16 | `provision_key` (dev key delivery) | 🟡 built, needs a decision | sealing is circular — `ozkey-34.md` §4.1 |
 | 17 | JTAG/UART disabled | 🔴 false | both live; USB CDC serial is how every bench log is read |
 | 18 | `*01#` keypad command opens BLE (DP 104, our extension) | 🟢 **verified 2026-08-16** | `doorlock-1.83` on LockA: `[TUYA<-] KEYPAD COMMAND *01#` → `[KEYCMD]` → `[BLE] window OPEN`, all same second. Exactly ONE window in the capture, 0 reader drops. **LockSim only — no real DL MCU can send it** |
-| 19 | Accidental BLE windows removed | 🟢 partly verified | LCD any-key: 5 keys incl. 3×`#`, no window (1.81). **3-failed-PIN gesture NOT yet exercised** |
+| 19 | Accidental BLE windows removed | 🟢 **fully verified 2026-08-16** | LCD any-key: 5 keys incl. 3×`#`, no window (1.81). 3-failed-entry gesture ran **twice** on 1.83: `1/3`, `2/3` open nothing, window on the 3rd, self-closes at 60s, counter resets after firing (4th entry logged `1/3`). A **successful** unlock (`ACCESS_RESULT SUCCESS`) opened no window — the privacy property holds |
 | 20 | `info.pub` reports the CURRENT key after `provision_key` | 🟡 fixed in 1.83, unexercised | XF-106 §17 run 1 read the pre-provision key: `chrInfo` was a boot-time snapshot. Now rebuilt on change; needs a re-run to confirm |
 
 ## 6. Firmware versions in play
