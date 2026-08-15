@@ -836,13 +836,16 @@ uint32_t clampHeartbeatS(uint32_t s) {
 }
 
 // ── MCU bus health (drives the dashboard) ───────────────────────────────────
-// Consecutive failed keypad entries — the MCU-lock pairing gesture (2026-08-16).
-// See the DP 8 handler for why one failure is no longer enough and why this
-// cannot be the *01# the LCD panel uses.
-#define OZ_PIN_FAIL_TO_PAIR     3
-#define OZ_PIN_FAIL_WINDOW_MS   30000UL
-static uint8_t       g_pinFailCount   = 0;
-static unsigned long g_pinFailFirstAt = 0;
+// Doorbell-opened BLE windows are rate-limited, because a doorbell can be
+// spammed and on a sleepy lock the radio IS the power budget. Ringing during an
+// OPEN window still extends it, so this never interrupts a real enrolment — it
+// only caps how much advertising a stranger at the door can force.
+#define OZ_BELL_COOLDOWN_MS 120000UL // 2 min of quiet after a bell window closes
+static unsigned long g_bellWindowEndedAt = 0;
+// Set when the CURRENT window was opened by the doorbell. closeBleWindow()'s
+// argument is the reason it CLOSED ("60s elapsed"), not what opened it, so the
+// gesture has to be remembered rather than sniffed out of that string.
+static bool g_bellOpenedWindow = false;
 
 uint32_t mcuTxFrames = 0;         // frames forwarded server → MCU
 uint32_t mcuRxFrames = 0;         // frames received MCU → module
@@ -1637,6 +1640,10 @@ void openBleWindow(const char *gesture) {
 }
 
 void closeBleWindow(const char *why) {
+  // Start the cooldown from when the window actually ENDED, not when it opened
+  // — otherwise a 60 s window inside a 120 s cooldown leaves only 60 s of real
+  // quiet.
+  if (g_bellOpenedWindow) { g_bellWindowEndedAt = millis(); g_bellOpenedWindow = false; }
   bleWindowUntil = 0;
   BLEDevice::stopAdvertising();
   Serial.printf("[BLE] window closed (%s)\n", why);
@@ -2202,47 +2209,58 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       // This also means DP 60 is no longer worth waiting for. It buys a
       // deliberate gesture; this buys the same privacy property today, on
       // shipping hardware, with no manufacturer allocation (ozkey-22 §7).
-      // ── 🟡 INTERIM (2026-08-16) — three failures, not one ─────────────────
+      // ── 🔴 A FAILED PIN NO LONGER OPENS ANYTHING (operator, 2026-08-16) ───
       //
-      // The operator's rule is "*01# opens BLE, otherwise stay silent". On the
-      // LCD panel that is now literally what happens. **On a lock with a real
-      // DL MCU it cannot be**: the MCU sends nothing until '#', and then only
-      // pass/fail — the typed characters never reach us. The supplier catalogue
-      // confirms it: DP 60 `alarm` carries `wrong_password`(1) and `key_in`(8),
-      // which say THAT a key was pressed, never WHICH; DP 61 carries a
-      // `cred_id`, i.e. which stored credential matched, not the digits.
+      // 1.81 raised the bar from one failed entry to three. The operator's
+      // objection is better than the fix: a pairing gesture made out of FAILED
+      // ATTEMPTS teaches people to jab at the keypad, and every jab is radio
+      // time. "We encourage people to play more with the doorlock and wear out
+      // the battery." On a Sleepy End Device that is the whole power budget,
+      // and it was reachable by anyone standing at the door, indefinitely,
+      // with no cooldown.
       //
-      // So deleting this outright would leave a production lock with NO
-      // at-the-door pairing gesture at all — the only way to make it
-      // discoverable would be the BOOT button, which is INSIDE the door. That
-      // breaks member enrolment and owner re-pairing on a wiped lock, which is
-      // the exact gap the keypad trigger was added to close.
-      //
-      // Interim: keep the path, raise the bar from ONE failure to THREE inside
-      // 30 s. A brushed key sends nothing at all (no '#'), and a single
-      // mistyped PIN no longer advertises — while all three recovery cases
-      // still work, because each already fails repeatedly. Awaiting the
-      // operator's (a)/(b) call; (a) is deleting these six lines.
-      if (v[0] != 0) {
-        const unsigned long now = millis();
-        if (!g_pinFailCount || (now - g_pinFailFirstAt) > OZ_PIN_FAIL_WINDOW_MS) {
-          g_pinFailCount = 0;
-          g_pinFailFirstAt = now;
-        }
-        g_pinFailCount++;
-        if (g_pinFailCount >= OZ_PIN_FAIL_TO_PAIR) {
-          g_pinFailCount = 0;
-          Serial.println("[BLE] 3 failed entries in 30s — pairing window opened "
-                         "(MCU cannot report *01#; see the comment here)");
-          openBleWindow("3x failed entry");
-        } else {
-          Serial.printf("[BLE] failed entry %u/%u — no window yet\n",
-                        (unsigned)g_pinFailCount, (unsigned)OZ_PIN_FAIL_TO_PAIR);
-        }
+      // A wrong PIN is now what it always should have been: a logged denial and
+      // nothing else. The deliberate gesture moved to the DOORBELL (DP 53) —
+      // see its handler below for why that is the right button.
+            return;
+    }
+    if (dpid == 5) { publishLog("battery_alarm", "MCU report"); return; }
+
+    // ── DP 53 DOORBELL — the pairing gesture that does not train bad habits ──
+    //
+    // Chosen over the failed-PIN gesture it replaces (operator, 2026-08-16),
+    // and it is better on three counts:
+    //
+    //   1. IT IS REAL. DP 53 `doorbell` is `status: confirmed` in the supplier
+    //      catalogue — unlike DP 104's *01#, which only LockSim can send. This
+    //      gesture will work on shipping hardware.
+    //   2. It is a DELIBERATE act with its own button, not an error condition.
+    //      Nobody rings a doorbell by brushing past it.
+    //   3. It does not reward jabbing at the keypad, which is what the
+    //      three-failures rule did — and keypad jabbing is radio time.
+    //
+    // Battery: a doorbell can still be spammed, so a window opened this way
+    // will not re-open for OZ_BELL_COOLDOWN_MS after it closes. Ringing again
+    // DURING an open window still extends it (openBleWindow resets the
+    // deadline), so a member part-way through enrolment is never cut off — the
+    // cooldown only bounds how much advertising a stranger can force.
+    if (dpid == 53) {
+      publishLog("doorbell", "MCU report");
+      const unsigned long now = millis();
+      if (bleWindowOpen()) {
+        g_bellOpenedWindow = true;
+        openBleWindow("doorbell (extending)");
+      } else if (!g_bellWindowEndedAt ||
+                 (now - g_bellWindowEndedAt) > OZ_BELL_COOLDOWN_MS) {
+        g_bellOpenedWindow = true;
+        openBleWindow("doorbell");
+      } else {
+        Serial.printf("[BELL] doorbell — window suppressed, %lus of cooldown "
+                      "left (battery)\n",
+                      (OZ_BELL_COOLDOWN_MS - (now - g_bellWindowEndedAt)) / 1000);
       }
       return;
     }
-    if (dpid == 5) { publishLog("battery_alarm", "MCU report"); return; }
 
     // ── DP 104 — `*NN#` KEYPAD COMMAND. OUR EXTENSION (operator, 2026-08-16) ─
     //
