@@ -4329,7 +4329,11 @@ static void handleBondRevoke(int senderSlot, const uint8_t *v, size_t vlen) {
                 ozBondCount(), OZ_BOND_MAX);
   screenDirty = true;
   notifyStatus("REVOKE_OK"); // the user's answer first…
-  publishLog("bond_revoked", label); // …then the housekeeping
+  // senderSlot, not -1: the actor is the bond that ASKED for the revoke, which
+  // we authenticated. Safe on self-revoke even though ozBondRevoke() has already
+  // memset the slot — actorSlot is only ever mapped to owner/member/keypad by
+  // ozEvtPush(), never used to index g_bonds[].
+  publishLog("bond_revoked", label, senderSlot); // …then the housekeeping
   // ozkey-17 U1: and tell every OTHER admin, unprompted. This is the event
   // whose absence produced XF-77 — a revoke that genuinely happened, which the
   // other side could not observe and therefore diagnosed as bond-table
@@ -4446,7 +4450,7 @@ static void handleInviteCancel(int senderSlot, const uint8_t *v, size_t vlen) {
 
   ozNonceBurn(v, OZ_NONCE_CANCELLED);
   Serial.println("[CANCEL] invite nonce burned — that QR can no longer enrol");
-  publishLog("invite_cancelled", "admin cancelled an unredeemed invite");
+  publishLog("invite_cancelled", "admin cancelled an unredeemed invite", senderSlot);
   notifyStatus("REVOKE_OK");
 }
 
@@ -4502,7 +4506,7 @@ static void handleListBonds(int senderSlot, const uint8_t *v, size_t vlen) {
                 (int)arr.size(), (unsigned)out.length());
   ozNotifyChunked(out);
   String detail = String(arr.size()) + " member(s)";
-  publishLog("bonds_listed", detail.c_str());
+  publishLog("bonds_listed", detail.c_str(), senderSlot);
 }
 
 static void ctlReset() {
