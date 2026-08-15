@@ -173,7 +173,7 @@ nobody has demonstrated it, regardless of what any other document says.
 | 7 | NEXUS `/locks/:mac/pubkey` | 🟢 verified | `nexus-02.md` §N-7; live 200 for LockA, `nexus-03.md` §5 |
 | 8 | `lock_registry` with `operational_mode` | 🟢 verified | `migration_v128_lock_registry.sql`, applied |
 | 9 | Factory bulk ingest | 🟢 built | `nexus-02.md` §N-8. 🔴 `FACTORY_API_KEY` still on `dev-factory-key` fallback |
-| 10 | App reads `info.pub` and cross-checks NEXUS | 🟡 ready, not run | XF-106 |
+| 10 | App reads `info.pub` and cross-checks NEXUS | 🟢 **verified 2026-08-16** | XF-106 §10: `nexus_pub == ble_pub == a99f0965e928…`, `match=true`. Also proves LockA's private key survived the 1.77→1.79 flash byte-identical (F-13) |
 | 11 | MCU ack gate on credentials | 🟡 built, bypassed in practice | app uses the legacy path; ack mechanism itself proven sound (matcher would fire) |
 | 12 | Thread SED + poll interval | 🟡 built, **default off**, never run | **unblocked 2026-08-16** — bridge unicast downlink verified (§9.1). Enabling still needs 1.80 flashed + a deliberate test |
 | 13 | Battery life | 🔴 **not measured** | no power instrument exists on this bench. FTD ~35 mA/~3 days is a *datasheet estimate*; the µA figures have no measurement behind them |
