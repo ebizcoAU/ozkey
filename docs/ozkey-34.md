@@ -248,6 +248,16 @@ directory row is explicitly retired.
 
 ## 10. Implementation status
 
+> **Decisions D1-D7 closed by the PM on 2026-08-16** — the full table is in
+> `ozkey-35.md` §9. The two that land here: **D1/D6 approve option (b)** for
+> `provision_key` sealing (§4.1's open question is now closed, with ftpos's two
+> conditions — a real support-only gate, and the forced re-pair surfaced
+> explicitly in the UI rather than as a silent reconnect), and **D5 rejects** a
+> conflicting public-key upload for a `production` row rather than overwriting.
+> **`doorlock-1.79` is committed (`2f9297e`) and flashed to LockA and the spare
+> 1.9".** Bond #0 survived; the broker reports `fw doorlock-1.79`. Still no
+> eFuse burned anywhere, so `production` mode remains unexercised.
+
 | Item | State |
 |---|---|
 | F-8 `operational_mode` NVS key | implemented, `doorlock-1.79` |

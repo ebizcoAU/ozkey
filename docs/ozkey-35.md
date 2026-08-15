@@ -94,16 +94,20 @@ survive the vendor disappearing.
 ```
 app → POST /locks/:id/... (ozlockserv)   → queued row
                                           → MQTT publish
-bridge → receives, relays over Thread UDP → ff03::1 multicast
+bridge → receives, relays over Thread UDP → UNICAST to the lock's own address
 lock  → opens envelope, counter-only freshness (no live challenge possible)
 lock  → DP frame to MCU
 ```
 
-🔴 **The downlink is multicast.** That is why the lock must currently run
-rx-on-when-idle (FTD) and why Sleepy End Device mode is off by default — a
-sleeping radio never hears a link-layer broadcast. Bridge-side unicast downlink
-is the prerequisite for SED, and it is **firmware's own work**, not another
-team's.
+**Updated 2026-08-16 — the downlink is now unicast** (`bridge32-1.39`, D2, §9.1).
+It used to be multicast `ff03::1`, which a Sleepy End Device cannot hear: a
+sleeping radio is not present for a link-layer broadcast. That was the blocker
+on SED, and it is cleared — the bridge learns each lock's address from its own
+uplinks and sends downlinks back to it, keeping multicast only as the fallback
+for a lock it has not heard from yet.
+
+🟡 **SED is unblocked but still off by default.** Removing the blocker is not the
+same as flipping the switch — see §9.4.
 
 ### 3.3 Audit (the lock is the record)
 
@@ -126,8 +130,9 @@ characteristic (`ozdoorlock_core.h:5858`) returns the public half.
 
 **`doorlock-1.79` adds** eFuse-first key loading, so `info.pub` returns the
 eFuse-derived key on a burned unit and the NVS key otherwise (`ozkey-34.md`).
-**1.79 is not flashed anywhere and no eFuse has ever been burned**, so this path
-has never executed.
+**1.79 is now on LockA and the spare 1.9" (2026-08-16), but no eFuse has ever
+been burned anywhere**, so the production half of that path has still never
+executed — every board falls through to NVS.
 
 **Three things that follow, and that keep being missed:**
 
@@ -170,7 +175,7 @@ nobody has demonstrated it, regardless of what any other document says.
 | 9 | Factory bulk ingest | 🟢 built | `nexus-02.md` §N-8. 🔴 `FACTORY_API_KEY` still on `dev-factory-key` fallback |
 | 10 | App reads `info.pub` and cross-checks NEXUS | 🟡 ready, not run | XF-106 |
 | 11 | MCU ack gate on credentials | 🟡 built, bypassed in practice | app uses the legacy path; ack mechanism itself proven sound (matcher would fire) |
-| 12 | Thread SED + poll interval | 🟡 built, **default off**, never run | blocked on bridge unicast downlink (§3.2) |
+| 12 | Thread SED + poll interval | 🟡 built, **default off**, never run | **unblocked 2026-08-16** — bridge unicast downlink verified (§9.1). Enabling still needs 1.80 flashed + a deliberate test |
 | 13 | Battery life | 🔴 **not measured** | no power instrument exists on this bench. FTD ~35 mA/~3 days is a *datasheet estimate*; the µA figures have no measurement behind them |
 | 14 | Plaintext `log` gate (C7) | 🔴 not built | scoped only; `mode` mapping question still open |
 | 15 | eFuse burn / production identity | 🔴 never burned | `ozLockKeyFromEfuse()` compiles, has never seen a burned block |
@@ -219,3 +224,73 @@ cited into the next document. Three cheap habits:
 
 And the one that produced §5: **"verified" means someone watched it happen.**
 Compiled is not run. Flashed is not exercised. Specified is not built.
+
+---
+
+## 9. Decisions closed 2026-08-16 (PM)
+
+| # | Decision | Outcome |
+|---|---|---|
+| D1 | `provision_key` sealing | **Option (b)** — seal under the lock's self-minted first-boot key, forced re-pair after |
+| D2 | Bridge unicast downlink ownership | **firmware** — confirming §1's note that there is no separate bridge team |
+| D3 | Spec corrections | server team updated from the actual findings |
+| D4 | N-6 dev-provisioning gate | support-only bearer token, **not** a plain env var |
+| D5 | Conflicting pubkey upload for a `production` row | **reject**, do not overwrite |
+| D6 | `provision_key` sign-off | approved, with ftpos's two conditions (real gate; forced re-pair surfaced explicitly in the UI, never a silent reconnect) |
+| D7 | XF-48 TRNG `lock_pub` | superseded |
+
+### 9.1 🟢 D2 is built and verified — the SED blocker is gone
+
+`bridge32-1.39`. The bridge learns each lock's IPv6 address from its own uplink
+traffic and sends downlinks straight back to it, keeping multicast only as the
+fallback for a lock it has not heard from yet (after a reboot, that is everyone,
+for up to one beacon interval — and it says so in the log rather than failing
+silently).
+
+Verified on the bench, no multicast involved:
+
+```
+bridge  [UNICAST] ozk-acebe639f8c4 reachable at fd8c:af8b:c85b:9d72:41d0:7ccf:b332:c5fd
+bridge  [UDP] >> [unicast] {"target":"ozk-acebe639f8c4",…,"via":"unicast"}
+lock    [UDP] rx 119 bytes … "via":"unicast"
+lock    [FWD] cmd -> MCU: unlock channel report
+lock    [TUYA->] 55 AA 00 06 00 05 01 01 00 01 01 0E
+```
+
+**A sleeping lock would have received that.** §5 row 12 moves from "blocked" to
+"unblocked, not yet enabled" — SED still defaults off, because removing a
+blocker is not the same as flipping a switch, and the switch deserves its own
+test.
+
+### 9.2 `doorlock-1.80` — a gap found while testing D2
+
+`cfgThreadSed` and `cfgThreadPollS` shipped in 1.79 as NVS keys **nothing could
+write**. Same class of mistake as a diagnostic nobody can read: a setting you
+cannot set is not a setting. Now:
+
+```json
+{"op":"thread_power","sed":true,"poll_s":5}
+```
+
+Poll retimes live. The link mode needs the stack re-read at boot, so `sed` is
+persisted and applied on the next boot — and the log says so, rather than
+leaving someone to infer it from a current measurement that did not move.
+
+### 9.3 Version state after this round
+
+| Version | State |
+|---|---|
+| `doorlock-1.79` | **running on LockA** — bond #0 survived the flash, broker confirms `fw` |
+| `doorlock-1.79` | also on the spare 1.9" (flashed first as a canary — the eFuse read path had never run anywhere) |
+| `doorlock-1.80` | built, **not flashed** — adds `thread_power` |
+| `bridge32-1.39` | **running on the bridge**, unicast downlink verified |
+
+Committed: `2f9297e` (1.79 + ozkey-34/35), `e2b3fe3` (bridge 1.39 + 1.80).
+
+### 9.4 What D2 does NOT close
+
+- **SED has still never run.** Enabling it needs 1.80 flashed, then
+  `{"op":"thread_power","sed":true}`, then a reboot, then a downlink test to
+  confirm commands still arrive while the radio sleeps.
+- **Battery is still unmeasured.** D2 makes the saving *reachable*; it does not
+  measure it. §5 row 13 stands — no power instrument exists on this bench.
