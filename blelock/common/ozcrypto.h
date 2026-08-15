@@ -19,6 +19,8 @@
 #include <Preferences.h>
 #include <string.h>
 #include "esp_random.h"
+#include "esp_efuse.h"      // ozkey-34 F-10 — production identity in BLOCK_KEY0
+#include "esp_efuse_chip.h" // EFUSE_BLK_KEY0
 #define MBEDTLS_ALLOW_PRIVATE_ACCESS // ecp_point X/Y/Z are private in mbedTLS 3.x
 #include "mbedtls/ecp.h"
 #include "mbedtls/gcm.h"
@@ -32,6 +34,22 @@ extern Preferences prefs; // namespace "blelock" (declared in blecomm.ino)
 static uint8_t g_lockPriv[32];
 static uint8_t g_lockPub[32];
 static bool g_lockKeyReady = false;
+
+// ── ozkey-34 — operational mode: where the identity key comes from ──────────
+//
+// "development" = NVS keypair (self-minted, or delivered by NEXUS via the app's
+//                 provision_key verb). Lost on factory reset.
+// "production"  = eFuse BLOCK_KEY0. Survives factory reset; cannot be erased.
+//
+// 🔴 MODE IS DERIVED FROM HARDWARE, NEVER REMEMBERED. It is not read back from
+// NVS, because a wiped lock must not be able to come up still CLAIMING a
+// security posture whose key material it no longer has. If the eFuse block
+// holds a valid key we are production, full stop; otherwise development.
+// ozkey-34 §9.
+static bool g_modeProduction = false;
+static const char *ozOperationalMode() {
+  return g_modeProduction ? "production" : "development";
+}
 
 // ── low-level helpers ─────────────────────────────────────────────────────────
 
@@ -148,9 +166,58 @@ static bool ozInviteMac(const uint8_t *s0, size_t s0Len, const String &deviceId,
 
 // ── lock keypair lifecycle ────────────────────────────────────────────────────
 
+// ── ozkey-34 F-10 — production identity, read from eFuse ────────────────────
+//
+// Returns true only if BLOCK_KEY0 holds a usable key. `esp_efuse_key_block_unused`
+// is the authoritative "nothing burned here" test (all-zero, unprotected,
+// purpose 0); we ALSO reject an all-zero read, because a block can be burned
+// with zeros and that is not an identity, it is a hole.
+//
+// The private scalar is read into a local, used to derive the public key, and
+// the local is zeroised before return — g_lockPriv necessarily retains it, as
+// every bond secret derivation needs it (ozBondSecret). Option (b) accepts a
+// software-readable key by design; see ozkey-34 §5/§7. Do not describe this as
+// extraction-resistant.
+static bool ozLockKeyFromEfuse() {
+  if (esp_efuse_key_block_unused(EFUSE_BLK_KEY0)) return false;
+
+  uint8_t priv[32];
+  esp_err_t e = esp_efuse_read_block(EFUSE_BLK_KEY0, priv, 0, 32 * 8);
+  if (e != ESP_OK) {
+    Serial.printf("[CRYPTO] eFuse read failed (%d) — staying development\n", (int)e);
+    memset(priv, 0, sizeof(priv));
+    return false;
+  }
+  bool allZero = true;
+  for (int i = 0; i < 32; i++) if (priv[i]) { allZero = false; break; }
+  if (allZero) {
+    Serial.println("[CRYPTO] eFuse BLOCK_KEY0 is all zero — not an identity");
+    return false;
+  }
+
+  memcpy(g_lockPriv, priv, 32);
+  memset(priv, 0, sizeof(priv)); // §3 step 2 — zeroise the working copy
+  ozClamp(g_lockPriv);
+  if (!ozX25519Base(g_lockPriv, g_lockPub)) {
+    Serial.println("[CRYPTO] FATAL: eFuse key did not derive a public key");
+    memset(g_lockPriv, 0, sizeof(g_lockPriv));
+    return false;
+  }
+  g_lockKeyReady = true;
+  g_modeProduction = true;
+  Serial.println("[CRYPTO] identity from eFuse BLOCK_KEY0 — mode=production");
+  return true;
+}
+
 // Load the ceremony keypair from NVS, or mint + persist one on first boot.
 // Call after WiFi/BLE init so the TRNG is seeded.
+//
+// ozkey-34: eFuse is tried FIRST. A burned lock is a production lock regardless
+// of what NVS happens to contain, so a stale development key can never shadow
+// the silicon identity.
 static void ozLockKeyInit() {
+  if (ozLockKeyFromEfuse()) return;
+
   prefs.begin("blelock", true);
   size_t haveP = prefs.getBytesLength("xpriv");
   size_t haveB = prefs.getBytesLength("xpub");

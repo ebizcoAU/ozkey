@@ -45,6 +45,7 @@
 #include "ozprofile.h" // ozkey-27 §4.5 — the DP map as DATA, shared with LockSim
 #include <OThread.h>     // Thread transport (ported from threadcomm.ino)
 #include <OThreadUDP.h>  // F4 UDP relay (bridge32/threadcomm proven, 2026-07-25/26)
+#include <openthread/link.h> // otLinkSetPollPeriod — SED poll interval (C9)
 // Receive half runs on lwIP, not OpenThread's internal UDP — see the root-cause
 // note above threadUdpBegin() (esp_openthread_netif_glue pushes inbound Thread
 // packets into lwIP, so otUdp* sockets never see them).
@@ -127,6 +128,7 @@ void mrdySet(bool assertLow);
 void notifyStatus(const char *wire);
 void onMqttMessage(char *topic, byte *payload, unsigned int length);
 void openBleWindow(const char *gesture);
+void ozThreadApplyPoll(bool fast); // C9 §5 — defined with the Thread code
 void pollThreadUdp();
 void publishEnroll();
 void publishHeartbeat();
@@ -358,7 +360,7 @@ String cfgSsid, cfgPass, cfgBrokerHost, cfgServerIp, cfgSiteId, cfgName, cfgDevi
 // PRESENTED to the broker. See ensureMqtt().
 String cfgBrokerUser, cfgBrokerSecret;
 uint16_t cfgBrokerPort = 1883, cfgServerPort = 4200;
-uint32_t cfgHeartbeatS = 60;
+uint32_t cfgHeartbeatS = 300; // C9 §3 — was 60
 bool provisioned = false, enrolled = false;
 String cfgMode = "ozkey-cloud", cfgRoomNo, cfgMacToken;
 bool isLocalMode() { return cfgMode == "ozkey-local"; }
@@ -370,6 +372,34 @@ String deviceId, macStr;
 // Selected once, at provisioning, by payload shape — see applyProvision().
 String cfgTransport = "wifi"; // NVS "xport"
 bool isThread() { return cfgTransport == "thread"; }
+
+// ── C9 §1/§2 — Thread SED (sleepy) mode + configurable poll interval ────────
+//
+// The lock has run as a FULL Thread device (rx-on-when-idle) since 2026-07-28.
+// That guarantees sub-second delivery and costs a continuously-powered radio:
+// order 30-40 mA, i.e. ~3 days on 4xAA. A Sleepy End Device wakes on a timer,
+// polls its parent, and sleeps — which is the only way this product reaches a
+// battery life worth quoting.
+//
+// 🔴 THE TRADE IS NOT JUST LATENCY — A SED CANNOT HEAR MULTICAST.
+// It polls its parent for UNICAST only; realm-local multicast is a link-layer
+// broadcast that a sleeping radio is not present for. Our downlink today is
+// ff03::1 (see threadUdpBegin's ground-truth comment, and bridge32's
+// sendToThreadGroup), so a SED lock stops receiving commands, time beacons and
+// everything else the bridge multicasts. That is why `cfgThreadSed` DEFAULTS
+// OFF: flipping it without bridge-side unicast downlink turns a working lock
+// deaf, silently. It is switchable now so the C9 current-draw measurement can
+// be taken on a bench board without shipping that regression.
+bool cfgThreadSed = false;      // NVS "sed"  — true = sleepy end device
+uint32_t cfgThreadPollS = 5;    // NVS "poll" — parent poll interval, seconds
+
+// Operator range 1-10 s. Below 1 s the poll traffic approaches rx-on's duty
+// cycle and the saving evaporates; above 10 s a queued unlock feels broken.
+uint32_t clampThreadPollS(uint32_t s) { return s < 1 ? 1 : (s > 10 ? 10 : s); }
+
+// §5 — while the BLE window is open somebody is standing at the door, so the
+// next command is imminent. 0 = "use the configured interval".
+#define OZ_POLL_FAST_MS 1000UL
 
 OpenThread thread;
 DataSet otDataset;
@@ -791,9 +821,18 @@ void mrdySet(bool assertLow) {
 }
 
 // §0.3: heartbeat_s doubles as the proactive-pull interval — user range is
-// 1-10 min (60-600 s); clamp whatever provisioning/ack delivers.
+// 1-15 min (60-900 s); clamp whatever provisioning/ack delivers.
+//
+// C9 §3 (operator, 2026-08-15): range widened 600 -> 900 s and the DEFAULT set
+// to 300 s. Note for the record — the directive described the old default as
+// 600 s; it was actually 60 s in every one of the three places it was spelled
+// (declaration, loadConfig, applyProvision). So this change makes a Wi-Fi lock
+// wake FIVE TIMES LESS often than before, not twice as often. That is the
+// battery-favouring direction the directive intended, but it also multiplies
+// worst-case latency for a queued remote command by five, so it is worth
+// knowing which way the number actually moved.
 uint32_t clampHeartbeatS(uint32_t s) {
-  return s < 60 ? 60 : (s > 600 ? 600 : s);
+  return s < 60 ? 60 : (s > 900 ? 900 : s);
 }
 
 // ── MCU bus health (drives the dashboard) ───────────────────────────────────
@@ -1425,7 +1464,9 @@ void loadConfig() {
   cfgServerPort = prefs.getUShort("sport", 4200);
   cfgSiteId = prefs.getString("site", "lab");
   cfgName = prefs.getString("name", "");
-  cfgHeartbeatS = clampHeartbeatS(prefs.getUInt("hb", 60));
+  cfgHeartbeatS = clampHeartbeatS(prefs.getUInt("hb", 300));
+  cfgThreadSed = prefs.getBool("sed", false);
+  cfgThreadPollS = clampThreadPollS(prefs.getUInt("poll", 5));
   cfgMode = prefs.getString("mode", "ozkey-cloud");
   cfgRoomNo = prefs.getString("room", "");
   cfgMacToken = prefs.getString("mtoken", "");
@@ -1452,6 +1493,8 @@ void saveConfig() {
   prefs.putString("site", cfgSiteId);
   prefs.putString("name", cfgName);
   prefs.putUInt("hb", cfgHeartbeatS);
+  prefs.putBool("sed", cfgThreadSed);
+  prefs.putUInt("poll", cfgThreadPollS);
   prefs.putString("mode", cfgMode);
   prefs.putString("room", cfgRoomNo);
   prefs.putString("mtoken", cfgMacToken);
@@ -1577,8 +1620,10 @@ void openBleWindow(const char *gesture) {
   // already up and we are deliberately SCAN_IND while busy (see bleSetBusy).
   // It still extends the deadline, which is the point: a long enrolment must
   // not have its window expire underneath it.
-  if (!wasOpen)
+  if (!wasOpen) {
     Serial.printf("[BLE] window OPEN %lus (%s)\n", BLE_WINDOW_MS / 1000, gesture);
+    ozThreadApplyPoll(true); // C9 §5 — someone is at the door; poll hard
+  }
   screenDirty = true;
 }
 
@@ -1586,6 +1631,7 @@ void closeBleWindow(const char *why) {
   bleWindowUntil = 0;
   BLEDevice::stopAdvertising();
   Serial.printf("[BLE] window closed (%s)\n", why);
+  ozThreadApplyPoll(false); // back to the configured interval
   screenDirty = true;
 }
 
@@ -2515,6 +2561,34 @@ void forwardHexToMcu(const String &hex) {
 // Fix: listen where the packets actually land — a normal lwIP AF_INET6 socket.
 static int ozRxFd = -1;
 
+// ── C9 §5 — fast poll while somebody is standing at the door ────────────────
+//
+// A 5 s poll means a queued unlock can sit up to 5 s before the lock asks its
+// parent for it. That is fine for a command arriving while nobody is present,
+// and awful for the one case where a person is waiting. The BLE window already
+// marks exactly that case (a keypad touch or BOOT press opened it), so drop to
+// 1 s for its duration and restore afterwards.
+//
+// No-op unless SED is active: with rx-on there is no poll timer to speed up.
+// Takes the OpenThread lock itself, so it must NOT be called from inside a
+// section that already holds it (see threadUdpBegin's warning about the
+// wrapper methods deadlocking).
+void ozThreadApplyPoll(bool fast) {
+  if (!cfgThreadSed || !isThread()) return;
+  otInstance *inst = esp_openthread_get_instance();
+  if (!inst) return;
+  const uint32_t ms = fast ? OZ_POLL_FAST_MS
+                           : clampThreadPollS(cfgThreadPollS) * 1000UL;
+  if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(200))) {
+    Serial.println("[THREAD] poll change skipped — stack busy");
+    return;
+  }
+  otError e = otLinkSetPollPeriod(inst, ms);
+  esp_openthread_lock_release();
+  Serial.printf("[THREAD] poll -> %lu ms (%s) rc=%d\n", (unsigned long)ms,
+                fast ? "BLE window open" : "idle", (int)e);
+}
+
 void threadUdpBegin() {
   if (threadUdpReady) return;
   threadUdpLastAttempt = millis();
@@ -2553,7 +2627,26 @@ void threadUdpBegin() {
     otLinkModeConfig lm = otThreadGetLinkMode(inst);
     Serial.printf("[THREAD] linkmode rx_on=%d ftd=%d netdata=%d\n",
                   (int)lm.mRxOnWhenIdle, (int)lm.mDeviceType, (int)lm.mNetworkData);
-    if (!lm.mRxOnWhenIdle) {
+    // C9 §1: the forced rx-on above is now conditional. `cfgThreadSed` is the
+    // ONLY thing that selects sleepy; the ground-truth read-back stays, because
+    // the reason it was added — rx-on was ASSUMED from CONFIG_OPENTHREAD_FTD=y
+    // and never verified — applies just as much to assuming we went sleepy.
+    if (cfgThreadSed) {
+      if (lm.mRxOnWhenIdle || lm.mDeviceType || lm.mNetworkData) {
+        lm.mRxOnWhenIdle = false; // the whole point: radio off between polls
+        lm.mDeviceType   = false; // MTD — a sleepy node must not be routable
+        lm.mNetworkData  = false; // stable-only network data, less to carry
+        otError le = otThreadSetLinkMode(inst, lm);
+        Serial.printf("[THREAD] SED requested — rx-on cleared -> %d\n", (int)le);
+      }
+      const uint32_t pollMs = clampThreadPollS(cfgThreadPollS) * 1000UL;
+      otError pe = otLinkSetPollPeriod(inst, pollMs);
+      Serial.printf("[THREAD] SED poll period %lu ms -> %d (readback %lu)\n",
+                    (unsigned long)pollMs, (int)pe,
+                    (unsigned long)otLinkGetPollPeriod(inst));
+      Serial.println("[THREAD] 🔴 SED: this node can no longer hear multicast — "
+                     "downlink must be UNICAST or commands will not arrive");
+    } else if (!lm.mRxOnWhenIdle) {
       lm.mRxOnWhenIdle = true;
       otError le = otThreadSetLinkMode(inst, lm);
       Serial.printf("[THREAD] was SLEEPY — forced rx-on-when-idle -> %d\n", (int)le);
@@ -3753,7 +3846,7 @@ void applyProvision(JsonDocument &doc) {
   cfgServerPort = doc["server_port"] | 4200;
   cfgSiteId = (const char *)(doc["site_id"] | "lab");
   cfgName = (const char *)(doc["name"] | "");
-  cfgHeartbeatS = clampHeartbeatS(doc["heartbeat_s"] | 60);
+  cfgHeartbeatS = clampHeartbeatS(doc["heartbeat_s"] | 300);
 
   // Transport discriminator (ozkey-10 §4): same rule threadcomm.ino already
   // used as a separate binary — network_key present -> Thread dataset;
@@ -4837,6 +4930,80 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
   // which lock they are standing at, so it is a trust surface: a member who
   // could rename it could make one door impersonate another. Naming is cheap to
   // do through the owner and not worth the ambiguity.
+  // ── ozkey-34 F-9 — provision_key: NEXUS-issued identity, DEVELOPMENT ONLY ──
+  //
+  // {"kind":"provision_key","pub":"<64 hex>","priv":"<64 hex>"}
+  //
+  // Three refusals, in order of how badly they would end:
+  //
+  // 1. PRODUCTION REFUSES OUTRIGHT. A production lock's identity lives in
+  //    eFuse and is not writable over the air by anyone, ever. If this verb
+  //    could overwrite it, the entire point of burning silicon would be a
+  //    60-second BLE window away from being undone.
+  // 2. OWNER ONLY. Same bar as every other identity-affecting verb.
+  // 3. The pair must AGREE — pub must be the X25519 base multiplication of
+  //    priv. NEXUS sends both, so a mismatch means corruption or a hostile
+  //    sender, and installing a pub the lock cannot prove would produce a lock
+  //    that is unreachable in a way nothing on the wire could diagnose.
+  //
+  // 🔴 INSTALLING THIS DESTROYS EVERY EXISTING BOND — ozkey-34 §6. Bond
+  // secrets are X25519(lock_priv, member_pub), so replacing lock_priv silently
+  // changes every one of them. We therefore WIPE THE BOND TABLE rather than
+  // leave a lock that reports bonds=1 and refuses every envelope. The app MUST
+  // re-pair afterwards; PROVISION_KEY_OK means "new identity, start over".
+  if (strcmp(kind, "provision_key") == 0) {
+    if (g_modeProduction) {
+      Serial.println("[OZKIE] provision_key REFUSED — this lock is production "
+                     "(identity is in eFuse and is not writable)");
+      notifyStatus("PROVISION_KEY_DENIED");
+      return;
+    }
+    if (slot != 0) {
+      Serial.printf("[OZKIE] provision_key REFUSED — bond %d is not the owner\n", slot);
+      notifyStatus("PROVISION_KEY_DENIED");
+      return;
+    }
+    uint8_t np[32], nb[32], check[32];
+    if (ozHexDecode(String((const char *)(doc["priv"] | "")), np, sizeof(np)) != 32 ||
+        ozHexDecode(String((const char *)(doc["pub"] | "")), nb, sizeof(nb)) != 32) {
+      Serial.println("[OZKIE] provision_key: pub/priv must both be 64 hex chars");
+      notifyStatus("PROVISION_KEY_DENIED");
+      return;
+    }
+    ozClamp(np);
+    if (!ozX25519Base(np, check) || memcmp(check, nb, 32) != 0) {
+      Serial.println("[OZKIE] provision_key: pub does NOT match priv — refusing "
+                     "an identity this lock could not prove");
+      memset(np, 0, sizeof(np));
+      notifyStatus("PROVISION_KEY_DENIED");
+      return;
+    }
+
+    memcpy(g_lockPriv, np, 32);
+    memcpy(g_lockPub, check, 32);
+    memset(np, 0, sizeof(np));
+    g_lockKeyReady = true;
+    prefs.begin("blelock", false);
+    prefs.putBytes("xpriv", g_lockPriv, 32);
+    prefs.putBytes("xpub", g_lockPub, 32);
+    prefs.end();
+
+    Serial.printf("[OZKIE] provision_key ACCEPTED — new info.pub=%s\n",
+                  ozLockPubHex().c_str());
+    Serial.println("[OZKIE] 🔴 all bonds invalidated by the key change — wiping "
+                   "the bond table; the app must re-pair");
+    notifyStatus("PROVISION_KEY_OK"); // answer BEFORE the bond goes away
+    delay(150);                        // let the notify flush (see notifyStatus)
+    // Every slot, INCLUDING bond #0 — the owner's secret was derived from the
+    // old private key too, so it is just as dead as the members'. Starting at
+    // 1 here (the usual "never touch slot 0" rule) would leave exactly the bond
+    // the app is holding, and it would fail on the next envelope.
+    for (int i = 0; i < OZ_BOND_MAX; i++)
+      if (g_bonds[i].present) ozBondRevoke(i);
+    screenDirty = true;
+    return;
+  }
+
   if (strcmp(kind, "set_name") == 0) {
     if (slot != 0) {
       Serial.printf("[OZKIE] set_name REFUSED — bond %d is not the owner\n", slot);
@@ -6211,6 +6378,16 @@ void setup() {
   // Ceremony identity (RF is up → TRNG seeded) + boot known-answer self-test.
   ozLockKeyInit();
   Serial.printf("[CRYPTO] info.pub=%s\n", ozLockPubHex().c_str());
+  // ozkey-34 F-8. The AUTHORITATIVE mode is derived in ozLockKeyInit() from
+  // whether eFuse holds a key; this NVS copy is written for diagnostics and so
+  // a support dump can say which posture the unit came up in. It is never read
+  // back to decide the mode — see ozOperationalMode()'s header for why a
+  // writable mode key would be a downgrade vector.
+  prefs.begin("blelock", false);
+  prefs.putString("opmode", ozOperationalMode());
+  prefs.end();
+  Serial.printf("[CRYPTO] operational_mode=%s (derived from hardware)\n",
+                ozOperationalMode());
   bootMark("lock keypair init");
   // M2: ownership state, printed every boot. This line is the Ask 6 factory-reset
   // evidence — after a reset both info.pub AND this must change (pub re-minted,
@@ -6772,7 +6949,7 @@ void loop() {
     // identical unquoted, and the empty case is the one that matters.
     Serial.printf("[MON] %s name='%s' xport=%s mode=%s wifi=%s ip=%s mqtt=%s thread=%s "
                   "udp=%s mcu=%s tx=%u rx=%u wake=%s mrdy=%s srdy=%s hb=%us "
-                  "naps=%u heap=%u clock=%s treq=%u tserved=%u\n",
+                  "radio=%s naps=%u heap=%u clock=%s treq=%u tserved=%u\n",
                   st, cfgName.c_str(),
                   provisioned ? cfgTransport.c_str() : "unset", modeInfo.c_str(),
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
@@ -6791,7 +6968,17 @@ void loop() {
                   wakeSim ? "sim" : "real",
                   mrdyAsserted ? "LOW" : "high",
                   digitalRead(SRDY_PIN) == LOW ? "LOW" : "high",
-                  cfgHeartbeatS, (unsigned)sleepWakeCount,
+                  cfgHeartbeatS,
+                  // C9: which radio duty cycle this lock is ACTUALLY running.
+                  // Printed for the same reason the link-mode read-back exists
+                  // — "we set SED at boot" is an intention, not an observation,
+                  // and the current-draw measurement is meaningless without
+                  // knowing which mode produced it.
+                  (!isThread() ? "n/a"
+                               : (cfgThreadSed ? (bleWindowOpen() ? "SED/1s"
+                                                                  : "SED")
+                                               : "rx-on")),
+                  (unsigned)sleepWakeCount,
                   (unsigned)ESP.getFreeHeap(),
                   // ozkey-21: "unknown" here means every temporary PIN/RFID
                   // window on this lock is unenforceable. It is the headline
