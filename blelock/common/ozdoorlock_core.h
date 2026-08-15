@@ -1609,6 +1609,7 @@ bool buttonWasDown = false;
 // note there about drawStatus() needing it before this point.
 
 void startBle(); // defined with the GATT setup, further down
+static void ozRefreshInfoChar(); // INFO is rebuilt on change, not snapshotted
 
 bool bleWindowOpen() { return bleWindowUntil && (long)(millis() - bleWindowUntil) < 0; }
 
@@ -5129,6 +5130,7 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
 
     Serial.printf("[OZKIE] provision_key ACCEPTED — new info.pub=%s\n",
                   ozLockPubHex().c_str());
+    ozRefreshInfoChar(); // the whole point: info.pub must report the NEW key
     Serial.println("[OZKIE] 🔴 all bonds invalidated by the key change — wiping "
                    "the bond table; the app must re-pair");
     notifyStatus("PROVISION_KEY_OK"); // answer BEFORE the bond goes away
@@ -5164,6 +5166,10 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
     saveConfig();
     Serial.printf("[OZKIE] set_name -> '%s' (persisted)\n", cfgName.c_str());
     screenDirty = true; // the whole point: the panel changes now, not at reboot
+    // …and so does info.name. The rename epic reported through a field that
+    // could not change until reboot; an app re-reading INFO after a successful
+    // rename would have been told the OLD name and had no way to know why.
+    ozRefreshInfoChar();
     notifyStatus("SETTING_OK");
     return;
   }
@@ -5949,6 +5955,49 @@ class ServerCB : public BLEServerCallbacks {
   }
 };
 
+// ── The INFO characteristic is REBUILT, not snapshotted (2026-08-16) ────────
+//
+// It used to be filled once inside startBle(), and startBle() only ever runs
+// when bleServer == nullptr — which is once per boot, because bleServer is
+// never nulled. So every field in here froze at GATT-build time.
+//
+// That is a real defect and it was found the expensive way: after
+// `provision_key` replaced LockA's identity, the app read `info.pub` and got
+// the PRE-provision key back (XF-106 §17 run 1). ftpos generously wrote it up
+// as transient BLE staleness; a phone-side GATT cache may well have played a
+// part, but ours was serving a stale value regardless.
+//
+// `pub` is the one that bites hardest, but it is not alone: `name` goes stale
+// after every set_name (the whole rename epic reported through a field that
+// could not change), and `transport` after a Wi-Fi/Thread conversion.
+//
+// Same fault class as the LCD showing "Thread: JOINED" from a latch that was
+// set once and cleared nowhere: a value that was true when it was written and
+// is never asked again.
+static void ozRefreshInfoChar() {
+  if (!chrInfo) return;
+  JsonDocument doc;
+  doc["device_id"] = deviceId;
+  doc["mac"] = macStr;
+  doc["fw"] = FW_VERSION;
+  doc["name"] = cfgName;
+  doc["pub"] = ozLockPubHex(); // X25519 ceremony pubkey (XF-46 §7.1)
+  // BUG FIX (2026-07-26, caught during app-impact review): blecomm.ino never
+  // reported "transport" since it was always Wi-Fi; threadcomm.ino hard-
+  // coded "thread" since it was always Thread. The unified binary can be
+  // EITHER depending on cfgTransport, and the app's existing auto-detect
+  // (info.transport=='thread' -> Thread courier flow) depends on this field
+  // existing — omitting it would silently make every unified lock look
+  // like a Wi-Fi lock to the app, always. NOTE: for a never-provisioned
+  // board this still reads "wifi" (the NVS default) — see the app-side
+  // discussion this same field surfaced (fresh-commissioning transport
+  // choice can't be auto-detected the way it could when two separate
+  // firmwares existed).
+  doc["transport"] = cfgTransport;
+  String info; serializeJson(doc, info);
+  chrInfo->setValue(info.c_str());
+}
+
 void startBle() {
   BLEDevice::init(BLE_NAME);
   bleServer = BLEDevice::createServer();
@@ -5989,26 +6038,7 @@ void startBle() {
   chrMember->setCallbacks(new MemberCB());
 
   chrInfo = svc->createCharacteristic(CHR_INFO, BLECharacteristic::PROPERTY_READ);
-  JsonDocument doc;
-  doc["device_id"] = deviceId;
-  doc["mac"] = macStr;
-  doc["fw"] = FW_VERSION;
-  doc["name"] = cfgName;
-  doc["pub"] = ozLockPubHex(); // X25519 ceremony pubkey (XF-46 §7.1)
-  // BUG FIX (2026-07-26, caught during app-impact review): blecomm.ino never
-  // reported "transport" since it was always Wi-Fi; threadcomm.ino hard-
-  // coded "thread" since it was always Thread. The unified binary can be
-  // EITHER depending on cfgTransport, and the app's existing auto-detect
-  // (info.transport=='thread' -> Thread courier flow) depends on this field
-  // existing — omitting it would silently make every unified lock look
-  // like a Wi-Fi lock to the app, always. NOTE: for a never-provisioned
-  // board this still reads "wifi" (the NVS default) — see the app-side
-  // discussion this same field surfaced (fresh-commissioning transport
-  // choice can't be auto-detected the way it could when two separate
-  // firmwares existed).
-  doc["transport"] = cfgTransport;
-  String info; serializeJson(doc, info);
-  chrInfo->setValue(info.c_str());
+  ozRefreshInfoChar();
 
   svc->start();
   BLEAdvertising *adv = BLEDevice::getAdvertising();
