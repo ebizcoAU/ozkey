@@ -836,6 +836,14 @@ uint32_t clampHeartbeatS(uint32_t s) {
 }
 
 // ── MCU bus health (drives the dashboard) ───────────────────────────────────
+// Consecutive failed keypad entries — the MCU-lock pairing gesture (2026-08-16).
+// See the DP 8 handler for why one failure is no longer enough and why this
+// cannot be the *01# the LCD panel uses.
+#define OZ_PIN_FAIL_TO_PAIR     3
+#define OZ_PIN_FAIL_WINDOW_MS   30000UL
+static uint8_t       g_pinFailCount   = 0;
+static unsigned long g_pinFailFirstAt = 0;
+
 uint32_t mcuTxFrames = 0;         // frames forwarded server → MCU
 uint32_t mcuRxFrames = 0;         // frames received MCU → module
 unsigned long lastMcuFrameAt = 0; // millis() of last frame FROM the MCU
@@ -2187,8 +2195,43 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       // This also means DP 60 is no longer worth waiting for. It buys a
       // deliberate gesture; this buys the same privacy property today, on
       // shipping hardware, with no manufacturer allocation (ozkey-22 §7).
+      // ── 🟡 INTERIM (2026-08-16) — three failures, not one ─────────────────
+      //
+      // The operator's rule is "*01# opens BLE, otherwise stay silent". On the
+      // LCD panel that is now literally what happens. **On a lock with a real
+      // DL MCU it cannot be**: the MCU sends nothing until '#', and then only
+      // pass/fail — the typed characters never reach us. The supplier catalogue
+      // confirms it: DP 60 `alarm` carries `wrong_password`(1) and `key_in`(8),
+      // which say THAT a key was pressed, never WHICH; DP 61 carries a
+      // `cred_id`, i.e. which stored credential matched, not the digits.
+      //
+      // So deleting this outright would leave a production lock with NO
+      // at-the-door pairing gesture at all — the only way to make it
+      // discoverable would be the BOOT button, which is INSIDE the door. That
+      // breaks member enrolment and owner re-pairing on a wiped lock, which is
+      // the exact gap the keypad trigger was added to close.
+      //
+      // Interim: keep the path, raise the bar from ONE failure to THREE inside
+      // 30 s. A brushed key sends nothing at all (no '#'), and a single
+      // mistyped PIN no longer advertises — while all three recovery cases
+      // still work, because each already fails repeatedly. Awaiting the
+      // operator's (a)/(b) call; (a) is deleting these six lines.
       if (v[0] != 0) {
-        openBleWindow("failed keypad attempt");
+        const unsigned long now = millis();
+        if (!g_pinFailCount || (now - g_pinFailFirstAt) > OZ_PIN_FAIL_WINDOW_MS) {
+          g_pinFailCount = 0;
+          g_pinFailFirstAt = now;
+        }
+        g_pinFailCount++;
+        if (g_pinFailCount >= OZ_PIN_FAIL_TO_PAIR) {
+          g_pinFailCount = 0;
+          Serial.println("[BLE] 3 failed entries in 30s — pairing window opened "
+                         "(MCU cannot report *01#; see the comment here)");
+          openBleWindow("3x failed entry");
+        } else {
+          Serial.printf("[BLE] failed entry %u/%u — no window yet\n",
+                        (unsigned)g_pinFailCount, (unsigned)OZ_PIN_FAIL_TO_PAIR);
+        }
       }
       return;
     }
@@ -6207,7 +6250,7 @@ void drawHexReadout() {
   gfx->print(dname);
 }
 
-bool resetArm = false;
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // §0.2/§0.3 keep-alive nap (wake_sim=false only). Persistent power — this is
@@ -6885,20 +6928,35 @@ void loop() {
       // an open window is discoverability, not access. If accidental windows
       // become a nuisance in the field, the fix is a deliberate gesture (two
       // taps, or a long press), NOT a return to a secret key.
-      if (provisioned) {
-        Serial.printf("[BLE] key '%c' pressed — pairing window requested\n",
-                      k ? k : '?');
-        openBleWindow("keypad");
-      }
-
-      if (resetArm) {
-        resetArm = false;
-        if (k == '5') factoryReset();
-        Serial.println("[RESET] disarmed");
-      } else if (k == '*') {
-        resetArm = true;
-        Serial.println("[RESET] armed — tap 5 to wipe");
-      }
+      // ── 🔴 THE LCD KEYPAD NO LONGER TOUCHES BLE OR RESET ─────────────────
+      // (operator, 2026-08-16: "ignore doorlock esp32 1.9 lcd keypad.. we only
+      // use in the lab. 5s hold on boot is good enough")
+      //
+      // Two triggers used to fire from this panel and both fired by ACCIDENT:
+      //
+      //   • ANY key opened a 60 s BLE window. The 2026-08-14 comment above
+      //     justified that partly on the panel's 10-20 s lag making "wrong key"
+      //     indistinguishable from "broken lock" — but that lag was the
+      //     Serial.print() stall, fixed in 1.72 (worst case now 95 ms). The
+      //     premise expired; the cost did not. A sleeve on the panel left the
+      //     lock advertising, and an advertising window is a PRIVACY surface
+      //     readable from the footpath (same channel the DP 8 handler above
+      //     closed on the successful-unlock path) — and, once C9's Sleepy End
+      //     Device lands, one of the most expensive things the radio does.
+      //   • `*` armed a factory reset that any following `5` completed. On this
+      //     layout `5` sits directly under `*`: two adjacent taps wiped the
+      //     lock's identity and every bond. Far too cheap for an irreversible
+      //     action.
+      //
+      // Both are simply GONE rather than replaced with a keypad gesture. This
+      // panel is bench hardware, and the BOOT button already covers both jobs
+      // deliberately and physically: a short press opens the window, a 5 s hold
+      // factory-resets. A gesture on a lab-only panel would be machinery to
+      // maintain for no product surface.
+      //
+      // The keypad still lights and logs — it remains useful for exercising
+      // touch zones, which is what it is for.
+      if (k) Serial.printf("[KEY] '%c' (no BLE/reset side effect)\n", k);
     }
   }
 
@@ -7075,7 +7133,7 @@ void loop() {
   // Reclaiming its ~40 KB would need BLEDevice::deinit() and a rebuild of the
   // GATT server on the next window — a bigger change than M3 should carry.)
   if (!isThread() && !wakeSim && state == ST_OPERATIONAL && enrolled &&
-      !bleWindowOpen() && !bleClientConnected && !resetArm &&
+      !bleWindowOpen() && !bleClientConnected &&
       doorStatus == "LOCKED" && !touchWasDown && !mrdyAsserted &&
       millis() - lastActivityAt > SLEEP_IDLE_MS) {
     enterKeepAliveSleep();
