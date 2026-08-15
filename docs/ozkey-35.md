@@ -181,6 +181,9 @@ nobody has demonstrated it, regardless of what any other document says.
 | 15 | eFuse burn / production identity | 🔴 never burned | `ozLockKeyFromEfuse()` compiles, has never seen a burned block |
 | 16 | `provision_key` (dev key delivery) | 🟡 built, needs a decision | sealing is circular — `ozkey-34.md` §4.1 |
 | 17 | JTAG/UART disabled | 🔴 false | both live; USB CDC serial is how every bench log is read |
+| 18 | `*01#` keypad command opens BLE (DP 104, our extension) | 🟢 **verified 2026-08-16** | `doorlock-1.83` on LockA: `[TUYA<-] KEYPAD COMMAND *01#` → `[KEYCMD]` → `[BLE] window OPEN`, all same second. Exactly ONE window in the capture, 0 reader drops. **LockSim only — no real DL MCU can send it** |
+| 19 | Accidental BLE windows removed | 🟢 partly verified | LCD any-key: 5 keys incl. 3×`#`, no window (1.81). **3-failed-PIN gesture NOT yet exercised** |
+| 20 | `info.pub` reports the CURRENT key after `provision_key` | 🟡 fixed in 1.83, unexercised | XF-106 §17 run 1 read the pre-provision key: `chrInfo` was a boot-time snapshot. Now rebuilt on change; needs a re-run to confirm |
 
 ## 6. Firmware versions in play
 
