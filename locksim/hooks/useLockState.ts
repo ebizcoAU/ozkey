@@ -164,6 +164,8 @@ export function useLockState({
 
   /** Source of truth for keypad entry; `pinBuffer` state mirrors it for the display. */
   const pinBufferRef = useRef("");
+  // True between a '*' and its terminating '#' — see pressKey.
+  const cmdModeRef = useRef(false);
   const sleepTimer = useRef<Timer | null>(null);
   const relockTimer = useRef<Timer | null>(null);
   const motorTimer = useRef<Timer | null>(null);
@@ -507,9 +509,47 @@ export function useLockState({
     (key: string) => {
       keyClick();
       wake(`KEYPAD INTERRUPT — KEY '${key}'`);
+      // ── '*' IS A COMMAND PREFIX, NOT A CLEAR KEY (operator, 2026-08-16) ──
+      //
+      // It used to just wipe the PIN buffer, which is why `*01#` produced
+      // NOTHING on the wire: '*' cleared, "01" was two digits, and '#'
+      // rejected it locally for being under the 4-digit minimum. The ESP32
+      // never saw a frame at all — so no firmware change could ever have
+      // recognised the gesture.
+      //
+      // Now `*NN#` is its own channel: the MCU reports the COMMAND, and the
+      // lock acts on a stated intent instead of inferring one from repeated
+      // PIN failures. Pressing '*' again abandons a command in progress, which
+      // is also how you still get the old clear behaviour.
       if (key === "*") {
+        if (cmdModeRef.current) {
+          setLastEvent("COMMAND ABANDONED");
+        }
+        cmdModeRef.current = true;
         pinBufferRef.current = "";
         setPinBuffer("");
+        setLastEvent("COMMAND MODE — type NN then #");
+        return;
+      }
+      if (key === "#" && cmdModeRef.current) {
+        const code = pinBufferRef.current;
+        cmdModeRef.current = false;
+        pinBufferRef.current = "";
+        setPinBuffer("");
+        if (!code.length) {
+          setLastEvent("COMMAND EMPTY — ignored");
+          return;
+        }
+        transmitRef.current(
+          TuyaCommand.DP_REPORT,
+          buildDpPayload(
+            DpId.KEYPAD_COMMAND_OURS,
+            DpType.STRING,
+            Array.from(code, (ch) => ch.charCodeAt(0))
+          ),
+          `KEYPAD COMMAND *${code}# -> OZKIE MCU (DP 104, our extension)`
+        );
+        setLastEvent(`COMMAND *${code}# SENT`);
         return;
       }
       if (key === "#") {

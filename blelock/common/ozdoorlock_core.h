@@ -2015,6 +2015,12 @@ String describeDpid(const uint8_t *f, size_t n) {
   }
   if (dpid == 1) return String("unlock channel report");
   if (dpid == 5) return String("battery alarm");
+  if (dpid == 104) { // our *NN# keypad command — see the handler for the number
+    char c[8] = {0};
+    const size_t take = vlen < sizeof(c) - 1 ? vlen : sizeof(c) - 1;
+    memcpy(c, v, take);
+    return String("KEYPAD COMMAND *") + c + "#";
+  }
   // M4 verbs. Named here so a bench capture reads as English rather than "DP
   // 101 type 0 len 32" — the whole point of the LockSim test is being able to
   // see at a glance that these never crossed the wire.
@@ -2236,6 +2242,55 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       return;
     }
     if (dpid == 5) { publishLog("battery_alarm", "MCU report"); return; }
+
+    // ── DP 104 — `*NN#` KEYPAD COMMAND. OUR EXTENSION (operator, 2026-08-16) ─
+    //
+    // "`*` should identify as cmd mode." A user types `*01#` at the door and
+    // the MCU reports the COMMAND — so the lock acts on a STATED INTENT
+    // instead of inferring one from repeated PIN failures.
+    //
+    // Why this could not work before: on a keypad, `*` is the CLEAR key and a
+    // short entry is discarded locally. `*01#` therefore put NOTHING on the
+    // wire — the ESP32 was not failing to recognise the gesture, it was never
+    // sent one. That is a property of the keypad, not of our parser, so the
+    // fix had to be on the MCU side. LockSim is ours, so the bench now behaves
+    // the way the product should.
+    //
+    // 🔴 STILL OUR FICTION ON REAL HARDWARE. No shipping DL MCU emits DP 104.
+    // The supplier catalogue carries no keystroke channel at all — DP 60
+    // `alarm` says THAT a key was pressed (`key_in`) and never which, DP 61
+    // carries a matched `cred_id`, not the digits. Until an allocation lands
+    // (ozkey-22 §7 / ozkey-27 Q2), a production lock still falls back to the
+    // three-failed-entries gesture in the DP 8 handler above.
+    //
+    // 104 is deliberate, not another guess: 101/102/103 are already our
+    // in-lock verb block and all four are UNUSED in the real catalogue
+    // (profiles/tuya-lock-catalogue.json rev 1, checked 2026-08-16). DP 60 —
+    // our first attempt at this — turned out to be the alarm enum, which is
+    // exactly the mistake this numbering avoids repeating.
+    if (dpid == 104) {
+      char cmd[8] = {0};
+      const size_t take = vlen < sizeof(cmd) - 1 ? vlen : sizeof(cmd) - 1;
+      memcpy(cmd, v, take);
+      for (size_t i = 0; i < take; i++)
+        if (cmd[i] < '0' || cmd[i] > '9') { cmd[i] = 0; break; } // digits only
+
+      if (strcmp(cmd, "01") == 0) {
+        if (provisioned) {
+          Serial.println("[KEYCMD] *01# — pairing window requested");
+          openBleWindow("*01# keypad command");
+        } else {
+          // Nothing to open: an unprovisioned lock already advertises. Saying
+          // so beats silence, which would read as "the command was ignored".
+          Serial.println("[KEYCMD] *01# — already advertising (unprovisioned)");
+        }
+      } else {
+        // Unknown codes are logged, never guessed at. The command space is
+        // ours to define and an unrecognised one is a spec gap, not an error.
+        Serial.printf("[KEYCMD] *%s# — no such command\n", cmd);
+      }
+      return;
+    }
 
     // ── 🔴 DP 60 HANDLER DELETED 2026-08-13 — the number was already taken ──
     //

@@ -129,6 +129,30 @@ export enum DpId {
    * See ozkey-22 §7 for the allocation request.
    */
   PAIRING_REQUEST_PROPOSED = 60,
+
+  /**
+   * KEYPAD COMMAND — `*NN#` typed at the door. OUR EXTENSION, DP 104.
+   *
+   * The operator's rule: **`*` is a command prefix, not a clear key.** A user
+   * types `*01#` and the MCU reports the COMMAND, not a failed PIN — so the
+   * lock can act on an intent instead of inferring one from repeated failures.
+   *
+   * WHY 104 AND NOT 60. DP 60 was our first guess and it was WRONG: the real
+   * Tuya catalogue defines 60 as the 18-value `alarm` enum
+   * (`wrong_password`, `key_in`, `pry`, …), which is why the firmware handler
+   * for it was deleted on 2026-08-13. 104 sits in the block we have already
+   * claimed for in-lock verbs — 101 `bond_revoke`, 102 `invite_cancel`,
+   * 103 `list_bonds` — and every one of 101-104 is UNUSED in the catalogue
+   * (`profiles/tuya-lock-catalogue.json` rev 1, verified 2026-08-16).
+   *
+   * STILL OUR FICTION. No shipping DL MCU emits this. It makes the bench
+   * behave the way the product should, and gives the firmware side something
+   * to be tested against the moment a manufacturer allocation lands. The
+   * request itself is ozkey-22 §7 / ozkey-27 Q2.
+   *
+   * Payload: ASCII digits between the `*` and the `#`, e.g. "01".
+   */
+  KEYPAD_COMMAND_OURS = 104,
 }
 
 /** Values carried by DP 8 (ACCESS_RESULT, ENUM). */
