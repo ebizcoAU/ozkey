@@ -3457,6 +3457,47 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     screenDirty = true;
     return;
   }
+  // ── C9 §1/§2 — the way SED and the poll interval are actually SETTABLE ────
+  //
+  // {"op":"thread_power","sed":true,"poll_s":5}
+  //
+  // Added because the NVS keys existed with nothing able to write them, which
+  // is the same class of mistake as a diagnostic nobody can read: a setting you
+  // cannot set is not a setting. Both fields optional, so poll can be tuned
+  // without touching the mode.
+  //
+  // Takes effect immediately for the poll interval; the LINK MODE change needs
+  // the stack re-read in threadUdpBegin(), so `sed` is persisted and applied on
+  // the next boot. Said out loud in the log rather than left for someone to
+  // discover from a current measurement that did not change.
+  if (op && strcmp(op, "thread_power") == 0) {
+    bool changed = false;
+    if (doc["sed"].is<bool>()) {
+      const bool want = doc["sed"].as<bool>();
+      if (want != cfgThreadSed) { cfgThreadSed = want; changed = true; }
+    }
+    if (doc["poll_s"].is<uint32_t>()) {
+      const uint32_t want = clampThreadPollS(doc["poll_s"].as<uint32_t>());
+      if (want != cfgThreadPollS) { cfgThreadPollS = want; changed = true; }
+    }
+    if (changed) {
+      prefs.begin("blelock", false);
+      prefs.putBool("sed", cfgThreadSed);
+      prefs.putUInt("poll", cfgThreadPollS);
+      prefs.end();
+    }
+    Serial.printf("[THREAD] thread_power: sed=%d poll=%lus%s\n",
+                  (int)cfgThreadSed, (unsigned long)cfgThreadPollS,
+                  changed ? "" : " (no change)");
+    // Poll period can be retimed live; rx-on-when-idle cannot, here.
+    ozThreadApplyPoll(bleWindowOpen());
+    if (changed && cfgThreadSed)
+      Serial.println("[THREAD] SED takes effect on the NEXT BOOT — and requires a "
+                     "bridge running bridge32-1.39+ for unicast downlink, or this "
+                     "lock will stop receiving commands");
+    return;
+  }
+
   if (op && strcmp(op, "provision_assign") == 0) {
     String amac = doc["mac"] | "";
     amac.replace(":", ""); amac.toLowerCase();

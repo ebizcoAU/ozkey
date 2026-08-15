@@ -179,7 +179,7 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.38"
+#define FW_VERSION "bridge32-1.39"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -1160,13 +1160,68 @@ void pollUplinkUdp() {
 static unsigned long g_lastLivenessAt = 0;
 static volatile bool g_livenessPushDue = false;
 
+// Same helper the lock has (ozdoorlock_core.h) and for the same reason: a log
+// that names a destination's LABEL rather than its address cannot be used to
+// diagnose a delivery failure.
+static String ozIp6Str(const uint8_t a[16]) {
+  char b[48];
+  snprintf(b, sizeof(b),
+           "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+           a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+           a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]);
+  return String(b);
+}
+
 #define OZ_LOCKMAP_MAX 32
 struct OzLockAddr {
   char     deviceId[24];
   uint8_t  ext[8];   // Thread extended address — the join key. See ozNoteLockExt.
   bool     used;
+  // ── ozkey-34/35 D2 — the unicast downlink address ─────────────────────────
+  //
+  // Learned from the SOURCE ADDRESS of this lock's own uplinks. Deliberately
+  // RAM-only, not added to the persisted 32-byte record: an address is the one
+  // thing in here that legitimately changes when a lock re-attaches, and a
+  // stale address restored from NVS after a bridge reboot would send every
+  // command into a hole. Locks beacon every 60 s, so the map repopulates on
+  // its own within one interval of a restart — `ext` is persisted because
+  // Thread identity is stable, `ip6` is not because addresses are not.
+  uint8_t  ip6[16];
+  bool     haveIp6;
 };
 static OzLockAddr g_lockMap[OZ_LOCKMAP_MAX];
+
+// Remember where a lock's uplinks come from, so downlinks can go back the same
+// way. Called on EVERY uplink (sealed or beacon) — cheap, and an address that
+// changed is exactly the case we must not miss.
+static void ozNoteLockIp6(const char *deviceId, const struct sockaddr_in6 *src) {
+  if (!deviceId || !src) return;
+  for (int i = 0; i < OZ_LOCKMAP_MAX; i++) {
+    if (!g_lockMap[i].used) continue;
+    if (strncmp(g_lockMap[i].deviceId, deviceId, sizeof(g_lockMap[i].deviceId)) != 0)
+      continue;
+    if (g_lockMap[i].haveIp6 &&
+        memcmp(g_lockMap[i].ip6, src->sin6_addr.s6_addr, 16) == 0)
+      return; // unchanged, the overwhelmingly common case — say nothing
+    memcpy(g_lockMap[i].ip6, src->sin6_addr.s6_addr, 16);
+    g_lockMap[i].haveIp6 = true;
+    Serial.printf("[UNICAST] %s reachable at %s\n", deviceId,
+                  ozIp6Str(g_lockMap[i].ip6).c_str());
+    return;
+  }
+}
+
+// Returns true and fills [out] if we know where this lock is.
+static bool ozLockIp6(const char *deviceId, IPAddress &out) {
+  for (int i = 0; i < OZ_LOCKMAP_MAX; i++) {
+    if (!g_lockMap[i].used || !g_lockMap[i].haveIp6) continue;
+    if (strncmp(g_lockMap[i].deviceId, deviceId, sizeof(g_lockMap[i].deviceId)) != 0)
+      continue;
+    out = IPAddress(IPv6, g_lockMap[i].ip6);
+    return true;
+  }
+  return false;
+}
 
 // Record device_id ↔ source address. Newest wins for a given device_id: a lock
 // that re-attaches gets a new address and the stale one must not linger, or we
@@ -1522,6 +1577,10 @@ static bool pollUplinkOne() {
     }
   }
 
+  // D2 — and where to send its downlinks. Must run AFTER ozNoteLockExt, which
+  // is what creates the map entry this writes into.
+  ozNoteLockIp6(from, &src);
+
   // ── ozkey-20 R3 — presence beacon, not a sealed uplink ──────────────────
   //
   // A beacon has no `envelope_hex`: it is unsealed liveness (device_id, Thread
@@ -1863,29 +1922,37 @@ void forwardOverThread(const String &target, const String &fieldName,
     return;
   }
   logThreadChildren(); // DIAGNOSTIC (temporary) — is the lock even on this mesh?
-  sendToThreadGroup(OZ_THREAD_GROUP, target, fieldName, valueHex, "ff03::4f5a");
-  // DIAGNOSTIC (2026-07-28, temporary): same datagram to realm-local
-  // all-nodes — see the OZ_REALM_ALLNODES note above.
-  sendToThreadGroup(OZ_REALM_ALLNODES, target, fieldName, valueHex, "ff03::1");
 
-  // DIAGNOSTIC (2026-07-28, temporary — REMOVE, hard-codes one bench lock).
-  // Unicast control test. The doorlock's mesh-local EID, read from its own
-  // boot dump. Its stack confirms it has joined BOTH ff03::4f5a and ff03::1,
-  // it is an attached Child of this bridge (RLOC16 0x7401), and its socket is
-  // bound with no netif filter — yet neither multicast is ever delivered.
-  // This separates the last two possibilities:
-  //   • unicast ARRIVES, multicast does not -> multicast delivery to a Child
-  //     is broken; the relay needs a lock->address map (which ozkey-11 §3
-  //     ruled unnecessary, but that assumed multicast worked).
-  //   • unicast ALSO fails -> UDP receive is broken end-to-end regardless of
-  //     addressing, and the next step is the OpenThread CLI (`ot ping`) to
-  //     test below our code entirely.
-  IPAddress benchLock;
-  if (benchLock.fromString("fd30:4e72:549c:3c5b:5630:8734:5090:340b")) {
-    sendToThreadGroup(benchLock, target, fieldName, valueHex, "unicast-ML-EID");
-  } else {
-    Serial.println("[UDP] bench unicast address failed to parse");
+  // ── D2 (ozkey-35 §3.2) — UNICAST FIRST, and why it is not optional ────────
+  //
+  // A Sleepy End Device polls its parent for UNICAST only. Realm-local
+  // multicast is a link-layer broadcast and a sleeping radio is simply not
+  // present for it, so every multicast downlink is lost the moment a lock
+  // stops being rx-on-when-idle. That is the entire reason SED ships disabled
+  // (doorlock's cfgThreadSed defaults false) and this is the prerequisite that
+  // unblocks it — ~3 days of battery on a full Thread device vs years on a
+  // sleepy one.
+  //
+  // Unicast is the better path even for an rx-on lock: it is the only
+  // destination that gets link-layer ACKs and MAC retries. Multicast is
+  // retained ONLY as the fallback for a lock we have not heard from yet, since
+  // the address is learned from the lock's own uplinks and a bridge that has
+  // just rebooted knows nobody until the next beacon (~60 s).
+  //
+  // This replaces the 2026-07-28 diagnostic that hard-coded one bench lock's
+  // mesh-local EID. That experiment answered its question — unicast arrives,
+  // multicast does not — and the answer is now the design.
+  IPAddress dest;
+  if (ozLockIp6(target.c_str(), dest)) {
+    sendToThreadGroup(dest, target, fieldName, valueHex, "unicast");
+    return; // delivered to a known address; do not also spray the mesh
   }
+
+  Serial.printf("[UNICAST] %s not in the address map yet — falling back to "
+                "multicast (a SLEEPY lock will NOT receive this)\n",
+                target.c_str());
+  sendToThreadGroup(OZ_THREAD_GROUP, target, fieldName, valueHex, "ff03::4f5a");
+  sendToThreadGroup(OZ_REALM_ALLNODES, target, fieldName, valueHex, "ff03::1");
 }
 
 void mqttConnect() {
