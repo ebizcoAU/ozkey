@@ -53,6 +53,17 @@ static const OzDpEntry OZ_DP_ozkie_legacy_v0[] = {
   {  60, OZ_DIR_UP  , OZ_DP_FICTION   , "pairing_request_proposed" },
 };
 
+// ozsim-fullfeature — 7 DPs
+static const OzDpEntry OZ_DP_ozsim_fullfeature[] = {
+  {  53, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "doorbell" },
+  {  61, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_password" },
+  {  63, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_fingerprint" },
+  {  64, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_card" },
+  {  69, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_temporary" },
+  {  72, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_remote" },
+  {  76, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_ble" },
+};
+
 // tuya-ds013-t3 — 34 DPs
 static const OzDpEntry OZ_DP_tuya_ds013_t3[] = {
   {   9, OZ_DIR_BOTH, OZ_DP_RESERVED  , "remote_no_pw_unlock_setting" },
@@ -101,10 +112,11 @@ static const OzDpEntry OZ_DP_tuya_t3_videolock[] = {
 
 static const OzProfile OZ_PROFILES[] = {
   { "ozkie-legacy-v0", 1, OZ_DP_ozkie_legacy_v0, (uint16_t)(sizeof(OZ_DP_ozkie_legacy_v0) / sizeof(OzDpEntry)), true, nullptr },
+  { "ozsim-fullfeature", 1, OZ_DP_ozsim_fullfeature, (uint16_t)(sizeof(OZ_DP_ozsim_fullfeature) / sizeof(OzDpEntry)), false, "ozsimfullfeature" },
   { "tuya-ds013-t3", 1, OZ_DP_tuya_ds013_t3, (uint16_t)(sizeof(OZ_DP_tuya_ds013_t3) / sizeof(OzDpEntry)), false, "vr4iiuqtyh0q4nix" },
   { "tuya-t3-videolock", 1, OZ_DP_tuya_t3_videolock, (uint16_t)(sizeof(OZ_DP_tuya_t3_videolock) / sizeof(OzDpEntry)), false, "3zlhjdesga1kyy75" },
 };
-static const uint8_t OZ_PROFILE_COUNT = 3;
+static const uint8_t OZ_PROFILE_COUNT = 4;
 
 // The profile the firmware boots with.
 //

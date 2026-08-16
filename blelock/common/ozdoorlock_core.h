@@ -1534,6 +1534,14 @@ void loadConfig() {
     // right map from the first millisecond, not from whenever 0x01 is answered.
     String pf = prefs.getString("prof", "");
     if (pf.length()) ozProfileSelect(pf.c_str());
+    // Last known identity. Reported immediately so `info` and the heartbeat
+    // are never blank for a lock we have already identified; the 0x01 ask
+    // still runs and overwrites this if the MCU now says something else.
+    cfgMcuPid = prefs.getString("mpid", "");
+    cfgMcuVer = prefs.getString("mver", "");
+    if (cfgMcuPid.length())
+      Serial.printf("[PID] restored '%s' (mcu_fw '%s') — will re-confirm\n",
+                    cfgMcuPid.c_str(), cfgMcuVer.c_str());
   }
   g_bellObserved = prefs.getBool("bell", false);
   cfgThreadSed = prefs.getBool("sed", false);
@@ -2169,6 +2177,16 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       prefs.putString("prof", p->id);
       prefs.end();
     }
+    // Persist the PID ITSELF, not just the profile it selected. Without this
+    // the lock boots on the right DP map while reporting no identity at all —
+    // and an app asking "what lock is this" gets `unknown` for a lock we had
+    // already identified, until the MCU happens to answer again. Overwritten
+    // whenever the MCU reports something different, so moving the co-processor
+    // PCB to another lock re-identifies rather than lying.
+    prefs.begin("blelock", false);
+    prefs.putString("mpid", cfgMcuPid);
+    prefs.putString("mver", cfgMcuVer);
+    prefs.end();
     ozRefreshInfoChar(); // pid / has_doorbell / profile all just changed
     return;
   }
@@ -6846,8 +6864,12 @@ void loop() {
   // Retried a few times because a cold MCU can miss the first frame, then
   // dropped: an MCU that never answers 0x01 is an older one that does not
   // implement it, and pestering it forever would be noise on a shared UART.
-  if (isThread() || cfgTransport == "wifi") {
-    if (!cfgMcuPid.length() && mcuLinkUp() && g_pidAsks < OZ_PID_MAX_ASKS &&
+  {
+    // Asked even when a PID is already restored from NVS: the stored value is
+    // a memory of the last MCU, and this board may have been moved to another
+    // lock. `g_pidAsks` stops after a real answer, so a confirmed lock asks
+    // once per boot, not forever.
+    if (g_pidAsks < OZ_PID_MAX_ASKS && mcuLinkUp() &&
         (!g_pidAskedAt || millis() - g_pidAskedAt > OZ_PID_RETRY_MS)) {
       ozAskMcuProductInfo();
       if (g_pidAsks == OZ_PID_MAX_ASKS)

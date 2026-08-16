@@ -6,6 +6,8 @@ import {
   DpId,
   DpType,
   TuyaCommand,
+  OZSIM_PID,
+  OZSIM_MCU_FW,
   buildDpPayload,
   buildFrame,
   buildTimeReply,
@@ -722,6 +724,21 @@ export function useLockState({
       wake("UART RX INTERRUPT — FRAME DECODED");
       if (frame.command === TuyaCommand.HEARTBEAT) {
         transmitRef.current(TuyaCommand.HEARTBEAT, [0x01], "Heartbeat response (MCU alive)");
+        return;
+      }
+
+      // 0x01 — "what are you?". Answering this is what lets the module pick
+      // its DP profile from the product rather than a compiled-in default.
+      // The PID is FICTIONAL (see OZSIM_PID): it exists so the discovery path
+      // is exercisable at all, since no real Tuya MCU has been on our wire.
+      if (frame.command === TuyaCommand.PRODUCT_INFO) {
+        const body = JSON.stringify({ p: OZSIM_PID, v: OZSIM_MCU_FW });
+        transmitRef.current(
+          TuyaCommand.PRODUCT_INFO,
+          Array.from(body, (ch) => ch.charCodeAt(0)),
+          `Product info: pid=${OZSIM_PID} (FICTIONAL), mcu fw=${OZSIM_MCU_FW}`
+        );
+        setLastEvent(`PRODUCT INFO SENT — ${OZSIM_PID}`);
         return;
       }
 

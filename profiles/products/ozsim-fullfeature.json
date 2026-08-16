@@ -1,0 +1,23 @@
+{
+  "$comment": "🔴 NOT A REAL PRODUCT. A fictional full-feature lock that exists ONLY so LockSim can answer Tuya 0x01 with a PID and the bench can exercise PID discovery end to end — ask, parse, match, switch profile, persist, report on info/heartbeat. Before this, none of that had ever run: LockSim did not answer 0x01 and no real Tuya MCU has been on our wire. The PID is deliberately un-Tuya-like so it can never be mistaken for a supplier value. Every DP below is selected from the REAL catalogue, so the fiction is in the PRODUCT, not in the DP numbers — a bench pass here says the discovery mechanism works, and says nothing about any shipping lock. See ozkey-37.",
+  "profile_id": "ozsim-fullfeature",
+  "rev": 1,
+  "catalogue": "tuya-lock-catalogue",
+  "complete": false,
+  "supplier": {
+    "product": "LockSim Full-Feature (FICTIONAL — bench only)",
+    "pid": "ozsimfullfeature",
+    "category": "smart_lock",
+    "module": "none — this is LockSim, our own MCU emulator"
+  },
+  "source": {
+    "doc": "none — invented for bench testing, 2026-08-17",
+    "note": "Operator: 'for the LOCKSIM we can makeup a PID that has keypad, rfid, doorbell, fingerprint'. Capabilities chosen to make every branch of the app's capability table reachable on the bench."
+  },
+  "features": {
+    "capabilities_note": "keypad + RFID + fingerprint + doorbell, i.e. the maximal case. The app's default profile for an UNKNOWN pid is the opposite (RFID + app only), so these two together exercise both ends of its lookup."
+  },
+  "selects": [53, 61, 63, 64, 69, 72, 76],
+  "overrides": [],
+  "extra": []
+}

@@ -22,6 +22,17 @@ export const MIN_FRAME_LENGTH = 7;
 
 export enum TuyaCommand {
   HEARTBEAT = 0x00,
+  /**
+   * PRODUCT INFO. Module asks `55 aa 00 01 00 00 00`; the MCU answers
+   * `{"p":"<tuya pid>","v":"<mcu fw>"}` (supplier doc §1).
+   *
+   * This is how a lock identifies ITSELF — the PID selects the DP profile, so
+   * one firmware fits every model instead of a build per product. LockSim
+   * answers it with a FICTIONAL PID (see OZSIM_PID) purely so the discovery
+   * path can be exercised on the bench; no real Tuya MCU has ever been on our
+   * wire.
+   */
+  PRODUCT_INFO = 0x01,
   DP_REPORT = 0x06,
   /**
    * ozkey-21 §2.3 — TIME SERVICE. The direction here is the whole point:
@@ -76,6 +87,21 @@ export function buildMcuFactoryReset(): ByteArray {
 export function buildMcuFactoryResetAck(ok: boolean): ByteArray {
   return [TimeNotifySub.FACTORY_RESET, ok ? 0x00 : 0x01];
 }
+
+/**
+ * 🔴 FICTIONAL product id, answered by LockSim to TuyaCommand.PRODUCT_INFO.
+ *
+ * Deliberately un-Tuya-like so it can never be mistaken for a supplier value.
+ * It maps to profiles/products/ozsim-fullfeature.json — keypad + RFID +
+ * fingerprint + doorbell, i.e. the maximal capability case, chosen so the
+ * app's capability table has both ends to test against: this, and the
+ * unknown-PID default which is the opposite.
+ *
+ * A bench pass here proves the DISCOVERY MECHANISM works. It says nothing
+ * about any shipping lock.
+ */
+export const OZSIM_PID = "ozsimfullfeature";
+export const OZSIM_MCU_FW = "0.0.1-locksim";
 
 /** Tuya Data Point payload types. */
 export enum DpType {
