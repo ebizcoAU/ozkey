@@ -160,3 +160,67 @@ deep sleep is worse than the light sleep we do today.
 - Any published battery claim needs its **opens/day** stated (§3).
 - The Thread argument should be made on **latency**, not battery (§5.1).
   Claiming Thread as the battery fix overstates a 10% difference.
+
+---
+
+## 9. 🔴 Correction — there is no universal at-the-door gesture, and the doorbell is a product tier
+
+**Added 2026-08-16, after the operator surveyed real product catalogues.** This
+corrects a claim made earlier the same day, in `doorlock-1.84`'s commit and in
+conversation: that DP 53 doorbell was "the one gesture that works on shipping
+hardware."
+
+**It is not, and the error is one of sampling.** Our
+`profiles/tuya-lock-catalogue.json` derives from a single product —
+`DS013-T3`, PID `vr4iiuqtyh0q4nix` — which the T3-U module document classifies
+as a **Video Lock**. A video lock has a doorbell by definition. Generalising
+from it was unfounded.
+
+### 9.1 What the evidence actually says
+
+| Claim | Verdict | Evidence |
+|---|---|---|
+| Doorbell is a product tier, not a baseline | ✅ confirmed | DP 53 reads `支持有人按门铃上报` — *"supports* reporting…". DP 54's own note says *"do not select this DP for the core-board solution"*, proving DPs are per-product **selections**. The T3-U module lists doorbell as a *"supported function"*. Tuya market doorbell/video-intercom as distinct solution tiers |
+| Doorbell button replaces `*` or `#` on some models | 🟡 partly confirmed | Not in the protocol document — it is industrial design, not protocol. Operator's catalogue survey found models where **`#` IS the doorbell button** |
+| `#`-as-submit is not universal | ✅ confirmed with nuance | Some manuals do use it (*"press `*` and `#` keys then input… and `#` key to confirm"*), others do not. **It depends entirely on how each DL MCU's firmware is written** |
+
+### 9.2 The consequence that decided the design
+
+**The two gestures can be mutually exclusive in hardware.** If the doorbell
+button physically replaces `*` or `#`, a lock with a doorbell may be unable to
+type `*01#` at all. So "doorbell for real locks, `*01#` for the rest" was never
+a coherent split.
+
+Combined with the fact that **no Tuya DP carries keystrokes** (DP 60 `alarm`
+reports *that* a key was pressed, never which; DP 61 carries a matched
+`cred_id`), `*01#` could only ever work against our own emulator.
+
+### 9.3 What was done
+
+- **`*01#` / DP 104 removed** from firmware and from LockSim (`doorlock-1.85`).
+  It was built, bench-verified, and deleted the same day. Keeping a verb only
+  our own simulator can send would mean a bench that passes and a product that
+  cannot.
+- **Doorbell (DP 53) retained** as the gesture — the best available where a
+  lock has one, explicitly **not** a general solution.
+- **BLE window shortened 60 s → 30 s.** The window is the lock's only exposed
+  surface, so its length is the exposure.
+- Factory reset confirmed reachable **only** by mechanical means (BOOT 5 s hold,
+  lock-body button via MCU) or by the app/server. No keypad path exists — the
+  `*05#` gesture was built and reverted in 1.81 and never shipped.
+
+### 9.4 🔴 The open question this leaves
+
+**On a lock with no doorbell, there is no way for a user at the door to make it
+discoverable.** BOOT is inside the door. That blocks member enrolment at the
+door and BLE unlock for an app user standing outside.
+
+This is now a **supplier question, not a firmware one**: *how does a user at the
+door signal this specific lock?* It has to be asked per model, because the
+survey shows there is no universal answer. Related open asks: `ozkey-22` §7
+(DP allocation for a pairing gesture), `ozkey-27` Q2 (MCU contract).
+
+**The wider lesson, which applies beyond this feature:** we have been treating
+one supplier document as "the Tuya catalogue". It is one product's DP
+selection. Anything read from it describes `DS013-T3` until a second source
+says otherwise.

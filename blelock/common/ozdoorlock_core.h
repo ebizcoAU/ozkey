@@ -1606,7 +1606,11 @@ bool buttonWasDown = false;
 // The 5 s hold is already factory reset, so short-press is free and unambiguous:
 // press and release = window, press and keep holding = wipe. The countdown
 // prints either way, so a user who overshoots sees it coming.
-#define BLE_WINDOW_MS 60000UL
+// 30 s, not 60 (operator, 2026-08-16). The window is the lock's only exposed
+// surface, so its length is the exposure. Halving it halves both the time a
+// passive scanner can see the lock and the advertising energy per open — and
+// 30 s is still comfortably longer than a pair-and-connect ceremony.
+#define BLE_WINDOW_MS 30000UL
 #define BUTTON_DEBOUNCE_MS 60UL
 // bleWindowUntil is declared with the other BLE globals near the top — see the
 // note there about drawStatus() needing it before this point.
@@ -2023,12 +2027,6 @@ String describeDpid(const uint8_t *f, size_t n) {
   }
   if (dpid == 1) return String("unlock channel report");
   if (dpid == 5) return String("battery alarm");
-  if (dpid == 104) { // our *NN# keypad command — see the handler for the number
-    char c[8] = {0};
-    const size_t take = vlen < sizeof(c) - 1 ? vlen : sizeof(c) - 1;
-    memcpy(c, v, take);
-    return String("KEYPAD COMMAND *") + c + "#";
-  }
   // M4 verbs. Named here so a bench capture reads as English rather than "DP
   // 101 type 0 len 32" — the whole point of the LockSim test is being able to
   // see at a glance that these never crossed the wire.
@@ -2226,24 +2224,33 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
     }
     if (dpid == 5) { publishLog("battery_alarm", "MCU report"); return; }
 
-    // ── DP 53 DOORBELL — the pairing gesture that does not train bad habits ──
+    // ── DP 53 DOORBELL — the pairing gesture, kept after a market check ────
     //
-    // Chosen over the failed-PIN gesture it replaces (operator, 2026-08-16),
-    // and it is better on three counts:
+    // Reinstated 2026-08-16 after the operator surveyed real product
+    // catalogues. It briefly did NOT open a window ("pressing the doorbell to
+    // turn BLE on opens more chance for BLE hacker") and `*01#` was to be the
+    // only gesture. The survey killed that: **`*01#` cannot work on a real
+    // lock**, and worse, on some Tuya models the doorbell button PHYSICALLY
+    // REPLACES the `*` or `#` key — so the two gestures can be mutually
+    // exclusive in hardware. There is no universal keypad behaviour to build
+    // on; `#`-as-submit varies by model.
     //
-    //   1. IT IS REAL. DP 53 `doorbell` is `status: confirmed` in the supplier
-    //      catalogue — unlike DP 104's *01#, which only LockSim can send. This
-    //      gesture will work on shipping hardware.
-    //   2. It is a DELIBERATE act with its own button, not an error condition.
-    //      Nobody rings a doorbell by brushing past it.
-    //   3. It does not reward jabbing at the keypad, which is what the
-    //      three-failures rule did — and keypad jabbing is radio time.
+    // 🔴 AND THE DOORBELL IS NOT UNIVERSAL EITHER. DP 53 is a catalogue entry
+    // products SELECT (`支持有人按门铃上报` — "supports reporting…"; DP 54's
+    // own note says "do not select this DP for the core-board solution").
+    // Tuya market it as a tier: doorbell/video-intercom solutions, not a
+    // baseline. Our whole catalogue derives from ONE product, DS013-T3, which
+    // the T3-U doc classifies as a **Video Lock** — a category that has a
+    // doorbell by definition. Do not read "confirmed in the catalogue" as
+    // "present on every lock". See ozkey-36 §9.
     //
-    // Battery: a doorbell can still be spammed, so a window opened this way
-    // will not re-open for OZ_BELL_COOLDOWN_MS after it closes. Ringing again
-    // DURING an open window still extends it (openBleWindow resets the
-    // deadline), so a member part-way through enrolment is never cut off — the
-    // cooldown only bounds how much advertising a stranger can force.
+    // So this is the best gesture available, not a general solution: it works
+    // on locks that selected DP 53, and nothing works on the ones that did
+    // not. That is a supplier question, not a firmware one.
+    //
+    // Battery: a doorbell can be spammed, so a window opened this way will not
+    // re-open for OZ_BELL_COOLDOWN_MS after it CLOSES. Ringing during an open
+    // window still extends it, so an enrolment in progress is never cut off.
     if (dpid == 53) {
       publishLog("doorbell", "MCU report");
       const unsigned long now = millis();
@@ -2262,54 +2269,25 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       return;
     }
 
-    // ── DP 104 — `*NN#` KEYPAD COMMAND. OUR EXTENSION (operator, 2026-08-16) ─
+    // ── DP 104 `*NN#` KEYPAD COMMAND — REMOVED 2026-08-16 ─────────────────
     //
-    // "`*` should identify as cmd mode." A user types `*01#` at the door and
-    // the MCU reports the COMMAND — so the lock acts on a STATED INTENT
-    // instead of inferring one from repeated PIN failures.
+    // Built, verified on the bench, and deleted the same day once the operator
+    // checked real product catalogues. It could never have worked outside
+    // LockSim:
     //
-    // Why this could not work before: on a keypad, `*` is the CLEAR key and a
-    // short entry is discarded locally. `*01#` therefore put NOTHING on the
-    // wire — the ESP32 was not failing to recognise the gesture, it was never
-    // sent one. That is a property of the keypad, not of our parser, so the
-    // fix had to be on the MCU side. LockSim is ours, so the bench now behaves
-    // the way the product should.
+    //   • the supplier catalogue carries NO keystroke channel — DP 60 `alarm`
+    //     reports THAT a key was pressed (`key_in`), never which; DP 61 carries
+    //     a matched `cred_id`, not digits;
+    //   • a real MCU sends nothing until the entry is submitted, then only
+    //     pass/fail;
+    //   • `#`-as-submit is not universal — it varies by model, and on some
+    //     locks `#` IS the doorbell button;
+    //   • so `*01#` is indistinguishable from any other rejected entry.
     //
-    // 🔴 STILL OUR FICTION ON REAL HARDWARE. No shipping DL MCU emits DP 104.
-    // The supplier catalogue carries no keystroke channel at all — DP 60
-    // `alarm` says THAT a key was pressed (`key_in`) and never which, DP 61
-    // carries a matched `cred_id`, not the digits. Until an allocation lands
-    // (ozkey-22 §7 / ozkey-27 Q2), a production lock still falls back to the
-    // three-failed-entries gesture in the DP 8 handler above.
-    //
-    // 104 is deliberate, not another guess: 101/102/103 are already our
-    // in-lock verb block and all four are UNUSED in the real catalogue
-    // (profiles/tuya-lock-catalogue.json rev 1, checked 2026-08-16). DP 60 —
-    // our first attempt at this — turned out to be the alarm enum, which is
-    // exactly the mistake this numbering avoids repeating.
-    if (dpid == 104) {
-      char cmd[8] = {0};
-      const size_t take = vlen < sizeof(cmd) - 1 ? vlen : sizeof(cmd) - 1;
-      memcpy(cmd, v, take);
-      for (size_t i = 0; i < take; i++)
-        if (cmd[i] < '0' || cmd[i] > '9') { cmd[i] = 0; break; } // digits only
-
-      if (strcmp(cmd, "01") == 0) {
-        if (provisioned) {
-          Serial.println("[KEYCMD] *01# — pairing window requested");
-          openBleWindow("*01# keypad command");
-        } else {
-          // Nothing to open: an unprovisioned lock already advertises. Saying
-          // so beats silence, which would read as "the command was ignored".
-          Serial.println("[KEYCMD] *01# — already advertising (unprovisioned)");
-        }
-      } else {
-        // Unknown codes are logged, never guessed at. The command space is
-        // ours to define and an unrecognised one is a spec gap, not an error.
-        Serial.printf("[KEYCMD] *%s# — no such command\n", cmd);
-      }
-      return;
-    }
+    // Keeping a verb only our own emulator can send would have meant a bench
+    // that passes and a product that cannot. The gesture is the doorbell
+    // (DP 53) where a lock has one, and an open supplier question where it
+    // does not.
 
     // ── 🔴 DP 60 HANDLER DELETED 2026-08-13 — the number was already taken ──
     //
