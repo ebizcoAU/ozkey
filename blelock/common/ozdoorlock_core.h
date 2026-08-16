@@ -896,7 +896,7 @@ static void ozAskMcuProductInfo() {
   g_pidAsks++;
 }
 // Set when the CURRENT window was opened by the doorbell. closeBleWindow()'s
-// argument is the reason it CLOSED ("60s elapsed"), not what opened it, so the
+// argument is the reason it CLOSED ("30s elapsed"), not what opened it, so the
 // gesture has to be remembered rather than sniffed out of that string.
 static bool g_bellOpenedWindow = false;
 
@@ -6857,7 +6857,16 @@ void loop() {
   }
 
   if (bleWindowUntil && !bleWindowOpen() && !bleClientConnected) {
-    closeBleWindow("60s elapsed");
+    // DERIVED, not a literal (1.90). This said "60s elapsed" for every close,
+    // frozen since before 1.85 shortened the window to 30 s — so the log
+    // confidently reported double the real duration, and it is exactly the line
+    // someone reads to VERIFY the window length. closeBleWindow() does no
+    // timing of its own; it prints whatever string it is handed. Same rule as
+    // FW_DISPLAY_VERSION and the "[BLE] window OPEN %lus" line above: derive it
+    // from BLE_WINDOW_MS so there is nothing left to keep in step by hand.
+    char why[24];
+    snprintf(why, sizeof(why), "%lus elapsed", BLE_WINDOW_MS / 1000);
+    closeBleWindow(why);
   }
   tuyaWirePump(); // MCU (LockSim) → module frames off the wire
 

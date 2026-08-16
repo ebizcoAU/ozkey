@@ -53,8 +53,9 @@ static const OzDpEntry OZ_DP_ozkie_legacy_v0[] = {
   {  60, OZ_DIR_UP  , OZ_DP_FICTION   , "pairing_request_proposed" },
 };
 
-// ozsim-fullfeature — 7 DPs
+// ozsim-fullfeature — 8 DPs
 static const OzDpEntry OZ_DP_ozsim_fullfeature[] = {
+  {   1, OZ_DIR_BOTH, OZ_DP_FICTION   , "unlock_channel" },
   {  53, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "doorbell" },
   {  61, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_password" },
   {  63, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_fingerprint" },

@@ -210,7 +210,14 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 //       — see doorlock.ino's changelog. All of it is in
 //       common/ozdoorlock_core.h, so it lands on both panels; only this version
 //       string is per-sketch.
-#define FW_VERSION "doorlock-1.89"
+// 1.90: the BLE window close log stops lying — it printed a hardcoded "60s
+//       elapsed" for a 30 s window. See doorlock.ino's changelog. The change
+//       is in common/ozdoorlock_core.h, so it lands on both panels; only this
+//       version string is per-sketch.
+// 1.91: bench unblock — fiction DP 1 restored to ozsim-fullfeature so app
+//       unlock works again. See doorlock.ino's changelog. Regenerated profile
+//       table only; no logic change, and it lands on both panels.
+#define FW_VERSION "doorlock-1.91"
 
 // ── DERIVED, not a second literal (2026-08-12) — see doorlock.ino for the
 // full reasoning. The warning above ("Change both, every time") described the

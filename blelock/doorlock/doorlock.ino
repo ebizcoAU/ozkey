@@ -229,7 +229,25 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //       on change. setup() is now timed stage by stage, because the panel is
 //       deaf until setup() returns and nothing had ever measured how long that
 //       is. See common/ozdoorlock_core.h for the full reasoning.
-#define FW_VERSION "doorlock-1.89"
+// 1.90: the BLE window close log stops lying. It printed a hardcoded "60s
+//       elapsed" on every close, left over from before 1.85 shortened the
+//       window to 30 s — so a capture taken to CONFIRM the window length
+//       reported exactly double it. Behaviour was always correct and is
+//       unchanged (BLE_WINDOW_MS has been the single source since 1.85);
+//       only the message was stale. Now derived from BLE_WINDOW_MS. Found
+//       while bench-verifying the doorbell window/cooldown on LockA, where
+//       the measured 01:47:03→01:47:33 close disagreed with its own log line.
+// 1.91: BENCH UNBLOCK — ozsim-fullfeature now carries fiction DP 1 in `extra`,
+//       so app unlock works on the bench again. PID discovery working is what
+//       broke it: the lock correctly switched off ozkie-legacy-v0 onto a
+//       real-shaped profile, and DP 1 (`unlock_channel`) is OUR INVENTION that
+//       no real profile carries — so ozDpForwardable(1) went false and every
+//       app unlock died as "[FWD] REJECTED DP 1". A real DS013-T3 fails the
+//       same way. No firmware logic changed; this is the regenerated profile
+//       table only. See the $comment in profiles/products/ozsim-fullfeature.json
+//       — the real fix is a supplier gap (DP 10 is reserved/blocked, DP 72 is
+//       an event report, not a command), not this line.
+#define FW_VERSION "doorlock-1.91"
 
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ────────
 //
