@@ -43,6 +43,17 @@ static const OzProfile *ozProfile() { return &OZ_PROFILES[g_ozProfileIdx]; }
 static const char *ozProfileId() { return ozProfile()->id; }
 
 /** Select by id. Returns false and changes nothing if the id is unknown. */
+// Find the profile whose Tuya PID matches what the MCU reported to 0x01.
+// Returns nullptr when we do not know this product — which is the SAFE
+// outcome: the caller keeps its current profile rather than guessing.
+static const OzProfile *ozProfileByTuyaPid(const char *pid) {
+  if (!pid || !*pid) return nullptr;
+  for (uint8_t i = 0; i < OZ_PROFILE_COUNT; i++)
+    if (OZ_PROFILES[i].tuya_pid && strcmp(OZ_PROFILES[i].tuya_pid, pid) == 0)
+      return &OZ_PROFILES[i];
+  return nullptr;
+}
+
 static bool ozProfileSelect(const char *id) {
   for (uint8_t i = 0; i < OZ_PROFILE_COUNT; i++) {
     if (strcmp(OZ_PROFILES[i].id, id) == 0) {

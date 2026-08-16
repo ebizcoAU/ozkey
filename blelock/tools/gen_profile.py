@@ -114,6 +114,11 @@ def generate():
     w("  const OzDpEntry  *entries;")
     w("  uint16_t          count;")
     w("  bool              deprecated;")
+    w("  // Tuya product ID, from profiles/products/*.json supplier.pid.")
+    w("  // This is what the DL MCU reports to command 0x01, so it is how a")
+    w("  // lock identifies ITSELF instead of being told what it is.")
+    w("  // nullptr where we have no PID (our own invented map).")
+    w("  const char       *tuya_pid;")
     w("};")
     w("")
 
@@ -123,7 +128,8 @@ def generate():
         entries = resolve(prod, catalogue)
         ident = c_ident(prod["profile_id"])
         names.append((prod["profile_id"], ident, prod.get("deprecated", False),
-                      int(prod.get("rev", 0))))
+                      int(prod.get("rev", 0)),
+                      (prod.get("supplier") or {}).get("pid")))
         w(f"// {prod['profile_id']} — {len(entries)} DPs"
           + (" — DEPRECATED (invented map)" if prod.get("deprecated") else ""))
         w(f"static const OzDpEntry OZ_DP_{ident}[] = {{")
@@ -134,9 +140,10 @@ def generate():
         w("")
 
     w("static const OzProfile OZ_PROFILES[] = {")
-    for pid, ident, dep, rev in names:
+    for pid, ident, dep, rev, tuya_pid in names:
+        tp = f'"{tuya_pid}"' if tuya_pid else "nullptr"
         w(f'  {{ "{pid}", {rev}, OZ_DP_{ident}, '
-          f"(uint16_t)(sizeof(OZ_DP_{ident}) / sizeof(OzDpEntry)), {str(dep).lower()} }},")
+          f"(uint16_t)(sizeof(OZ_DP_{ident}) / sizeof(OzDpEntry)), {str(dep).lower()}, {tp} }},")
     w("};")
     w(f"static const uint8_t OZ_PROFILE_COUNT = {len(names)};")
     w("")

@@ -32,6 +32,11 @@ struct OzProfile {
   const OzDpEntry  *entries;
   uint16_t          count;
   bool              deprecated;
+  // Tuya product ID, from profiles/products/*.json supplier.pid.
+  // This is what the DL MCU reports to command 0x01, so it is how a
+  // lock identifies ITSELF instead of being told what it is.
+  // nullptr where we have no PID (our own invented map).
+  const char       *tuya_pid;
 };
 
 // ozkie-legacy-v0 — 10 DPs — DEPRECATED (invented map)
@@ -95,9 +100,9 @@ static const OzDpEntry OZ_DP_tuya_t3_videolock[] = {
 };
 
 static const OzProfile OZ_PROFILES[] = {
-  { "ozkie-legacy-v0", 1, OZ_DP_ozkie_legacy_v0, (uint16_t)(sizeof(OZ_DP_ozkie_legacy_v0) / sizeof(OzDpEntry)), true },
-  { "tuya-ds013-t3", 1, OZ_DP_tuya_ds013_t3, (uint16_t)(sizeof(OZ_DP_tuya_ds013_t3) / sizeof(OzDpEntry)), false },
-  { "tuya-t3-videolock", 1, OZ_DP_tuya_t3_videolock, (uint16_t)(sizeof(OZ_DP_tuya_t3_videolock) / sizeof(OzDpEntry)), false },
+  { "ozkie-legacy-v0", 1, OZ_DP_ozkie_legacy_v0, (uint16_t)(sizeof(OZ_DP_ozkie_legacy_v0) / sizeof(OzDpEntry)), true, nullptr },
+  { "tuya-ds013-t3", 1, OZ_DP_tuya_ds013_t3, (uint16_t)(sizeof(OZ_DP_tuya_ds013_t3) / sizeof(OzDpEntry)), false, "vr4iiuqtyh0q4nix" },
+  { "tuya-t3-videolock", 1, OZ_DP_tuya_t3_videolock, (uint16_t)(sizeof(OZ_DP_tuya_t3_videolock) / sizeof(OzDpEntry)), false, "3zlhjdesga1kyy75" },
 };
 static const uint8_t OZ_PROFILE_COUNT = 3;
 

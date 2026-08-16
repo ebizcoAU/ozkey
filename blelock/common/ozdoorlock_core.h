@@ -842,6 +842,59 @@ uint32_t clampHeartbeatS(uint32_t s) {
 // only caps how much advertising a stranger at the door can force.
 #define OZ_BELL_COOLDOWN_MS 120000UL // 2 min of quiet after a bell window closes
 static unsigned long g_bellWindowEndedAt = 0;
+
+// ── has_doorbell — reported on info, so the app stops telling people to press
+// a button their lock may not have (XF-107, operator 2026-08-16) ────────────
+//
+// TWO SOURCES, and the weaker one is the default:
+//
+//   1. THE PRODUCT PROFILE. profiles/ is the per-product DP SELECTION, which
+//      is precisely "which model is this" expressed as data. tuya-ds013-t3
+//      selects DP 53; ozkie-legacy-v0 (our default) does not. So the flag is
+//      false unless a profile that declares a doorbell has been selected —
+//      exactly the operator's rule: default false unless explicitly
+//      configured.
+//   2. OBSERVATION. If a DP 53 ever actually arrives from the MCU, the lock
+//      HAS a doorbell — that is proof, not configuration, and it cannot be a
+//      false positive. Latched and persisted so one press settles it forever.
+//
+// 🔴 THE ASYMMETRY IS DELIBERATE (operator): a false positive is worse than a
+// false negative. Telling someone to press a button that does not exist leaves
+// them stuck at a door; telling them to use a fallback merely costs a step. So
+// nothing here infers a doorbell from silence, and only real evidence upgrades
+// the answer.
+static bool g_bellObserved = false;
+static bool ozHasDoorbell() { return g_bellObserved || ozDpFind(53) != nullptr; }
+
+// ── Tuya 0x01 — ASK THE MCU WHAT IT IS, instead of being told ──────────────
+//
+// The protocol has had this all along and we never used it (supplier doc
+// §1: module sends `55 aa 00 01 00 00 00`, MCU answers
+// `{"p":"<PID>","v":"<mcu fw>"}`). The PID is the product identity Tuya
+// assigns, and `profiles/products/*.json` already carry it as `supplier.pid`
+// — so the lock can look up its OWN DP map rather than shipping a different
+// firmware per model, or trusting a default that is our invented map.
+//
+// Why this matters beyond has_doorbell: the profile decides which DPs are
+// forwardable and how credentials are encoded. Booting on the wrong one is
+// how `ozDpForwardable()` came to forward the SETTINGS DPs and block every
+// credential operation (ozkey-27 §2.1) — the precise inverse of its intent.
+//
+// 🔴 UNKNOWN PID KEEPS THE CURRENT PROFILE. Never guess: a lock that reports
+// something we have no map for is exactly the lock we must not improvise on.
+String cfgMcuPid, cfgMcuVer;
+static unsigned long g_pidAskedAt = 0;
+static uint8_t g_pidAsks = 0;
+#define OZ_PID_RETRY_MS   5000UL
+#define OZ_PID_MAX_ASKS   6
+
+static void ozAskMcuProductInfo() {
+  const uint8_t f[7] = {0x55, 0xAA, 0x00, 0x01, 0x00, 0x00, 0x00};
+  Serial.println("[PID] asking the MCU what it is (0x01)");
+  tuyaWireSend(f, sizeof(f));
+  g_pidAskedAt = millis();
+  g_pidAsks++;
+}
 // Set when the CURRENT window was opened by the doorbell. closeBleWindow()'s
 // argument is the reason it CLOSED ("60s elapsed"), not what opened it, so the
 // gesture has to be remembered rather than sniffed out of that string.
@@ -1476,6 +1529,13 @@ void loadConfig() {
   cfgSiteId = prefs.getString("site", "lab");
   cfgName = prefs.getString("name", "");
   cfgHeartbeatS = clampHeartbeatS(prefs.getUInt("hb", 300));
+  {
+    // A profile the MCU told us about last boot. Restored so a lock is on the
+    // right map from the first millisecond, not from whenever 0x01 is answered.
+    String pf = prefs.getString("prof", "");
+    if (pf.length()) ozProfileSelect(pf.c_str());
+  }
+  g_bellObserved = prefs.getBool("bell", false);
   cfgThreadSed = prefs.getBool("sed", false);
   cfgThreadPollS = clampThreadPollS(prefs.getUInt("poll", 5));
   cfgMode = prefs.getString("mode", "ozkey-cloud");
@@ -2065,6 +2125,54 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
 
   if (n >= 4 && f[3] == 0x00) return; // MCU heartbeat = link-alive only
 
+  // ── 0x01 — the MCU's answer to "what are you?" ───────────────────────────
+  //
+  // {"p":"<tuya pid>","v":"<mcu fw>"}. The PID selects our DP profile, so the
+  // lock discovers its own map instead of booting on whatever default was
+  // compiled in. See ozAskMcuProductInfo() for why that matters.
+  if (n >= 7 && f[3] == 0x01) {
+    const uint16_t vlen = ((uint16_t)f[4] << 8) | f[5];
+    if (vlen == 0 || (size_t)vlen + 7 > n) {
+      Serial.println("[PID] 0x01 reply malformed — ignored");
+      return;
+    }
+    String body;
+    body.reserve(vlen + 1);
+    for (uint16_t i = 0; i < vlen; i++) body += (char)f[6 + i];
+
+    JsonDocument pd;
+    if (deserializeJson(pd, body) != DeserializationError::Ok) {
+      Serial.printf("[PID] 0x01 reply is not JSON: %s\n", body.c_str());
+      return;
+    }
+    cfgMcuPid = String((const char *)(pd["p"] | ""));
+    cfgMcuVer = String((const char *)(pd["v"] | ""));
+    g_pidAsks = OZ_PID_MAX_ASKS; // answered — stop asking
+    Serial.printf("[PID] MCU reports pid='%s' mcu_fw='%s'\n",
+                  cfgMcuPid.c_str(), cfgMcuVer.c_str());
+
+    const OzProfile *p = ozProfileByTuyaPid(cfgMcuPid.c_str());
+    if (!p) {
+      // The safe outcome. An unknown product is exactly the one not to
+      // improvise a DP map for.
+      Serial.printf("[PID] no profile for '%s' — KEEPING '%s'. Add it to "
+                    "profiles/products/ before trusting this lock's DP map.\n",
+                    cfgMcuPid.c_str(), ozProfileId());
+    } else if (strcmp(p->id, ozProfileId()) == 0) {
+      Serial.printf("[PID] profile '%s' already active — confirmed by the MCU\n",
+                    p->id);
+    } else {
+      Serial.printf("[PID] 🔴 profile '%s' -> '%s' (the MCU says so; we were "
+                    "running a default)\n", ozProfileId(), p->id);
+      ozProfileSelect(p->id);
+      prefs.begin("blelock", false);
+      prefs.putString("prof", p->id);
+      prefs.end();
+    }
+    ozRefreshInfoChar(); // pid / has_doorbell / profile all just changed
+    return;
+  }
+
   // ── ozkey-22 R1 — 0x34, the MULTIPLEXED extended command ──────────────────
   //
   // 0x34 is not one command. Its first payload byte is a sub-command:
@@ -2252,6 +2360,15 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
     // re-open for OZ_BELL_COOLDOWN_MS after it CLOSES. Ringing during an open
     // window still extends it, so an enrolment in progress is never cut off.
     if (dpid == 53) {
+      // Proof this lock has a doorbell, which no configuration can give us.
+      if (!g_bellObserved) {
+        g_bellObserved = true;
+        prefs.begin("blelock", false);
+        prefs.putBool("bell", true);
+        prefs.end();
+        Serial.println("[BELL] first doorbell seen — has_doorbell latched true");
+        ozRefreshInfoChar(); // info must stop saying false immediately
+      }
       publishLog("doorbell", "MCU report");
       const unsigned long now = millis();
       if (bleWindowOpen()) {
@@ -5978,6 +6095,12 @@ static void ozRefreshInfoChar() {
   doc["fw"] = FW_VERSION;
   doc["name"] = cfgName;
   doc["pub"] = ozLockPubHex(); // X25519 ceremony pubkey (XF-46 §7.1)
+  // XF-107 §3.1 — so BANOI can branch its at-the-door instruction instead of
+  // promising a doorbell every lock may not have. See ozHasDoorbell().
+  doc["has_doorbell"] = ozHasDoorbell();
+  doc["profile"] = ozProfileId();
+  if (cfgMcuPid.length()) doc["tuya_pid"] = cfgMcuPid;
+  if (cfgMcuVer.length()) doc["mcu_fw"] = cfgMcuVer;
   // BUG FIX (2026-07-26, caught during app-impact review): blecomm.ino never
   // reported "transport" since it was always Wi-Fi; threadcomm.ino hard-
   // coded "thread" since it was always Thread. The unified binary can be
@@ -6707,6 +6830,20 @@ void loop() {
     closeBleWindow("60s elapsed");
   }
   tuyaWirePump(); // MCU (LockSim) → module frames off the wire
+
+  // Ask the MCU what it is, once the wire is alive and it has said something.
+  // Retried a few times because a cold MCU can miss the first frame, then
+  // dropped: an MCU that never answers 0x01 is an older one that does not
+  // implement it, and pestering it forever would be noise on a shared UART.
+  if (isThread() || cfgTransport == "wifi") {
+    if (!cfgMcuPid.length() && mcuLinkUp() && g_pidAsks < OZ_PID_MAX_ASKS &&
+        (!g_pidAskedAt || millis() - g_pidAskedAt > OZ_PID_RETRY_MS)) {
+      ozAskMcuProductInfo();
+      if (g_pidAsks == OZ_PID_MAX_ASKS)
+        Serial.println("[PID] MCU never answered 0x01 — staying on the "
+                       "compiled-in profile. It may predate product info.");
+    }
+  }
 
   // ── WiFi progress (Wi-Fi transport only) ─────────────────────────────────
   static wl_status_t lastWifi = WL_IDLE_STATUS;
