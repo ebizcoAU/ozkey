@@ -2554,6 +2554,7 @@ void publishHeartbeat() {
   // unprompted, so the app can learn a lock's identity without anyone standing
   // at it. Same argument the `name` field above is here for.
   if (cfgMcuPid.length()) doc["tuya_pid"] = cfgMcuPid;
+  doc["profile"] = ozProfileId();
   doc["has_doorbell"] = ozHasDoorbell();
 
   // ── ozkey-32 §5 Option A — THE LOCK IS AUTHORITATIVE FOR ITS OWN NAME ─────
@@ -7042,6 +7043,9 @@ void loop() {
     // unprompted, so the app can learn a lock's identity without anyone standing
     // at it. Same argument the `name` field above is here for.
     if (cfgMcuPid.length()) hb["tuya_pid"] = cfgMcuPid;
+    // Which DP map this lock is ACTUALLY running. Fleet-visible so a lock
+    // still on the invented default is findable without a BLE session.
+    hb["profile"] = ozProfileId();
     hb["has_doorbell"] = ozHasDoorbell();
     hb["mcu_link_up"] = mcuLinkUp();          // ozkey-20 §5a
     hb["uptime_s"] = (uint32_t)(millis() / 1000);
