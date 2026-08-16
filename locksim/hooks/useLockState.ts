@@ -629,6 +629,22 @@ export function useLockState({
    * firmware side be written and tested before the manufacturer allocates a
    * real DP — but nothing on real hardware sends this today.
    */
+  /**
+   * DP 53 doorbell — a real, confirmed Tuya DP, unlike the proposed DP 60
+   * below. Firmware (doorlock-1.84+) opens the BLE pairing window on this,
+   * with a 2-minute cooldown after the window closes so ringing repeatedly
+   * cannot hold the radio on and flatten the battery.
+   */
+  const ringDoorbell = useCallback(() => {
+    wake("DOORBELL PRESSED");
+    transmitRef.current(
+      TuyaCommand.DP_REPORT,
+      buildDpPayload(DpId.DOORBELL, DpType.BOOL, [0x01]),
+      "DP 53 doorbell -> OZKIE MCU — visitor at the door"
+    );
+    setLastEvent("DOORBELL RUNG (DP 53)");
+  }, [wake]);
+
   const keypadPairingGesture = useCallback(() => {
     wake("KEYPAD PAIRING GESTURE (DL MCU owns the keypad)");
     transmitRef.current(
@@ -884,6 +900,7 @@ export function useLockState({
     lastEvent,
     credentials,
     pressKey,
+    ringDoorbell,
     tapRfid,
     scanFingerprint,
     triggerLowBattery,

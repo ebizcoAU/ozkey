@@ -11,6 +11,8 @@ interface PeripheralControlsProps {
   onFactoryReset: () => void;
   /** PROPOSED DP 60 — keypad pairing gesture, DL MCU owns the keypad. */
   onPairingGesture: () => void;
+  /** DP 53 doorbell — REAL, confirmed Tuya DP. The gesture that ships. */
+  onDoorbell: () => void;
   lowBattery: boolean;
   credentials: StoredCredential[];
   /** ozkey-21 — the MCU's clock, null when the module never served time. */
@@ -27,6 +29,7 @@ export default function PeripheralControls({
   onLowBattery,
   onFactoryReset,
   onPairingGesture,
+  onDoorbell,
   lowBattery,
   credentials,
   mcuUnix,
@@ -79,6 +82,23 @@ export default function PeripheralControls({
         }`}
       >
         ⚠ {lowBattery ? "Clear Low Battery Event" : "Low Battery Event Trigger"}
+      </button>
+
+      {/*
+        DP 53 doorbell — the ONLY at-the-door pairing gesture that works on
+        shipping hardware. `status: confirmed` in the real Tuya catalogue, so
+        unlike the two below this is not our invention. doorlock-1.84 opens a
+        BLE window on it, with a 2-minute cooldown after the window closes so
+        ringing repeatedly cannot hold the radio on (ozkey-36: on a battery
+        lock the radio IS the power budget).
+      */}
+      <button
+        type="button"
+        onPointerDown={onDoorbell}
+        title="DP 53 — a REAL Tuya DP (status: confirmed). Opens the BLE pairing window on doorlock-1.84+"
+        className={`${buttonBase} border-emerald-800/60 bg-emerald-950/40 text-emerald-300 active:bg-emerald-900/40`}
+      >
+        🔔 Ring Doorbell <span className="opacity-60">(DP 53, real)</span>
       </button>
 
       {/*

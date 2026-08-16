@@ -131,6 +131,18 @@ export enum DpId {
   PAIRING_REQUEST_PROPOSED = 60,
 
   /**
+   * DOORBELL — DP 53, `bool`, `status: confirmed` in the real Tuya catalogue.
+   *
+   * The pairing gesture that will actually work on shipping hardware
+   * (ozkey-36 / doorlock-1.84). Unlike PAIRING_REQUEST_PROPOSED above and
+   * KEYPAD_COMMAND_OURS, this DP is not our invention: a real DL MCU has a
+   * doorbell button and reports it here. Firmware opens a BLE pairing window
+   * on it, rate-limited so the bell cannot be used to hold the radio on.
+   */
+  DOORBELL = 53,
+
+
+  /**
    * KEYPAD COMMAND — `*NN#` typed at the door. OUR EXTENSION, DP 104.
    *
    * The operator's rule: **`*` is a command prefix, not a clear key.** A user

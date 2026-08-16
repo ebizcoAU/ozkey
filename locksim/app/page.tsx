@@ -443,6 +443,7 @@ export default function Page() {
               onLowBattery={lock.triggerLowBattery}
               onFactoryReset={lock.mcuFactoryReset}
               onPairingGesture={lock.keypadPairingGesture}
+              onDoorbell={lock.ringDoorbell}
               lowBattery={lock.lowBattery}
               credentials={lock.credentials}
               mcuUnix={lock.mcuUnix}
