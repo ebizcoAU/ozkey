@@ -2527,6 +2527,17 @@ void publishHeartbeat() {
   // never reported liveness. Not fixed here; that is ozkey-20 R3 and it needs
   // the uplink path, not this one.
   doc["roster_epoch"] = g_rosterEpoch;
+  // XF-108 §5 — the PID rides the heartbeat too, not just BLE `info`.
+  //
+  // ftpos capture `tuya_pid` where a BLE session already reads `info`:
+  // commissioning and member enrolment. That leaves every ALREADY-COMMISSIONED
+  // lock with no PID until someone re-runs one of those — which for an
+  // installed door is approximately never. The heartbeat reaches the server
+  // unprompted, so the app can learn a lock's identity without anyone standing
+  // at it. Same argument the `name` field above is here for.
+  if (cfgMcuPid.length()) doc["tuya_pid"] = cfgMcuPid;
+  doc["has_doorbell"] = ozHasDoorbell();
+
   // ── ozkey-32 §5 Option A — THE LOCK IS AUTHORITATIVE FOR ITS OWN NAME ─────
   // (operator, 2026-08-14)
   //
@@ -7000,6 +7011,16 @@ void loop() {
     // one happened.
     hb["name"] = cfgName;
     hb["bonds"] = ozBondCount();
+    // XF-108 §5 — the PID rides the heartbeat too, not just BLE `info`.
+    //
+    // ftpos capture `tuya_pid` where a BLE session already reads `info`:
+    // commissioning and member enrolment. That leaves every ALREADY-COMMISSIONED
+    // lock with no PID until someone re-runs one of those — which for an
+    // installed door is approximately never. The heartbeat reaches the server
+    // unprompted, so the app can learn a lock's identity without anyone standing
+    // at it. Same argument the `name` field above is here for.
+    if (cfgMcuPid.length()) hb["tuya_pid"] = cfgMcuPid;
+    hb["has_doorbell"] = ozHasDoorbell();
     hb["mcu_link_up"] = mcuLinkUp();          // ozkey-20 §5a
     hb["uptime_s"] = (uint32_t)(millis() / 1000);
     // ── ozkey-21 — PULL, don't sit waiting (operator, 2026-08-11) ─────────

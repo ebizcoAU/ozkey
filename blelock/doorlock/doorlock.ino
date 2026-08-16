@@ -229,7 +229,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //       on change. setup() is now timed stage by stage, because the panel is
 //       deaf until setup() returns and nothing had ever measured how long that
 //       is. See common/ozdoorlock_core.h for the full reasoning.
-#define FW_VERSION "doorlock-1.86"
+#define FW_VERSION "doorlock-1.87"
 
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ────────
 //
