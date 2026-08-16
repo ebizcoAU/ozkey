@@ -176,7 +176,7 @@ nobody has demonstrated it, regardless of what any other document says.
 | 10 | App reads `info.pub` and cross-checks NEXUS | 🟢 **verified 2026-08-16** | XF-106 §10: `nexus_pub == ble_pub == a99f0965e928…`, `match=true`. Also proves LockA's private key survived the 1.77→1.79 flash byte-identical (F-13) |
 | 11 | MCU ack gate on credentials | 🟡 built, bypassed in practice | app uses the legacy path; ack mechanism itself proven sound (matcher would fire) |
 | 12 | Thread SED + poll interval | 🟡 built, **default off**, never run | **unblocked 2026-08-16** — bridge unicast downlink verified (§9.1). Enabling still needs 1.80 flashed + a deliberate test |
-| 13 | Battery life | 🔴 **not measured** | no power instrument exists on this bench. FTD ~35 mA/~3 days is a *datasheet estimate*; the µA figures have no measurement behind them |
+| 13 | Battery life | 🔴 **not measured** | no power instrument exists on this bench. FTD ~35 mA/~3 days is a *datasheet estimate*; the µA figures have no measurement behind them. **See `ozkey-36.md`** — modelling the WHOLE lock (not just the comms module) puts a piggyback lock at ~1.1 years at 20 opens/day, and the DL MCU is 75% of that budget |
 | 14 | Plaintext `log` gate (C7) | 🔴 not built | scoped only; `mode` mapping question still open |
 | 15 | eFuse burn / production identity | 🔴 never burned | `ozLockKeyFromEfuse()` compiles, has never seen a burned block |
 | 16 | `provision_key` (dev key delivery) | 🟡 built, needs a decision | sealing is circular — `ozkey-34.md` §4.1 |
