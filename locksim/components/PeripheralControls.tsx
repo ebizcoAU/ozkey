@@ -88,7 +88,8 @@ export default function PeripheralControls({
         DP 53 doorbell — the ONLY at-the-door pairing gesture that works on
         shipping hardware. `status: confirmed` in the real Tuya catalogue, so
         unlike the two below this is not our invention. doorlock-1.84 opens a
-        BLE window on it, with a 2-minute cooldown after the window closes so
+        60 s BLE window on it (~15 s of which is advertising-to-discovery
+        latency on a real phone), with a 2-minute cooldown after it closes so
         ringing repeatedly cannot hold the radio on (ozkey-36: on a battery
         lock the radio IS the power budget).
       */}

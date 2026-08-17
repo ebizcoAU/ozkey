@@ -286,13 +286,47 @@ export function useLockState({
     [flashAlarm, reportAccessResult]
   );
 
-  /** Local credential entry (keypad / card / fingerprint). Unchanged ordering. */
+  /**
+   * The REAL T3 access-event report (L-1/L-3, operator directive 2026-08-17).
+   *
+   * DP 61/63/64/76 — `status: confirmed`, `type: value`, `verb: event.access`,
+   * payload = cred_id. This is what a real DS013-T3 sends when a credential
+   * opens the door, and it carries information our fiction never could: WHICH
+   * stored credential it was. DP 2 carried a raw card UID, DP 3 a bare bool.
+   *
+   * Single transmit site, deliberately — the comment on reportAccessResult()
+   * above records what happened last time this kind of report was written out
+   * at each call site instead: one path simply never got it, in total silence.
+   *
+   * 🔴 This is a REPORT, not a credential write. See DpId's note: provisioning
+   * is DP 13/14/15 and all three are supplier-blocked (ozkey-27 Q2).
+   */
+  const reportAccessEvent = useCallback(
+    (dpId: DpId, credId: number, source: string) => {
+      transmitRef.current(
+        TuyaCommand.DP_REPORT,
+        buildDpPayload(dpId, DpType.VALUE, u32be(credId)),
+        `DP ${dpId} access event — cred_id=${credId} (${source}) [real T3 DP]`
+      );
+    },
+    []
+  );
+
+  /**
+   * Local credential entry (keypad / card / fingerprint). Unchanged ordering.
+   *
+   * `event` is the REAL T3 access-event DP for this credential kind. It is
+   * optional so that grant() paths with no real-DP equivalent (the master PIN,
+   * which is not a stored credential and has no cred_id) simply omit it rather
+   * than inventing a slot number.
+   */
   const grant = useCallback(
-    (source: string) => {
+    (source: string, event?: { dp: DpId; credId: number }) => {
       reportAccessResult(AccessResult.SUCCESS, `Access result: SUCCESS — ${source}`);
+      if (event) reportAccessEvent(event.dp, event.credId, source);
       unlockCycle(source);
     },
-    [unlockCycle, reportAccessResult]
+    [unlockCycle, reportAccessResult, reportAccessEvent]
   );
 
   /**
@@ -312,7 +346,18 @@ export function useLockState({
    *    from one with none, and right now the firmware has none.
    */
   const remoteUnlock = useCallback(
-    (source: string) => {
+    /**
+     * `event` is the REAL T3 access-event DP for HOW this unlock arrived, and
+     * the distinction is a genuine one in the catalogue:
+     *
+     *   DP 72 `unlock_remote`  access_kind: remote  — over the network
+     *   DP 76 `unlock_ble`     access_kind: ble     — over Bluetooth, offline
+     *
+     * A real lock reports which of the two happened; our fiction (DP 1) could
+     * not express the difference at all. Optional so a caller with no real
+     * equivalent omits it rather than inventing one.
+     */
+    (source: string, event?: { dp: DpId; credId: number }) => {
       unlockCycle(source);
       const delay = Math.max(0, Math.round(ackDelayRef.current));
       const t = setTimeout(() => {
@@ -321,10 +366,11 @@ export function useLockState({
           AccessResult.SUCCESS,
           `Access result: SUCCESS — ${source} (+${delay}ms)`
         );
+        if (event) reportAccessEvent(event.dp, event.credId, source);
       }, delay);
       ackTimers.current.push(t);
     },
-    [unlockCycle, reportAccessResult]
+    [unlockCycle, reportAccessResult, reportAccessEvent]
   );
 
   // ---------------------------------------------------------------------
@@ -479,7 +525,10 @@ export function useLockState({
       const mcuNow = readMcuUnix(mcuClockRef.current);
       const valid = candidates.find((c) => checkWindowMcu(c, mcuNow) === "VALID");
       if (valid) {
-        grant(`TEMP PIN — SLOT ${valid.slot}`);
+        grant(`TEMP PIN — SLOT ${valid.slot}`, {
+          dp: DpId.UNLOCK_PASSWORD,
+          credId: valid.slot,
+        });
         return;
       }
       const first = candidates[0];
@@ -562,7 +611,10 @@ export function useLockState({
       // ozkey-21 — MCU clock, same fail-closed rule as the PIN path.
       const window = checkWindowMcu(cred, readMcuUnix(mcuClockRef.current));
       if (window === "VALID") {
-        grant(`TEMP RFID — SLOT ${cred.slot}`);
+        grant(`TEMP RFID — SLOT ${cred.slot}`, {
+          dp: DpId.UNLOCK_CARD,
+          credId: cred.slot,
+        });
       } else if (window === "TIME_UNKNOWN") {
         deny(
           `TEMP RFID SLOT ${cred.slot} — TIME_UNKNOWN, MCU never served time by module (refusing)`,
@@ -662,7 +714,11 @@ export function useLockState({
       buildDpPayload(DpId.FINGERPRINT, DpType.BOOL, [pass ? 0x01 : 0x00]),
       `Fingerprint verification: ${pass ? "SUCCESS" : "FAILED"}`
     );
-    if (pass) grant("FINGERPRINT");
+    // cred_id 1: LockSim has no fingerprint ENROLMENT store (the sensor is a
+    // simple alternating pass/fail), so there is no real slot to report. A
+    // fixed id is honest for a simulator and keeps the DP 63 shape exercisable;
+    // it is NOT a claim that finger #1 was matched.
+    if (pass) grant("FINGERPRINT", { dp: DpId.UNLOCK_FINGERPRINT, credId: 1 });
     else deny("FINGERPRINT NO MATCH", AccessResult.DENIED);
   }, [wake, grant, deny]);
 
@@ -782,7 +838,12 @@ export function useLockState({
         return;
       }
 
-      if (frame.command !== TuyaCommand.DP_REPORT) return;
+      // INBOUND is module → MCU, i.e. DP_ISSUE (0x06). DP_REPORT (0x07) is our
+      // OWN direction and must not be required here — gating this on DP_REPORT
+      // after the 0x06/0x07 split would silently drop every command the module
+      // sends us (remote unlock, credential writes).
+      if (frame.command !== TuyaCommand.DP_ISSUE && frame.command !== TuyaCommand.DP_REPORT)
+        return;
 
       for (const dp of frame.dataPoints) {
         switch (dp.dpId) {
@@ -790,7 +851,35 @@ export function useLockState({
             // Was `unlockCycle(...)`, which opened the bolt and told the module
             // NOTHING — the module's whole picture of "did it work" was the fact
             // that it had written bytes to a serial port. Now it answers.
-            if (dp.type === DpType.BOOL && dp.value === 1) remoteUnlock("REMOTE UNLOCK COMMAND");
+            // DP 1 is OUR FICTION (XF-110). The real catalogue equivalent of a
+            // network-issued unlock is DP 72 `unlock_remote`, so report that
+            // back — the module asked on an invented DP, the MCU answers on the
+            // real one, which is exactly the migration this bench exists to
+            // exercise. cred_id 0 = "no stored credential", correct here: a
+            // remote unlock is authorised by the server/app, not by a slot.
+            if (dp.type === DpType.BOOL && dp.value === 1)
+              remoteUnlock("REMOTE UNLOCK COMMAND", { dp: DpId.UNLOCK_REMOTE, credId: 0 });
+            break;
+          /**
+           * DP 76 `unlock_ble` — INBOUND, module → MCU. Corrected 2026-08-17.
+           *
+           * 🔴 THIS WAS BUILT BACKWARDS. LockSim had a button that EMITTED
+           * DP 76, which is impossible on real hardware: **the DL MCU has no
+           * BLE radio** (operator). BLE belongs to the wireless module — T3-U
+           * is BLE 5.4, ours is the ESP32-C6 — so the MCU can never originate
+           * a BLE unlock. The module completes the BLE ceremony and then tells
+           * the MCU to open, carrying cred_id.
+           *
+           * This matters beyond tidiness: DP 76 is `status: confirmed` with a
+           * fully specified 4-byte payload (range 0..99999) and is issuable
+           * under 0x06 in the supplier's own table — unlike DP 10, whose
+           * payload is "0x00-0xff" and therefore unimplementable. So this may
+           * be the one REAL unlock command available to us today, and it is
+           * exactly the offline-BLE path OZLOCK is built on. See ozkey-39 §3.5.
+           */
+          case DpId.UNLOCK_BLE:
+            if (dp.type === DpType.VALUE)
+              remoteUnlock(`BLE UNLOCK (DP 76, cred_id=${dp.value})`);
             break;
           case DpId.ADD_TEMP_PIN:
           case DpId.ADD_TEMP_RFID: {

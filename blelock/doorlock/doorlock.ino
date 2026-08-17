@@ -247,7 +247,53 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //       table only. See the $comment in profiles/products/ozsim-fullfeature.json
 //       — the real fix is a supplier gap (DP 10 is reserved/blocked, DP 72 is
 //       an event report, not a command), not this line.
-#define FW_VERSION "doorlock-1.91"
+// 1.92: the MCU reports with 0x07, and we only ever parsed 0x06. The Tuya
+//       general variant is a TWO-command-word protocol — 0x06 module-issues,
+//       0x07 MCU-reports — and the supplier's own instruction table says so
+//       for every DP. A real lock's reports (doorbell, access events, battery
+//       alarm, credential reports) would ALL have been dropped as an unparsed
+//       "cmd 0x7". Inbound now accepts 0x07, and still accepts 0x06 until
+//       LockSim is flipped. Outbound is unchanged and correct at 0x06.
+//       Invisible until now because locksim's DP_REPORT is also 0x06: the
+//       bench agreed with itself and disagreed with the supplier — the same
+//       shape as the DP 1 fiction. See ozkey-39 §1.1, XF-110 §10.2.
+// 1.93: the lock now UNDERSTANDS the real access-event DPs — 61 unlock_password,
+//       63 unlock_fingerprint, 64 unlock_card, 72 unlock_remote, 73
+//       unlock_remote_voice, 76 unlock_ble. They carry a cred_id, so an audit
+//       line can finally say WHICH credential opened the door; our fiction
+//       never could (DP 2 was a raw card UID, DP 3 a bare bool). Until now all
+//       six fell through to UNCLASSIFIED, so on a real lock every access event
+//       would have been invisible while the invented DPs carried the whole
+//       trail — the same shape as XF-110's DP 1. Gated on ozDpFind() so a lock
+//       only honours DPs its own profile selects. REPORT-ONLY: credential
+//       WRITES are DP 13/14/15 and remain supplier-blocked (ozkey-39 §2).
+// 1.94: BLE unlock now issues the REAL DP 76 `unlock_ble`, and the BLE window
+//       doubles 30s -> 60s (cooldown stays 120s).
+//
+//       DP 76 is issued ONLY when the sealed unlock arrived over BLE and the
+//       active profile carries it — the DP asserts HOW the door opened, so a
+//       lock must not claim Bluetooth for an MQTT/Thread command. An explicit
+//       `viaBle` flag is plumbed through the sealed-dispatch path rather than
+//       inferred from `hasChallenge`, which happened to correlate. Network
+//       unlock stays on fiction DP 1: DP 10 is supplier-blocked and DP 72 is
+//       an event REPORT, not a command (ozkey-39 §3.5).
+//
+//       🔴 Two gates asked `dp != 1` as a stand-in for "is this an unlock" —
+//       correct only while unlock WAS DP 1. Left alone, DP 76 would have
+//       denied every MEMBER the one verb they are allowed, and made the
+//       latency-critical verb wait on an MCU ack. Both now ask `isUnlock`.
+//       The legacy raw-DP path still uses `dp != 1` and correctly so: there
+//       the number comes off the wire, not from us.
+//
+//       Window: operator measured that BLE advertising takes ~15s before the
+//       app can SEE the lock. A 30s window therefore left ~15s to unlock a
+//       phone, open the app and tap — it was closing underneath people at the
+//       door, and BOOT is on the INSIDE of a production lock. I first tried
+//       halving the COOLDOWN; the operator's measurement showed the window
+//       was the real fault. 60s window, cooldown unchanged at 120s. The
+//       "Ns elapsed" log is derived from BLE_WINDOW_MS (1.90) so it follows
+//       automatically — a hardcoded string would have started lying again.
+#define FW_VERSION "doorlock-1.94"
 
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ────────
 //

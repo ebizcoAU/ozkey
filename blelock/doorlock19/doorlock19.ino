@@ -217,7 +217,18 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 // 1.91: bench unblock — fiction DP 1 restored to ozsim-fullfeature so app
 //       unlock works again. See doorlock.ino's changelog. Regenerated profile
 //       table only; no logic change, and it lands on both panels.
-#define FW_VERSION "doorlock-1.91"
+// 1.92: inbound DP frames now accept 0x07 (MCU report), not just 0x06 — a real
+//       lock's reports would all have been dropped. See doorlock.ino's
+//       changelog; the change is in common/ozdoorlock_core.h so it lands on
+//       both panels.
+// 1.93: real access-event DPs (61/63/64/72/73/76) are now classified and
+//       published with their cred_id instead of falling through to
+//       UNCLASSIFIED. See doorlock.ino's changelog; the change is in
+//       common/ozdoorlock_core.h so it lands on both panels.
+// 1.94: BLE unlock issues real DP 76; BLE window 30s -> 60s (~15s of it is
+//       advertising-to-discovery latency). See
+//       doorlock.ino's changelog; both live in common/ozdoorlock_core.h.
+#define FW_VERSION "doorlock-1.94"
 
 // ── DERIVED, not a second literal (2026-08-12) — see doorlock.ino for the
 // full reasoning. The warning above ("Change both, every time") described the

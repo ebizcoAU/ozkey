@@ -81,7 +81,8 @@ static OzCtlOpen ozControlOpen(const uint8_t *buf, size_t n, int *outSlot,
                                 uint8_t *pt, size_t ptCap, size_t *outPtLen,
                                 uint64_t *outCounter);
 static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
-                                        uint64_t counter, bool hasChallenge);
+                                        uint64_t counter, bool hasChallenge,
+                                        bool viaBle);
 static size_t ozHexDecode(const String &hex, uint8_t *out, size_t cap);
 static bool ozDpForwardable(uint8_t dp);
 static void ozReportOutcome(int slot, const char *code, const String &detail);
@@ -98,7 +99,7 @@ static void handleBondRevoke(int senderSlot, const uint8_t *v, size_t vlen);
 static void handleInviteCancel(int senderSlot, const uint8_t *v, size_t vlen);
 static void handleListBonds(int senderSlot, const uint8_t *v, size_t vlen);
 static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen);
-static void ozSemanticDispatch(int slot, const char *json, size_t len);
+static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaBle);
 static void ozNotifyChunked(const String &json);
 uint32_t clampHeartbeatS(uint32_t s);
 uint32_t txlogCountLines(const char *path);
@@ -840,6 +841,17 @@ uint32_t clampHeartbeatS(uint32_t s) {
 // spammed and on a sleepy lock the radio IS the power budget. Ringing during an
 // OPEN window still extends it, so this never interrupts a real enrolment — it
 // only caps how much advertising a stranger at the door can force.
+// 120 s, and the WINDOW is what changed instead (operator, 2026-08-18).
+//
+// The first fix attempted here was halving this to 60 s, on the theory that
+// the cooldown was what stranded a user who missed the window. The operator
+// supplied the measurement that showed the real cause: **BLE advertising takes
+// ~15 s before the app can even SEE the lock.** So a 30 s window gave a person
+// ~15 s to unlock a phone, open the app and tap — and it routinely closed
+// underneath them. The window was too short; the cooldown was never the
+// problem. Widening the window (BLE_WINDOW_MS, now 60 s) fixes the actual
+// failure, and lets the cooldown stay at the full 2 min it needs to be for the
+// battery argument to hold.
 #define OZ_BELL_COOLDOWN_MS 120000UL // 2 min of quiet after a bell window closes
 static unsigned long g_bellWindowEndedAt = 0;
 
@@ -1678,7 +1690,23 @@ bool buttonWasDown = false;
 // surface, so its length is the exposure. Halving it halves both the time a
 // passive scanner can see the lock and the advertising energy per open — and
 // 30 s is still comfortably longer than a pair-and-connect ceremony.
-#define BLE_WINDOW_MS 30000UL
+// 60 s, doubled from 30 s (operator, 2026-08-18, from a real observation on
+// the bench):
+//
+//   "BLE turn on it needs 15s for app to see. by the time he get ready and
+//    open door via ble.. the window closed"
+//
+// That 15 s is the advertising-to-discovery latency on a real phone, and it is
+// pure overhead — the user cannot act during it. A 30 s window therefore gave
+// someone roughly 15 s to unlock a phone, open the app, find the lock and tap.
+// It was closing underneath people at the door, which is a failure of the one
+// gesture a production lock has (BOOT is on the INSIDE).
+//
+// 🔴 DO NOT "OPTIMISE" THIS BACK DOWN without re-measuring discovery latency
+// first. The number that matters is not how long the window is, it is how long
+// the window is MINUS how long discovery takes — and only the second half is
+// measurable from the bench.
+#define BLE_WINDOW_MS 60000UL
 #define BUTTON_DEBOUNCE_MS 60UL
 // bleWindowUntil is declared with the other BLE globals near the top — see the
 // note there about drawStatus() needing it before this point.
@@ -2083,9 +2111,35 @@ void serveMcuTimePush() {
 }
 
 // Short human line for the console + dashboard ("what did the MCU say?")
+// ── INBOUND DP frames: the MCU reports with 0x07, not 0x06 (1.92) ───────────
+//
+// The Tuya "general" variant is a TWO-command-word protocol, and the supplier's
+// own instruction table (通讯协议(产品功能部分)指令收发表) is explicit:
+//
+//     命令字 0x06   模块发送   MODULE issues to the MCU
+//     命令字 0x07   MCU上报    MCU reports to the module
+//
+// We had 0x06 hardcoded in BOTH directions, so every DP report from a real lock
+// — doorbell, access events, battery alarm, credential reports — would have
+// been dropped as an unparsed "cmd 0x7". The outbound path (ozTuyaFrameOk,
+// forwardFrameToMcu) is correct at 0x06 and is deliberately NOT changed.
+//
+// 🔴 WHY THIS SURVIVED SO LONG: locksim/lib/tuya.ts defines DP_REPORT = 0x06.
+// LockSim was written to match this firmware, so both halves of the bench
+// agreed with each other and disagreed with the supplier — the bench could not
+// see the bug because the bench WAS the bug. Structurally identical to the
+// DP 1 fiction (XF-110): see ozkey-39 §1.1.
+//
+// 0x06 stays accepted inbound until LockSim is flipped to 0x07 — cutting the
+// old path before the new one is live just breaks the bench, the same
+// discipline the CTL plaintext path already documents.
+static inline bool ozIsInboundDp(const uint8_t *f, size_t n) {
+  return n >= 11 && (f[3] == 0x07 || f[3] == 0x06);
+}
+
 String describeDpid(const uint8_t *f, size_t n) {
   if (n >= 4 && f[3] == 0x00) return String("MCU heartbeat");
-  if (n < 11 || f[3] != 0x06) return String("cmd 0x") + String(f[3], HEX);
+  if (!ozIsInboundDp(f, n)) return String("cmd 0x") + String(f[3], HEX);
   uint8_t dpid = f[6], type = f[7];
   uint16_t vlen = ((uint16_t)f[8] << 8) | f[9];
   const uint8_t *v = f + 10;
@@ -2267,7 +2321,7 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
     return;
   }
 
-  if (n >= 11 && f[3] == 0x06) {
+  if (ozIsInboundDp(f, n)) {
     uint8_t dpid = f[6], type = f[7];
     uint16_t vlen = ((uint16_t)f[8] << 8) | f[9];
     const uint8_t *v = f + 10;
@@ -2404,6 +2458,53 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       return;
     }
 
+    // ── REAL T3 ACCESS-EVENT DPs (1.92) ─────────────────────────────────────
+    //
+    // DP 61/63/64/72/73/76 — `status: confirmed`, `type: value`,
+    // `verb: event.access`, payload = `cred_id`. These are what a REAL lock
+    // reports when a credential opens the door, and they REPLACE our fiction
+    // (DP 1/2/3) the moment a lock adopts a real product profile.
+    //
+    // Until now they fell through to UNCLASSIFIED and we published nothing but
+    // a shape — so on a real lock, every access event would have been invisible
+    // while the invented DPs carried the whole audit trail. Same class of
+    // problem as XF-110's DP 1: the fiction worked and the real thing did not.
+    //
+    // WHY cred_id MATTERS: our fiction could never express WHICH credential
+    // opened the door — DP 2 carried a raw card UID, DP 3 a bare bool. These
+    // carry the stored slot, which is exactly what an audit line needs.
+    //
+    // 🔴 REPORT-ONLY. These say a credential WAS USED. They are not credential
+    // writes — provisioning is DP 13/14/15, all `status: reserved`, blocked on
+    // the supplier's RAW payload layout (ozkey-27 Q2 / ozkey-39 §2).
+    //
+    // Gated on ozDpFind() so a lock only honours the DPs its own profile
+    // selects — an access event on a DP this product does not have is either a
+    // bug or a spoof, and the profile is the only thing that can tell.
+    if (type == 0x02 && (dpid == 61 || dpid == 63 || dpid == 64 || dpid == 72 ||
+                         dpid == 73 || dpid == 76)) {
+      if (ozDpFind(dpid) == nullptr) {
+        Serial.printf("[ACCESS] DP %u not selected by profile '%s' — ignored\n",
+                      dpid, ozProfileId());
+        return;
+      }
+      uint32_t credId = 0;
+      for (uint16_t i = 0; i < vlen && i < 4; i++) credId = (credId << 8) | v[i];
+      const char *kind = dpid == 61   ? "pin"
+                         : dpid == 63 ? "fingerprint"
+                         : dpid == 64 ? "rfid"
+                         : dpid == 72 ? "remote"
+                         : dpid == 73 ? "remote_voice"
+                                      : "ble";
+      char detail[64];
+      snprintf(detail, sizeof(detail), "%s cred_id=%lu (DP %u)", kind,
+               (unsigned long)credId, dpid);
+      Serial.printf("[ACCESS] %s\n", detail);
+      markDoorUnlocked(); // a real access event means the bolt moved
+      publishLog("granted", detail);
+      return;
+    }
+
     // ── DP 104 `*NN#` KEYPAD COMMAND — REMOVED 2026-08-16 ─────────────────
     //
     // Built, verified on the bench, and deleted the same day once the operator
@@ -2480,7 +2581,7 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
   hex.trim();
   Serial.printf("[TUYA<-] UNCLASSIFIED DP, NOT published: %s\n", hex.c_str());
 
-  if (n >= 11 && f[3] == 0x06) {
+  if (ozIsInboundDp(f, n)) {
     // Shape only. Enough to discover which DPs exist and how often, with no
     // possibility of leaking what they carry.
     char shape[64];
@@ -3087,7 +3188,8 @@ void pollThreadUdp() {
                           " (no bond could decrypt it)");
       return;
     }
-    ozControlVerifyAndDispatch(slot, pt, ptLen, counter, false /*hasChallenge*/);
+    ozControlVerifyAndDispatch(slot, pt, ptLen, counter, false /*hasChallenge*/,
+                               false /*viaBle — arrived over Thread/UDP*/);
     return;
   }
 
@@ -3820,7 +3922,8 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
       notifyStatus("UNLOCK_DENIED");
       return;
     }
-    ozControlVerifyAndDispatch(slot, pt, ptLen, counter, false /*hasChallenge*/);
+    ozControlVerifyAndDispatch(slot, pt, ptLen, counter, false /*hasChallenge*/,
+                               false /*viaBle — arrived over MQTT*/);
     return;
   }
 
@@ -5140,7 +5243,7 @@ static bool ozQueryRateOk(int slot) {
 // `list_bonds` is still for; pagination is future work if it is ever needed.
 #define OZ_QUERY_PLAINTEXT_BUDGET 480
 
-static void ozSemanticDispatch(int slot, const char *json, size_t len) {
+static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaBle) {
   JsonDocument doc;
   if (deserializeJson(doc, json, len) != DeserializationError::Ok) {
     Serial.println("[OZKIE] plaintext is authentic but not valid JSON — rejected");
@@ -5503,8 +5606,43 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
   uint8_t val[OZ_SEM_VAL_MAX];
   size_t vlen = 0;
 
-  if (strcmp(kind, "unlock") == 0) {
-    dp = 1; type = 0x01 /* BOOL */; val[0] = 0x01; vlen = 1;
+  // ── "is this an unlock" is a SEMANTIC question, not a DP number ──────────
+  //
+  // The gates below used to ask `dp != 1`, which was only ever right because
+  // unlock happened to be DP 1 — our own fiction. The moment unlock can also
+  // be DP 76, that test silently starts denying MEMBERS the one verb they are
+  // allowed, and makes the latency-critical verb wait for an MCU ack. Ask the
+  // real question instead.
+  const bool isUnlock = (strcmp(kind, "unlock") == 0);
+
+  if (isUnlock) {
+    // ── DP 76 `unlock_ble` — the REAL command, when this is a BLE unlock ────
+    //
+    // Supplier's instruction table: DP 76 = 0x4c, issuable by the MODULE under
+    // 0x06, type 0x04 VALUE, 4 bytes, range 0..99999 — a FULLY SPECIFIED
+    // payload, unlike DP 10 `remote_unlock` whose layout is "0x00-0xff" and
+    // therefore unimplementable (ozkey-27 Q2). The T3 module doc names the
+    // intent outright: "To enable Bluetooth lock control when the device is
+    // offline, select DP76 - unlock_ble."
+    //
+    // 🔴 GATED ON viaBle, and that is the whole point. DP 76 asserts HOW the
+    // door was opened, and a lock's audit trail must not claim Bluetooth for a
+    // command that arrived over MQTT or Thread. There is no real equivalent
+    // for the network path — DP 10 is supplier-blocked and DP 72 is an
+    // event.access REPORT, not a command — so network unlock stays on fiction
+    // DP 1 until the supplier answers. See ozkey-39 §3.5, XF-110 §10.
+    //
+    // cred_id = the bond slot that authorised it, so the MCU's own access
+    // record names WHICH credential opened the door. DP 1 could never say.
+    if (viaBle && ozDpFind(76) != nullptr) {
+      const uint32_t credId = (uint32_t)slot;
+      dp = 76; type = 0x02 /* VALUE */;
+      val[0] = (uint8_t)(credId >> 24); val[1] = (uint8_t)(credId >> 16);
+      val[2] = (uint8_t)(credId >> 8);  val[3] = (uint8_t)(credId & 0xFF);
+      vlen = 4;
+    } else {
+      dp = 1; type = 0x01 /* BOOL */; val[0] = 0x01; vlen = 1;
+    }
   } else if (strcmp(kind, "grant_pin") == 0 || strcmp(kind, "grant_rfid") == 0) {
     dp = (strcmp(kind, "grant_pin") == 0) ? 21 : 23;
     type = 0x00 /* RAW */;
@@ -5532,7 +5670,7 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
 
   // Same admin bar the DP path applies (ozkey-13 F4): a member may unlock the
   // door they're standing at, but must never issue or delete a credential.
-  if (dp != 1 && g_bonds[slot].role != OZ_ROLE_ADMIN) {
+  if (!isUnlock && g_bonds[slot].role != OZ_ROLE_ADMIN) {
     Serial.printf("[OZKIE] %s is role-gated to bond #0 — bond %d ('%s', member) "
                   "denied\n", kind, slot, g_bonds[slot].label);
     notifyStatus("UNLOCK_DENIED");
@@ -5561,7 +5699,7 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len) {
   // 1.61 — a CREDENTIAL operation must be confirmed by the MCU before we call
   // it a success. An unlock is exempt: its proof is the bolt, and it is the one
   // latency-critical verb here (see ozAwaitMcuAck's header).
-  if (dp != 1 && !ozAwaitMcuAck(dp)) {
+  if (!isUnlock && !ozAwaitMcuAck(dp)) {
     // Distinct from UNLOCK_DENIED, which means "I refused you". This means "I
     // accepted you and cannot confirm the lock stored it" — a different thing
     // for an app to show a user, and previously indistinguishable from success.
@@ -5700,7 +5838,8 @@ static OzCtlOpen ozControlOpen(const uint8_t *buf, size_t n, int *outSlot,
 // live challenge to check-and-strip (BLE) or the frame starts at byte 0
 // (MQTT — see the block comment above).
 static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
-                                        uint64_t counter, bool hasChallenge) {
+                                        uint64_t counter, bool hasChallenge,
+                                        bool viaBle) {
   // ── ozkey-21 T5: expiry is checked ON THE COMMAND PATH, not only on a timer.
   //
   // The 15 s sweep alone would leave a window in which an expired member could
@@ -5793,7 +5932,7 @@ static void ozControlVerifyAndDispatch(int slot, uint8_t *pt, size_t ptLen,
   if (semantic) {
     Serial.printf("[CTL] OPENED — bond %d, counter %llu, OZKIE (%u B)\n", slot,
                   (unsigned long long)counter, (unsigned)blen);
-    ozSemanticDispatch(slot, (const char *)body, blen);
+    ozSemanticDispatch(slot, (const char *)body, blen, viaBle);
   } else {
     Serial.printf("[CTL] OPENED — bond %d, counter %llu, DP %u (legacy frame)\n",
                   slot, (unsigned long long)counter, body[6]);
@@ -5843,7 +5982,8 @@ static bool ozControlTry(bool final) {
     return true;
   }
 
-  ozControlVerifyAndDispatch(slot, pt, ptLen, counter, true /*hasChallenge*/);
+  ozControlVerifyAndDispatch(slot, pt, ptLen, counter, true /*hasChallenge*/,
+                             true /*viaBle — the BLE control characteristic*/);
   return true;
 }
 

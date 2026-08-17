@@ -33,7 +33,32 @@ export enum TuyaCommand {
    * wire.
    */
   PRODUCT_INFO = 0x01,
-  DP_REPORT = 0x06,
+  /**
+   * DP ISSUE — **module → MCU**. `模块发送` in the supplier's instruction table.
+   *
+   * This is what the OZKIE module sends US (LockSim plays the DL MCU): remote
+   * unlock requests, credential writes, settings.
+   */
+  DP_ISSUE = 0x06,
+  /**
+   * DP REPORT — **MCU → module**. `MCU上报` in the supplier's table.
+   *
+   * 🔴 THIS WAS 0x06 UNTIL 2026-08-17, AND THAT WAS WRONG. The Tuya general
+   * variant is a TWO-command-word protocol: the module issues on 0x06 and the
+   * MCU reports on 0x07. We used 0x06 for both directions, and so did the
+   * firmware — which is exactly why nothing ever caught it. LockSim was written
+   * to match `ozdoorlock_core.h`, so both halves of the bench agreed with each
+   * other and disagreed with the supplier: the bench could not see the bug
+   * because the bench WAS the bug.
+   *
+   * Against a real Luona DS013-T3 every report we send would have been the
+   * wrong command word, and every report IT sent would have been dropped by our
+   * firmware as an unparsed "cmd 0x7". Same shape as the DP 1 fiction
+   * (XF-110). See ozkey-39 §1.1.
+   *
+   * Firmware ≥ 1.92 accepts both inbound during the transition.
+   */
+  DP_REPORT = 0x07,
   /**
    * ozkey-21 §2.3 — TIME SERVICE. The direction here is the whole point:
    * in Tuya's architecture the MODULE owns the clock and the MCU is its
@@ -174,7 +199,48 @@ export enum DpId {
    */
   DOORBELL = 53,
 
+  // ── REAL T3 ACCESS-EVENT DPs (L-1/L-3, operator directive 2026-08-17) ──────
+  //
+  // All four are `status: confirmed` in the supplier catalogue, `type: value`,
+  // `verb: event.access`, `field: cred_id`. They are the DPs a REAL DS013-T3
+  // reports on, and they are what replaces our fiction (DP 1/2/3) once a lock
+  // adopts a real product profile.
+  //
+  // 🔴 READ THIS BEFORE ASSUMING THEY SOLVE CREDENTIALS. These are access
+  // EVENT REPORTS — "credential N was used to open the door" — NOT credential
+  // writes. Provisioning a PIN or a card is DP 13/14/15
+  // (`bulk_unlock_method_add/delete/modify`, verb `cred.put`/`cred.delete`),
+  // and ALL THREE ARE status:reserved — BLOCKED, because the supplier never
+  // supplied the RAW payload layout (ozkey-27 Q2). Emitting these four does
+  // not unblock credential provisioning; it is the same supplier gap that
+  // blocks DP 10 remote unlock (XF-110 §3).
+  //
+  // The payload is a cred_id, so a report says WHICH stored credential opened
+  // the door — which is exactly what our fiction could never express: DP 2
+  // carried a raw card UID and DP 3 a bare bool.
 
+  /** PIN entry opened the door — VALUE = cred_id. Catalogue range 0..65535. */
+  UNLOCK_PASSWORD = 61,
+  /** Fingerprint opened the door — VALUE = cred_id. Catalogue range 0..65535. */
+  UNLOCK_FINGERPRINT = 63,
+  /** RFID card opened the door — VALUE = cred_id. Catalogue range 0..65535. */
+  UNLOCK_CARD = 64,
+  /**
+   * A REMOTE (network) unlock opened the door — VALUE = cred_id,
+   * `access_kind: remote`. This is the real catalogue equivalent of what our
+   * fiction DP 1 does today, and the counterpart to DP 76's offline-BLE path.
+   */
+  UNLOCK_REMOTE = 72,
+  /**
+   * BLE opened the door — VALUE = cred_id. Catalogue range 0..99999.
+   *
+   * The strongest-evidenced DP we have: cross-confirmed in BOTH supplier
+   * documents, and the T3 module doc names it explicitly — *"To enable
+   * Bluetooth lock control when the device is offline, select DP76 -
+   * unlock_ble."* That offline clause is the whole OZLOCK premise, so this is
+   * the DP our BLE unlock path should ultimately report on.
+   */
+  UNLOCK_BLE = 76,
 }
 
 /** Values carried by DP 8 (ACCESS_RESULT, ENUM). */
@@ -297,7 +363,13 @@ export function parseFrame(bytes: ByteArray): ParseResult {
       version: bytes[2],
       command,
       payload,
-      dataPoints: command === TuyaCommand.DP_REPORT ? parseDataPoints(payload) : [],
+      // Both command words carry DP units — 0x06 is what the module issues to us,
+    // 0x07 is what we report back. The parser decodes either; only the
+    // DIRECTION differs, not the payload shape.
+    dataPoints:
+      command === TuyaCommand.DP_ISSUE || command === TuyaCommand.DP_REPORT
+        ? parseDataPoints(payload)
+        : [],
     },
   };
 }
@@ -621,24 +693,26 @@ export function annotateFrame(frame: TuyaFrame, profile?: ResolvedProfile): stri
       ? [`Parsed Incoming Hex -> Time Push (0x34) — ${fmtUnix(t.unix!)}`]
       : ["Parsed Incoming Hex -> Time Push (0x34) — module reports NO VALID TIME"];
   }
-  if (frame.command !== TuyaCommand.DP_REPORT) {
+  // INCOMING means module → MCU, i.e. DP_ISSUE (0x06). 0x07 is accepted too so
+  // a pasted capture of our own reports still decodes in the console.
+  if (frame.command !== TuyaCommand.DP_ISSUE && frame.command !== TuyaCommand.DP_REPORT) {
     return [`Parsed Incoming Hex -> Command 0x${toHexByte(frame.command)} (unhandled by lock firmware)`];
   }
   if (frame.dataPoints.length === 0) {
-    return ["Parsed Incoming Hex -> DP_REPORT with no decodable data points"];
+    return ["Parsed Incoming Hex -> DP frame with no decodable data points"];
   }
   return frame.dataPoints.map((dp) => `Parsed Incoming Hex -> ${annotateDp(dp, profile)}`);
 }
 
 /** Reference frame: remote unlock request (DP 1, BOOL, value 0x01) with valid checksum. */
 export const SAMPLE_REMOTE_UNLOCK_FRAME = toHexString(
-  buildFrame(TuyaCommand.DP_REPORT, buildDpPayload(DpId.UNLOCK_CHANNEL, DpType.BOOL, [0x01]))
+  buildFrame(TuyaCommand.DP_ISSUE, buildDpPayload(DpId.UNLOCK_CHANNEL, DpType.BOOL, [0x01]))
 );
 
 /** Reference frame: add temp PIN 482915 to slot 14, valid 2026-01-01 → 2026-12-31 UTC. */
 export const SAMPLE_ADD_TEMP_PIN_FRAME = toHexString(
   buildFrame(
-    TuyaCommand.DP_REPORT,
+    TuyaCommand.DP_ISSUE,
     buildDpPayload(
       DpId.ADD_TEMP_PIN,
       DpType.RAW,
@@ -655,7 +729,7 @@ export const SAMPLE_ADD_TEMP_PIN_FRAME = toHexString(
 /** Reference frame: add temp RFID card 04 A3 7F 1C to slot 3, same validity window. */
 export const SAMPLE_ADD_TEMP_RFID_FRAME = toHexString(
   buildFrame(
-    TuyaCommand.DP_REPORT,
+    TuyaCommand.DP_ISSUE,
     buildDpPayload(
       DpId.ADD_TEMP_RFID,
       DpType.RAW,
