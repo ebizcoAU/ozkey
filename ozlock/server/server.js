@@ -2644,6 +2644,38 @@ api.post('/locks/:id/unlock', async (req, res) => {
         });
     }
 
+    // XF-113 §5.1 — do not report success for an undeliverable command.
+    // `lock.presence`/`presence_reason` are already kept live by LWT +
+    // recomputeAndStorePresence() (bridge offline, lock off-mesh behind a
+    // healthy bridge, or a Wi-Fi lock's own LWT) — this was previously never
+    // read here, so a publish to an absent subscriber (fire-and-forget MQTT,
+    // no error) still returned ok:true/delivered. Checked BEFORE anything is
+    // queued, same reasoning as the capability gate below: a refused unlock
+    // leaves no row to expire later and no audit entry implying it was
+    // attempted at the door.
+    if (lock.presence === 'offline') {
+      logEvent(
+        'warn',
+        `Remote UNLOCK refused for "${lock.label}" — unreachable (${lock.presence_reason || 'offline'})`
+      );
+      return res.status(409).json({
+        ok: false,
+        code: lock.presence_reason || 'lock_unreachable',
+        error: 'lock_unreachable',
+        detail:
+          'This doorlock is not currently reachable, so the command would never be ' +
+          'delivered. ' +
+          (lock.bridge_id
+            ? 'Its bridge (or the lock behind it) is offline — nothing is subscribed ' +
+              'to receive the command.'
+            : 'It has no live network connection.') +
+          ' Falling back to BLE-at-the-door is the only path that can work right now.',
+        device_id: deviceId,
+        presence_reason: lock.presence_reason,
+        ref: 'XF-113 §5.1',
+      });
+    }
+
     // XF-48 ask (E) — capability gate. Checked BEFORE anything is queued, so a
     // refused unlock leaves no row to expire later and no audit entry implying
     // it was attempted at the door.

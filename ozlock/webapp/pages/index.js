@@ -24,106 +24,31 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  C,
+  panelStyle,
+  inputStyle,
+  agoLabel,
+  shortId,
+  statusColor,
+  actionColor,
+  levelColor,
+  extractIds,
+  presence,
+} from '../lib/theme';
+import PanelTitle from '../components/PanelTitle';
+import OverviewTab from '../components/OverviewTab';
 
 const API = 'http://localhost:4200/ozlockserv/api';
 
-/* ---------------------------------------------------------------------------
- * Palette
- * ------------------------------------------------------------------------- */
-const C = {
-  bg: '#0C1220',
-  panel: '#16202F',
-  panelEdge: '#2B3B52',
-  text: '#E2E8F0',
-  dim: '#8CA3BD',
-  teal: '#2DD4BF',
-  green: '#22C55E',
-  blue: '#38BDF8',
-  red: '#EF4444',
-  gray: '#475569',
-  amber: '#F59E0B',
-  violet: '#C084FC',
-  termGreen: '#4ADE80',
-};
-
-const panelStyle = {
-  background: C.panel,
-  border: `1px solid ${C.panelEdge}`,
-  borderRadius: 8,
-  padding: 12,
-};
-
-const inputStyle = {
-  width: '100%',
-  boxSizing: 'border-box',
-  background: C.bg,
-  border: `1px solid ${C.panelEdge}`,
-  borderRadius: 6,
-  color: C.text,
-  padding: '8px 10px',
-  fontSize: 13,
-  fontFamily: 'inherit',
-  outline: 'none',
-};
-
-function PanelTitle({ dot, children, right }) {
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
-      <span style={{ width: 7, height: 7, borderRadius: '50%', background: dot, boxShadow: `0 0 6px ${dot}` }} />
-      <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1.2, textTransform: 'uppercase', color: C.text }}>
-        {children}
-      </span>
-      {right && <span style={{ marginLeft: 'auto' }}>{right}</span>}
-    </div>
-  );
-}
-
-function agoLabel(iso) {
-  if (!iso) return 'never';
-  const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
-  if (s < 90) return `${s}s ago`;
-  if (s < 5400) return `${Math.round(s / 60)}m ago`;
-  if (s < 129600) return `${Math.round(s / 3600)}h ago`;
-  return `${Math.round(s / 86400)}d ago`;
-}
-
-function shortId(id, head = 10) {
-  if (!id) return '—';
-  return id.length > head + 6 ? `${id.slice(0, head)}…${id.slice(-4)}` : id;
-}
-
-const statusColor = (s) =>
-  ({ enrolled: C.green, registered: C.amber, revoked: C.gray }[s] || C.dim);
-
-const actionColor = (a) =>
-  ({ pair: C.blue, grant: C.violet, revoke: C.red, unlock: C.teal, settings: C.amber }[a] || C.dim);
-
 // resultColor (granted/denied/expired) removed 2026-07-31 with the door log —
 // it coloured door outcomes, which this console no longer receives.
-
-const levelColor = (l) =>
-  ({ error: C.red, warn: C.amber, pair: C.blue, key: C.violet, sync: C.teal, lock: C.blue }[l] ||
-  C.termGreen);
-
-/** Pull a device id (ozl-/ozk-) and/or app id (app_) out of a free-text event. */
-function extractIds(message) {
-  const m = String(message);
-  const dev = m.match(/\b(oz[lk]-[0-9a-f]{6,})\b/i);
-  const app = m.match(/\b(app_[0-9a-zA-Z]{6,})\b/);
-  return { deviceId: dev ? dev[1] : null, appId: app ? app[1] : null };
-}
-
-function presence(lock) {
-  if (!lock || !lock.last_seen_at) return { col: C.gray, label: 'never seen' };
-  const s = (Date.now() - new Date(lock.last_seen_at).getTime()) / 1000;
-  if (s < Math.max(90, (lock.heartbeat_s || 60) * 2)) return { col: C.green, label: 'online' };
-  return { col: C.amber, label: `asleep · ${agoLabel(lock.last_seen_at)}` };
-}
 
 /* ===========================================================================
  * Registry console
  * ========================================================================= */
 export default function OzlockConsole() {
+  const [activeTab, setActiveTab] = useState('overview'); // 'overview' | 'registry'
   const [gatewayUp, setGatewayUp] = useState(false);
   const [mqttUp, setMqttUp] = useState(false);
 
@@ -262,6 +187,11 @@ export default function OzlockConsole() {
     setLockDetail(null);
     loadSelection({ kind: 'lock', id });
   };
+
+  // Quick-find (Overview tab) jumps here, then switches to the Registry tab
+  // so the existing inspector renders the same way a manual click would.
+  const jumpToApp = (id) => { selectApp(id); setActiveTab('registry'); };
+  const jumpToLock = (id) => { selectLock(id); setActiveTab('registry'); };
 
   /* -------------------------------------------------------------------------
    * Registry admin (prune stale records — NOT an app action)
@@ -422,15 +352,43 @@ export default function OzlockConsole() {
         <div style={{ fontSize: 14, fontWeight: 800, letterSpacing: 1.5, whiteSpace: 'nowrap' }}>
           OZLOCK <span style={{ color: C.teal }}>//</span> REGISTRY CONSOLE
         </div>
-        <span style={{ fontSize: 10, color: C.dim }}>
+        <span style={{ fontSize: 10, color: C.dim, whiteSpace: 'nowrap' }}>
           rendezvous directory · read-only · does not grant keys or add locks
         </span>
-        <input
-          style={{ ...inputStyle, flex: '1 1 220px', maxWidth: 340, marginLeft: 'auto', padding: '6px 10px' }}
-          placeholder="search app id / device id / label…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
+        <div style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
+          {[
+            ['overview', 'Overview'],
+            ['registry', 'Registry'],
+          ].map(([id, label]) => (
+            <button
+              key={id}
+              onClick={() => setActiveTab(id)}
+              style={{
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: 1,
+                textTransform: 'uppercase',
+                padding: '6px 14px',
+                borderRadius: 5,
+                border: `1px solid ${activeTab === id ? C.teal : C.panelEdge}`,
+                background: activeTab === id ? C.bg : 'transparent',
+                color: activeTab === id ? C.teal : C.dim,
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {activeTab === 'registry' && (
+          <input
+            style={{ ...inputStyle, flex: '1 1 220px', maxWidth: 340, padding: '6px 10px' }}
+            placeholder="search app id / device id / label…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        )}
         <div style={{ display: 'flex', gap: 12, fontSize: 10 }}>
           {[
             ['OZLOCK', gatewayUp],
@@ -452,6 +410,19 @@ export default function OzlockConsole() {
         </div>
       </div>
 
+      {activeTab === 'overview' && (
+        <OverviewTab
+          apps={apps}
+          locks={locks}
+          gatewayUp={gatewayUp}
+          mqttUp={mqttUp}
+          onJumpToApp={jumpToApp}
+          onJumpToLock={jumpToLock}
+        />
+      )}
+
+      {activeTab === 'registry' && (
+      <>
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'stretch' }}>
         {/* ---- Left: registry browser ---------------------------------- */}
         <div style={{ ...panelStyle, flex: '1 1 340px', minWidth: 300 }}>
@@ -796,7 +767,7 @@ export default function OzlockConsole() {
             background: '#050B14',
             border: `1px solid ${C.panelEdge}`,
             borderRadius: 6,
-            height: 920,
+            height: 870,
             overflowY: 'auto',
             padding: '10px 12px',
             fontSize: 12,
@@ -837,6 +808,8 @@ export default function OzlockConsole() {
           })}
         </div>
       </div>
+      </>
+      )}
 
       <style jsx global>{`
         html,
