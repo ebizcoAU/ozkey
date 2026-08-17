@@ -247,6 +247,24 @@ to the cloud directory:
 - The lock returns its own ephemeral public key to the App. Both sides run HKDF-SHA256 on the shared
   `pairing_secret` to derive per-direction AES-256-GCM session keys, sealing all subsequent communication.
 
+### 5.3. Capability Discovery & Default Profile
+
+When a lock reports its Tuya product ID (`tuya_pid`) via BLE `info`, the app queries NEXUS for the lock's
+capabilities. If the PID is unknown or absent, the following default profile applies:
+
+| Feature | Default | Rationale |
+|---|---|---|
+| RFID | ✅ Yes | Near-universal across commodity smart locks — baseline hardware |
+| App Control (BLE + Thread/Wi-Fi) | ✅ Yes | BLE bonding is how every OZLOCK works — foundational |
+| Doorbell | ❌ No | A false positive strands someone at a door |
+| Video | ❌ No | Premium tier only |
+| Fingerprint | ❌ No | Premium tier only |
+| Keypad | ❌ No | Premium tier only |
+
+This default is intentionally conservative for features where a false positive would strand a user at a
+door (doorbell), while assuming baseline hardware (RFID) and foundational app control. Real capabilities
+are confirmed via NEXUS when a PID is recognised. Source: `XFtposDecisions-109.md` §13, `nexus-10.md` §1.
+
 ---
 
 ## 6. Comparison & Differentiation
@@ -297,7 +315,7 @@ credibility.
 | C2 | Server relays envelope_hex verbatim, blind and content-blind | VERIFIED | buildCredentialFrame() deleted from relay code |
 | C3 | Monotonic counter prevents replay attacks on physical locks | VERIFIED | Counter_floor per bond; written to U0 block |
 | C4 | Credentials (PIN/RFID) never stored in plaintext on server | VERIFIED | Relay database stores metadata and envelope only |
-| C5 | Lock works offline via BLE and physical PIN keypad | VERIFIED | Credentials verified locally on lock MCU filesystem |
+| C5 | Lock works offline via BLE and physical PIN keypad | **TRUE OF THE LOCK, NOT REACHABLE BY THE USER** | The lock half is verified — credentials are checked locally on the lock MCU and a BLE unlock works when driven directly (bench, `ozctl.py`). But **no user can reach it**: BANOI's `_UnlockPath.of()` chooses BLE vs. remote on *static capability alone* (`banoi_doorlock.dart:3004-3030` — "does a bridge front this lock"), with no live-reachability input, and the app never subscribes to `bridges/+/presence` at all (`ozlock_live.dart:131-133`). So a Thread lock always routes to the network path even with its bridge powered off. Reproduced on the bench 2026-08-18 — see XF-113. |
 | C6 | Lock-to-app channel is sealed securely | VERIFIED | ozkey-17 U1 secure channel implementation |
 | C7 | Server stores no record of door events or log audits | **NOT BUILT** | No such compile-time flag exists. The gate was scoped, a `mode` mapping question was raised (`ozkey-cloud`/`ozkey-local` is cloud-vs-on-prem, not residential-vs-commercial), and the eFuse directives overtook it before implementation. |
 | C8 | Sleepy End Device power optimization on Thread | **BUILT, DEFAULT OFF, NEVER RUN** | Contradicted by this document's own §3.3.2. `cfgThreadSed` defaults false pending bridge unicast downlink. SED has never been enabled on any board. |
@@ -319,6 +337,53 @@ credibility.
 > inaccuracies outside this table, not yet corrected here: §3.3.2's stated SED fallback (says
 > Wi-Fi 60s; is actually FTD-on-Thread) and §4.1's JTAG/UART-disabled claim (both are live —
 > USB CDC serial is how every bench log is read).
+
+> **🔴 MAJOR FLAW, 2026-08-18 (firmware, reproduced on the bench; operator-directed entry) —
+> THE OFFLINE PATH IS NOT DELIVERABLE END TO END. See `XFtposDecisions-113`.**
+>
+> This document's central promise — that OZLOCK keeps working when the network does not —
+> is **true of every component in isolation and false of the assembled system**. C5 is
+> corrected in place above.
+>
+> **What was observed.** With the bridge physically powered off, the app still routed the
+> unlock over the network. The server accepted it, queued it, and answered `delivered`;
+> nothing was subscribed to receive it; the door never moved. No component was individually
+> wrong — MQTT publish is fire-and-forget and QoS 0 to an absent subscriber is a no-op by
+> design — but **nothing in the chain converted "published" into "delivered"**, and the top
+> of the chain reported the former as the latter.
+>
+> **Precision (ftpos, XF-113 §7.2), because it changes the fix:** the app's copy never
+> literally claimed the door opened — it reads *"Đã gửi lệnh mở — chờ khoá nhận"* ("command
+> sent, waiting for the lock to receive"). The defect is that **nothing ever follows**: no
+> timeout, no retry, no downgrade to a failure state. The user sees a hedged "sent" and then
+> silence, indefinitely. This is a **stuck-in-limbo** failure rather than a false-positive
+> one, which is a distinction worth keeping — but in the hands of a user standing at a locked
+> door the two are indistinguishable.
+>
+> **Why it disables the offline story.** BLE is the fallback only if something decides the
+> network path failed. Nothing did. So the offline-BLE route — the property this
+> specification is built on, and the reason DP 76 `unlock_ble` exists — **could not be
+> reached by any user, on any lock, regardless of firmware.**
+>
+> **Not a signalling gap.** Firmware already published everything needed: a retained MQTT
+> Last Will on `bridges/<id>/presence` (`ozkey-20` R1), verified firing correctly with the
+> bridge off, plus per-lock `age_s` in `liveness`. The signal existed and was correct; it was
+> simply never read.
+>
+> **Status:** the **server half is CLOSED** — `POST /locks/:id/unlock` now reads `presence`
+> *before* the queue insert and refuses with `409 bridge_offline` / `lock_unreachable`
+> rather than queuing and reporting delivery; live-verified 2026-08-18 on both transports.
+> The **app half is OPEN** — the 409 and its machine-readable `code` exist, but the BLE
+> fallback is not wired, so C5 stays corrected until it is. A firmware question also remains
+> open (XF-113 §5.3): whether the lock should *acknowledge* an unlock so success can be
+> earned rather than assumed. On a Thread lock today there is nothing to wait for —
+> `publishLog()` returns early when MQTT is not connected (`ozkey-20` §2.1), so the door log
+> never leaves the lock.
+>
+> **The lesson worth keeping in the spec, not just the bug tracker:** every component here
+> was individually verified, and the *system* property still failed. Component-level
+> VERIFIED marks in the table above do not compose into an end-to-end guarantee, and this
+> table should not be read as if they do.
 
 ---
 
