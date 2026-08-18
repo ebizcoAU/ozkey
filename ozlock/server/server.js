@@ -1285,8 +1285,21 @@ function waitForLockResetVerdict(deviceId, msgId, timeoutMs) {
 function notifyLockResetWaiters(deviceId, msgId, verdict, cause) {
   const set = pendingLockResets.get(deviceId);
   if (!set) return;
+  // XF-115 §3: today every Thread-relayed reset outcome arrives with no
+  // msg_id at all (fixed once firmware ships bridge32/doorlock carrying it
+  // through — see ozkey-41 §10 discussion). An id-less message can't be
+  // correlated by id, so fall back to device-only matching — but ONLY when
+  // there is exactly one waiter, since that's the sole case with nothing to
+  // disambiguate. With 2+ concurrent waiters for the same device (e.g. a
+  // rapid double DELETE), an id-less message is genuinely ambiguous and
+  // must settle none of them rather than guessing and resolving the wrong
+  // one.
+  if (!msgId) {
+    if (set.size === 1) for (const waiter of set) waiter.settle(verdict, cause);
+    return;
+  }
   for (const waiter of Array.from(set)) {
-    if (waiter.msgId && msgId && waiter.msgId !== msgId) continue; // §5.3
+    if (waiter.msgId && waiter.msgId !== msgId) continue;
     waiter.settle(verdict, cause);
   }
 }
