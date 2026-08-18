@@ -131,6 +131,11 @@ const CONFIG = {
   // no async delay on the bridge's side — so this is round-trip + broker
   // latency budget, not a real processing wait.
   BRIDGE_RESET_TIMEOUT_MS: 5000,
+  // ozkey-41 §5/§6: doorlock-1.96/bridge32-1.40 publish the reset outcome to
+  // `locks/<id>/presence` synchronously, right before the wipe (or on
+  // refusal) — same latency shape as the bridge's own signal, so the same
+  // bound applies.
+  LOCK_RESET_TIMEOUT_MS: 5000,
   // ozkey-27 §9 (firmware, 2026-08-13): the ozkey-20 §23.1 utc push below
   // fired only on the presence 'online' transition — a server restart while
   // a bridge was already online, a missed presence message, or a reconnect
@@ -845,8 +850,12 @@ function publishRetainedTime(why) {
 // what a fresh outcome code is answering, not a guess dressed up as one.
 const lastGrantSentByDevice = new Map(); // deviceId -> { grantId, queueId }
 
-/** Drain queued actions for a device; expired unlock-style rows are skipped. */
-async function flushQueueForDevice(siteId, deviceId) {
+/** Drain queued actions for a device; expired unlock-style rows are skipped.
+ * `onSent(job, msgId)`, if given, fires for each job actually published —
+ * lets a caller that just queued a specific job (e.g. `DELETE /locks/:id`)
+ * learn the `msg_id` that went out for it, without every other caller
+ * needing to care (ozkey-41 §5.3 correlation). */
+async function flushQueueForDevice(siteId, deviceId, onSent) {
   const [queued] = await pool.query(
     "SELECT * FROM pending_queue WHERE device_id = ? AND status = 'queued' ORDER BY id ASC",
     [deviceId]
@@ -923,6 +932,7 @@ async function flushQueueForDevice(siteId, deviceId) {
       }
     }
     sent++;
+    if (onSent) onSent(job, envelope.msg_id);
     logEvent(
       'sync',
       `${deviceId} wake -> burst ${job.action_type} #${job.id} down ${commandTopic}` +
@@ -1146,9 +1156,14 @@ async function recomputeAndStorePresence(deviceId) {
   return { presence, reason };
 }
 
-/** ozkey-20 R1: retained LWT on the lock's own presence topic (Wi-Fi-direct
- * locks only — a Thread lock has no MQTT session to set a Will on).
- * Payload: {"state":"online"|"offline","reason":"lwt"}. */
+/** ozkey-20 R1 + ozkey-41: `locks/<id>/presence`. `reason` is one of
+ * `lwt` (retained, broker-published Will), no-reason (retained, published by
+ * the lock on every connect — §4.2), or a reset outcome — `factory_reset`
+ * (retained, before the wipe), `factory_reset_denied` / `no_bond` (not
+ * retained). Reset outcomes also carry `msg_id`, echoed from the request,
+ * for `pendingLockResets` correlation (§5.3) — a Thread lock's outcome
+ * arrives on this exact same topic, relayed verbatim by bridge32 (§2.1), so
+ * no transport branching is needed here. */
 async function handleLockPresence(deviceId, payload) {
   let obj;
   try {
@@ -1165,6 +1180,19 @@ async function handleLockPresence(deviceId, payload) {
       'info',
       `Presence: lock ${deviceId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}, verdict=${result.reason}`
     );
+
+  // ozkey-41 §5.2: `no_bond` means the sender's request couldn't even be
+  // decrypted — the lock is ALREADY unowned, which for a removal is the
+  // desired end state, not a refusal. Resolve it the same as a confirmed
+  // reset. `lwt` and a plain online/reconnect message are not reset
+  // outcomes and are deliberately not resolved here.
+  if (pendingLockResets.has(deviceId)) {
+    if (obj.reason === 'factory_reset' || obj.reason === 'no_bond') {
+      notifyLockResetWaiters(deviceId, obj.msg_id, 'reset_confirmed', 'presence_confirmed');
+    } else if (obj.reason === 'factory_reset_denied') {
+      notifyLockResetWaiters(deviceId, obj.msg_id, 'reset_denied', 'presence_denied');
+    }
+  }
 }
 
 /** ozkey-20 R1, bridge half. Same payload shape, `bridges_presence` instead
@@ -1222,6 +1250,45 @@ function notifyBridgeResetWaiters(bridgeId, verdict, cause) {
   const set = pendingBridgeResets.get(bridgeId);
   if (!set) return;
   for (const settle of Array.from(set)) settle(verdict, cause);
+}
+
+// ozkey-41 §5: the lock sibling of pendingBridgeResets, built once firmware
+// actually shipped a wire-level ack for locks (doorlock-1.96/bridge32-1.40 —
+// `locks/<id>/presence`, `reason` one of `factory_reset`/
+// `factory_reset_denied`/`no_bond`). Unlike the bridge map, a lock waiter
+// also carries the request's `msg_id` — §5.3: a real ack and the app's own
+// 3-minute escape hatch both end with the entry disappearing, and `msg_id`
+// is the only thing on the wire that tells them apart, so a waiter must only
+// settle on a matching id.
+const pendingLockResets = new Map(); // deviceId -> Set<{ msgId, settle }>
+
+function waitForLockResetVerdict(deviceId, msgId, timeoutMs) {
+  return new Promise((resolve) => {
+    const waiter = {
+      msgId,
+      settle: (verdict, cause) => {
+        clearTimeout(timer);
+        const set = pendingLockResets.get(deviceId);
+        if (set) {
+          set.delete(waiter);
+          if (!set.size) pendingLockResets.delete(deviceId);
+        }
+        resolve({ verdict, cause });
+      },
+    };
+    const timer = setTimeout(() => waiter.settle('unknown', 'timeout'), timeoutMs);
+    if (!pendingLockResets.has(deviceId)) pendingLockResets.set(deviceId, new Set());
+    pendingLockResets.get(deviceId).add(waiter);
+  });
+}
+
+function notifyLockResetWaiters(deviceId, msgId, verdict, cause) {
+  const set = pendingLockResets.get(deviceId);
+  if (!set) return;
+  for (const waiter of Array.from(set)) {
+    if (waiter.msgId && msgId && waiter.msgId !== msgId) continue; // §5.3
+    waiter.settle(verdict, cause);
+  }
 }
 
 async function handleBridgePresence(bridgeId, payload) {
@@ -2340,6 +2407,7 @@ api.delete('/locks/:id', async (req, res) => {
     let attempted = false;
     let transportOk = false;
     let likelyDelivered = false;
+    let resetMsgId = null; // ozkey-41 §5.3: only the sealed branch below gets one
     if (lock) {
       if (envelope_hex) {
         // XF-91 §5 — sealed unpair, required for a Thread lock: bridge32 has
@@ -2355,7 +2423,9 @@ api.delete('/locks/:id', async (req, res) => {
           [id, lock.site_id, envelope_hex, expiresAt]
         );
         attempted = true;
-        const sent = await flushQueueForDevice(lock.site_id, id);
+        const sent = await flushQueueForDevice(lock.site_id, id, (job, msgId) => {
+          if (job.id === queueResult.insertId) resetMsgId = msgId;
+        });
         transportOk = sent > 0;
         logEvent(
           'key',
@@ -2398,9 +2468,25 @@ api.delete('/locks/:id', async (req, res) => {
     if (d.affectedRows === 0)
       return res.status(404).json({ ok: false, code: 'lock_not_found', error: `Lock ${id} not found` });
     if (lock && lock.mac) nexusDecommission(lock.mac); // fire-and-forget, see nexusDecommission()
+
+    // ozkey-41 §5/§6: wait for the real wire-level outcome — done after the
+    // commit above (this server's own bookkeeping is unconditional, same as
+    // before) rather than gating the DB delete on it, since how the app
+    // itself should react to a denial/no_bond/timeout is still open (XF-114
+    // §7.6 ask 3). `no_bond` resolves as a CONFIRMED reset (§5.2 — the lock
+    // couldn't even decrypt the request because it's already unowned, which
+    // for a removal is the desired end state, not a refusal).
+    let verdict = null;
+    let cause = null;
+    if (transportOk && resetMsgId) {
+      ({ verdict, cause } = await waitForLockResetVerdict(id, resetMsgId, CONFIG.LOCK_RESET_TIMEOUT_MS));
+    }
+
     logEvent(
       'info',
-      `Doorlock ${id} removed + factory_reset sent (attempted=${attempted} likely_delivered=${likelyDelivered} transport_ok=${transportOk})`
+      `Doorlock ${id} removed + factory_reset sent (attempted=${attempted} likely_delivered=${likelyDelivered} transport_ok=${transportOk}` +
+        (verdict ? ` verdict=${verdict}${cause ? `/${cause}` : ''}` : '') +
+        ')'
     );
     res.json({
       ok: true,
@@ -2411,6 +2497,8 @@ api.delete('/locks/:id', async (req, res) => {
         transport_ok: transportOk,
         presence: lock ? lock.presence : 'unknown',
         presence_reason: lock ? lock.presence_reason : null,
+        verdict,
+        cause,
       },
     });
   } catch (err) {
