@@ -97,6 +97,21 @@ interface UseLockStateOptions {
    */
   pushRxLog?: (text: string, notes: string[], error?: boolean) => void;
   /**
+   * The Tuya PID this emulated MCU answers command `0x01` with — normally the
+   * `supplier.pid` of the profile selected in the UI.
+   *
+   * Until 2026-08-18 LockSim answered `OZSIM_PID` unconditionally, so
+   * selecting `tuya-ds013-t3` changed how the console INTERPRETED bytes while
+   * the MCU carried on claiming to be a fictional product. The module would
+   * then discover a PID that disagreed with the profile the bench was reading
+   * under — the two ends of the wire holding different ideas of what the
+   * device is, which is the exact failure `profiles/` exists to prevent.
+   *
+   * Undefined falls back to `OZSIM_PID`, which keeps the default
+   * (`ozkie-legacy-v0`, no PID) behaving exactly as it did.
+   */
+  tuyaPid?: string;
+  /**
    * ozkey-21 — what the EMULATED MODULE knows, in ms, or null if no module is
    * emulating the time service.
    *
@@ -140,6 +155,7 @@ export function useLockState({
   onAccess,
   mcuAckDelayMs,
   pushRxLog,
+  tuyaPid,
   moduleTimeSource,
   receiveFromModule,
   linkReady,
@@ -785,16 +801,24 @@ export function useLockState({
 
       // 0x01 — "what are you?". Answering this is what lets the module pick
       // its DP profile from the product rather than a compiled-in default.
-      // The PID is FICTIONAL (see OZSIM_PID): it exists so the discovery path
-      // is exercisable at all, since no real Tuya MCU has been on our wire.
+      //
+      // The PID comes from the SELECTED profile so the MCU's self-description
+      // and the console's interpretation cannot drift apart. A profile with no
+      // `supplier.pid` — `ozkie-legacy-v0` (our invented map) and
+      // `tuya-generic-lock` (the maker we have no PID for, by definition) —
+      // falls back to the FICTIONAL OZSIM_PID, which exists so the discovery
+      // path is exercisable at all, since no real Tuya MCU has been on our
+      // wire.
       if (frame.command === TuyaCommand.PRODUCT_INFO) {
-        const body = JSON.stringify({ p: OZSIM_PID, v: OZSIM_MCU_FW });
+        const pid = tuyaPid || OZSIM_PID;
+        const fictional = pid === OZSIM_PID;
+        const body = JSON.stringify({ p: pid, v: OZSIM_MCU_FW });
         transmitRef.current(
           TuyaCommand.PRODUCT_INFO,
           Array.from(body, (ch) => ch.charCodeAt(0)),
-          `Product info: pid=${OZSIM_PID} (FICTIONAL), mcu fw=${OZSIM_MCU_FW}`
+          `Product info: pid=${pid}${fictional ? " (FICTIONAL)" : ""}, mcu fw=${OZSIM_MCU_FW}`
         );
-        setLastEvent(`PRODUCT INFO SENT — ${OZSIM_PID}`);
+        setLastEvent(`PRODUCT INFO SENT — ${pid}`);
         return;
       }
 
@@ -947,7 +971,7 @@ export function useLockState({
         }
       }
     },
-    [wake, remoteUnlock, persistCredentials]
+    [wake, remoteUnlock, persistCredentials, tuyaPid]
   );
 
   useEffect(

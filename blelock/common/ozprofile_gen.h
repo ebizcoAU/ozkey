@@ -103,6 +103,44 @@ static const OzDpEntry OZ_DP_tuya_ds013_t3[] = {
   { 156, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "wifi_connection_strategy" },
 };
 
+// tuya-generic-lock — 34 DPs
+static const OzDpEntry OZ_DP_tuya_generic_lock[] = {
+  {   9, OZ_DIR_BOTH, OZ_DP_RESERVED  , "remote_no_pw_unlock_setting" },
+  {  10, OZ_DIR_BOTH, OZ_DP_RESERVED  , "remote_unlock" },
+  {  11, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "connection_mode" },
+  {  13, OZ_DIR_BOTH, OZ_DP_RESERVED  , "bulk_unlock_method_add" },
+  {  14, OZ_DIR_BOTH, OZ_DP_RESERVED  , "bulk_unlock_method_delete" },
+  {  15, OZ_DIR_BOTH, OZ_DP_RESERVED  , "bulk_unlock_method_modify" },
+  {  16, OZ_DIR_BOTH, OZ_DP_RESERVED  , "bulk_password_add" },
+  {  17, OZ_DIR_BOTH, OZ_DP_RESERVED  , "bulk_password_delete" },
+  {  18, OZ_DIR_BOTH, OZ_DP_RESERVED  , "bulk_password_modify" },
+  {  19, OZ_DIR_BOTH, OZ_DP_RESERVED  , "bulk_unlock_method_sync" },
+  {  21, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "navigation_volume" },
+  {  23, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "auto_lock" },
+  {  24, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "auto_lock_delay" },
+  {  42, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "ble_switch" },
+  {  45, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "battery_percentage" },
+  {  47, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "bolt_state" },
+  {  52, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "opened_from_inside" },
+  {  53, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "doorbell" },
+  {  54, OZ_DIR_BOTH, OZ_DP_RESERVED  , "device_info" },
+  {  60, OZ_DIR_UP  , OZ_DP_CONFIRMED , "alarm" },
+  {  61, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_password" },
+  {  63, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_fingerprint" },
+  {  64, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_card" },
+  {  69, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_temporary" },
+  {  72, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_remote" },
+  {  73, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_remote_voice" },
+  {  74, OZ_DIR_BOTH, OZ_DP_RESERVED  , "unlock_combination_record" },
+  {  76, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "unlock_ble" },
+  {  86, OZ_DIR_BOTH, OZ_DP_RESERVED  , "offline_password_params" },
+  {  87, OZ_DIR_UP  , OZ_DP_RESERVED  , "offline_password_clear_single_report" },
+  {  88, OZ_DIR_UP  , OZ_DP_RESERVED  , "offline_password_clear_all_report" },
+  {  89, OZ_DIR_UP  , OZ_DP_RESERVED  , "offline_password_unlock_report" },
+  {  98, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "hijack_alarm" },
+  { 156, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "wifi_connection_strategy" },
+};
+
 // tuya-t3-videolock — 4 DPs
 static const OzDpEntry OZ_DP_tuya_t3_videolock[] = {
   {  42, OZ_DIR_BOTH, OZ_DP_CONFIRMED , "ble_switch" },
@@ -115,9 +153,10 @@ static const OzProfile OZ_PROFILES[] = {
   { "ozkie-legacy-v0", 1, OZ_DP_ozkie_legacy_v0, (uint16_t)(sizeof(OZ_DP_ozkie_legacy_v0) / sizeof(OzDpEntry)), true, nullptr },
   { "ozsim-fullfeature", 1, OZ_DP_ozsim_fullfeature, (uint16_t)(sizeof(OZ_DP_ozsim_fullfeature) / sizeof(OzDpEntry)), false, "ozsimfullfeature" },
   { "tuya-ds013-t3", 1, OZ_DP_tuya_ds013_t3, (uint16_t)(sizeof(OZ_DP_tuya_ds013_t3) / sizeof(OzDpEntry)), false, "vr4iiuqtyh0q4nix" },
+  { "tuya-generic-lock", 1, OZ_DP_tuya_generic_lock, (uint16_t)(sizeof(OZ_DP_tuya_generic_lock) / sizeof(OzDpEntry)), false, nullptr },
   { "tuya-t3-videolock", 1, OZ_DP_tuya_t3_videolock, (uint16_t)(sizeof(OZ_DP_tuya_t3_videolock) / sizeof(OzDpEntry)), false, "3zlhjdesga1kyy75" },
 };
-static const uint8_t OZ_PROFILE_COUNT = 4;
+static const uint8_t OZ_PROFILE_COUNT = 5;
 
 // The profile the firmware boots with.
 //

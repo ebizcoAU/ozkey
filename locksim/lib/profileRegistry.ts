@@ -9,8 +9,10 @@
  */
 
 import catalogue from "../../profiles/tuya-lock-catalogue.json";
+import generic from "../../profiles/products/tuya-generic-lock.json";
 import ds013 from "../../profiles/products/tuya-ds013-t3.json";
 import videolock from "../../profiles/products/tuya-t3-videolock.json";
+import ozsim from "../../profiles/products/ozsim-fullfeature.json";
 import legacy from "../../profiles/products/ozkie-legacy-v0.json";
 
 import {
@@ -55,8 +57,23 @@ function build(p: unknown): ResolvedProfile {
  * sits next to it so the same bytes can be reinterpreted without a rebuild:
  * that side-by-side is the clearest demonstration that our DP numbers were
  * invented (`ozkey-27 §2.1`).
+ *
+ * `tuya-generic-lock` is the one to reach for when asking "what would a maker
+ * we have no datasheet for actually do to us?" — the standard pre-flashed
+ * Tuya DL-MCU, 34 DPs, 9 of them `reserved` and refusing loudly. See
+ * `docs/DPSuppliers/genericDPList.md`.
+ *
+ * `ozsim-fullfeature` was reachable by the FIRMWARE (it is globbed into
+ * `ozprofile_gen.h`) but was never listed here, so LockSim's own UI could not
+ * select the profile whose PID LockSim answers `0x01` with. Fixed 2026-08-18.
  */
-export const PROFILES: ResolvedProfile[] = [build(legacy), build(ds013), build(videolock)];
+export const PROFILES: ResolvedProfile[] = [
+  build(legacy),
+  build(generic),
+  build(ds013),
+  build(videolock),
+  build(ozsim),
+];
 
 export const PROFILE_IDS = PROFILES.map((p) => p.profile_id);
 

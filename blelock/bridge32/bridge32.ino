@@ -35,6 +35,11 @@
 #include <openthread/thread_ftd.h> // otChildInfo / otThreadGetChildInfoByIndex
                                    // (FTD-only API) — see logThreadChildren()
 #include "../common/oztime.h" // ozkey-21 T3 — OZ_TIME_FLOOR, shared with the locks
+// XF-115 §7.3 — the ONE definition of a lock's presence payload. The bridge
+// publishes presence ON BEHALF OF Thread locks, so it must emit byte-identical
+// shape to a Wi-Fi lock publishing for itself. Forwarding the lock's internal
+// datagram verbatim is what crashed BANOI1.
+#include "../common/ozpresence.h"
 #include "esp_coexist.h"
 
 // How long "no clock yet" is NORMAL rather than a fault. At boot the bridge has
@@ -179,7 +184,7 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.39"
+#define FW_VERSION "bridge32-1.41"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -766,6 +771,11 @@ String mqttCommandTopic, mqttCommandTopicLegacy;
 unsigned long mqttLastAttempt = 0;
 #define MQTT_RETRY_MS 5000UL
 
+// XF-115 / Q4 — the `msg_id` of the command currently being forwarded, stamped
+// onto the datagram so the lock can echo it in its outcome. Empty for anything
+// the bridge originates itself (time beacons).
+static String g_fwdMsgId;
+
 void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   // Incoming WiFi/MQTT traffic — no ladder status step of its own, so wake
   // the screen explicitly here (2026-07-27).
@@ -973,7 +983,13 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   lcdRxFlashActive = true;
   lcdWake(); // redraws immediately with the banner
 
+  // XF-115 / Q4 — carry the request id down to the lock. Until 1.41 the bridge
+  // held `msg_id` (it arrives on every ozlockserv command) and DROPPED it here,
+  // so a Thread lock could not name the request its reset outcome answered and
+  // server's pendingLockResets waiter could never settle for one.
+  g_fwdMsgId = (const char *)(doc["msg_id"] | "");
   forwardOverThread(target, fieldName, valueHex);
+  g_fwdMsgId = "";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1592,6 +1608,86 @@ static bool pollUplinkOne() {
   // Handled BEFORE the sealed path so it is never mistaken for a lost uplink.
   if (!envHex) {
     const char *kind = doc["kind"] | "";
+
+    // ── XF-114 — RESET OUTCOME RELAY (2026-08-19) ─────────────────────────
+    //
+    // A Thread lock has no MQTT session, so when it factory-resets it cannot
+    // tell anyone — the app sat waiting for an acknowledgement that was never
+    // transmitted on any wire, which is the whole of XF-114. doorlock-1.95
+    // fixed that for Wi-Fi locks by publishing to their own presence topic;
+    // this is the Thread half, and the bridge is the only thing that can carry
+    // it.
+    //
+    // 🔴 THIS IS THE LOCK'S LAST BREATH. It is sent immediately before a
+    // platform reset that never returns, so there is no retry, no second
+    // chance, and no way for the lock to learn whether it arrived. Publish it
+    // first and reason about it afterwards.
+    //
+    // Republished to `locks/<id>/presence` — NOT `heartbeat` — so it lands on
+    // the topic the server already subscribes to for presence and can resolve
+    // a pending DELETE against.
+    if (strcmp(kind, "reset_outcome") == 0) {
+      if (!mqttClient.connected()) {
+        // The one message we most need not to lose, and the broker is down.
+        // Say so loudly: this is the lock's only chance and it is gone.
+        Serial.printf("[RESET] %s: broker down, RESET OUTCOME LOST\n", from);
+        return true;
+      }
+      const char *reason = doc["reason"] | "";
+      const String msgId = String((const char *)(doc["msg_id"] | ""));
+      const bool online = (strcmp((const char *)(doc["state"] | "offline"), "online") == 0);
+
+      // ── 🔴 DE-DUPLICATE — XF-115 §6.1, and this one caused a P1 ──────────
+      //
+      // The lock DUAL-SENDS its outcome: unicast (for the MAC ACK) and
+      // ff03::1 (which needs no peer address). That redundancy is deliberate
+      // and stays — it is the lock's LAST BREATH before a platform reset, it
+      // cannot be retried, and halving the attempts to avoid a duplicate would
+      // trade a lost reset for a tidy log.
+      //
+      // So the duplication is suppressed HERE, where it costs nothing: both
+      // datagrams still arrive, exactly one MQTT message leaves. Consumers see
+      // one outcome per reset; the radio keeps both chances.
+      //
+      // WHY IT MATTERS (measured, not theoretical): the second copy reached
+      // BANOI as a second `acked ok` a few hundred ms after the first, and its
+      // removal screen popped itself twice — `You have popped the last page off
+      // of the stack`. Firmware had classified this duplicate as "harmless".
+      static String lastFrom, lastMsgId, lastReason;
+      static unsigned long lastAt = 0;
+      const bool dupe = lastAt && (millis() - lastAt < 15000UL) &&
+                        lastFrom == from && lastMsgId == msgId &&
+                        lastReason == reason;
+      if (dupe) {
+        Serial.printf("[RESET] %s: duplicate outcome suppressed (msg_id='%s')\n",
+                      from, msgId.c_str());
+        return true;
+      }
+      lastFrom = from; lastMsgId = msgId; lastReason = reason; lastAt = millis();
+
+      // ── REBUILT, not forwarded ───────────────────────────────────────────
+      //
+      // 1.40 forwarded the lock's datagram VERBATIM, so its internal field
+      // names (`from`, `kind`) became the published schema on the Thread path
+      // while Wi-Fi locks published {state,id,role,reason,msg_id}. Two shapes,
+      // one topic, one of them retained and therefore redelivered forever.
+      //
+      // The shared builder now decides what leaves, for BOTH transports.
+      const String out = ozBuildLockPresence(String(from), online, reason, msgId);
+      const String topic = "ozkie/" + cfgSiteId + "/locks/" + String(from) + "/presence";
+      const bool retain = ozPresenceShouldRetain(online);
+      const bool ok = mqttClient.publish(topic.c_str(), out.c_str(), retain);
+      // This lock has gone away; forget that we ever marked it online, so that
+      // when it comes back its first beacon re-publishes `online` and clears
+      // the retained value below.
+      if (!online) ozForgetLockOnline(from);
+      Serial.printf("[RESET] %s -> %s reason='%s' msg_id='%s'%s%s\n", from,
+                    topic.c_str(), reason, msgId.c_str(),
+                    retain ? " (retained)" : " (not retained)",
+                    ok ? "" : " PUBLISH FAILED");
+      return true;
+    }
+
     if (strcmp(kind, "presence") != 0) {
       Serial.printf("[UPLINK] %s: no envelope and kind='%s' — dropped\n", from, kind);
       return true;
@@ -1609,6 +1705,18 @@ static bool pollUplinkOne() {
       const bool ok = mqttClient.publish(topic.c_str(), buf);
       Serial.printf("[BEACON] %s -> %s%s\n", from, topic.c_str(),
                     ok ? "" : " PUBLISH FAILED");
+      // Q3 — this lock is demonstrably alive, so assert it on the presence
+      // topic and clear whatever retained value is sitting there (typically a
+      // `factory_reset` from before it was re-paired). Once per online
+      // transition, not once per beacon — see ozClaimLockOnline().
+      if (ozClaimLockOnline(from)) {
+        const String pres = ozBuildLockPresence(String(from), true,
+                                                OZ_PRESENCE_ONLINE, String(""),
+                                                (const char *)(doc["fw"] | ""));
+        const String ptopic = "ozkie/" + cfgSiteId + "/locks/" + String(from) + "/presence";
+        mqttClient.publish(ptopic.c_str(), pres.c_str(), true /*retain*/);
+        Serial.printf("[PRESENCE] %s -> online (retained, clears any stale reset)\n", from);
+      }
     } else {
       Serial.printf("[BEACON] %s: broker down, presence dropped\n", from);
     }
@@ -1756,6 +1864,49 @@ static void ozBridgeClockRestore() {
 }
 
 
+// ── XF-115 / Q3 — the bridge owns presence for its Thread children ──────────
+//
+// A Wi-Fi lock clears its own retained presence when it reconnects to MQTT.
+// A THREAD LOCK NEVER CAN: clearing happens on MQTT connect and it has no MQTT
+// session, ever. So its retained {"state":"offline","reason":"factory_reset"}
+// would survive the lock being wiped, re-paired and brought back into service —
+// permanently describing a working lock as factory-reset. That is the same
+// standing-false-statement bug 1.96 fixed for Wi-Fi locks, and the Thread half
+// was left open.
+//
+// The bridge is the only thing that can speak for these locks, so it publishes
+// `online` on their behalf. Driven off the presence BEACON rather than a
+// commissioning event: a beacon means the lock is demonstrably alive and
+// talking RIGHT NOW, which is the property we want to assert, and it
+// self-heals — a lock that was reset, re-paired, power-cycled or simply missed
+// by an event still gets corrected on its next beacon.
+//
+// Published ONCE per lock per online-transition, not per beacon: the table
+// below remembers who we have already marked online, so a 60 s beacon does not
+// become a 60 s retained write per lock across a whole site.
+#define OZ_BR_MAX_CHILDREN 16
+static String g_onlineLocks[OZ_BR_MAX_CHILDREN];
+
+static void ozForgetLockOnline(const char *id) {
+  for (uint8_t i = 0; i < OZ_BR_MAX_CHILDREN; i++)
+    if (g_onlineLocks[i] == id) { g_onlineLocks[i] = ""; return; }
+}
+
+/** True if `id` was not already marked online (and claims a slot for it). */
+static bool ozClaimLockOnline(const char *id) {
+  int8_t free_i = -1;
+  for (uint8_t i = 0; i < OZ_BR_MAX_CHILDREN; i++) {
+    if (g_onlineLocks[i] == id) return false; // already announced
+    if (free_i < 0 && g_onlineLocks[i].length() == 0) free_i = (int8_t)i;
+  }
+  // Table full: announce anyway rather than stay silent. A redundant retained
+  // write is cheap; a lock stuck reading "factory_reset" forever is not. The
+  // cap only bounds how much we remember, never what we are willing to say.
+  if (free_i < 0) return true;
+  g_onlineLocks[free_i] = id;
+  return true;
+}
+
 static bool sendToThreadGroup(const IPAddress &group, const String &target,
                               const String &fieldName, const String &valueHex,
                               const char *label) {
@@ -1767,6 +1918,9 @@ static bool sendToThreadGroup(const IPAddress &group, const String &target,
   doc["target"] = target;
   doc[fieldName] = valueHex;
   doc["via"] = label;
+  // Q4 — the lock reads this and echoes it in its reset outcome. Absent for
+  // bridge-originated datagrams, which answer no request.
+  if (g_fwdMsgId.length()) doc["msg_id"] = g_fwdMsgId;
   // ozkey-21 T3 — stamp UTC on every forwarded command. This is the cheap half
   // of time distribution: the datagram is already being sent, so a lock that
   // gets any traffic at all stays in sync for free. The beacon below exists

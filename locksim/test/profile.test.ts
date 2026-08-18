@@ -393,6 +393,70 @@ test("under the REAL profile the old allow-list would have been inverted", () =>
   assert.equal(real.byDp.get(22), undefined, "DP 22 is not allocated at all");
 });
 
+// ── the generic pre-flashed Tuya DL-MCU ─────────────────────────────────────
+//
+// docs/DPSuppliers/genericDPList.md. The operator's read is that most makers
+// buy a pre-flashed Tuya DL-MCU and tick standard boxes at PID creation, so
+// the interesting question is not "what did THIS vendor invent" but "what does
+// the standard set do to us". These pin the answer so it cannot drift.
+
+console.log("\ntuya-generic-lock — the standard set\n");
+
+const generic = loadProfile("tuya-generic-lock");
+
+test("it selects the whole catalogue EXCEPT the two Tuya says not to select", () => {
+  const cat = loadCatalogue("tuya-lock-catalogue").entries.map((e) => e.dp);
+  const got = generic.entries.map((e) => e.dp);
+  assert.deepEqual(
+    got,
+    cat.filter((dp) => dp !== 149 && dp !== 212),
+    "generic must track the catalogue — a new catalogue DP belongs here too"
+  );
+  // Ladin §3.1: "Do not select DP149." DP 212 is audio/video-lock only.
+  assert.equal(generic.byDp.get(149), undefined);
+  assert.equal(generic.byDp.get(212), undefined);
+});
+
+test("🔴 it has NO Tuya PID — a generic lock is reached by fallback, never by match", () => {
+  // Inventing a PID here would make discovery "match" a maker that does not
+  // exist, which is the fiction ozsim-fullfeature was built to avoid.
+  assert.equal(generic.tuya_pid, undefined);
+  assert.equal(loadProfile("tuya-ds013-t3").tuya_pid, "vr4iiuqtyh0q4nix");
+  assert.equal(loadProfile("ozkie-legacy-v0").tuya_pid, undefined);
+});
+
+test("🔴 it CANNOT remotely unlock — DP 10's payload layout was never supplied", () => {
+  // The supplier declined to specify it (0x00-0xff in the 功能指令 column while
+  // DP 11 is fully specified two rows away). Until that lands there is no real
+  // DP that opens a door, and DP 72 is a REPORT that one happened, not a
+  // command. This test is the reminder, not a bug.
+  const d = dispositionFor(generic, 10, "down");
+  assert.equal(d.action, "unsupported");
+  assert.equal(generic.byDp.get(72)!.verb, "event.access");
+});
+
+test("every credential WRITE is present and refuses loudly", () => {
+  // Present, not omitted: a real supplier's lock would show us exactly this,
+  // and the bench should meet UNSUPPORTED here rather than silence.
+  for (const dp of [9, 13, 14, 15, 16, 17, 18, 19, 86]) {
+    assert.equal(generic.byDp.get(dp)!.status, "reserved", `DP ${dp}`);
+    assert.equal(dispositionFor(generic, dp, "down").action, "unsupported", `DP ${dp}`);
+  }
+});
+
+test("the access events that DO work carry a credential class", () => {
+  const kinds = [61, 63, 64, 69, 72, 73, 76].map((dp) => generic.byDp.get(dp)!.access_kind);
+  assert.deepEqual(kinds, ["pin", "fingerprint", "rfid", "temp_pin", "remote", "remote_voice", "ble"]);
+});
+
+test("it carries no fiction — that is the difference from ozsim-fullfeature", () => {
+  for (const e of generic.entries) {
+    assert.notEqual(e.status, "fiction", `DP ${e.dp} (${e.name}) is fiction`);
+  }
+  assert.equal(generic.byDp.get(1), undefined, "DP 1 is OUR invention, not a Tuya DP");
+  assert.equal(loadProfile("ozsim-fullfeature").byDp.get(1)!.status, "fiction");
+});
+
 console.log("\ntwo loaders, one truth\n");
 
 // The browser cannot read `profiles/` off disk, so profileRegistry.ts imports

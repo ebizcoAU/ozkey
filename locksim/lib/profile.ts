@@ -111,6 +111,17 @@ export interface ResolvedProfile {
   profile_id: string;
   rev: number;
   deprecated: boolean;
+  /**
+   * The product's Tuya PID — what a real DL-MCU answers to command `0x01`,
+   * i.e. how a lock identifies ITSELF instead of being told what it is.
+   *
+   * `undefined` where we have no PID, which is not an oversight in either
+   * case it occurs: `ozkie-legacy-v0` is our own invented map and never had
+   * one, and `tuya-generic-lock` is by definition the maker we do NOT have a
+   * PID for. A profile without a PID can only be reached by fallback, never
+   * by discovery.
+   */
+  tuya_pid?: string;
   /** Every entry this product carries, ordered by DP id. */
   entries: DpEntry[];
   cmd?: Record<string, unknown>;
@@ -190,6 +201,7 @@ export function resolveProfile(product: ProductProfile, catalogue?: Catalogue): 
     profile_id: product.profile_id,
     rev: product.rev,
     deprecated: product.deprecated === true,
+    tuya_pid: product.supplier?.pid,
     entries,
     cmd: product.cmd,
     link: product.link,

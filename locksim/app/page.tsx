@@ -199,6 +199,11 @@ export default function Page() {
     onAccess: publishAccessLog,
     mcuAckDelayMs: settings.mcuAckDelayMs,
     pushRxLog: protocol.pushRxLog,
+    // Answer Tuya command 0x01 as the SELECTED product, so the MCU's own
+    // self-description and the profile this console reads under cannot drift
+    // apart. Undefined (no `supplier.pid`) falls back to the fictional
+    // OZSIM_PID — see useLockState's `tuyaPid`.
+    tuyaPid: profile.tuya_pid,
     // ozkey-21 — Mode A: LockSim is emulating the missing Wi-Fi module too, so
     // it answers the MCU's time request like a real Tuya module would.
     // Mode B: null, because the module is a physical ESP32 and whether it

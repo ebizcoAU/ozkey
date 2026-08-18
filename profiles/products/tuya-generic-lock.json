@@ -1,0 +1,64 @@
+{
+  "$comment": "THE GENERIC PRE-FLASHED TUYA DL-MCU. Operator, 2026-08-18: '90% of the makers talked about standard DP from the TUYA developer website... the rest seem likely to buy directly from TUYA pre-made, pre-flashed DL-MCU.' This profile is that maker. It is NOT a fictional product like ozsim-fullfeature — every DP in it is a real catalogue DP with a documented type, witnessed in a real supplier document. What is unknown is only WHICH maker: this is the shape you get when someone ticks the standard boxes at PID creation and does not send you a datasheet. See docs/DPSuppliers/genericDPList.md.",
+  "profile_id": "tuya-generic-lock",
+  "rev": 1,
+  "catalogue": "tuya-lock-catalogue",
+  "complete": false,
+
+  "supplier": {
+    "$comment": "NO `pid` KEY, DELIBERATELY. A generic lock is the product we do NOT have a PID for — that is the entire premise. Inventing one here would make PID discovery 'match' a maker that does not exist, which is exactly the fiction ozsim-fullfeature was carefully built to avoid (ozkey-37). A generic lock must be reached by FALLBACK, never by match. Firmware does not have that fallback yet — ozProfileByTuyaPid() returns nullptr on an unknown PID and keeps the current profile, deliberately. Wiring this profile in as the fallback is a real firmware change and L-4's business, not this file's.",
+    "product": "Generic Tuya smart lock (standard pre-flashed DL-MCU)",
+    "category": "smart_lock",
+    "module": "unknown — any Tuya Wi-Fi/BLE module speaking the general serial protocol"
+  },
+
+  "source": {
+    "doc": "docs/DPSuppliers/genericDPList.md",
+    "derived_from": "profiles/tuya-lock-catalogue.json rev 1 — the union of Luona DS013-T3 (protocol_vr4iiuqtyh0q4nix_20260811.pdf) and Ladin T3-U (T3_Final_Customer_Version_EN.docx)",
+    "generated": "2026-08-18",
+    "note": "Two independent vendors, two different products, agreeing on DP 42/76/149/212 and contradicting each other on nothing. That agreement is the evidence that this DP numbering is Tuya's standard for the category and not either vendor's invention (ozkey-27 §3)."
+  },
+
+  "cmd": {
+    "$comment": "RESOLVED to `general` for both suppliers we hold. Luona's own instruction table prints 0x06/0x07 for every DP; Ladin's T3 doc names the general variant and only notes that command 0x84 is unsupported. 🔴 We parsed 0x06 in BOTH directions until doorlock-1.92 — a real MCU reports on 0x07, so every real report would have been dropped as an unparsed cmd 0x7. Ask any new supplier to confirm the variant anyway (genericDPList.md §5, question 4).",
+    "variant": "general",
+    "dp_issue": 6,
+    "dp_report": 7,
+    "time_local": 28,
+    "time_gmt": 12
+  },
+
+  "link": {
+    "$comment": "🔴 UNRESOLVED AND GUESSED. Ladin documents an active-HIGH, edge-triggered wake (module->MCU 300 ms on P32; MCU->module >=1 ms on P13, rising edge). Luona documents NO handshake at all. The two suppliers do not agree, so there is no generic answer — this is per-vendor, not per-catalogue (ozkey-39). `assert: low` below is inherited from tuya-ds013-t3 and has never met real hardware. GPIO numbers are board config, not supplier config (ozkey-27 §8.4).",
+    "srdy": { "assert": "low", "style": "unconfirmed" },
+    "mrdy": { "assert": "low", "style": "unconfirmed" },
+    "topology": "unresolved"
+  },
+
+  "features": {
+    "$comment": "Only what a standard module is documented to do. Nothing aspirational.",
+    "offline_record_buffer": 20,
+    "offline_record_note": "The MCU buffers door records while offline and replays them backdated, oldest overwritten, each with a time-basis flag (0 none / 1 device-local / 2 GMT). Events arrive OUT OF ORDER and may duplicate — dedupe on msg_id, order on occurred_at. ozkey-27 §2.4.",
+    "credential_expiry_on_mcu": true,
+    "credential_expiry_note": "The multi-group password service carries per-credential effective+expiry datetime in GMT, use-count (0 unlimited / 1 one-shot) and status, re-sent in full every time (全量下发). Answers ozkey-21 §8.3 — and requires GMT, confirming ozkey-21 §8.4.",
+    "time_basis": "gmt",
+    "capabilities_note": "PIN + RFID + fingerprint + temporary PIN + offline PIN + doorbell + duress. This is the maximal HONEST lock: every capability here is backed by a real catalogue DP, unlike ozsim-fullfeature which carries a fiction DP 1 to unblock the bench."
+  },
+
+  "selects": [
+    9, 10, 11,
+    13, 14, 15, 16, 17, 18, 19,
+    21, 23, 24,
+    42, 45, 47,
+    52, 53, 54,
+    60, 61, 63, 64, 69,
+    72, 73, 74, 76,
+    86, 87, 88, 89,
+    98, 156
+  ],
+
+  "$selects_comment": "Every catalogue DP EXCEPT 149 and 212 — the two Tuya itself says not to select (Ladin §3.1: 'Do not select DP149'; DP 212 is audio/video-lock only and needs the IPC skill). Note what this buys on the bench: 9 of these 34 are status:reserved, so they are PRESENT and REFUSE LOUDLY with UNSUPPORTED. That is what a real supplier's lock does to us TODAY — the credential-write payload layouts were declined, not omitted (genericDPList.md §3.1). 🔴 It also means this profile CANNOT REMOTELY UNLOCK: DP 10 remote_unlock is reserved, and DP 72 is a report that a remote unlock happened, not a command to open. That hole is real and is the single highest-value question to put to a supplier.",
+
+  "overrides": [],
+  "extra": []
+}

@@ -228,7 +228,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 // 1.94: BLE unlock issues real DP 76; BLE window 30s -> 60s (~15s of it is
 //       advertising-to-discovery latency). See
 //       doorlock.ino's changelog; both live in common/ozdoorlock_core.h.
-#define FW_VERSION "doorlock-1.94"
+#define FW_VERSION "doorlock-1.97"
 
 // ── DERIVED, not a second literal (2026-08-12) — see doorlock.ino for the
 // full reasoning. The warning above ("Change both, every time") described the

@@ -28,6 +28,9 @@
 
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
+// XF-115 §7.3 — the ONE definition of a lock's presence payload, shared with
+// bridge32 so the Wi-Fi and Thread producers cannot disagree about the shape.
+#include "ozpresence.h"
 #include <WiFi.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -76,7 +79,27 @@ void drawKeypad();
 void drawHexReadout();
 int hexNibble(char c);
 static bool ozControlTry(bool final);
-enum OzCtlOpen { OZCTL_OPENED, OZCTL_FAILED_DEFINITE, OZCTL_FAILED_MAYBE_INCOMPLETE };
+// XF-114 §10.3 — NO_BOND is split out of FAILED_DEFINITE deliberately.
+//
+// "This sender holds no bond on me" and "this message is malformed or forged"
+// are both definite failures, and until 1.95 both surfaced to the app as a
+// bare UNLOCK_DENIED. For an UNLOCK that conflation is harmless. For a REMOVE
+// it is the difference between "refused" and "the thing you asked for has
+// already happened" — an unowned lock IS the end state a delete is trying to
+// reach, and the app was reporting it as a failure and keeping the entry
+// (bench, 2026-08-18).
+//
+// 🔴 Note what the lock CANNOT say here: with no bond there is no shared
+// secret, so the envelope never opens and we do not know which verb was
+// requested. NO_BOND is therefore a statement about the SENDER, not about the
+// command — "I do not know you" — and it is the app's job to combine that with
+// the request it has outstanding.
+enum OzCtlOpen {
+  OZCTL_OPENED,
+  OZCTL_FAILED_DEFINITE,
+  OZCTL_FAILED_NO_BOND,
+  OZCTL_FAILED_MAYBE_INCOMPLETE
+};
 static OzCtlOpen ozControlOpen(const uint8_t *buf, size_t n, int *outSlot,
                                 uint8_t *pt, size_t ptCap, size_t *outPtLen,
                                 uint64_t *outCounter);
@@ -135,6 +158,9 @@ void publishEnroll();
 void publishHeartbeat();
 void publishLog(const char *result, const char *detail, int actorSlot = -1);
 void publishUnpairedAnnounce();
+// XF-114 §13.4 — declared here because the BOOT-hold gesture and the DL MCU's
+// 0x34 reset both call it well above its definition.
+static void ozPublishResetOutcome(const char *reason, bool retain);
 void saveConfig();
 void setup();
 void startBle();
@@ -715,6 +741,18 @@ unsigned long lastEnrollSent = 0;
 uint8_t enrollAttempts = 0;
 unsigned long lastUnpairedAnnounce = 0;
 String topicCommand, topicEnroll, topicHeartbeat, topicLog, topicPairConfirm;
+// XF-114 §9 — the lock's own presence topic. The SERVER has subscribed to
+// `ozkie/<site>/locks/+/presence` and carried a handleLockPresence() since
+// ozkey-20 R1, but NOTHING IN THIS FIRMWARE HAS EVER PUBLISHED TO IT. The
+// consumer was built and the producer never was, so the topic has been silent
+// its whole life. 1.95 makes the lock the first publisher — see
+// ozPublishResetOutcome().
+String topicPresence;
+// XF-114 §13.4 — the `msg_id` of the MQTT command currently being handled, so
+// an outcome can be correlated to the request that caused it instead of being
+// matched by timing. Empty for anything not delivered over MQTT (BLE control,
+// Thread, the BOOT-hold gesture, the DL MCU's own reset button).
+String g_cmdMsgId;
 String topicUplink; // ozkey-17 U1 — sealed lock->app content, opaque to the server
 String topicTime;   // ozkey-33 — site-wide RETAINED {"utc","tz"}, read-only to us
 String topicCommandLegacy; // S16 — pre-rename root, subscribed during migration only
@@ -1759,6 +1797,13 @@ void checkFactoryResetButton() {
     unsigned long held = millis() - buttonHeldSince;
     if (held >= FACTORY_RESET_HOLD_MS) {
       Serial.println("[RESET] BOOT held 5s — factory reset");
+      // XF-114 §13.4 / nexus-14 §2 Gap B — the MECHANICAL reset, the one path
+      // with no server anywhere in it. Someone standing at the door wipes a
+      // lock and, until 1.95, the fleet found out by noticing it had gone
+      // quiet. This is also the case that makes the key in NEXUS wrong with
+      // nobody to notice (a wipe mints a new keypair), so the announcement
+      // matters well beyond this ticket.
+      ozPublishResetOutcome("factory_reset", true);
       factoryReset(); // does not return
     } else if (held > 800 && (held / 500) % 2 == 0) {
       Serial.printf("[RESET] holding BOOT... %lus/5s\n", held / 1000);
@@ -2288,6 +2333,13 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       // locally, as part of handling its own button; that is ozkey-22 §2.1
       // row 1 and §6 Q0, still unconfirmed with the manufacturer. We must not
       // pretend to have done it.
+      //
+      // XF-114 §13.4 — tell the network as well. NOBODY ASKED FOR THIS ONE: it
+      // is the lock body's own reset button, so there is no pending request and
+      // no msg_id. Without this the server's first hint that a deployed lock
+      // wiped itself is that it stops answering, which is indistinguishable
+      // from a flat battery.
+      ozPublishResetOutcome("factory_reset", true);
       factoryReset(); // never returns
       return;
     }
@@ -2747,6 +2799,7 @@ void publishUnpairedAnnounce() {
   Serial.println("[PAIR->] unpaired announce (waiting for room assign)");
 }
 
+
 // Shared by both transports (2026-07-26 unification): a command frame is a
 // command frame regardless of whether it arrived via MQTT payload_hex
 // (Wi-Fi) or the F4 Thread UDP relay's "payload" field — parse the hex,
@@ -3140,6 +3193,20 @@ void pollThreadUdp() {
   // refused (stale/duplicate beacon) — the offset is still current information.
   ozHarvestTime(doc, "bridge");
 
+  // XF-115 §4 / Q4 — the request id this datagram is carrying, so an outcome we
+  // publish while handling it can NAME the request instead of being matched by
+  // timing. bridge32-1.41 stamps it on the downlink; older bridges do not send
+  // it and the field is simply absent, which degrades to exactly the pre-1.97
+  // behaviour rather than breaking.
+  //
+  // Scope-guarded for the same reason as the MQTT handler: this function has
+  // several early returns, and an id left set would later be attached to a
+  // BOOT-hold reset that answers no request at all.
+  g_cmdMsgId = doc["msg_id"] | "";
+  struct ThreadMsgIdScope {
+    ~ThreadMsgIdScope() { g_cmdMsgId = ""; }
+  } threadMsgIdScope;
+
   String target = (const char *)(doc["target"] | "");
   if (target != deviceId) { // not for us
     // "*" is the T3 time beacon: genuinely for everyone, and its whole payload
@@ -3183,9 +3250,17 @@ void pollThreadUdp() {
       // nowhere, so it was indistinguishable from the datagram never arriving.
       // Now it says so, addressed to the owner, with the size and which failure
       // mode ozControlOpen reported.
+      // 1.95: name the failure instead of printing the enum's ordinal. Adding
+      // OZCTL_FAILED_NO_BOND shifted MAYBE_INCOMPLETE from 2 to 3, so every
+      // "r=2" in an older capture means something different from an "r=2"
+      // written today — a log whose meaning silently changed under it is worse
+      // than no log (silent-failures rule).
+      const char *why = r == OZCTL_FAILED_NO_BOND ? "sender holds no bond"
+                        : r == OZCTL_FAILED_MAYBE_INCOMPLETE
+                            ? "truncated or still arriving"
+                            : "wrong key, failed MAC, or malformed";
       ozReportOutcome(-1, "ENVELOPE_NOT_OPENED",
-                      String("thread relay, ") + (unsigned)n + " B, r=" + (int)r +
-                          " (no bond could decrypt it)");
+                      String("thread relay, ") + (unsigned)n + " B — " + why);
       return;
     }
     ozControlVerifyAndDispatch(slot, pt, ptLen, counter, false /*hasChallenge*/,
@@ -3323,6 +3398,118 @@ static bool ozThreadUdpSendOnce(const String &payload, const uint8_t addr[16],
 // no lwIP join, which is precisely why it works where ff03::4f5a does not.
 static bool ozUplinkBootstrapSend(const String &payload) {
   return ozThreadUdpSendOnce(payload, OZ_ALLNODES_BYTES, "ff03::1 BOOTSTRAP");
+}
+
+// ── XF-114 §13.4 — say on the WIRE what happened to a reset request ──────────
+//
+// THE BUG THIS CLOSES, measured on the bench 2026-08-18:
+//
+//   [MQTT<-] …/command {"action":"factory-reset","envelope_hex":…}
+//   [CTL]    OPENED — bond 0, counter 4, OZKIE (24 B)
+//   [OZKIE]  factory_reset authorised by owner — wiping
+//   [STATUS] FACTORY_RESET (SET ONLY — no live link, links=0)   ← never sent
+//   [RESET]  factory reset — wiping NVS + txlog
+//
+// The command arrived over MQTT; the only acknowledgement we had was a BLE GATT
+// write. With no BLE client connected the value went into a characteristic
+// nobody was subscribed to, and 150 ms later the platform reset destroyed it.
+// The app waited for a signal that was never transmitted on any wire — twice,
+// on two different phones, which is why it read as intermittent.
+//
+// 🔴 THE ACK IS A PROMISE, NOT A REPORT. factoryReset() ends in a platform
+// reset and NEVER RETURNS, so this MUST be published BEFORE the wipe. Anything
+// published after it is never published. Same ordering rule as the ozkey-22 R1
+// MCU reset ack and bridge32's own reset signal.
+//
+// Shape is bridge32:947's, deliberately unchanged — the server already parses
+// {"state","reason"} on the bridge topic and can build the lock half by copying
+// a pattern it has running rather than learning a new one (XF-114 §13.1: that
+// pattern is bridge-only today; server has to build it a second time, which is
+// exactly what it said it would do).
+//
+// `retain` differs by outcome, and the distinction is bridge32's too:
+//   • SUCCESS   → retained. The lock is about to vanish for a while; a late
+//                 subscriber must still learn it went away deliberately rather
+//                 than reading the silence as a dead lock.
+//   • REFUSED   → NOT retained. A refusal is an EVENT, not a liveness state.
+//                 Retaining it would replay "I refused" on every reconnect,
+//                 long after the request is gone.
+static void ozPublishResetOutcome(const char *reason, bool retain) {
+  if (!mqtt.connected()) {
+    // ── 1.95b — THREAD LOCKS GO VIA THE BRIDGE ───────────────────────────
+    //
+    // A Thread lock has no MQTT session, so the branch below can never run for
+    // it. That was 1.95's stated limit, and it left the whole Thread fleet
+    // exactly where XF-114 started: the lock wipes and nobody is told.
+    //
+    // The carrier already exists and needed no new machinery. The lock sends
+    // an UNSEALED presence beacon over Thread UDP every 60 s and bridge32
+    // republishes it to `locks/<id>/heartbeat` (ozkey-20 R3). This rides the
+    // same socket with a different `kind`, and the bridge routes it to the
+    // presence topic instead.
+    //
+    // UNSEALED is correct here and worth stating: the payload is
+    // {state, reason, msg_id} — a device announcing its own reset. There is
+    // nothing private in it, and sealing it would be worse than useless since
+    // the wipe destroys the keys a moment later and no bond may even exist to
+    // seal to (the no_bond case).
+    //
+    // ⚠ Still fire-and-forget. lwip_sendto() returning >= 0 means QUEUED
+    // LOCALLY — never delivered. Dual-sent (unicast for the MAC ACK, ff03::1
+    // because it needs no address) exactly as the beacon is, which is the best
+    // this layer offers. A lock off the mesh still cannot report, and says so.
+    if (isThread() && ozRxFd >= 0) {
+      // 🔴 THIS IS AN INTERNAL TRANSPORT FORMAT, NOT THE PUBLISHED SHAPE.
+      //
+      // Until 1.97 the bridge forwarded this object VERBATIM to MQTT, so these
+      // field names — chosen for the bridge's own routing — became the public
+      // schema on one of two paths and crashed the app (XF-115). bridge32-1.41
+      // now REBUILDS the published message with the shared builder
+      // (ozpresence.h) from the fields below. What goes on the wire to the
+      // broker is decided in exactly one place, for both transports.
+      //
+      // `from` and `kind` stay because the bridge routes on them.
+      JsonDocument t;
+      t["from"] = deviceId;
+      t["kind"] = "reset_outcome"; // bridge32 routes on this
+      t["state"] = retain ? "offline" : "online";
+      t["reason"] = reason;
+      if (g_cmdMsgId.length()) t["msg_id"] = g_cmdMsgId;
+      String out;
+      serializeJson(t, out);
+      if (g_haveDownlinkPeer)
+        ozThreadUdpSendOnce(out, (const uint8_t *)&g_lastDownlinkPeer.sin6_addr,
+                            "reset unicast");
+      ozThreadUdpSendOnce(out, OZ_ALLNODES_BYTES, "reset ff03::1");
+      // Same reasoning as the MQTT settle below — what follows is a platform
+      // reset, so give the radio a moment to actually transmit.
+      delay(150);
+      Serial.printf("[RESET->] thread relay, reason='%s'\n", reason);
+      return;
+    }
+    // Not silent: this is the REMAINING limit, and a limit you cannot see is
+    // the failure mode this whole ticket is about (silent-failures rule). A
+    // BLE-delivered reset to a Wi-Fi lock whose broker is down lands here, as
+    // does a Thread lock that is off the mesh.
+    Serial.printf("[RESET->] '%s' NOT published — no mqtt, no thread (app cannot be told)\n",
+                  reason);
+    return;
+  }
+  // 1.97 — built by the SHARED builder (ozpresence.h), not hand-rolled here.
+  // Hand-rolling is exactly how the Thread path came to emit a different object
+  // than this one and crash the app (XF-115). `retain` and `online` are the same
+  // fact — a lock that went away vs one that refused — so the builder derives
+  // the retain rule rather than trusting the two to be passed consistently.
+  const String out = ozBuildLockPresence(deviceId, !retain, reason, g_cmdMsgId);
+  mqtt.publish(topicPresence.c_str(), out.c_str(), ozPresenceShouldRetain(!retain));
+  // PubSubClient hands the bytes to the socket but does not wait for them to
+  // leave it. The wipe that follows is a platform reset, so give the TCP write
+  // a moment to actually go out — the same reasoning as notifyStatus()'s 150 ms
+  // BLE settle, for the same reason: the thing we are racing is our own death.
+  mqtt.loop();
+  delay(120);
+  Serial.printf("[RESET->] %s reason='%s'%s\n", topicPresence.c_str(), reason,
+                retain ? " (retained)" : " (not retained)");
 }
 
 // Retries are scheduled, NOT blocking. ozUplinkSend() is reached from the BLE
@@ -3786,9 +3973,30 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   // there would be redelivered as a replayed command on every reconnect.
   ozHarvestTime(doc, "server");
 
+  // XF-114 §13.4 — remember which request we are acting on, for the whole of
+  // this handler. Every reset path below can then name it in its outcome
+  // instead of leaving the app to match on timing.
+  //
+  // Cleared by a scope guard rather than a line at the bottom: this function
+  // has ~20 early returns, so a trailing assignment would miss nearly all of
+  // them and leave a stale msg_id to be attached to the NEXT reset — including
+  // a BOOT-hold gesture minutes later, which would then claim to answer a
+  // request nobody made. Wrong correlation is worse than none.
+  g_cmdMsgId = doc["msg_id"] | "";
+  struct MsgIdScope {
+    ~MsgIdScope() { g_cmdMsgId = ""; }
+  } msgIdScope;
+
   const char *op = doc["op"] | (const char *)nullptr;
   if (op && (strcmp(op, "factory_reset") == 0 || strcmp(op, "unpair") == 0)) {
     Serial.println("[MQTT<-] factory_reset (unpaired by app/server)");
+    // 🔴 STILL UNAUTHENTICATED — no seal, no bond, no sender identity, on a
+    // broker that enforces no credentials (ozkey-13 S8/S9). PM has directed
+    // this path's removal, gated on the server always taking the sealed branch
+    // (XF-114 §7.7). It is acked here rather than left half-done: while it
+    // exists it is a real way locks get wiped, and a wipe nobody is told about
+    // is the exact defect 1.95 exists to close.
+    ozPublishResetOutcome("factory_reset", true);
     factoryReset();
     return;
   }
@@ -3919,7 +4127,14 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     // arriving" case the way BLE's chunked writes have one, so both failure
     // kinds are equally final here.
     if (r != OZCTL_OPENED) {
-      notifyStatus("UNLOCK_DENIED");
+      // XF-114 §10 — the run-2 case, on the transport where it actually hurts.
+      // notifyStatus() writes a BLE characteristic; a command that arrived over
+      // MQTT has no BLE client to hear it, so an unopenable envelope was
+      // silence. If the sender simply holds no bond, say so ON MQTT with the
+      // msg_id attached: the app is holding a pending removal for a lock that
+      // is ALREADY unowned, which is success, not failure.
+      notifyStatus(r == OZCTL_FAILED_NO_BOND ? "NO_BOND" : "UNLOCK_DENIED");
+      if (r == OZCTL_FAILED_NO_BOND) ozPublishResetOutcome("no_bond", false);
       return;
     }
     ozControlVerifyAndDispatch(slot, pt, ptLen, counter, false /*hasChallenge*/,
@@ -4030,10 +4245,69 @@ void ensureMqtt() {
   // (or restored from an older NVS) has an empty bsecret and MUST still connect
   // exactly as it does today. Anonymous-until-provisioned stays working.
   const bool haveCreds = cfgBrokerUser.length() && cfgBrokerSecret.length();
-  const bool ok = haveCreds
-                      ? mqtt.connect(deviceId.c_str(), cfgBrokerUser.c_str(),
-                                     cfgBrokerSecret.c_str())
-                      : mqtt.connect(deviceId.c_str());
+  // ── 1.96 — LAST WILL + RETAINED ONLINE, mirroring bridge32 ───────────────
+  //
+  // 🔴 THIS EXISTS BECAUSE 1.95 SHIPPED HALF A CONTRACT AND WOULD HAVE LIED.
+  //
+  // 1.95 publishes a RETAINED {"state":"offline","reason":"factory_reset"} to
+  // this topic before wiping. Nothing ever published "online" to it, so that
+  // retained value would have survived the lock being re-paired and brought
+  // back to life — and every future subscriber (a server restart, a new
+  // consumer) would read a working lock as factory-reset, indefinitely. A
+  // retained message with no counterpart is not a signal, it is a permanent
+  // false statement.
+  //
+  // ozkey-20 R1 specified exactly this and the server has carried
+  // handleLockPresence() for it ever since — {"state":"online"|"offline",
+  // "reason":"lwt"} — but NO FIRMWARE EVER PUBLISHED IT. The consumer was
+  // built and the producer never was, which is the same shape of gap XF-114
+  // turned out to be.
+  //
+  // ⚠ SERVER-VISIBLE BEHAVIOUR CHANGE: Wi-Fi locks now flip `presence` on
+  // disconnect instead of only ever aging out via last_seen_at. That is the
+  // documented intent, but it is new traffic on a handler that has never
+  // received any.
+  //
+  // ── 🔴 1.97 — THE WILL IS **NOT RETAINED**, and that is load-bearing ──────
+  //
+  // 1.96 retained it, and measurement showed the Will then DESTROYS the reset
+  // outcome it was meant to complement (ozkey-41 §12, LockB, 2026-08-19):
+  //
+  //   t+0s    {"state":"offline",…,"reason":"factory_reset","msg_id":"ozl-482-…"}
+  //   t+~60s  {"state":"offline",…,"reason":"lwt"}          <- retained slot now
+  //
+  // The collision is STRUCTURAL, not a race that might not happen: a factory
+  // reset always ends in a platform reset, which always drops the connection,
+  // which always fires the Will. So the retained slot ALWAYS ended up saying
+  // "not connected" with no reason and no msg_id, on every reset, on every
+  // Wi-Fi lock — losing exactly the information the reset outcome exists to
+  // carry.
+  //
+  // Not retained, the Will still does its real job: it is delivered LIVE to
+  // whoever is subscribed, so the server marks the lock offline in real time
+  // and handleLockPresence() is unaffected. What it stops doing is overwriting
+  // a deliberate, durable statement with a generic one.
+  //
+  // The retained slot now holds the lock's last DELIBERATE statement — `online`
+  // on connect, or `factory_reset` before a wipe.
+  //
+  // ⚠ KNOWN TRADE (ozkey-41 §12.4a, operator's call): a lock that dies without
+  // saying so — flat battery, crash, unplugged — leaves a stale retained
+  // `online`. A late subscriber would read it as alive. That is already covered
+  // server-side by last_seen_at ageing, and it is the cheaper of the two
+  // wrongs: a stale "alive" self-corrects the moment the lock is looked at,
+  // whereas a lost factory_reset is unrecoverable.
+  const String willPayload =
+      ozBuildLockPresence(deviceId, false, OZ_PRESENCE_LWT, String(""));
+  const bool ok =
+      haveCreds ? mqtt.connect(deviceId.c_str(), cfgBrokerUser.c_str(),
+                               cfgBrokerSecret.c_str(), topicPresence.c_str(),
+                               1 /*willQos — the BROKER honours this, not us*/,
+                               false /*willRetain — see the 1.97 note above*/,
+                               willPayload.c_str())
+                : mqtt.connect(deviceId.c_str(), nullptr, nullptr,
+                               topicPresence.c_str(), 1, false /*willRetain*/,
+                               willPayload.c_str());
   if (!haveCreds) {
     // Not fatal today (the lab broker enforces nothing) but it is exactly the
     // device that breaks the moment ACLs land, so say so out loud.
@@ -4056,6 +4330,17 @@ void ensureMqtt() {
     // ozkey-33: retained, so this delivers a clock within ms of every wake.
     if (topicTime.length()) mqtt.subscribe(topicTime.c_str(), 1);
     if (isLocalMode() && !enrolled) mqtt.subscribe(topicPairConfirm.c_str(), 1);
+    // 1.96 — clear our own will, and any stale retained factory_reset from a
+    // previous life, the moment we are up. Until this lands the retained value
+    // on this topic is whatever we died saying last time: for a lock that was
+    // reset and then re-paired, that is "offline / factory_reset" describing a
+    // lock which is demonstrably alive and talking. Same call bridge32 makes
+    // immediately after its own connect, for the same reason.
+    {
+      const String online = ozBuildLockPresence(deviceId, true, OZ_PRESENCE_ONLINE,
+                                                String(""), FW_VERSION);
+      mqtt.publish(topicPresence.c_str(), online.c_str(), true /*retain*/);
+    }
     Serial.println("[MQTT] connected + subscribed command topic");
     if (state == ST_JOINING) {
       notifyStatus("BROKER_OK");
@@ -5286,13 +5571,26 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
     if (slot != 0) {
       Serial.printf("[OZKIE] %s REFUSED — bond %d is not the owner\n", kind, slot);
       notifyStatus("REVOKE_DENIED");
+      // XF-114 §13.4 — and say it on the wire too. A member's refused reset
+      // used to exist only as a BLE notify and a Serial line, so over MQTT it
+      // was indistinguishable from the lock never having heard the request.
+      // NOT retained: a refusal is an event, not a liveness state.
+      ozPublishResetOutcome("factory_reset_denied", false);
       return;
     }
     Serial.printf("[OZKIE] %s authorised by owner — wiping\n", kind);
     // Tell the app before we go: factoryReset() ends in a platform reset and
     // never returns, so anything sent after it is never sent. Same ordering
     // rule as the ozkey-22 R1 MCU reset ack.
+    //
+    // 🔴 BOTH transports, deliberately. notifyStatus() reaches a BLE client if
+    // one is connected; ozPublishResetOutcome() reaches the network. The bench
+    // failure (XF-114 §9.3) was a command delivered over MQTT whose only
+    // acknowledgement was the BLE half — `links=0`, nothing sent, app waited
+    // forever. Neither call knows which transport carried the request, and
+    // neither needs to: whichever one the app is listening on, it hears.
     notifyStatus("FACTORY_RESET");
+    ozPublishResetOutcome("factory_reset", true);
     factoryReset(); // never returns
     return;
   }
@@ -5804,7 +6102,9 @@ static OzCtlOpen ozControlOpen(const uint8_t *buf, size_t n, int *outSlot,
   const int slot = ozBondFind(senderPub);
   if (slot < 0) {
     Serial.printf("[CTL] %.16s… holds no bond on this lock\n", appIdHex);
-    return OZCTL_FAILED_DEFINITE;
+    // XF-114 §10.3 — distinct from a malformed/forged frame. See the OzCtlOpen
+    // enum: for a REMOVE this is not a refusal, it is "already done".
+    return OZCTL_FAILED_NO_BOND;
   }
 
   uint8_t ps[32], key[32];
@@ -5978,7 +6278,10 @@ static bool ozControlTry(bool final) {
   ctlConsume(n);
 
   if (r != OZCTL_OPENED) {
-    notifyStatus("UNLOCK_DENIED");
+    // XF-114 §10.3 — "I do not know you" is not "I refuse you". The app needs
+    // to tell an already-unowned lock (remove locally, you have won) from a
+    // rejected frame (stop), and until 1.95 both arrived as UNLOCK_DENIED.
+    notifyStatus(r == OZCTL_FAILED_NO_BOND ? "NO_BOND" : "UNLOCK_DENIED");
     return true;
   }
 
@@ -6354,6 +6657,8 @@ void buildTopics() {
   topicEnroll = base + "enroll";
   topicHeartbeat = base + "heartbeat";
   topicLog = base + "log";
+  topicPresence = base + "presence"; // XF-114 §9 — see the declaration
+
   // ozkey-17 §6a: a SEPARATE topic from heartbeat/log on purpose. Those two are
   // operational metadata the server legitimately reads (presence, fw, transport,
   // and the wake that flushes its queue). This one carries sealed content the
