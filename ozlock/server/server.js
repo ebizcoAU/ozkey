@@ -140,6 +140,14 @@ const CONFIG = {
   // re-push utc to a given bridge — riding the mechanism that already
   // exists rather than adding a new timer.
   UTC_PUSH_REFRESH_MS: 10 * 60 * 1000,
+  // nexus-14 ask #3: DELETE /locks/:id tells Nexus's lock_registry to
+  // tombstone the MAC, so a decommissioned lock's stored pubkey doesn't
+  // silently go on serving as if it were still live. No baked-in default
+  // for the key — it is Nexus's secret, not ozlock's, and must never be
+  // committed into this repo; unset means the call is skipped (logged), not
+  // a hard failure, since Nexus notification is best-effort from here.
+  NEXUS_URL: process.env.OZLOCK_NEXUS_URL || 'http://localhost:4000',
+  NEXUS_SERVER_KEY: process.env.OZLOCK_SERVER_API_KEY || null,
   DB: {
     host: 'localhost',
     user: 'root',
@@ -2195,6 +2203,34 @@ async function purgeLockRows(conn, where, args) {
   await conn.query(`DELETE FROM audit_log WHERE ${where}`, args);
 }
 
+/**
+ * nexus-14 ask #3: tombstone this lock's MAC in Nexus's lock_registry on
+ * removal. Best-effort and non-blocking — DELETE /locks/:id must succeed
+ * from the app's point of view even if Nexus is unreachable; a missed
+ * tombstone is a stale-but-safe row (nexus-14 §1: staleness only turns
+ * dangerous on a REKEY going unreported, which this is not), not a reason
+ * to fail the lock removal the operator is standing at the door for.
+ */
+async function nexusDecommission(mac) {
+  if (!mac) return;
+  if (!CONFIG.NEXUS_SERVER_KEY) {
+    logEvent('warn', `Nexus decommission SKIPPED for mac=${mac} — OZLOCK_SERVER_API_KEY not set`);
+    return;
+  }
+  const normalizedMac = String(mac).toLowerCase().replace(/[^0-9a-f]/g, '');
+  try {
+    const resp = await fetch(`${CONFIG.NEXUS_URL}/api/v1/lock-lifecycle/${normalizedMac}/decommission`, {
+      method: 'POST',
+      headers: { 'X-Ozlock-Server-Key': CONFIG.NEXUS_SERVER_KEY },
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (resp.ok) logEvent('info', `Nexus decommission OK for mac=${normalizedMac}`);
+    else logEvent('warn', `Nexus decommission REJECTED for mac=${normalizedMac} — ${resp.status} ${body.message || ''}`);
+  } catch (err) {
+    logEvent('warn', `Nexus decommission unreachable for mac=${normalizedMac} — ${err.message}`);
+  }
+}
+
 /** Parse pagination query (?limit=&offset=), clamped; default 12 rows/page. */
 function pageParams(query) {
   const limit = Math.min(200, Math.max(1, Number(query.limit) || 12));
@@ -2298,7 +2334,7 @@ api.delete('/locks/:id', async (req, res) => {
     // not just the record): tell it to wipe NVS and return to ADVERTISING.
     // Best-effort — an offline lock misses it and needs the on-device reset.
     const [[lock]] = await conn.query(
-      'SELECT site_id, bridge_id, last_seen_at, heartbeat_s, presence, presence_reason FROM locks WHERE id = ?',
+      'SELECT site_id, bridge_id, last_seen_at, heartbeat_s, presence, presence_reason, mac FROM locks WHERE id = ?',
       [id]
     );
     let attempted = false;
@@ -2361,6 +2397,7 @@ api.delete('/locks/:id', async (req, res) => {
     await conn.commit();
     if (d.affectedRows === 0)
       return res.status(404).json({ ok: false, code: 'lock_not_found', error: `Lock ${id} not found` });
+    if (lock && lock.mac) nexusDecommission(lock.mac); // fire-and-forget, see nexusDecommission()
     logEvent(
       'info',
       `Doorlock ${id} removed + factory_reset sent (attempted=${attempted} likely_delivered=${likelyDelivered} transport_ok=${transportOk})`
