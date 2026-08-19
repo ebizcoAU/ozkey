@@ -622,6 +622,23 @@ bool threadUdpReady = false;
 unsigned long threadUdpLastAttempt = 0;
 #define THREAD_UDP_RETRY_MS 3000UL
 
+// XF-116 — beacon the moment we can talk, not `cfgHeartbeatS` after BOOT.
+//
+// The beacon gate is `millis() - lastThreadBeaconAt > cfgHeartbeatS * 1000`
+// with lastThreadBeaconAt starting at 0, so the FIRST beacon of a lock's life
+// lands 300 s after boot no matter how quickly Thread came up. Measured
+// 2026-08-19: LockA attached 40 s after a factory reset and said nothing for
+// another 4 m 34 s.
+//
+// Nothing downstream can compensate. That beacon is the only unprompted thing
+// a Thread lock ever says, so until it goes out: bridge32 cannot map our ext
+// address to our device_id (so it cannot publish presence for us — the ext
+// CHANGES across a factory reset, so it cannot be cached either), the server
+// answers "unreachable" and 409s every remote unlock, and `need_time` has not
+// been asked so the clock stays UNKNOWN and time-bounded credentials are
+// unenforceable. One silent timer, four visible failures.
+bool g_threadBeaconDue = false;
+
 // BLE
 BLEServer *bleServer = nullptr;
 BLECharacteristic *chrStatus = nullptr, *chrInfo = nullptr, *chrMember = nullptr;
@@ -3094,6 +3111,12 @@ void threadUdpBegin() {
   }
 
   threadUdpReady = ok;
+  // XF-116 — the rising edge of "we can transmit" is the earliest honest
+  // moment to announce ourselves, and this function only runs on that edge
+  // (its caller guards on !threadUdpReady). Arm the beacon rather than
+  // sending here: this runs inside socket setup, and the beacon builder wants
+  // the OpenThread lock plus a settled roster/bond count.
+  if (ok) g_threadBeaconDue = true;
   Serial.printf("[UDP] lwip socket %s fd=%d on port %u (group ff03::4f5a)\n",
                 ok ? "open" : "FAILED", ozRxFd, OZ_THREAD_UDP_PORT);
 
@@ -7462,7 +7485,13 @@ void loop() {
   // Fire-and-forget by design (ozkey-20 §7.2): a lost beacon is replaced by
   // the next one, and retransmitting stale liveness is worse than useless.
   if (isThread() && threadUdpReady &&
-      millis() - lastThreadBeaconAt > cfgHeartbeatS * 1000UL) {
+      (g_threadBeaconDue ||
+       millis() - lastThreadBeaconAt > cfgHeartbeatS * 1000UL)) {
+    // XF-116. An explicit flag rather than back-dating lastThreadBeaconAt:
+    // that trick relies on unsigned wraparound when millis() is still smaller
+    // than the interval, which is correct and unreadable. This says what it
+    // means, and clearing it here means an armed beacon fires exactly once.
+    g_threadBeaconDue = false;
     lastThreadBeaconAt = millis();
 
     char extHex[17] = {0};

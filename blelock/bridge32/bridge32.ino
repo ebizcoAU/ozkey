@@ -184,7 +184,7 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.41"
+#define FW_VERSION "bridge32-1.42"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -1370,6 +1370,14 @@ static void ozThreadStateChanged(otChangedFlags flags, void *) {
   }
 }
 
+// Which locks we have already published a retained `online` for. Declared here
+// rather than beside its helpers further down because publishThreadLiveness()
+// below also reads it, to retract claims for children that have gone (XF-116
+// §3(2)) — and the Arduino preprocessor auto-prototypes functions, not data.
+// See the fuller note on ozClaimLockOnline() for why the table exists at all.
+#define OZ_BR_MAX_CHILDREN 16
+static String g_onlineLocks[OZ_BR_MAX_CHILDREN];
+
 // Walk the child table and publish one report for the whole mesh.
 static void publishThreadLiveness() {
   if (!mqttClient.connected()) return;
@@ -1378,6 +1386,10 @@ static void publishThreadLiveness() {
 
   String locks;
   int n = 0;
+  // XF-116 §3(2) — who we can still see this pass, so we can retract stale
+  // `online` claims below. Bounded by the same table that bounds the claims.
+  String seen[OZ_BR_MAX_CHILDREN];
+  uint8_t seenN = 0;
   esp_openthread_lock_acquire(portMAX_DELAY);
   // OUR OWN ROLE — decisive for how the server must read this report.
   // otThreadGetChildInfoByIndex() is LOCAL TO A PARENT. A bridge that is
@@ -1403,6 +1415,8 @@ static void publishThreadLiveness() {
 
     char ext[17];
     ozHexExt(ci.mExtAddress.m8, 8, ext);
+
+    if (id && seenN < OZ_BR_MAX_CHILDREN) seen[seenN++] = id;
 
     if (n++) locks += ",";
     locks += "{";
@@ -1441,6 +1455,45 @@ static void publishThreadLiveness() {
                    ",\"children\":" + String(n) + ",\"locks\":[" + locks + "]}";
   const String topic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/liveness";
   const bool ok = mqttClient.publish(topic.c_str(), payload.c_str());
+
+  // ── XF-116 §3(2) — retract our OWN stale `online` claims ─────────────────
+  //
+  // We publish a RETAINED `online` when a lock beacons. Nothing ever cleared
+  // it, so a Thread lock that dies quietly leaves "online" on its topic
+  // forever: not a signal, a permanent false statement. If you publish a
+  // retained X you owe whatever publishes not-X.
+  //
+  // 🔴 SCOPE, deliberately narrow. The note above ("a lock that has aged out
+  // is simply absent here — the SERVER decides that absence means lost")
+  // still stands and this does not violate it. We are not declaring locks
+  // lost, and we say nothing about locks we have never heard of. We retract
+  // exactly the claims THIS bridge made, which is the one thing no other
+  // party can do for us.
+  //
+  // Gated on `authoritative`: a bridge that is itself a Child has no child
+  // table, so every lock would look absent and we would retract the entire
+  // site on one bad pass. Same trap the `authoritative` field exists to warn
+  // the server about — we must not fall into it ourselves.
+  if (authoritative) {
+    for (uint8_t i = 0; i < OZ_BR_MAX_CHILDREN; i++) {
+      if (g_onlineLocks[i].length() == 0) continue;
+      bool stillHere = false;
+      for (uint8_t j = 0; j < seenN; j++)
+        if (seen[j] == g_onlineLocks[i]) { stillHere = true; break; }
+      if (stillHere) continue;
+
+      const String gone = g_onlineLocks[i];
+      const String out = ozBuildLockPresence(gone, false, OZ_PRESENCE_LWT,
+                                             String(""));
+      const String ptopic =
+          "ozkie/" + cfgSiteId + "/locks/" + gone + "/presence";
+      mqttClient.publish(ptopic.c_str(), out.c_str(),
+                         ozPresenceShouldRetain(false));
+      g_onlineLocks[i] = ""; // forget, so a return beacon re-announces
+      Serial.printf("[PRESENCE] %s -> offline (left the child table)\n",
+                    gone.c_str());
+    }
+  }
   // ozkey-21 T3 diagnostic: utc=0 means NTP has not answered, so no beacon has
   // gone out and every Thread lock is still clock=UNKNOWN. The [TIME] lines are
   // one-shot at boot, which makes them useless for answering "is it working
@@ -1882,10 +1935,9 @@ static void ozBridgeClockRestore() {
 // by an event still gets corrected on its next beacon.
 //
 // Published ONCE per lock per online-transition, not per beacon: the table
-// below remembers who we have already marked online, so a 60 s beacon does not
+// (declared above publishThreadLiveness(), which also reads it — XF-116)
+// remembers who we have already marked online, so a 60 s beacon does not
 // become a 60 s retained write per lock across a whole site.
-#define OZ_BR_MAX_CHILDREN 16
-static String g_onlineLocks[OZ_BR_MAX_CHILDREN];
 
 static void ozForgetLockOnline(const char *id) {
   for (uint8_t i = 0; i < OZ_BR_MAX_CHILDREN; i++)
