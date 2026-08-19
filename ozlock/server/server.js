@@ -1071,14 +1071,23 @@ async function handleUplinkOutcome(fromDeviceId, payloadStr) {
  * verdicts with zero further server change the moment firmware catches up.
  * ------------------------------------------------------------------------- */
 
-// ozkey-20 §10 Q1: provisional, NOT derived from measured mAge behavior —
-// R2 doesn't exist on the wire yet, so there is nothing to measure against.
-// 3x this doc's own assumed 30s R2 poll interval, so one missed report
-// doesn't false-positive. Revisit once real thread_liveness data exists.
-const THREAD_UNREACHABLE_AGE_S = 90;
+// XF-117 (2026-08-19, firmware's measurement): `age_s` is OpenThread's MLE
+// age — time since last contact — which climbs precisely because a healthy
+// child beacons every 300s and doesn't chatter in between. A fixed age
+// threshold therefore measures SILENCE, not reachability: firmware measured
+// a healthy, attached, rx_on:true lock reading `lock_unreachable` 59% of the
+// time under the previous 90s threshold (ozkey-20 §10 Q1's number, picked
+// before any real thread_liveness data existed to check it against).
+// THREAD_UNREACHABLE_AGE_S is retired — see THREAD_AGE_LOST_SENTINEL below,
+// which is the actual reachability signal: OpenThread's own child-table
+// eviction, verified live (firmware powered a lock off, watched it leave the
+// bridge's child table at ~240s, well-defined and far sharper than guessing
+// at an age cutoff).
 // Sentinel for thread_liveness `"state":"lost"` (aged out of the table
-// entirely) — treated as "even less reachable than the threshold" without
-// a second column, since both cases produce the identical R6 verdict.
+// entirely, per the absence-inference in handleThreadLiveness) — the one
+// value that means "not currently a child of the bridge", as opposed to any
+// real reported age, however high, which means the lock IS in the table and
+// therefore reachable right now.
 const THREAD_AGE_LOST_SENTINEL = 32767; // SMALLINT max — thread_age_s is a SMALLINT column
 const BATTERY_LOW_PCT = 15; // ozkey-20 R6 table's own figure, not derived here.
 
@@ -1095,8 +1104,10 @@ function computeFaultAttribution(lock, bridgePresence) {
 
   if (isThread) {
     if (bridgePresence === 'offline') return 'bridge_offline';
-    if (lock.thread_age_s != null && lock.thread_age_s > THREAD_UNREACHABLE_AGE_S)
-      return 'lock_unreachable';
+    // XF-117: gate on child-table membership (the lost sentinel), not on
+    // age_s — a lock still present in the last authoritative report is
+    // reachable regardless of how long it has been quiet.
+    if (lock.thread_age_s === THREAD_AGE_LOST_SENTINEL) return 'lock_unreachable';
   } else {
     if (lock.presence === 'offline') return 'lock_offline_wifi';
   }
