@@ -184,7 +184,7 @@ unsigned long lastLcdActivityAt = 0;
 //             CHILD amber, else red). "OK" hid the single most important fact
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
-#define FW_VERSION "bridge32-1.42"
+#define FW_VERSION "bridge32-1.44"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -1378,6 +1378,20 @@ static void ozThreadStateChanged(otChangedFlags flags, void *) {
 #define OZ_BR_MAX_CHILDREN 16
 static String g_onlineLocks[OZ_BR_MAX_CHILDREN];
 
+// 1.44 — how many datagrams the de-dup guard in pollUplinkOne() has swallowed,
+// published on the liveness topic. Declared here for the same reason as the
+// table above: publishThreadLiveness() reads it and Arduino auto-prototypes
+// functions, not data.
+//
+// WHY THIS COUNTER EXISTS: 1.43 shipped with its only witness being a
+// Serial.printf on the bridge, and this bridge's USB CDC output drops the start
+// of most lines. So when the duplicates stopped, there was no way to tell
+// whether the guard had caught them or whether none had arrived — the fix
+// looked identical to the bug not occurring. A suppression that cannot be
+// observed is not a verifiable fix, and MQTT is the transport we can actually
+// read. If this stays at 0 while duplicates persist, the guard is not firing.
+static uint32_t g_dupSuppressed = 0;
+
 // Walk the child table and publish one report for the whole mesh.
 static void publishThreadLiveness() {
   if (!mqttClient.connected()) return;
@@ -1452,7 +1466,12 @@ static void publishThreadLiveness() {
   String payload = "{\"kind\":\"thread_liveness\",\"bridge_id\":\"" + deviceId +
                    "\",\"role\":\"" + roleName + "\",\"authoritative\":" +
                    (authoritative ? "true" : "false") +
-                   ",\"children\":" + String(n) + ",\"locks\":[" + locks + "]}";
+                   ",\"children\":" + String(n) +
+                   // 1.44 — see g_dupSuppressed. Rides the report that already
+                   // exists rather than adding a topic; it is bridge health,
+                   // which is what this topic is for.
+                   ",\"dup_suppressed\":" + String(g_dupSuppressed) +
+                   ",\"locks\":[" + locks + "]}";
   const String topic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/liveness";
   const bool ok = mqttClient.publish(topic.c_str(), payload.c_str());
 
@@ -1600,6 +1619,18 @@ static void ozRouterPromotionTick() {
 
 // Returns true if a datagram was read (caller should try again), false when
 // the socket is empty or the read failed.
+// XF-116 §7.6 — recent-datagram memory for the de-dup below.
+//
+// 12 slots: a site can have several locks talking at once and each sends every
+// datagram twice, so the window must hold both copies of each in flight without
+// a busy neighbour evicting them. 15 s matches the window 1.41 used for reset
+// outcomes — long enough to cover the gap between the unicast and multicast
+// copies (milliseconds in practice), short enough that a lock legitimately
+// repeating itself later is never swallowed.
+#define OZ_BR_DUP_SLOTS 12
+#define OZ_BR_DUP_WINDOW_MS 15000UL
+
+
 static bool pollUplinkOne() {
   char buf[OZ_UPLINK_RX_BUF];
   struct sockaddr_in6 src;
@@ -1649,6 +1680,58 @@ static bool pollUplinkOne() {
   // D2 — and where to send its downlinks. Must run AFTER ozNoteLockExt, which
   // is what creates the map entry this writes into.
   ozNoteLockIp6(from, &src);
+
+  // ── XF-116 §7.6 — ONE de-dup for EVERY relayed datagram ──────────────────
+  //
+  // The lock sends every datagram TWICE, on purpose: unicast (to get the
+  // MAC-layer ACK) and ff03::1 (which needs no address). Three sites do it —
+  // ozdoorlock_core.h:3504/3506 reset, :3604/3607 uplink, :7558/7560 beacon.
+  // Both copies arrive here.
+  //
+  // 1.41 de-duplicated ONLY reset outcomes, because a reset outcome was what
+  // crashed BANOI (XF-115). That was a fix scoped to the symptom rather than
+  // to the duplication, and it left the other two paths doubled: measured
+  // 2026-08-19, every sealed uplink reached the app twice and every Thread
+  // heartbeat became two MQTT publishes — doubled broker traffic and doubled
+  // server work, fleet-wide, permanently.
+  //
+  // Keyed on a hash of the whole datagram rather than on msg_id: heartbeats
+  // carry no msg_id and no counter, so nothing else is common to all three
+  // kinds. The two copies are the same String sent twice, so they are
+  // byte-identical and hash equal — and anything genuinely new differs
+  // somewhere (sealed traffic carries a monotonic counter, beacons carry
+  // uptime/roster), so a real message is never mistaken for a repeat.
+  //
+  // Placed AFTER the ext/IP learning above: that is idempotent and worth
+  // doing from whichever copy lands first. What we suppress is the OUTBOUND
+  // effect, not the knowledge.
+  {
+    uint32_t h = 2166136261u; // FNV-1a
+    for (int k = 0; k < n; k++) { h ^= (uint8_t)buf[k]; h *= 16777619u; }
+
+    static String dupFrom[OZ_BR_DUP_SLOTS];
+    static uint32_t dupHash[OZ_BR_DUP_SLOTS];
+    static unsigned long dupAt[OZ_BR_DUP_SLOTS];
+    static uint8_t dupNext = 0;
+
+    for (uint8_t i = 0; i < OZ_BR_DUP_SLOTS; i++) {
+      if (dupAt[i] && millis() - dupAt[i] < OZ_BR_DUP_WINDOW_MS &&
+          dupHash[i] == h && dupFrom[i] == from) {
+        // Name the kind: a suppression we cannot attribute is a suppression
+        // we cannot audit, and silently dropping lock traffic is exactly the
+        // class of bug this file keeps finding.
+        g_dupSuppressed++;
+        Serial.printf("[UPLINK] %s: duplicate %s suppressed (hash=%08x, total=%lu)\n",
+                      from, (const char *)(doc["kind"] | "datagram"),
+                      (unsigned)h, (unsigned long)g_dupSuppressed);
+        return true; // consumed one; keep draining
+      }
+    }
+    dupFrom[dupNext] = from;
+    dupHash[dupNext] = h;
+    dupAt[dupNext] = millis() ? millis() : 1; // 0 means "slot unused"
+    dupNext = (uint8_t)((dupNext + 1) % OZ_BR_DUP_SLOTS);
+  }
 
   // ── ozkey-20 R3 — presence beacon, not a sealed uplink ──────────────────
   //
@@ -1706,17 +1789,14 @@ static bool pollUplinkOne() {
       // BANOI as a second `acked ok` a few hundred ms after the first, and its
       // removal screen popped itself twice — `You have popped the last page off
       // of the stack`. Firmware had classified this duplicate as "harmless".
-      static String lastFrom, lastMsgId, lastReason;
-      static unsigned long lastAt = 0;
-      const bool dupe = lastAt && (millis() - lastAt < 15000UL) &&
-                        lastFrom == from && lastMsgId == msgId &&
-                        lastReason == reason;
-      if (dupe) {
-        Serial.printf("[RESET] %s: duplicate outcome suppressed (msg_id='%s')\n",
-                      from, msgId.c_str());
-        return true;
-      }
-      lastFrom = from; lastMsgId = msgId; lastReason = reason; lastAt = millis();
+      // 1.43 — the msg_id/reason-keyed guard that used to sit here is GONE,
+      // replaced by the datagram-hash de-dup at the top of this function
+      // (XF-116 §7.6), which covers reset outcomes, sealed uplinks and beacons
+      // alike. Deliberately not kept as belt-and-braces: it could never fire
+      // again, and a guard that cannot fire is indistinguishable from a guard
+      // that is broken — this file has been bitten by exactly that before.
+      // The duplicate it caught is the same two-copy dual send, so the general
+      // guard sees the identical bytes and stops it strictly earlier.
 
       // ── REBUILT, not forwarded ───────────────────────────────────────────
       //
