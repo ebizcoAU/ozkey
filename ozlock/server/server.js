@@ -612,6 +612,26 @@ async function initDatabase() {
         ADD COLUMN mcu_last_frame_s SMALLINT NULL
     `);
 
+  // XF-119 §6/§9.3 ask 2: the RAW `reason` off the most recent
+  // `locks/<id>/presence` message, distinct from `presence_reason` (which is
+  // computeFaultAttribution()'s own derived R6 vocabulary and does not
+  // include `factory_reset` at all — confirmed while building this, see
+  // handleLockPresence()). Lets DELETE /locks/:id answer "has this lock
+  // already told us it reset?" from state already held, instead of opening
+  // a reset-wait window nothing can ever close for a lock that reset itself
+  // (BOOT hold, DL-MCU button) with the app never involved. Cleared to NULL
+  // by the same handler whenever a message carries no `reason` (the
+  // canonical `online` message per ozpresence.h) — so a stale factory_reset
+  // cannot outlive the lock coming back, same non-staleness property XF-119
+  // §6 already relies on for the retained MQTT value itself.
+  const [[{ hasLastResetReason }]] = await pool.query(
+    `SELECT COUNT(*) AS hasLastResetReason FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'last_reset_reason'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasLastResetReason)
+    await pool.query('ALTER TABLE locks ADD COLUMN last_reset_reason VARCHAR(32) NULL');
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bridges_presence (
       bridge_id   VARCHAR(64) PRIMARY KEY,
@@ -1184,7 +1204,14 @@ async function handleLockPresence(deviceId, payload) {
     return;
   }
   const state = obj.state === 'online' || obj.state === 'offline' ? obj.state : 'unknown';
-  await pool.query('UPDATE locks SET presence = ? WHERE id = ?', [state, deviceId]);
+  // XF-119 §6/§9.3 ask 2: raw reason, not the derived R6 one — cleared to
+  // NULL by the canonical online message (no `reason` field, ozpresence.h),
+  // so this can never outlive a re-pair.
+  await pool.query('UPDATE locks SET presence = ?, last_reset_reason = ? WHERE id = ?', [
+    state,
+    obj.reason || null,
+    deviceId,
+  ]);
   const result = await recomputeAndStorePresence(deviceId);
   if (result)
     logEvent(
@@ -2425,15 +2452,28 @@ api.delete('/locks/:id', async (req, res) => {
     // not just the record): tell it to wipe NVS and return to ADVERTISING.
     // Best-effort — an offline lock misses it and needs the on-device reset.
     const [[lock]] = await conn.query(
-      'SELECT site_id, bridge_id, last_seen_at, heartbeat_s, presence, presence_reason, mac FROM locks WHERE id = ?',
+      'SELECT site_id, bridge_id, last_seen_at, heartbeat_s, presence, presence_reason, mac, last_reset_reason FROM locks WHERE id = ?',
       [id]
     );
     let attempted = false;
     let transportOk = false;
     let likelyDelivered = false;
     let resetMsgId = null; // ozkey-41 §5.3: only the sealed branch below gets one
+    // XF-119 §6/§9.3 ask 2: the lock may have ALREADY told us it reset —
+    // BOOT hold, the DL-MCU's own button, or a prior request this server
+    // never issued or already forgot about. That message carries no
+    // msg_id to wait on and never will (ozpresence.h, deliberately — a
+    // reset nobody requested has no request to name), so opening a wait
+    // here would time out on a lock that has already reached the goal
+    // state. Skip publishing anything and resolve immediately instead.
+    const alreadyReset = !!lock && lock.last_reset_reason === 'factory_reset';
     if (lock) {
-      if (envelope_hex) {
+      if (alreadyReset) {
+        logEvent(
+          'key',
+          `Factory reset SKIPPED for lock ${id} — already reset per retained presence (XF-119)`
+        );
+      } else if (envelope_hex) {
         // XF-91 §5 — sealed unpair, required for a Thread lock: bridge32 has
         // no `locks/+/command` subscription at all, so the plain path below
         // reaches nothing on that transport (confirmed on hardware, XF-91
@@ -2502,7 +2542,10 @@ api.delete('/locks/:id', async (req, res) => {
     // for a removal is the desired end state, not a refusal).
     let verdict = null;
     let cause = null;
-    if (transportOk && resetMsgId) {
+    if (alreadyReset) {
+      verdict = 'reset_confirmed';
+      cause = 'already_reset';
+    } else if (transportOk && resetMsgId) {
       ({ verdict, cause } = await waitForLockResetVerdict(id, resetMsgId, CONFIG.LOCK_RESET_TIMEOUT_MS));
     }
 
