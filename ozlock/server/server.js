@@ -632,6 +632,28 @@ async function initDatabase() {
   if (!hasLastResetReason)
     await pool.query('ALTER TABLE locks ADD COLUMN last_reset_reason VARCHAR(32) NULL');
 
+  // XF-122 §5 ask 3: there is no generic Tuya DP map — DP numbers mean
+  // different things per product (DP 76 is `unlock_ble` on Luona,
+  // `fill_light` on Tuya's own Wi-Fi-Lock-Pro standard). `profile` names
+  // which pinned DP map the lock's firmware build resolves verbs against
+  // (`tuya-luona-ds013-t3`, …); `tuya_pid` is the lock's own MCU-reported
+  // product id, used to detect a build/PID mismatch. Both ride the enroll
+  // payload (`handleEnroll()`) alongside the existing fw/caps/verbs fields.
+  // The app needs them to survive its own restart without re-pairing —
+  // it shows "Detected: <model>" from `tuya_pid` and must not have to talk
+  // to the lock again just to redraw that screen (XF-122 §7).
+  const [[{ hasTuyaPid }]] = await pool.query(
+    `SELECT COUNT(*) AS hasTuyaPid FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'tuya_pid'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasTuyaPid)
+    await pool.query(`
+      ALTER TABLE locks
+        ADD COLUMN tuya_pid VARCHAR(32) NULL,
+        ADD COLUMN profile  VARCHAR(64) NULL
+    `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bridges_presence (
       bridge_id   VARCHAR(64) PRIMARY KEY,
@@ -1815,13 +1837,20 @@ async function handleEnroll(siteId, topicDeviceId, obj) {
   // above. Same COALESCE rule as the heartbeat — a pre-XF-57 firmware omits both
   // fields and must not blank them.
   const ident = deviceIdentity(obj);
+  // XF-122 §5 ask 3. COALESCE, not a bare overwrite: a pre-2.14 firmware
+  // enrolling (or re-enrolling) sends neither field, and that must leave
+  // whatever this row already knows untouched rather than blanking it —
+  // same discipline as transport/caps above, for the same reason.
+  const tuyaPid = typeof obj.tuya_pid === 'string' && obj.tuya_pid.length <= 32 ? obj.tuya_pid : null;
+  const profile = typeof obj.profile === 'string' && obj.profile.length <= 64 ? obj.profile : null;
   await pool.query(
     `UPDATE locks SET app_id = ?, mac = ?, label = ?, fw = ?, status = 'enrolled',
        bridge_id = NULL,
        transport = COALESCE(?, transport), caps = COALESCE(?, caps),
+       tuya_pid = COALESCE(?, tuya_pid), profile = COALESCE(?, profile),
        heartbeat_s = COALESCE(heartbeat_s, ?), broker_username = ?, broker_secret = ?, last_seen_at = NOW()
      WHERE id = ?`,
-    [appId, mac, label, obj.fw || null, ident.transport, ident.caps,
+    [appId, mac, label, obj.fw || null, ident.transport, ident.caps, tuyaPid, profile,
      CONFIG.DEFAULT_HEARTBEAT_S, brokerUsername, brokerSecret, deviceId]
   );
 
@@ -2159,7 +2188,7 @@ api.get('/locks', async (req, res) => {
     // reachable via Thread/bridge before falling back to asking the user for BLE.
     const [rows] = await pool.query(
       `SELECT id, site_id, app_id, mac, label, fw, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at, bridge_id, caps, transport,
+              last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
               presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s
          FROM locks ORDER BY enrolled_at DESC`
     );
@@ -2244,7 +2273,7 @@ api.get('/locks/:id', async (req, res) => {
     // This is XF-48 ask 1 (the capability field) landing on the read path.
     const [[lock]] = await pool.query(
       `SELECT id, app_id, site_id, mac, label, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at, bridge_id, caps, transport,
+              last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
               presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s
          FROM locks WHERE id = ?`,
       [req.params.id]
