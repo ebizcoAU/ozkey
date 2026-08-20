@@ -9,10 +9,9 @@
  */
 
 import catalogue from "../../profiles/tuya-lock-catalogue.json";
-import generic from "../../profiles/products/tuya-generic-lock.json";
-import ds013 from "../../profiles/products/tuya-ds013-t3.json";
-import videolock from "../../profiles/products/tuya-t3-videolock.json";
-import legacy from "../../profiles/products/ozkie-legacy-v0.json";
+import wifipro from "../../profiles/products/tuya-wifi-lock-pro.json";
+import luona from "../../profiles/products/tuya-luona-ds013-t3.json";
+import ladin from "../../profiles/products/tuya-ladin-f7-t3.json";
 
 import {
   resolveProfile,
@@ -74,7 +73,7 @@ function build(p: unknown): ResolvedProfile {
  * of any kind, so a lock running it accepts a PIN grant and silently drops it —
  * both ends reporting success. That is exactly what happened on the bench on
  * 2026-08-20 (`ozkey-42 §2.4`). Every honest thing it could be used for
- * (exercising the real access-event DPs) `tuya-ds013-t3` does better, with a
+ * (exercising the real access-event DPs) `tuya-luona-ds013-t3` does better, with a
  * real PID and a real supplier document behind it.
  *
  * The JSON stays in `profiles/products/` — firmware still globs it into
@@ -82,10 +81,9 @@ function build(p: unknown): ResolvedProfile {
  * FOOT-GUN in the operator's dropdown, not the profile.
  */
 export const PROFILES: ResolvedProfile[] = [
-  build(legacy),
-  build(generic),
-  build(ds013),
-  build(videolock),
+  build(wifipro),
+  build(luona),
+  build(ladin),
 ];
 
 export const PROFILE_IDS = PROFILES.map((p) => p.profile_id);

@@ -2428,34 +2428,34 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
 
     const OzProfile *p = ozProfileByTuyaPid(cfgMcuPid.c_str());
     if (!p) {
-      // ── UNKNOWN PRODUCT (PM directive 2026-08-20, task 3) ─────────────────
+      // ── UNKNOWN PRODUCT — REFUSE, DO NOT GUESS (revised 2026-08-20) ───────
       //
-      // An UNPINNED build has expressed no opinion, and its compiled-in default
-      // is `ozkie-legacy-v0` — our INVENTED map. Staying there means a lock we
-      // have never seen speaks DP 1, 21, 23: numbers no real Tuya product
-      // implements, which is how an unknown lock ends up silently doing
-      // nothing (or worse, writing a PIN onto its volume control).
+      // 🔴 THIS USED TO FALL BACK TO `tuya-generic-lock`, AND THAT WAS WRONG.
       //
-      // `tuya-generic-lock` is the honest answer for an unidentified lock: 34
-      // REAL catalogue DPs, with the 15 undocumented ones marked RESERVED so a
-      // verb resolves to "known DP, payload not supplied" rather than to
-      // fiction. Better to refuse accurately than to act on an invented map.
+      // The reasoning was "generic = real DPs, better than our invented map".
+      // It does not survive contact with Tuya's own documentation: DP numbers
+      // are assigned PER PRODUCT CATEGORY at PID creation, so there is no
+      // generic lock DP map. The same number means different things:
       //
-      // A PINNED build never moves. Someone decided what hardware this is at
-      // build time, and an unknown PID does not overrule them — it is reported
-      // and ignored, exactly like the mismatch case below.
-      if (!OZ_PROFILE_PINNED && ozProfileSelect("tuya-generic-lock")) {
-        Serial.printf("[PID] unknown product '%s' and this build is NOT pinned "
-                      "— falling back to '%s' (real DPs) instead of the "
-                      "invented map. Pin with PROFILE= if you know the "
-                      "hardware.\n",
-                      cfgMcuPid.c_str(), ozProfileId());
-        g_profileMismatch = true; // visible on the heartbeat; we are guessing
-      } else {
-        Serial.printf("[PID] no profile for '%s' — KEEPING '%s'. Add it to "
-                      "profiles/products/ before trusting this lock's DP map.\n",
-                      cfgMcuPid.c_str(), ozProfileId());
-      }
+      //   DP 76  = unlock_ble   on Luona DS013-T3   -> opens the door
+      //   DP 76  = fill_light   on Tuya Wi-Fi Lock Pro -> turns on a lamp
+      //   DP 16  = bulk_password_add on Luona; duress_alarm on Wi-Fi Lock Pro;
+      //            sound level of the chime on a Residential Lock
+      //
+      // So applying ANY map to a lock we cannot identify risks writing a
+      // credential into a chime volume or unlocking a door by adjusting a
+      // light. That is the DP 21 -> navigation_volume bug we fixed this
+      // morning, one level up and with worse consequences.
+      //
+      // An unidentified lock is precisely the lock whose DP map we must not
+      // improvise. Keep whatever this build was pinned to, say so loudly, and
+      // let the verb resolver refuse — refusing is a correct answer.
+      Serial.printf("[PID] unknown product '%s' — KEEPING '%s'. There is NO "
+                    "generic Tuya DP map to fall back on: DP numbers are "
+                    "per-product-category. Add a profile for this product "
+                    "before trusting this lock's DP map.\n",
+                    cfgMcuPid.c_str(), ozProfileId());
+      g_profileMismatch = true; // we are running a map this hardware may not share
     } else if (strcmp(p->id, ozProfileId()) == 0) {
       Serial.printf("[PID] profile '%s' confirmed by the MCU — build and "
                     "hardware agree\n", p->id);
@@ -7265,6 +7265,26 @@ void drawHexReadout() {
   if (barState != lastBar) {
     lastBar = barState;
     gfx->fillRect(0, HEX_TOP + 2, barW, HEX_H - 4, open ? C_GREEN : C_RED);
+    // 🟡 TEMPORARY, operator 2026-08-20: label the bar in words.
+    //
+    // The colour alone is easy to miss — during the first successful DP 76
+    // unlock the operator was watching this panel and saw nothing, because a
+    // 40 px block changing hue is not what the eye catches. It also auto-relocks
+    // after 5 s, so the window to notice is short.
+    //
+    // REMOVE BEFORE THE REAL PCB SHIPS. On production the bolt state belongs to
+    // the DL MCU and its own indicator; this is a bench affordance, not product
+    // UI, and a lock that reports its own door state from the module's MIRROR of
+    // MCU traffic would be asserting something it does not actually own.
+    //
+    // Drawn inside the existing bar so no other element moves: size 1 is 6 px
+    // per glyph, so "OPEN"/"LOCK" is 24 px in a 40 px bar. Painted only on a
+    // state CHANGE, preserving the 2026-08-11 flicker fix — repainting this row
+    // every tick was a visible strobe.
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_BLACK, open ? C_GREEN : C_RED); // opaque, no clear step
+    gfx->setCursor(8, HEX_TOP + 6);
+    gfx->print(open ? "OPEN" : "LOCK");
   }
 
   // ── LEFT: the clock, size 2 ────────────────────────────────────────────

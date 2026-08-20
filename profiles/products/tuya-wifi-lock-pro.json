@@ -1,0 +1,413 @@
+{
+  "$comment": "🔴 TUYA'S OWN Wi-Fi Lock Pro DP MAP — the platform standard, NOT a vendor's. Source: https://developer.tuya.com/en/docs/iot/wifi-dp?id=K9fewhnlvk6by\n\nSTANDALONE, and that is the whole point. DP numbers are assigned PER PRODUCT CATEGORY at PID creation, so there is no shared catalogue that can serve both this and a vendor map. Proof: DP 76 is `fill_light` here and `unlock_ble` on Luona's DS013-T3 — the same number turns on a lamp or opens a door. DP 16 is `duress_alarm` here and `bulk_password_add` there. Selecting from one catalogue would have meant one of them was silently wrong.\n\nUse this as the reference map for a lock built to Tuya's standard. Do NOT use it as a fallback for an unidentified lock — an unknown lock may be a Residential Lock, where DP 16 is `sound level of the chime`.",
+  "profile_id": "tuya-wifi-lock-pro",
+  "rev": 1,
+  "standalone": true,
+  "complete": false,
+  "supplier": {
+    "product": "Tuya Wi-Fi Lock Pro (platform standard DP map)",
+    "category": "wifi_lock_pro",
+    "module": "any Tuya Wi-Fi module built to the standard Wi-Fi Lock Pro DP set",
+    "$comment": "No PID: this is a CATEGORY, not a product. A real lock built to it has its own PID and should get its own profile."
+  },
+  "source": {
+    "doc": "https://developer.tuya.com/en/docs/iot/wifi-dp?id=K9fewhnlvk6by",
+    "retrieved": "2026-08-20",
+    "note": "DP list is complete per the reference. RAW DPs are marked `reserved`: the reference names the FIELD ORDER (e.g. DP 49 Validity+KeyID+Times+Key) but not byte widths, so a frame still cannot be built without more detail."
+  },
+  "entries": [
+    {
+      "dp": 1,
+      "name": "unlock_fingerprint",
+      "type": "value",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "hw_id"
+    },
+    {
+      "dp": 2,
+      "name": "unlock_password",
+      "type": "value",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "hw_id"
+    },
+    {
+      "dp": 3,
+      "name": "unlock_temporary",
+      "type": "value",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "hw_id"
+    },
+    {
+      "dp": 5,
+      "name": "unlock_card",
+      "type": "value",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "hw_id"
+    },
+    {
+      "dp": 6,
+      "name": "unlock_face",
+      "type": "value",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "hw_id"
+    },
+    {
+      "dp": 7,
+      "name": "unlock_key",
+      "type": "value",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "hw_id"
+    },
+    {
+      "dp": 8,
+      "name": "alert_records",
+      "type": "enum",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.alarm",
+      "field": "type"
+    },
+    {
+      "dp": 9,
+      "name": "remote_unlock_request",
+      "type": "value",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.unlock_request",
+      "field": "countdown"
+    },
+    {
+      "dp": 10,
+      "name": "arm_away",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.armed",
+      "verb_down": "lock.settings.set",
+      "field_down": "arm_away"
+    },
+    {
+      "dp": 11,
+      "name": "battery_state",
+      "type": "enum",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.battery",
+      "field": "level"
+    },
+    {
+      "dp": 12,
+      "name": "battery_percentage",
+      "type": "value",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.battery",
+      "field": "percent"
+    },
+    {
+      "dp": 13,
+      "name": "double_lock_state",
+      "type": "bool",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.bolt",
+      "field": "double_locked"
+    },
+    {
+      "dp": 14,
+      "name": "child_lock",
+      "type": "bool",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.child_lock"
+    },
+    {
+      "dp": 15,
+      "name": "unlock_remote_app",
+      "type": "value",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.access",
+      "field": "member_id"
+    },
+    {
+      "dp": 16,
+      "name": "duress_alarm",
+      "type": "bool",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.duress"
+    },
+    {
+      "dp": 17,
+      "name": "unlock_from_inside",
+      "type": "bool",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.inside_open"
+    },
+    {
+      "dp": 18,
+      "name": "door_state",
+      "type": "enum",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.door"
+    },
+    {
+      "dp": 19,
+      "name": "doorbell_call",
+      "type": "bool",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.doorbell"
+    },
+    {
+      "dp": 21,
+      "name": "liftup_double_lock",
+      "type": "bool",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.bolt",
+      "field": "liftup"
+    },
+    {
+      "dp": 25,
+      "name": "sync_fingerprints",
+      "type": "raw",
+      "dir": "up",
+      "status": "reserved",
+      "verb": "cred.sync",
+      "field": "fingerprint",
+      "blocked_by": "RAW payload structure documented only as a field ORDER on the Tuya reference; byte widths not given"
+    },
+    {
+      "dp": 26,
+      "name": "sync_codes",
+      "type": "raw",
+      "dir": "up",
+      "status": "reserved",
+      "verb": "cred.sync",
+      "field": "pin",
+      "blocked_by": "RAW payload structure documented only as a field ORDER on the Tuya reference; byte widths not given"
+    },
+    {
+      "dp": 27,
+      "name": "sync_cards",
+      "type": "raw",
+      "dir": "up",
+      "status": "reserved",
+      "verb": "cred.sync",
+      "field": "card",
+      "blocked_by": "RAW payload structure documented only as a field ORDER on the Tuya reference; byte widths not given"
+    },
+    {
+      "dp": 32,
+      "name": "offline_password_unlock_report",
+      "type": "raw",
+      "dir": "up",
+      "status": "reserved",
+      "verb": "event.access",
+      "field": "offline_pin",
+      "blocked_by": "RAW payload structure documented only as a field ORDER on the Tuya reference; byte widths not given"
+    },
+    {
+      "dp": 33,
+      "name": "offline_password_clear_report",
+      "type": "raw",
+      "dir": "up",
+      "status": "reserved",
+      "verb": "event.cred_cleared",
+      "blocked_by": "RAW payload structure documented only as a field ORDER on the Tuya reference; byte widths not given"
+    },
+    {
+      "dp": 34,
+      "name": "query_added_method",
+      "type": "bool",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "cred.query"
+    },
+    {
+      "dp": 35,
+      "name": "added_method",
+      "type": "enum",
+      "dir": "down",
+      "status": "confirmed",
+      "verb_down": "cred.put",
+      "field_down": "method"
+    },
+    {
+      "dp": 37,
+      "name": "added_response",
+      "type": "bool",
+      "dir": "down",
+      "status": "confirmed",
+      "verb_down": "cred.put",
+      "field_down": "response"
+    },
+    {
+      "dp": 38,
+      "name": "remote_delete_allowed",
+      "type": "bool",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.cred_policy"
+    },
+    {
+      "dp": 39,
+      "name": "remote_delete_fingerprint",
+      "type": "value",
+      "dir": "down",
+      "status": "confirmed",
+      "verb_down": "cred.delete",
+      "field_down": "fingerprint"
+    },
+    {
+      "dp": 40,
+      "name": "remote_delete_response",
+      "type": "bool",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.cred_cleared",
+      "field": "response"
+    },
+    {
+      "dp": 41,
+      "name": "remote_delete_code",
+      "type": "value",
+      "dir": "down",
+      "status": "confirmed",
+      "verb_down": "cred.delete",
+      "field_down": "pin"
+    },
+    {
+      "dp": 43,
+      "name": "remote_delete_card",
+      "type": "value",
+      "dir": "down",
+      "status": "confirmed",
+      "verb_down": "cred.delete",
+      "field_down": "card"
+    },
+    {
+      "dp": 44,
+      "name": "unlock_combination_record",
+      "type": "raw",
+      "dir": "up",
+      "status": "reserved",
+      "verb": "event.access",
+      "field": "combination",
+      "blocked_by": "RAW payload structure documented only as a field ORDER on the Tuya reference; byte widths not given"
+    },
+    {
+      "dp": 48,
+      "name": "forced_double_lock",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.bolt",
+      "field": "forced",
+      "verb_down": "lock.settings.set",
+      "field_down": "forced_double_lock"
+    },
+    {
+      "dp": 49,
+      "name": "remote_unlock_key_config",
+      "type": "raw",
+      "dir": "both",
+      "status": "reserved",
+      "verb_down": "cred.put",
+      "field_down": "remote_key",
+      "blocked_by": "RAW payload structure documented only as a field ORDER on the Tuya reference; byte widths not given"
+    },
+    {
+      "dp": 50,
+      "name": "remote_unlock",
+      "type": "raw",
+      "dir": "both",
+      "status": "reserved",
+      "verb_down": "lock.unlock",
+      "field_down": "remote",
+      "blocked_by": "RAW payload structure documented only as a field ORDER on the Tuya reference; byte widths not given"
+    },
+    {
+      "dp": 55,
+      "name": "lock_state",
+      "type": "bool",
+      "dir": "up",
+      "status": "confirmed",
+      "verb": "event.bolt",
+      "field": "locked"
+    },
+    {
+      "dp": 57,
+      "name": "locking_records",
+      "type": "raw",
+      "dir": "up",
+      "status": "reserved",
+      "verb": "event.access",
+      "field": "locking",
+      "blocked_by": "RAW payload structure documented only as a field ORDER on the Tuya reference; byte widths not given"
+    },
+    {
+      "dp": 58,
+      "name": "lock_always_on",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.always_on",
+      "verb_down": "lock.settings.set",
+      "field_down": "always_on"
+    },
+    {
+      "dp": 68,
+      "name": "auto_lock",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.autolock",
+      "verb_down": "lock.settings.set",
+      "field_down": "autolock"
+    },
+    {
+      "dp": 69,
+      "name": "auto_lock_delay",
+      "type": "value",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.autolock",
+      "field": "delay",
+      "verb_down": "lock.settings.set",
+      "field_down": "autolock_delay"
+    },
+    {
+      "dp": 76,
+      "name": "fill_light",
+      "type": "bool",
+      "dir": "both",
+      "status": "confirmed",
+      "verb": "event.fill_light",
+      "verb_down": "lock.settings.set",
+      "field_down": "fill_light"
+    }
+  ],
+  "in_lock": {
+    "$comment": "DPIDs handled IN-LOCK and never forwarded to the MCU. These are OURS — our BLE bond-management channel, not Tuya datapoints — so they are product-INDEPENDENT and belong on every profile.\n\nThey lived only on ozkie-legacy-v0 until it was deleted 2026-08-20, which would have silently removed bond revoke / invite cancel / list bonds from every real product. Verified unallocated in the manufacturer space on DS013-T3; re-verify against any new supplier's DP list before assuming the same, because 101-103 are not reserved by Tuya.",
+    "101": "bond_revoke",
+    "102": "invite_cancel",
+    "103": "list_bonds"
+  }
+}

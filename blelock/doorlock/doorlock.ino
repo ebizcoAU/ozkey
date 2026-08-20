@@ -293,7 +293,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 
 //       was the real fault. 60s window, cooldown unchanged at 120s. The
 //       "Ns elapsed" log is derived from BLE_WINDOW_MS (1.90) so it follows
 //       automatically — a hardcoded string would have started lying again.
-#define FW_VERSION "doorlock-2.11"
+#define FW_VERSION "doorlock-2.14"
 
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ────────
 //

@@ -1,0 +1,62 @@
+{
+  "$comment": "🔴 STUB — NOT USABLE. We have no DP reference from Ladin Tech.\n\nThe only DPs here are the four their T3 module integration document names in passing (§3.1 PID Creation). The authoritative 'Visible Intercom Door Lock DP Reference' was requested in ozkey-27 Q2e and has never arrived; ozkey-42 re-requests it.\n\nThis file exists so the gap is VISIBLE rather than implied by absence. Do not pin a build to it and do not infer that unlisted DPs are unsupported — we simply have not been told. Confirm the model and PID with Ladin: our only evidence names an 'AI High-end Visible Intercom Door Lock', PID 3zlhjdesga1kyy75, which may or may not be the F7-T3.",
+  "profile_id": "tuya-ladin-f7-t3",
+  "rev": 1,
+  "standalone": true,
+  "complete": false,
+  "supplier": {
+    "manufacturer": "Ladin Tech",
+    "product": "F7-T3 (UNCONFIRMED — see $comment)",
+    "category": "video_lock",
+    "module": "T3-U / T3-U-IPEX (Beken BK7236)"
+  },
+  "source": {
+    "doc": "docs/DPSuppliers/T3_Final_Customer_Version_EN.docx",
+    "section": "§3.1 PID Creation",
+    "note": "Module integration overview, not a DP reference. Four DPs named in passing."
+  },
+  "blocked_by": "ozkey-42 — Ladin has not supplied a DP reference",
+  "entries": [
+    {
+      "dp": 42,
+      "name": "ble_switch",
+      "type": "bool",
+      "dir": "both",
+      "status": "unknown",
+      "$c": "Named in §3.1: controls BLE when Wi-Fi is disconnected in dual-mode."
+    },
+    {
+      "dp": 76,
+      "name": "unlock_ble",
+      "type": "value",
+      "dir": "both",
+      "status": "unknown",
+      "verb": "event.access",
+      "verb_down": "lock.unlock",
+      "field_down": "ble",
+      "$c": "§3.1: 'To enable Bluetooth lock control when the device is offline, select DP76 - unlock_ble.'"
+    },
+    {
+      "dp": 149,
+      "name": "reserved_do_not_select",
+      "type": "raw",
+      "dir": "both",
+      "status": "unknown",
+      "$c": "§3.1: 'Do not select DP149.'"
+    },
+    {
+      "dp": 212,
+      "name": "initiative_message",
+      "type": "raw",
+      "dir": "up",
+      "status": "unknown",
+      "$c": "§3.1: omit for video intercom locks if audio/video entries should be hidden."
+    }
+  ],
+  "in_lock": {
+    "$comment": "DPIDs handled IN-LOCK and never forwarded to the MCU. These are OURS — our BLE bond-management channel, not Tuya datapoints — so they are product-INDEPENDENT and belong on every profile.\n\nThey lived only on ozkie-legacy-v0 until it was deleted 2026-08-20, which would have silently removed bond revoke / invite cancel / list bonds from every real product. Verified unallocated in the manufacturer space on DS013-T3; re-verify against any new supplier's DP list before assuming the same, because 101-103 are not reserved by Tuya.",
+    "101": "bond_revoke",
+    "102": "invite_cancel",
+    "103": "list_bonds"
+  }
+}

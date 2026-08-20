@@ -229,7 +229,7 @@ test("every `reserved` entry says what it is blocked on", () => {
 
 console.log("\nDS013-T3 — the real catalogue meanings\n");
 
-const ds013 = loadProfile("tuya-ds013-t3");
+const ds013 = loadProfile("tuya-luona-ds013-t3");
 
 test("DP 21 is navigation_volume, NOT add_temp_pin", () => {
   const e = ds013.byDp.get(21)!;
@@ -312,44 +312,28 @@ test("MCU-side credential expiry is recorded as a capability", () => {
   assert.equal((ds013.features as { offline_record_buffer: number }).offline_record_buffer, 20);
 });
 
-console.log("\nlegacy profile\n");
+console.log("\nozkie-legacy-v0 — DELETED 2026-08-20\n");
 
-const legacy = loadProfile("ozkie-legacy-v0");
-
-test("legacy profile is standalone and marked deprecated", () => {
-  assert.equal(legacy.deprecated, true);
-});
-
-test("every legacy entry is marked fiction and names what it collides with", () => {
-  for (const e of legacy.entries) {
-    assert.equal(e.status, "fiction", `DP ${e.dp} (${e.name}) should be fiction`);
-    assert.ok(e.collides_with, `DP ${e.dp} (${e.name}) has no collides_with`);
-  }
-});
-
-test("legacy still WORKS — it has to, it is what ships today", () => {
-  assert.equal(dispositionFor(legacy, 1, "down").action, "handle");
-  assert.equal(dispositionFor(legacy, 21, "down").action, "handle");
-});
-
-test("the in-lock bond DPIDs 101/102/103 are carried and are not fiction", () => {
-  assert.deepEqual(Object.keys(legacy.in_lock).sort(), ["101", "102", "103"]);
-});
-
-test("legacy and DS013-T3 disagree about 21/23/24 — which is the entire point", () => {
-  assert.notEqual(legacy.byDp.get(21)!.name, ds013.byDp.get(21)!.name);
-  assert.notEqual(legacy.byDp.get(23)!.name, ds013.byDp.get(23)!.name);
-  assert.notEqual(legacy.byDp.get(24)!.name, ds013.byDp.get(24)!.name);
-});
+// The invented map is gone. It defined DP 1 as unlock and DP 21-24 as
+// credential CRUD; on every real product those numbers mean something else
+// (DP 21 is navigation_volume on Luona, liftup_double_lock on Tuya's standard).
+// Keeping it as a "safe default" meant every unpinned lock spoke a language no
+// manufacturer implements. The tests that pinned its shape went with it —
+// asserting the exact contents of a fiction is not a regression guard, it is a
+// commitment to the fiction.
+//
+// What replaced them: the collision tests in the tuya-wifi-lock-pro block,
+// which assert that the SAME DP means different things per product. That is the
+// fact worth protecting.
 
 console.log("\npartial profiles\n");
 
-test("the video-lock profile is flagged incomplete", () => {
-  assert.equal(loadProduct("tuya-t3-videolock").complete, false);
+test("the Ladin profile is flagged incomplete — we have no DP reference from them", () => {
+  assert.equal(loadProduct("tuya-ladin-f7-t3").complete, false);
 });
 
-test("DP 42 and 76 mean the same in both products — the catalogue-is-standard evidence", () => {
-  const video = loadProfile("tuya-t3-videolock");
+test("DP 42 and 76 agree between Luona and Ladin — both are T3-U modules, NOT evidence of a universal standard", () => {
+  const video = loadProfile("tuya-ladin-f7-t3");
   assert.equal(video.byDp.get(42)!.name, ds013.byDp.get(42)!.name);
   assert.equal(video.byDp.get(76)!.name, ds013.byDp.get(76)!.name);
   assert.equal(video.byDp.get(76)!.name, "unlock_ble");
@@ -363,28 +347,19 @@ test("DP 42 and 76 mean the same in both products — the catalogue-is-standard 
 // EXACTLY — and the doorlock asserts it on every boot (ozM4SelfTest). Assert
 // the same thing here, so the two ends cannot drift apart silently.
 
-test("legacy profile reproduces the old ozDpForwardable() allow-list exactly", () => {
-  const legacyP = loadProfile("ozkie-legacy-v0");
-  const forwardable = (dp: number) => dispositionFor(legacyP, dp, "down").action === "handle";
-
-  for (const dp of [1, 21, 22, 23, 24]) {
-    assert.ok(forwardable(dp), `DP ${dp} must still be forwardable`);
-  }
-  // 101/102 are bond verbs the MCU has no concept of; forwarding one would let
-  // an unauthenticated publisher revoke the owner's members.
-  for (const dp of [101, 102]) {
-    assert.ok(!forwardable(dp), `DP ${dp} must NEVER reach the MCU`);
-  }
-  // 2/5/8/60 exist in the legacy profile but are report-only, so a downstream
-  // write of them is refused on direction — which is how the profile reproduces
-  // an allow-list that never mentioned direction at all.
-  for (const dp of [0, 2, 5, 8, 20, 25, 60, 100, 103, 200, 255]) {
-    assert.ok(!forwardable(dp), `DP ${dp} must not be forwardable`);
+test("DP 1 is not an unlock command on ANY surviving profile", () => {
+  // Replaces "legacy profile reproduces the old allow-list": that test pinned
+  // the shape of our invented map, which was deleted 2026-08-20. The fact worth
+  // guarding now is the opposite one — the fiction must not come back.
+  for (const prof of PROFILES) {
+    const dp1 = prof.byDp.get(1);
+    if (!dp1) continue;
+    assert.notEqual(dp1.verb_down, "lock.unlock", `${prof.profile_id}: DP 1 must not be an unlock command`);
   }
 });
 
 test("under the REAL profile the old allow-list would have been inverted", () => {
-  const real = loadProfile("tuya-ds013-t3");
+  const real = loadProfile("tuya-luona-ds013-t3");
   const forwardable = (dp: number) => dispositionFor(real, dp, "down").action === "handle";
   // The settings DPs the old constant happened to permit...
   for (const dp of [21, 23, 24]) assert.ok(forwardable(dp), `DP ${dp} is a real setting`);
@@ -400,63 +375,60 @@ test("under the REAL profile the old allow-list would have been inverted", () =>
 // the interesting question is not "what did THIS vendor invent" but "what does
 // the standard set do to us". These pin the answer so it cannot drift.
 
-console.log("\ntuya-generic-lock — the standard set\n");
+console.log("\ntuya-wifi-lock-pro — Tuya's own standard DP map\n");
 
-const generic = loadProfile("tuya-generic-lock");
+// 🔴 THESE TESTS REPLACED THE `tuya-generic-lock` BLOCK, 2026-08-20, and the
+// reason matters more than the assertions.
+//
+// `tuya-generic-lock` claimed to be "the standard Tuya lock DP map". It was
+// not: it was Luona's DS013-T3 map with the PID stripped out. Checking Tuya's
+// own published references showed there IS no universal lock DP numbering —
+// numbers are assigned PER PRODUCT CATEGORY at PID creation:
+//
+//   DP 76  fill_light (Wi-Fi Lock Pro)  vs  unlock_ble (Luona DS013-T3)
+//   DP 16  duress_alarm                 vs  bulk_password_add
+//   DP 21  liftup_double_lock           vs  navigation_volume
+//
+// So a "generic" profile is a category error, and using one as a fallback for
+// an unidentified lock could unlock a door by switching on a lamp. This file
+// now holds the REAL Tuya standard, standalone, and asserts the collisions so
+// nobody re-derives the mistake.
 
-test("it selects the whole catalogue EXCEPT the two Tuya says not to select", () => {
+const wifipro = loadProfile("tuya-wifi-lock-pro");
+
+test("it is STANDALONE — it cannot share the vendor catalogue", () => {
+  // The catalogue is Luona-derived. Selecting from it would mean one of the two
+  // maps was silently wrong about every colliding DP.
   const cat = loadCatalogue("tuya-lock-catalogue").entries.map((e) => e.dp);
-  const got = generic.entries.map((e) => e.dp);
-  assert.deepEqual(
-    got,
-    cat.filter((dp) => dp !== 149 && dp !== 212),
-    "generic must track the catalogue — a new catalogue DP belongs here too"
-  );
-  // Ladin §3.1: "Do not select DP149." DP 212 is audio/video-lock only.
-  assert.equal(generic.byDp.get(149), undefined);
-  assert.equal(generic.byDp.get(212), undefined);
+  const mine = wifipro.entries.map((e) => e.dp);
+  assert.notDeepEqual(mine, cat, "a category map must not track a vendor catalogue");
+  assert.ok(wifipro.entries.length > 30, "the standard set is substantial");
 });
 
-test("🔴 it has NO Tuya PID — a generic lock is reached by fallback, never by match", () => {
-  // Inventing a PID here would make discovery "match" a maker that does not
-  // exist, which is the fiction ozsim-fullfeature was built to avoid.
-  assert.equal(generic.tuya_pid, undefined);
-  assert.equal(loadProfile("tuya-ds013-t3").tuya_pid, "vr4iiuqtyh0q4nix");
-  assert.equal(loadProfile("ozkie-legacy-v0").tuya_pid, undefined);
+test("🔴 the DP collisions that make per-vendor profiles mandatory", () => {
+  const luona = loadProfile("tuya-luona-ds013-t3");
+  // The one that matters most: we ship remote unlock on DP 76.
+  assert.equal(wifipro.byDp.get(76)!.name, "fill_light");
+  assert.equal(luona.byDp.get(76)!.name, "unlock_ble");
+  // And the credential DP we refuse on.
+  assert.equal(wifipro.byDp.get(16)!.name, "duress_alarm");
+  assert.equal(luona.byDp.get(16)!.name, "bulk_password_add");
 });
 
-test("🔴 it CANNOT remotely unlock — DP 10's payload layout was never supplied", () => {
-  // The supplier declined to specify it (0x00-0xff in the 功能指令 column while
-  // DP 11 is fully specified two rows away). Until that lands there is no real
-  // DP that opens a door, and DP 72 is a REPORT that one happened, not a
-  // command. This test is the reminder, not a bug.
-  const d = dispositionFor(generic, 10, "down");
-  assert.equal(d.action, "unsupported");
-  assert.equal(generic.byDp.get(72)!.verb, "event.access");
+test("🔴 it has NO PID — it is a CATEGORY, not a product", () => {
+  // A real lock built to this standard has its own PID and its own profile.
+  // Inventing one here would make discovery match a maker that does not exist.
+  assert.equal(wifipro.tuya_pid, undefined);
+  assert.equal(loadProfile("tuya-luona-ds013-t3").tuya_pid, "vr4iiuqtyh0q4nix");
 });
 
-test("every credential WRITE is present and refuses loudly", () => {
-  // Present, not omitted: a real supplier's lock would show us exactly this,
-  // and the bench should meet UNSUPPORTED here rather than silence.
-  for (const dp of [9, 13, 14, 15, 16, 17, 18, 19, 86]) {
-    assert.equal(generic.byDp.get(dp)!.status, "reserved", `DP ${dp}`);
-    assert.equal(dispositionFor(generic, dp, "down").action, "unsupported", `DP ${dp}`);
-  }
+test("it carries no fiction — DP 1 is ours, and is absent here", () => {
+  // DP 1 on the standard map is `unlock_fingerprint`, a REPORT — never our
+  // invented unlock command.
+  const dp1 = wifipro.byDp.get(1);
+  assert.equal(dp1!.name, "unlock_fingerprint");
+  assert.equal(dp1!.dir, "up");
 });
-
-test("the access events that DO work carry a credential class", () => {
-  const kinds = [61, 63, 64, 69, 72, 73, 76].map((dp) => generic.byDp.get(dp)!.access_kind);
-  assert.deepEqual(kinds, ["pin", "fingerprint", "rfid", "temp_pin", "remote", "remote_voice", "ble"]);
-});
-
-test("it carries no fiction — that is the difference from ozsim-fullfeature", () => {
-  for (const e of generic.entries) {
-    assert.notEqual(e.status, "fiction", `DP ${e.dp} (${e.name}) is fiction`);
-  }
-  assert.equal(generic.byDp.get(1), undefined, "DP 1 is OUR invention, not a Tuya DP");
-  assert.equal(loadProfile("ozsim-fullfeature").byDp.get(1)!.status, "fiction");
-});
-
 console.log("\ntwo loaders, one truth\n");
 
 // The browser cannot read `profiles/` off disk, so profileRegistry.ts imports
@@ -475,12 +447,12 @@ test("the browser registry resolves identically to the filesystem loader", () =>
 });
 
 test("the registry strips $comment too — in_lock must hold only real DPIDs", () => {
-  const keys = Object.keys(getProfile("ozkie-legacy-v0").in_lock).sort();
+  const keys = Object.keys(getProfile("tuya-luona-ds013-t3").in_lock).sort();
   assert.deepEqual(keys, ["101", "102", "103"]);
 });
 
-test("the default profile is the legacy fiction, deliberately", () => {
-  assert.equal(DEFAULT_PROFILE_ID, "ozkie-legacy-v0");
+test("the default is Tuya's standard map — and an unpinned build is a guess", () => {
+  assert.equal(DEFAULT_PROFILE_ID, "tuya-wifi-lock-pro");
 });
 
 // ── summary ─────────────────────────────────────────────────────────────────

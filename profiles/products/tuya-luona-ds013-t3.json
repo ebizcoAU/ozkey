@@ -1,20 +1,20 @@
 {
-  "$comment": "Smart Lock DS013-T3 — the first real supplier DP list we have held. Selects from tuya-lock-catalogue.json. See ozkey-27 §2.",
-  "profile_id": "tuya-ds013-t3",
-  "rev": 1,
+  "$comment": "Luona Smart's DS013-T3. Renamed 2026-08-20 to name the MANUFACTURER: DP numbers are assigned per product category at PID creation, so a DP map belongs to a vendor's product and cannot be shared. DP 76 is `unlock_ble` here and `fill_light` on Tuya's own Wi-Fi Lock Pro.",
+  "profile_id": "tuya-luona-ds013-t3",
+  "rev": 2,
   "catalogue": "tuya-lock-catalogue",
   "supplier": {
     "product": "Smart Lock DS013-T3",
     "pid": "vr4iiuqtyh0q4nix",
     "category": "smart_lock",
-    "module": "T3-U (Beken BK7236)"
+    "module": "T3-U (Beken BK7236)",
+    "manufacturer": "Luona Smart"
   },
   "source": {
     "doc": "docs/DPSuppliers/protocol_vr4iiuqtyh0q4nix_20260811.pdf",
     "generated": "2026-08-11",
     "title": "涂鸦云低功耗通用串口接入协议"
   },
-
   "cmd": {
     "$comment": "🔴 UNRESOLVED — ozkey-27 §2.2 / Q1. The PDF body describes the LOW-POWER variant; the PDF's own final 功能协议 table and the T3 module doc both name the GENERAL variant. Two of three signals say general, which is what we already implement. Do not build against either until the supplier answers.",
     "variant": "unresolved",
@@ -37,15 +37,19 @@
       }
     }
   },
-
   "link": {
     "$comment": "The MCU's handshake CONVENTION only. GPIO numbers are board config, not supplier config — ozkey-27 §8.4.",
-    "srdy": { "assert": "low", "style": "unconfirmed" },
-    "mrdy": { "assert": "low", "style": "unconfirmed" },
+    "srdy": {
+      "assert": "low",
+      "style": "unconfirmed"
+    },
+    "mrdy": {
+      "assert": "low",
+      "style": "unconfirmed"
+    },
     "topology": "unresolved",
     "topology_note": "SIMLOCK v2.1 says N8-master/DL-MCU-slave; operator specifies CO-MASTER. ozkey-27 §8.3 / Q14."
   },
-
   "features": {
     "offline_record_buffer": 20,
     "offline_record_note": "MCU buffers up to 20 door records when offline and replays them backdated, oldest overwritten, each with a time-basis flag (0 none / 1 device-local / 2 GMT). Events arrive out of order and may duplicate — dedupe on msg_id, order on occurred_at. ozkey-27 §2.4.",
@@ -53,19 +57,48 @@
     "credential_expiry_note": "The 0x13 multi-group password service carries per-credential effective+expiry datetime in GMT, use-count (0 unlimited / 1 one-shot) and status. Full set is re-sent every time (全量下发) and the lock replaces its state. This answers ozkey-21 §8.3 for this supplier. Requires GMT — confirms ozkey-21 §8.4.",
     "time_basis": "gmt"
   },
-
   "selects": [
-    9, 10, 11,
-    13, 14, 15, 16, 17, 18, 19,
-    21, 23, 24,
-    42, 45, 47,
-    52, 53, 54,
-    60, 61, 63, 64, 69,
-    72, 73, 74, 76,
-    86, 87, 88, 89,
-    98, 156
+    9,
+    10,
+    11,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    21,
+    23,
+    24,
+    42,
+    45,
+    47,
+    52,
+    53,
+    54,
+    60,
+    61,
+    63,
+    64,
+    69,
+    72,
+    73,
+    74,
+    76,
+    86,
+    87,
+    88,
+    89,
+    98,
+    156
   ],
-
   "overrides": [],
-  "extra": []
+  "extra": [],
+  "in_lock": {
+    "$comment": "DPIDs handled IN-LOCK and never forwarded to the MCU. These are OURS — our BLE bond-management channel, not Tuya datapoints — so they are product-INDEPENDENT and belong on every profile.\n\nThey lived only on ozkie-legacy-v0 until it was deleted 2026-08-20, which would have silently removed bond revoke / invite cancel / list bonds from every real product. Verified unallocated in the manufacturer space on DS013-T3; re-verify against any new supplier's DP list before assuming the same, because 101-103 are not reserved by Tuya.",
+    "101": "bond_revoke",
+    "102": "invite_cancel",
+    "103": "list_bonds"
+  }
 }

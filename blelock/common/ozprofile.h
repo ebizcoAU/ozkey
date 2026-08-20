@@ -118,9 +118,20 @@ static void ozProfileBegin() {
     g_ozProfileIdx = 0;
   }
   g_ozProfilePinned = true;
-  Serial.printf("[PROFILE] pinned at build time: '%s' (rev %u, %u DPs)\n",
+  Serial.printf("[PROFILE] %s: '%s' (rev %u, %u DPs)\n",
+                OZ_PROFILE_PINNED ? "pinned at build time" : "DEFAULT — NOT PINNED",
                 ozProfileId(), (unsigned)ozProfile()->rev,
                 (unsigned)ozProfile()->count);
+  if (!OZ_PROFILE_PINNED) {
+    // 🔴 Since ozkie-legacy-v0 was deleted (2026-08-20) every profile describes
+    // a REAL product, and DP numbers differ between them — DP 76 is
+    // `unlock_ble` on a Luona DS013-T3 and `fill_light` on Tuya's standard map.
+    // So an unpinned build is not "the safe default", it is a guess about which
+    // lock is in the door. Say so; do not let it pass silently.
+    Serial.printf("[PROFILE] 🔴 this build was NOT pinned. '%s' is a GUESS — "
+                  "DP numbers differ per product. Rebuild with PROFILE=<id>.\n",
+                  ozProfileId());
+  }
 }
 
 /** Table lookup. Profiles are small (10-34 entries) and sorted, but linear is

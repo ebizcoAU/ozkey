@@ -596,7 +596,7 @@ const DP_NAMES: Record<number, string> = {
  *
  * This is the point of the whole profile layer made visible: the same bytes
  * mean different things under different profiles, and until now the console
- * asserted one interpretation as if it were fact. Under `tuya-ds013-t3` a
+ * asserted one interpretation as if it were fact. Under `tuya-luona-ds013-t3` a
  * DP 21 write is `navigation_volume`; under `ozkie-legacy-v0` it is our
  * invented "Add Temporary PIN". Both are shown for what they are.
  */
