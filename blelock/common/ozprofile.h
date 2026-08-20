@@ -64,9 +64,63 @@ static bool ozProfileSelect(const char *id) {
   return false;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 THE DP MAP IS A BUILD-TIME DECISION (operator, 2026-08-20)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A lock is manufactured against ONE DL-MCU. Which DP list it speaks is a fact
+// about the hardware in the door, decided before the firmware is flashed — it
+// is not something to negotiate at runtime with whatever is on the far end of
+// the UART.
+//
+// WHY THIS EXISTS. Until now firmware discovered its profile at runtime from
+// the MCU's 0x01 product-info reply and ADOPTED it. LockSim can change its DP
+// list from a dropdown; firmware cannot, and must not try to keep up. On the
+// bench, 2026-08-20, firmware was observed switching ozsim-fullfeature ->
+// tuya-ds013-t3 -> back again while the simulator's UI never moved, because a
+// UART reconnect re-announced a stale identity. For part of that window the
+// lock was interpreting every DP under a map for a product that was not
+// attached, and nothing anywhere reported the disagreement (XF-118 §4).
+//
+// SECURITY, not just tidiness: runtime adoption means anything that can put
+// bytes on the Tuya UART can tell the lock what its DP numbers MEAN. Choosing
+// the map at build time removes that as an input entirely.
+//
+// Override per build; the default preserves the historical behaviour:
+//   make flash BOARD=19 PROFILE=tuya-ds013-t3
+#ifndef OZ_PROFILE_BUILD
+#define OZ_PROFILE_BUILD OZ_PROFILE_DEFAULT_ID
+#endif
+
+// Set by the Makefile when PROFILE= was passed. An EXPLICIT flag rather than
+// comparing OZ_PROFILE_BUILD to the default, because `PROFILE=ozkie-legacy-v0`
+// is a deliberate choice and must not be mistaken for "nobody chose".
+//
+// It decides one thing: whether an unknown MCU PID may move us to the generic
+// profile. A pinned build never moves — the whole point of pinning is that the
+// far end of the UART does not get a vote (XF-118 §4).
+#ifndef OZ_PROFILE_PINNED
+#define OZ_PROFILE_PINNED 0
+#endif
+
+/** True once ozProfileBegin() has pinned the build profile. */
+static bool g_ozProfilePinned = false;
+
 /** Resolve the boot default. Call once from setup(). */
 static void ozProfileBegin() {
-  if (!ozProfileSelect(OZ_PROFILE_DEFAULT_ID)) g_ozProfileIdx = 0;
+  if (!ozProfileSelect(OZ_PROFILE_BUILD)) {
+    // A build pinned to a profile that is not compiled in is a build error we
+    // can only discover here. Say so loudly rather than silently running the
+    // wrong map — that is the whole failure this pinning exists to end.
+    Serial.printf("[PROFILE] 🔴 BUILD PINNED TO '%s' WHICH IS NOT COMPILED IN "
+                  "— falling back to '%s'. Fix OZ_PROFILE_BUILD.\n",
+                  OZ_PROFILE_BUILD, OZ_PROFILES[0].id);
+    g_ozProfileIdx = 0;
+  }
+  g_ozProfilePinned = true;
+  Serial.printf("[PROFILE] pinned at build time: '%s' (rev %u, %u DPs)\n",
+                ozProfileId(), (unsigned)ozProfile()->rev,
+                (unsigned)ozProfile()->count);
 }
 
 /** Table lookup. Profiles are small (10-34 entries) and sorted, but linear is
@@ -112,4 +166,65 @@ static OzDisposition ozProfileDisposition(uint8_t dp, OzDpDir want) {
 /** Convenience for the forward path — same predicate `ozDpForwardable()` had. */
 static bool ozDpForwardable(uint8_t dp) {
   return ozProfileDisposition(dp, OZ_DIR_DOWN) == OZ_DISP_HANDLE;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OZKIE VERB RESOLVER (XF-120 / PM directive 2026-08-20)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Firmware is the ONLY layer that may know a Tuya DP number. The app sends a
+// semantic verb, the server relays it opaquely, and this is where the verb
+// becomes a DP — from data, not from a C branch.
+//
+// It replaces `if (isUnlock) { if (ozDpFind(76)) dp = 76; else dp = 1; }`, which
+// compiled two DP numbers into logic and made "profile-driven" aspirational: a
+// second supplier whose unlock DP was not 76 needed a firmware change. It is
+// also how DP 1 — a number we invented — survived long enough to reach real
+// hardware and silently fail there.
+//
+// Ordering IS policy. The generator sorts (verb, STATUS, field), so a bare verb
+// with no field lands on the CONFIRMED candidate before any RESERVED one:
+// `lock.unlock` resolves to DP 76, never to DP 10 whose payload layout the
+// supplier has never supplied (ozkey-42 §2.2).
+//
+// Returns nullptr when this product has no such command — which is a real and
+// useful answer, not a failure: it is how a lock says "I cannot do that", and
+// the caller must surface it rather than substituting something that looks
+// close. Substituting is exactly what produced the DP 1 fiction.
+
+/** Resolve an OZKIE verb to a DP on the ACTIVE profile.
+ *
+ * @param verb  e.g. "lock.unlock", "cred.put"
+ * @param field optional sub-type ("pin", "ble", …). nullptr matches the first
+ *              candidate for `verb` in generator order (confirmed first).
+ * @param dir   OZ_DIR_DOWN for a command we send, OZ_DIR_UP for a report.
+ * @return the mapping, or nullptr if this product cannot do it.
+ *
+ * The caller MUST check `status`: a non-null result with OZ_DP_RESERVED means
+ * "this lock has the DP but we were never told its payload layout" — known,
+ * and still unusable.
+ */
+static const OzVerbMap *ozResolveVerb(const char *verb, const char *field,
+                                      OzDpDir dir) {
+  if (!verb || !*verb) return nullptr;
+  const OzProfile *p = ozProfile();
+  if (!p->verbs) return nullptr;
+  for (uint16_t i = 0; i < p->verb_count; i++) {
+    const OzVerbMap *m = &p->verbs[i];
+    if (m->dir != dir) continue;
+    if (strcmp(m->verb, verb) != 0) continue;
+    // A caller that names no field takes the first (best-status) candidate.
+    // A caller that names one must match it exactly — asking for `cred.put`
+    // on "pin" must never be answered with the RFID DP.
+    if (field && *field) {
+      if (!m->field || strcmp(m->field, field) != 0) continue;
+    }
+    return m;
+  }
+  return nullptr;
+}
+
+/** True if the verb resolves AND is actually usable on this product. */
+static bool ozVerbUsable(const OzVerbMap *m) {
+  return m && m->status == OZ_DP_CONFIRMED;
 }

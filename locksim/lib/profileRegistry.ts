@@ -12,7 +12,6 @@ import catalogue from "../../profiles/tuya-lock-catalogue.json";
 import generic from "../../profiles/products/tuya-generic-lock.json";
 import ds013 from "../../profiles/products/tuya-ds013-t3.json";
 import videolock from "../../profiles/products/tuya-t3-videolock.json";
-import ozsim from "../../profiles/products/ozsim-fullfeature.json";
 import legacy from "../../profiles/products/ozkie-legacy-v0.json";
 
 import {
@@ -63,16 +62,30 @@ function build(p: unknown): ResolvedProfile {
  * Tuya DL-MCU, 34 DPs, 9 of them `reserved` and refusing loudly. See
  * `docs/DPSuppliers/genericDPList.md`.
  *
- * `ozsim-fullfeature` was reachable by the FIRMWARE (it is globbed into
- * `ozprofile_gen.h`) but was never listed here, so LockSim's own UI could not
- * select the profile whose PID LockSim answers `0x01` with. Fixed 2026-08-18.
+ * 🔴 `ozsim-fullfeature` IS DELIBERATELY NOT LISTED (removed 2026-08-20, at the
+ * operator's request after it cost a bench session).
+ *
+ * It was added on 2026-08-18 so the UI could select the profile whose PID
+ * LockSim used to answer `0x01` with. That reason is gone: a profile with no
+ * PID now stays SILENT rather than falling back to `OZSIM_PID`
+ * (see useLockState.ts), so nothing reaches this profile by accident any more.
+ *
+ * Why it must not be selectable: it is a FICTION that carries no credential DP
+ * of any kind, so a lock running it accepts a PIN grant and silently drops it —
+ * both ends reporting success. That is exactly what happened on the bench on
+ * 2026-08-20 (`ozkey-42 §2.4`). Every honest thing it could be used for
+ * (exercising the real access-event DPs) `tuya-ds013-t3` does better, with a
+ * real PID and a real supplier document behind it.
+ *
+ * The JSON stays in `profiles/products/` — firmware still globs it into
+ * `ozprofile_gen.h` and it remains a valid target there. This removes the
+ * FOOT-GUN in the operator's dropdown, not the profile.
  */
 export const PROFILES: ResolvedProfile[] = [
   build(legacy),
   build(generic),
   build(ds013),
   build(videolock),
-  build(ozsim),
 ];
 
 export const PROFILE_IDS = PROFILES.map((p) => p.profile_id);

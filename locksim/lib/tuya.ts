@@ -60,6 +60,24 @@ export enum TuyaCommand {
    */
   DP_REPORT = 0x07,
   /**
+   * STATUS QUERY — **module → MCU**. `55 AA 00 08 00 00 07`.
+   *
+   * Tuya's docs: "the module gets the status of all the data points of the MCU
+   * and sets them to the initial values that are displayed on the app. After
+   * receiving the 0x08 command, the MCU reports all the DP data at one time or
+   * several times."
+   *
+   * 0x01 gives the product's IDENTITY (its PID). This gives its CAPABILITIES —
+   * which DPs it actually implements. Together they are the whole picture, and
+   * until 2026-08-20 we only ever asked the first half, so nothing had ever
+   * checked a lock's DP map against the hardware in front of us.
+   *
+   * LockSim answers it from the SELECTED PROFILE, which is the honest answer: a
+   * simulator standing in for a DS013-T3 should report exactly the DPs a
+   * DS013-T3 has, no more.
+   */
+  QUERY_STATUS = 0x08,
+  /**
    * ozkey-21 §2.3 — TIME SERVICE. The direction here is the whole point:
    * in Tuya's architecture the MODULE owns the clock and the MCU is its
    * client. Tuya's docs: "the module comes with a software real-time clock

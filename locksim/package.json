@@ -1,12 +1,12 @@
 {
   "name": "locksim",
-  "version": "1.2.0",
+  "version": "1.7.0",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3100",
     "build": "next build",
     "start": "next start -p 3100",
-    "test": "python3 ../blelock/tools/gen_profile.py --check && tsx test/mcuClock.test.ts && tsx test/profile.test.ts && tsx test/credential.test.ts && tsx test/version.test.ts",
+    "test": "python3 ../blelock/tools/gen_profile.py --check && tsx test/mcuClock.test.ts && tsx test/profile.test.ts && tsx test/verbresolve.test.ts && tsx test/credential.test.ts && tsx test/version.test.ts",
     "build:check": "NEXT_BUILD_CHECK=1 next build"
   },
   "dependencies": {

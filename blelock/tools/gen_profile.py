@@ -32,6 +32,10 @@ OUT = ROOT / "blelock" / "common" / "ozprofile_gen.h"
 # blocked_by strings to decide whether to forward a frame.
 DIR = {"up": 0, "down": 1, "both": 2}
 STATUS = {"confirmed": 0, "reserved": 1, "unknown": 2, "fiction": 3}
+# Tuya wire types, from the catalogue's `type`. Needed by the verb resolver so
+# firmware can build a frame without a second table of its own.
+DPTYPE = {"raw": 0x00, "bool": 0x01, "value": 0x02, "string": 0x03,
+          "enum": 0x04, "bitmap": 0x05}
 
 
 def strip_comments(v):
@@ -108,6 +112,30 @@ def generate():
     w("  const char *name;")
     w("};")
     w("")
+    # ── XF-120 / PM directive 2026-08-20 — the OZKIE verb resolver ──────────
+    #
+    # WHY THIS TABLE EXISTS. Firmware used to pick the DP for a verb in C:
+    # `if (isUnlock) { if (ozDpFind(76)) dp = 76; else dp = 1; }`. That is a DP
+    # number compiled into logic, so a second supplier whose unlock DP is not 76
+    # needs a firmware change — which makes "profile-driven" aspirational rather
+    # than true, and it is how DP 1 (a number we invented) survived this long.
+    #
+    # The catalogue already carried `verb` for the UP direction. rev 2 adds
+    # `verb_down`/`field_down` for the DOWN direction, because a DP can be both:
+    # DP 76 reports `event.access` upward and accepts `lock.unlock` downward.
+    #
+    # Resolution is on (verb, field, dir) because verb alone is ambiguous —
+    # `cred.put` serves DP 13/16/86 and `lock.settings.set` serves seven DPs.
+    # Verified unique across all 20 commandable DPs at catalogue rev 2.
+    w("struct OzVerbMap {")
+    w("  const char *verb;   // OZKIE verb, e.g. \"lock.unlock\"")
+    w("  const char *field;  // sub-type, e.g. \"pin\"/\"ble\"; nullptr if none")
+    w("  OzDpDir     dir;    // OZ_DIR_DOWN = command, OZ_DIR_UP = report")
+    w("  uint16_t    dp;")
+    w("  uint8_t     type;   // Tuya wire type — 0x00 RAW .. 0x05 BITMAP")
+    w("  OzDpStatus  status; // RESERVED here means: known DP, unusable payload")
+    w("};")
+    w("")
     w("struct OzProfile {")
     w("  const char       *id;")
     w("  uint16_t          rev;   // ozkey-28 §3.6 — device.info reports this")
@@ -119,10 +147,14 @@ def generate():
     w("  // lock identifies ITSELF instead of being told what it is.")
     w("  // nullptr where we have no PID (our own invented map).")
     w("  const char       *tuya_pid;")
+    w("  // Verb resolver table for THIS product — see OzVerbMap.")
+    w("  const OzVerbMap  *verbs;")
+    w("  uint16_t          verb_count;")
     w("};")
     w("")
 
     names = []
+    verb_counts = {}
     for path in products:
         prod = load(path)
         entries = resolve(prod, catalogue)
@@ -139,11 +171,63 @@ def generate():
         w("};")
         w("")
 
+        # ── the verb table for this product ─────────────────────────────────
+        #
+        # Built from the SAME resolved entry list as the DP table above, so a
+        # verb can never resolve to a DP this product does not select. That is
+        # the whole point: one resolution, one source.
+        rows = []
+        for e in entries:
+            if e.get("verb_down"):
+                rows.append((e["verb_down"], e.get("field_down"), "OZ_DIR_DOWN", e))
+            if e.get("verb"):
+                rows.append((e["verb"], e.get("field"), "OZ_DIR_UP", e))
+        # Sort by (verb, STATUS, field) — status BEFORE field, deliberately.
+        # A bare `lock.unlock` with no field must land on DP 76 (confirmed),
+        # not DP 10 (reserved, payload layout never supplied — ozkey-42 P0).
+        # Sorting by field first happened to give the right answer only because
+        # "ble" < "remote" alphabetically; that is luck, not policy.
+        # A bare `lock.unlock` with no field must land on DP 76 (confirmed), not
+        # DP 10 (reserved, payload layout never supplied — ozkey-42 P0). The
+        # resolver returns the first match, so the order here IS the policy.
+        rows.sort(key=lambda r: (r[0], STATUS[r[3]["status"]], r[1] or ""))
+        # 🔴 UNIQUENESS IS A DOWN-DIRECTION INVARIANT ONLY.
+        #
+        # DOWN is verb -> DP: firmware is handed `{"kind":"unlock"}` and must
+        # pick exactly one DP, so an ambiguous (verb, field) is a real defect
+        # and is refused here at build time rather than guessed at runtime.
+        #
+        # UP is DP -> verb: firmware is handed a DP number by the MCU and asks
+        # what it means. That direction cannot be ambiguous — a DP has one verb
+        # — and it is NOT a (verb, field) lookup. Seven DPs legitimately report
+        # `event.access` (password, fingerprint, card, temp, remote, voice,
+        # ble); requiring those to be distinguishable BY VERB was my modelling
+        # error, not a catalogue defect.
+        seen = {}
+        for v, f, d, e in rows:
+            if d != "OZ_DIR_DOWN":
+                continue
+            k = (v, f)
+            if k in seen:
+                raise SystemExit(
+                    f"{prod['profile_id']}: command {v}/{f} resolves to both DP "
+                    f"{seen[k]} and DP {e['dp']} — ambiguous, fix the catalogue")
+            seen[k] = e["dp"]
+        w(f"static const OzVerbMap OZ_VERBS_{ident}[] = {{")
+        for v, f, d, e in rows:
+            fs = f'"{f}"' if f else "nullptr"
+            w(f'  {{ "{v}", {fs:<22}, {d:<12}, {e["dp"]:>3}, '
+              f'0x{DPTYPE[e["type"]]:02X}, {"OZ_DP_" + e["status"].upper()} }},')
+        w("};")
+        w("")
+        verb_counts[ident] = len(rows)
+
     w("static const OzProfile OZ_PROFILES[] = {")
     for pid, ident, dep, rev, tuya_pid in names:
         tp = f'"{tuya_pid}"' if tuya_pid else "nullptr"
         w(f'  {{ "{pid}", {rev}, OZ_DP_{ident}, '
-          f"(uint16_t)(sizeof(OZ_DP_{ident}) / sizeof(OzDpEntry)), {str(dep).lower()}, {tp} }},")
+          f"(uint16_t)(sizeof(OZ_DP_{ident}) / sizeof(OzDpEntry)), {str(dep).lower()}, {tp}, "
+          f"OZ_VERBS_{ident}, {verb_counts[ident]} }},")
     w("};")
     w(f"static const uint8_t OZ_PROFILE_COUNT = {len(names)};")
     w("")

@@ -113,7 +113,7 @@ static bool ozM4SelfTest();
 static bool ozTuyaFrameOk(const uint8_t *f, size_t n);
 static bool touchReadRegs(uint8_t *buf);
 static size_t ozBuildDpFrame(uint8_t dp, uint8_t type, const uint8_t *val, size_t vlen, uint8_t *out);
-static void addIdentity(JsonDocument &doc);
+static void addIdentity(JsonDocument &doc, bool full = false);
 static void bond0Accept(OzBondVerdict v, const uint8_t provPub[32]);
 static void copyLabelUtf8(const char *src, char *dst, size_t cap);
 static void ctlConsume(size_t n);
@@ -952,6 +952,14 @@ static bool ozHasDoorbell() { return g_bellObserved || ozDpFind(53) != nullptr; 
 String cfgMcuPid, cfgMcuVer;
 static unsigned long g_pidAskedAt = 0;
 static uint8_t g_pidAsks = 0;
+// True once an MCU has told us what it is THIS BOOT. A second, contradicting
+// answer is refused rather than adopted — see the 0x01 handler.
+static bool g_pidLatched = false;
+// 🔴 The MCU reported a product this build was not made for. Surfaced on the
+// heartbeat because a mismatch that only exists in a serial log nobody is
+// reading is not a diagnostic — and this one means every DP on the wire is
+// being read under the wrong map.
+static bool g_profileMismatch = false;
 #define OZ_PID_RETRY_MS   5000UL
 #define OZ_PID_MAX_ASKS   6
 
@@ -961,6 +969,76 @@ static void ozAskMcuProductInfo() {
   tuyaWireSend(f, sizeof(f));
   g_pidAskedAt = millis();
   g_pidAsks++;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 0x08 — ASK THE MCU WHICH DPs IT ACTUALLY HAS (operator, 2026-08-20)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 0x01 tells us the product's IDENTITY (the PID). 0x08 tells us its
+// CAPABILITIES: the MCU answers by reporting the current status of every DP it
+// supports, as a series of (or one grouped) 0x07 frames. Together they are the
+// complete picture; we have only ever asked the first half.
+//
+// WHY THIS MATTERS HERE. The DP map is pinned at build time and the PID only
+// confirms the product NAME. Nothing has ever checked the pinned profile
+// against what the hardware really implements — so a profile that selects a DP
+// the MCU does not have looks perfectly healthy until a command silently does
+// nothing, which is precisely how 2026-08-20 was spent.
+//
+// It also answers, from the hardware rather than from a document, the question
+// blocking remote unlock: does this MCU actually implement DP 76? And it tells
+// us which of the 15 RESERVED DPs physically exist — evidence we cannot get
+// any other way while the supplier's payload layouts are missing (ozkey-42).
+//
+// We only OBSERVE. A DP the MCU reports but our profile lacks is logged, never
+// adopted: the profile is a build-time decision and the far end of the UART
+// does not get a vote (XF-118 §4).
+static uint8_t g_dpSeen[32];      // bitmap, DP 0..255 — one bit per DP
+static bool g_dpListAsked = false;
+static unsigned long g_dpListAskedAt = 0;
+static bool g_dpListReported = false;
+// Census ends after this much SILENCE from the MCU, not this long after the
+// query — see the census branch in handleMcuFrame().
+#define OZ_DPQ_IDLE_MS 2500UL
+
+static void ozNoteDpSeen(uint8_t dp) { g_dpSeen[dp >> 3] |= (uint8_t)(1u << (dp & 7)); }
+static bool ozDpWasSeen(uint8_t dp) { return (g_dpSeen[dp >> 3] >> (dp & 7)) & 1u; }
+
+static void ozAskMcuDpList() {
+  // 55 AA 00 08 00 00 07 — checksum 0x07 over the six preceding bytes.
+  const uint8_t f[7] = {0x55, 0xAA, 0x00, 0x08, 0x00, 0x00, 0x07};
+  Serial.println("[DPQ] asking the MCU which DPs it has (0x08)");
+  tuyaWireSend(f, sizeof(f));
+  g_dpListAsked = true;
+  g_dpListAskedAt = millis();
+}
+
+/** Compare what the MCU reported against the profile we were built with. */
+static void ozReportDpListComparison() {
+  const OzProfile *p = ozProfile();
+  uint8_t missing = 0, extra = 0;
+  Serial.printf("[DPQ] MCU DP list vs profile '%s':\n", p->id);
+  for (uint16_t i = 0; i < p->count; i++) {
+    const uint8_t dp = (uint8_t)p->entries[i].dp;
+    if (!ozDpWasSeen(dp)) {
+      // Only meaningful for DPs the MCU would volunteer. A command-only DP is
+      // not expected in a status dump, so this is a hint, not a verdict.
+      Serial.printf("[DPQ]   profile has DP %-3u (%s) — MCU did not report it\n",
+                    dp, p->entries[i].name);
+      missing++;
+    }
+  }
+  for (uint16_t dp = 0; dp < 256; dp++) {
+    if (ozDpWasSeen((uint8_t)dp) && !ozDpFind((uint8_t)dp)) {
+      Serial.printf("[DPQ]   🔴 MCU reports DP %-3u which this profile does NOT "
+                    "have — logged, NOT adopted\n", (unsigned)dp);
+      extra++;
+    }
+  }
+  Serial.printf("[DPQ] %u profile DPs unreported, %u MCU DPs unknown to us\n",
+                (unsigned)missing, (unsigned)extra);
+  if (extra) g_profileMismatch = true; // the hardware is not what we built for
 }
 // Set when the CURRENT window was opened by the doorbell. closeBleWindow()'s
 // argument is the reason it CLOSED ("30s elapsed"), not what opened it, so the
@@ -1066,6 +1144,13 @@ static const char *ozEvtVerbFor(const char *result) {
       !strcmp(result, "expired"))
     return "event.access";
   if (!strcmp(result, "battery_alarm")) return "event.battery";
+  // XF-118 P4 — DP 53. The catalogue has declared `verb: event.doorbell` for
+  // this DP since rev 1; firmware published it as a bare `publishLog("doorbell")`
+  // which fell through to `event.device` below, so the app received a generic
+  // device line for the one event a visitor actually generates. The DP was
+  // handled correctly all along — only its verb was wrong, which is the kind of
+  // mismatch that looks like a missing feature from the consumer's end.
+  if (!strcmp(result, "doorbell")) return "event.doorbell";
   // Roster changes are in-lock facts, not door events, but they belong in the
   // audit trail: "who was allowed to open this door, and when did that change"
   // is exactly the question an owner asks of a log.
@@ -2240,6 +2325,42 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
     g_ackSeen = true;
   }
 
+  // 0x08 census — record every DP the MCU has ever reported, whether or not we
+  // asked for it. Cheap (a 32-byte bitmap) and it is the only evidence we have
+  // of what this hardware ACTUALLY implements, as opposed to what its PID
+  // claims or what our build assumed. See ozAskMcuDpList().
+  if (ozIsInboundDp(f, n)) ozNoteDpSeen(f[6]);
+
+  // 🔴 A CENSUS REPLY IS STATE, NOT AN EVENT (found on the bench 2026-08-20).
+  //
+  // Tuya's 0x08 makes the MCU report the CURRENT VALUE of every DP it has. Those
+  // arrive as ordinary 0x07 frames — indistinguishable, byte for byte, from a
+  // real event. On the first live run firmware dutifully treated them as
+  // things that had just happened: DP 53 latched `has_doorbell` and OPENED THE
+  // BLE PAIRING WINDOW, and DP 63/64/76 would have been published as fresh
+  // access events, writing phantom unlocks into the audit log.
+  //
+  // Asking a lock what it can do must never make it behave as though all of it
+  // just happened. In production this would open the radio on every MCU
+  // reconnect — a security-relevant side effect of a diagnostic.
+  //
+  // So: during the census window we COUNT the DP and drop the frame. The
+  // window is short and self-limiting, and anything genuinely urgent will be
+  // re-reported by the MCU when it actually occurs.
+  if (g_dpListAsked && !g_dpListReported && ozIsInboundDp(f, n)) {
+    // The window ends on SILENCE, not on a fixed timer from the query. Tuya
+    // lets the MCU answer "at one time or several times" and says nothing
+    // about pacing; LockSim spreads 34 DPs over ~7 s. A fixed 3 s window
+    // closed mid-census and the remainder were processed as live events —
+    // exactly the bug this block exists to prevent, just later. Each reply
+    // pushes the deadline out, so the census lasts as long as the MCU keeps
+    // talking and no longer.
+    g_dpListAskedAt = millis();
+    Serial.printf("[DPQ] census: DP %u present (state, not an event)\n",
+                  (unsigned)f[6]);
+    return;
+  }
+
   mcuRxFrames++;
   lastMcuFrameAt = millis();
   lastActivityAt = millis();
@@ -2269,29 +2390,98 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       Serial.printf("[PID] 0x01 reply is not JSON: %s\n", body.c_str());
       return;
     }
-    cfgMcuPid = String((const char *)(pd["p"] | ""));
+    const String newPid = String((const char *)(pd["p"] | ""));
+
+    // ── 🔴 ONE IDENTITY PER BOOT (2026-08-20) ───────────────────────────────
+    //
+    // This handler accepts ANY inbound 0x01, solicited or not, because a real
+    // MCU may volunteer its product info. That is fine the FIRST time. It is
+    // not fine on the second, because it silently rewrites this lock's entire
+    // DP map mid-session.
+    //
+    // Observed on the bench: firmware went ozsim-fullfeature -> tuya-ds013-t3
+    // -> back to ozsim-fullfeature while the simulator's UI never moved, so the
+    // lock was interpreting every DP under a map for a product that was not
+    // attached, and nothing anywhere reported the disagreement. The operator
+    // then issued a PIN that vanished without an error at either end
+    // (ozkey-42 §2.4, XF-118).
+    //
+    // A lock is ONE product. If the MCU's answer changes, either the hardware
+    // was swapped — which needs a reboot anyway — or something is lying. Both
+    // are better served by refusing and saying so than by quietly adopting it:
+    // an inconsistent identity must be LOUD, because every DP decision after it
+    // depends on which answer we believed.
+    if (g_pidLatched && newPid != cfgMcuPid) {
+      Serial.printf("[PID] 🔴 CONFLICT — MCU now says '%s' but this boot "
+                    "latched '%s'. IGNORING the new answer and staying on "
+                    "profile '%s'. Reboot the lock to re-identify.\n",
+                    newPid.c_str(), cfgMcuPid.c_str(), ozProfileId());
+      return;
+    }
+
+    cfgMcuPid = newPid;
     cfgMcuVer = String((const char *)(pd["v"] | ""));
+    g_pidLatched = true;
     g_pidAsks = OZ_PID_MAX_ASKS; // answered — stop asking
     Serial.printf("[PID] MCU reports pid='%s' mcu_fw='%s'\n",
                   cfgMcuPid.c_str(), cfgMcuVer.c_str());
 
     const OzProfile *p = ozProfileByTuyaPid(cfgMcuPid.c_str());
     if (!p) {
-      // The safe outcome. An unknown product is exactly the one not to
-      // improvise a DP map for.
-      Serial.printf("[PID] no profile for '%s' — KEEPING '%s'. Add it to "
-                    "profiles/products/ before trusting this lock's DP map.\n",
-                    cfgMcuPid.c_str(), ozProfileId());
+      // ── UNKNOWN PRODUCT (PM directive 2026-08-20, task 3) ─────────────────
+      //
+      // An UNPINNED build has expressed no opinion, and its compiled-in default
+      // is `ozkie-legacy-v0` — our INVENTED map. Staying there means a lock we
+      // have never seen speaks DP 1, 21, 23: numbers no real Tuya product
+      // implements, which is how an unknown lock ends up silently doing
+      // nothing (or worse, writing a PIN onto its volume control).
+      //
+      // `tuya-generic-lock` is the honest answer for an unidentified lock: 34
+      // REAL catalogue DPs, with the 15 undocumented ones marked RESERVED so a
+      // verb resolves to "known DP, payload not supplied" rather than to
+      // fiction. Better to refuse accurately than to act on an invented map.
+      //
+      // A PINNED build never moves. Someone decided what hardware this is at
+      // build time, and an unknown PID does not overrule them — it is reported
+      // and ignored, exactly like the mismatch case below.
+      if (!OZ_PROFILE_PINNED && ozProfileSelect("tuya-generic-lock")) {
+        Serial.printf("[PID] unknown product '%s' and this build is NOT pinned "
+                      "— falling back to '%s' (real DPs) instead of the "
+                      "invented map. Pin with PROFILE= if you know the "
+                      "hardware.\n",
+                      cfgMcuPid.c_str(), ozProfileId());
+        g_profileMismatch = true; // visible on the heartbeat; we are guessing
+      } else {
+        Serial.printf("[PID] no profile for '%s' — KEEPING '%s'. Add it to "
+                      "profiles/products/ before trusting this lock's DP map.\n",
+                      cfgMcuPid.c_str(), ozProfileId());
+      }
     } else if (strcmp(p->id, ozProfileId()) == 0) {
-      Serial.printf("[PID] profile '%s' already active — confirmed by the MCU\n",
-                    p->id);
+      Serial.printf("[PID] profile '%s' confirmed by the MCU — build and "
+                    "hardware agree\n", p->id);
     } else {
-      Serial.printf("[PID] 🔴 profile '%s' -> '%s' (the MCU says so; we were "
-                    "running a default)\n", ozProfileId(), p->id);
-      ozProfileSelect(p->id);
-      prefs.begin("blelock", false);
-      prefs.putString("prof", p->id);
-      prefs.end();
+      // ── 🔴 CONFIRM, NEVER ADOPT (operator, 2026-08-20) ────────────────────
+      //
+      // This used to call ozProfileSelect(p->id) and persist it, so the MCU
+      // could rewrite this lock's entire DP map at runtime. The DP map is now
+      // a BUILD-TIME decision (see OZ_PROFILE_BUILD in ozprofile.h) and this
+      // is only a cross-check.
+      //
+      // A mismatch is a REAL and serious condition — this firmware was built
+      // for one product and is installed against another — so it is reported
+      // as loudly as we can and changes nothing. Adopting would "fix" the
+      // symptom by making the lock run a map its build was never tested
+      // against, which is how the bench spent 2026-08-20 chasing a PIN that
+      // silently vanished (ozkey-42 §2.4).
+      //
+      // The fix for a genuine mismatch is to rebuild with the right
+      // OZ_PROFILE_BUILD, not to let the far end of a UART decide.
+      Serial.printf("[PID] 🔴 MISMATCH — MCU reports '%s' (profile '%s') but "
+                    "this build is pinned to '%s'. KEEPING '%s'. Rebuild with "
+                    "PROFILE=%s if this hardware is correct.\n",
+                    cfgMcuPid.c_str(), p->id, ozProfileId(), ozProfileId(),
+                    p->id);
+      g_profileMismatch = true; // surfaced on the heartbeat — see below
     }
     // Persist the PID ITSELF, not just the profile it selected. Without this
     // the lock boots on the right DP map while reporting no identity at all —
@@ -2751,7 +2941,14 @@ void publishHeartbeat() {
   // re-enroll (a re-provision of an already-enrolled lock does not), and this is
   // the only message a lock in service sends unprompted — so it is the only
   // thing that can make a stale server row self-heal within one interval.
-  addIdentity(doc);
+  //
+  // `full=false`: the coarse `caps` summary rides every heartbeat because it is
+  // small and self-healing, but the detailed `verbs` list does NOT. Capability
+  // is discovered once at pairing and stored by the app (operator, 2026-08-20);
+  // re-sending the whole list every interval spends airtime restating something
+  // that cannot change without a reflash. If it DOES change, `profile_mismatch`
+  // below is the signal that the app's stored copy is stale.
+  addIdentity(doc, false);
   String out; serializeJson(doc, out);
   mqtt.publish(topicHeartbeat.c_str(), out.c_str());
 }
@@ -2770,7 +2967,7 @@ void publishHeartbeat() {
 // deliver — the lock knows it is on Thread but cannot know its bridge is alive.
 // The server intersects this with its own bridge binding (effectiveCaps), so
 // neither side can over-promise alone.
-static void addIdentity(JsonDocument &doc) {
+static void addIdentity(JsonDocument &doc, bool full) {
   doc["transport"] = cfgTransport;
   JsonArray caps = doc["caps"].to<JsonArray>();
   // Wi-Fi/economy locks sleep and wake on the heartbeat interval, so they cannot
@@ -2785,10 +2982,54 @@ static void addIdentity(JsonDocument &doc) {
   // weaker promise (someone must be at the door) and an app that could not tell
   // them apart would offer "unlock remotely" on a lock that only opens when
   // somebody is standing at it.
-  if (isThread()) caps.add("remote_unlock");
-  else caps.add("assisted_unlock");
-  caps.add("pin_sync");
+  // ── 🔴 CAPABILITY IS NOW RESOLVED, NOT ASSERTED (operator, 2026-08-20) ────
+  //
+  // `pin_sync` used to be added unconditionally. On a real supplier profile the
+  // credential DPs are RESERVED — the payload layout has never been supplied —
+  // so the lock was telling the app "I can store PINs" about a lock that
+  // physically cannot. The app then issued one, everything reported success,
+  // and it vanished (ozkey-42 §2.4).
+  //
+  // A capability is a PROMISE. It must be derived from whether the verb
+  // actually resolves to a usable DP on this product, not from what tier of
+  // lock we think this is. The transport still decides WHICH unlock we can
+  // offer — an economy Wi-Fi lock sleeps and cannot promise "open now" — but it
+  // no longer decides WHETHER we can unlock at all.
+  const bool canUnlock = ozVerbUsable(ozResolveVerb("lock.unlock", nullptr, OZ_DIR_DOWN));
+  const bool canPin    = ozVerbUsable(ozResolveVerb("cred.put", "pin", OZ_DIR_DOWN));
+  const bool canRfid   = ozVerbUsable(ozResolveVerb("cred.put", "rfid", OZ_DIR_DOWN));
+
+  if (canUnlock) caps.add(isThread() ? "remote_unlock" : "assisted_unlock");
+  if (canPin) caps.add("pin_sync");
+  if (canRfid) caps.add("rfid_sync");
+  // Ours, not the MCU's: the txlog is written by this firmware and does not
+  // depend on any DP being implemented.
   caps.add("audit");
+
+  // The explicit verb list the app asked for. `caps` is a coarse product-tier
+  // summary and several consumers already branch on it; this is the precise
+  // answer — every OZKIE verb this lock can actually carry out, so the app can
+  // disable what it cannot do rather than sending a command nobody understands.
+  //
+  // Derived from the profile, which is build-time truth. The 0x08 census
+  // refines it: a DP the MCU never reports sets `profile_mismatch`, and the
+  // operator can then see that the promise and the hardware disagree.
+  if (!full) return; // heartbeat: coarse caps only — see publishHeartbeat()
+  JsonArray verbs = doc["verbs"].to<JsonArray>();
+  static const char *const kProbe[][2] = {
+      {"lock.unlock", nullptr},     {"cred.put", "pin"},
+      {"cred.put", "rfid"},         {"cred.delete", "pin"},
+      {"cred.delete", "rfid"},      {"cred.sync", nullptr},
+      {"lock.settings.set", "autolock"}, {"lock.settings.set", "volume"},
+  };
+  for (const auto &pr : kProbe) {
+    const OzVerbMap *m = ozResolveVerb(pr[0], pr[1], OZ_DIR_DOWN);
+    if (!ozVerbUsable(m)) continue;
+    JsonObject v = verbs.add<JsonObject>();
+    v["verb"] = pr[0];
+    if (pr[1]) v["field"] = pr[1];
+    v["dp"] = m->dp;
+  }
 }
 
 void publishEnroll() {
@@ -2796,7 +3037,10 @@ void publishEnroll() {
   doc["device_id"] = deviceId;
   doc["mac"] = macStr;
   doc["fw"] = FW_VERSION;
-  addIdentity(doc);
+  // `full=true`: enrolment IS pairing, and it is the moment the app learns what
+  // this lock can and cannot do. Everything the app needs to disable an
+  // unsupported action goes here, once.
+  addIdentity(doc, true);
   if (cfgName.length()) doc["name"] = cfgName;
   String out; serializeJson(doc, out);
   mqtt.publish(topicEnroll.c_str(), out.c_str());
@@ -5946,28 +6190,120 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
     // intent outright: "To enable Bluetooth lock control when the device is
     // offline, select DP76 - unlock_ble."
     //
-    // 🔴 GATED ON viaBle, and that is the whole point. DP 76 asserts HOW the
-    // door was opened, and a lock's audit trail must not claim Bluetooth for a
-    // command that arrived over MQTT or Thread. There is no real equivalent
-    // for the network path — DP 10 is supplier-blocked and DP 72 is an
-    // event.access REPORT, not a command — so network unlock stays on fiction
-    // DP 1 until the supplier answers. See ozkey-39 §3.5, XF-110 §10.
+    // 🔴 NO LONGER GATED ON viaBle — operator's call, 2026-08-20.
+    //
+    // It used to be `viaBle && ozDpFind(76)`, so a network unlock fell through
+    // to fiction DP 1. The reasoning was audit honesty: DP 76 asserts the door
+    // was opened over Bluetooth, and a lock's record should not claim BLE for a
+    // command that arrived over Thread.
+    //
+    // That reasoning was right about the audit and wrong about the priority.
+    // Measured on the bench today: with a REAL supplier profile
+    // (`tuya-ds013-t3`) loaded, DP 1 is not in the product at all, so a network
+    // unlock is silently discarded — server reports `delivered`, app reports
+    // success, door stays shut. We were protecting the accuracy of a log entry
+    // for an event that could no longer happen.
+    //
+    // 🔴 THE TRANSPORT WAS NEVER THE PROBLEM. The door opens on the last hop —
+    // module -> DL-MCU over the Tuya UART — and BLE/Thread/MQTT only decide how
+    // the request reached US. Making the DP depend on the transport was our own
+    // invention; the supplier's table says DP 76 is issuable by the module and
+    // says nothing about how the request arrived. DP 10 `remote_unlock` is the
+    // nominal network equivalent and is unimplementable (`0x00-0xff`, no
+    // layout — ozkey-42 §2.2).
+    //
+    // WHAT WE GIVE UP: the MCU's OWN access record may now say "ble" for a
+    // network-originated unlock. We keep the truth where it matters — our
+    // txlog and `event.access` record the real actor, bond slot and transport,
+    // and those are the records the app and server actually read. The MCU's
+    // internal log is one we neither own nor consume.
+    //
+    // 🔴 RESOLVED FROM DATA, NOT BRANCHED IN C (PM directive 2026-08-20).
+    //
+    // This used to be `if (ozDpFind(76)) dp = 76; else dp = 1;` — two DP
+    // numbers compiled into logic. A supplier whose unlock DP was neither would
+    // have needed a firmware change, which made "profile-driven" aspirational,
+    // and it is how DP 1 survived long enough to reach real hardware.
+    //
+    // No field is named, so the resolver returns the best-status candidate for
+    // `lock.unlock`: DP 76 on a real profile, DP 10 never (RESERVED, sorted
+    // after), DP 1 on the legacy map where it is genuinely correct.
     //
     // cred_id = the bond slot that authorised it, so the MCU's own access
     // record names WHICH credential opened the door. DP 1 could never say.
-    if (viaBle && ozDpFind(76) != nullptr) {
+    const OzVerbMap *m = ozResolveVerb("lock.unlock", nullptr, OZ_DIR_DOWN);
+    if (!m) {
+      // This product has no unlock command at all. Say so — never substitute
+      // something that looks close, which is precisely how DP 1 happened.
+      Serial.printf("[OZKIE] unlock: profile '%s' has no lock.unlock command "
+                    "— refusing\n", ozProfileId());
+      ozReportOutcome(slot, "UNLOCK_UNSUPPORTED",
+                      String("profile ") + ozProfileId() + " has no unlock DP");
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    if (!ozVerbUsable(m)) {
+      // Known DP, unusable payload — DP 10's layout was never supplied. That is
+      // a different answer from "unknown", and the app deserves to hear which.
+      Serial.printf("[OZKIE] unlock: DP %u is not usable (status %u) on '%s' "
+                    "— refusing\n", (unsigned)m->dp, (unsigned)m->status,
+                    ozProfileId());
+      ozReportOutcome(slot, "UNLOCK_UNSUPPORTED",
+                      String("DP ") + m->dp + " payload layout not supplied");
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    dp = m->dp;
+    type = m->type;
+    if (type == 0x02 /* VALUE */) {
       const uint32_t credId = (uint32_t)slot;
-      dp = 76; type = 0x02 /* VALUE */;
       val[0] = (uint8_t)(credId >> 24); val[1] = (uint8_t)(credId >> 16);
       val[2] = (uint8_t)(credId >> 8);  val[3] = (uint8_t)(credId & 0xFF);
       vlen = 4;
     } else {
-      dp = 1; type = 0x01 /* BOOL */; val[0] = 0x01; vlen = 1;
+      // BOOL — the legacy map's DP 1, whose value is simply "open". `dp` and
+      // `type` already came from the resolver; do NOT reassign them here, or
+      // the table stops being the source of truth for the one case it still
+      // governs.
+      val[0] = 0x01; vlen = 1;
     }
   } else if (strcmp(kind, "grant_pin") == 0 || strcmp(kind, "grant_rfid") == 0) {
-    dp = (strcmp(kind, "grant_pin") == 0) ? 21 : 23;
-    type = 0x00 /* RAW */;
-    vlen = ozSemGrantValue(doc, strcmp(kind, "grant_pin") == 0, val, sizeof(val));
+    // 🔴 RESOLVED, NOT HARDCODED — and this one is a safety fix, not tidiness.
+    //
+    // This used to be `dp = grant_pin ? 21 : 23`, unconditionally. On the real
+    // supplier map DP 21 is `navigation_volume` and DP 23 is `auto_lock`, and
+    // both ARE selected by the profile — so nothing rejected them. Issuing a
+    // PIN against a real DS013-T3 wrote the credential onto the VOLUME
+    // CONTROL, with both ends reporting success (ozkey-42 §2.4.1, demonstrated
+    // on the bench 2026-08-20).
+    //
+    // The resolver returns the real credential DPs (16 for a PIN, 13 for RFID),
+    // both RESERVED because the supplier has never supplied their payload
+    // layout — so the grant is now REFUSED with a reason instead of silently
+    // misfiring. Refusing is the correct behaviour until ozkey-42 P0 lands.
+    const bool isPin = (strcmp(kind, "grant_pin") == 0);
+    const OzVerbMap *g = ozResolveVerb("cred.put", isPin ? "pin" : "rfid",
+                                       OZ_DIR_DOWN);
+    if (!g) {
+      Serial.printf("[OZKIE] %s: profile '%s' has no cred.put — refusing\n",
+                    kind, ozProfileId());
+      ozReportOutcome(slot, "CRED_UNSUPPORTED",
+                      String("profile ") + ozProfileId() + " cannot store credentials");
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    if (!ozVerbUsable(g)) {
+      Serial.printf("[OZKIE] %s: DP %u payload layout not supplied "
+                    "(ozkey-42 P0) — refusing rather than misfiring\n",
+                    kind, (unsigned)g->dp);
+      ozReportOutcome(slot, "CRED_UNSUPPORTED",
+                      String("DP ") + g->dp + " payload layout not supplied");
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    dp = g->dp;
+    type = g->type;
+    vlen = ozSemGrantValue(doc, isPin, val, sizeof(val));
     if (vlen == 0) {
       Serial.printf("[OZKIE] %s: bad or missing slot/cred/from/to\n", kind);
       notifyStatus("UNLOCK_DENIED");
@@ -6030,10 +6366,22 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
     return;
   }
 
-  publishLog("granted", slot == 0
-                            ? (dp == 1 ? "OZKIE unlock (owner)" : "OZKIE credential (owner)")
-                            : "OZKIE unlock (member)",
-             slot);
+  // 🔴 `isUnlock`, NOT `dp == 1` (2026-08-20). The old test was the same trap
+  // this function's own header warns about 20 lines up: it read correctly only
+  // while unlock WAS DP 1. Now that an unlock on a real profile is DP 76, that
+  // test would have logged every owner unlock as "credential" — a mislabelled
+  // audit line, which is worse than a missing one because it is believed.
+  //
+  // `via` is recorded because we no longer choose the DP by transport: DP 76
+  // asserts "opened over BLE" to the MCU whatever the truth was, so OUR record
+  // is now the only place the real transport survives. This is the log the app
+  // and server actually read; the MCU's internal one we neither own nor
+  // consume. See the DP-selection note above.
+  char gdetail[72];
+  snprintf(gdetail, sizeof(gdetail), "OZKIE %s (%s, via %s)",
+           isUnlock ? "unlock" : "credential", slot == 0 ? "owner" : "member",
+           viaBle ? "ble" : "net");
+  publishLog("granted", gdetail, slot);
   notifyStatus("UNLOCK_OK");
 }
 
@@ -7084,6 +7432,23 @@ void setup() {
   Serial.printf("[BOOT] reset reason: %s (%d)\n", rrName, (int)rr);
 
   // Tuya MCU bus → LockSim Mode B (raw 55 AA frames, wire-tested 2026-07-19)
+  // 🔴 RX BUFFER BEFORE begin() — the 0x08 census overflows the default.
+  //
+  // Measured on the bench 2026-08-20: LockSim answered a status query with all
+  // 34 DPs of `tuya-ds013-t3` in one burst — its console confirmed "reported 34
+  // DPs" — and firmware recorded only 8. The other 26 frames were dropped in
+  // the UART driver, silently, before any of our code saw them.
+  //
+  // 34 frames x ~12 bytes = ~408 bytes, against the ESP32's default 256-byte
+  // RX ring. A real MCU answering 0x08 will burst exactly the same way — Tuya
+  // explicitly allows "all at one time" — so this is not a simulator artefact.
+  //
+  // The failure mode is the dangerous kind: a partial census looks like a
+  // successful one. Firmware would have concluded the hardware lacks DP 76 and
+  // refused to unlock, blaming the lock for our own dropped bytes.
+  //
+  // Must precede begin(); setRxBufferSize() is ignored once the driver is up.
+  Serial1.setRxBufferSize(2048);
   Serial1.begin(9600, SERIAL_8N1, TUYA_RX_PIN, TUYA_TX_PIN);
   Serial.println("[TUYA] Serial1 up @ 9600 8N1 GPIO16(TX)/GPIO17(RX)");
   bootMark("banner + profile + tuya wire");
@@ -7354,6 +7719,47 @@ void loop() {
         Serial.println("[PID] MCU never answered 0x01 — staying on the "
                        "compiled-in profile. It may predate product info.");
     }
+
+    // ── 0x08 DP census, once, after identity has settled ──────────────────
+    //
+    // Ordered AFTER 0x01 deliberately: the answer is only interesting once we
+    // know which profile we are comparing against, and asking both at once
+    // makes the two conversations interleave on one UART for no gain.
+    //
+    // Fire-and-forget with a settle window rather than a reply count, because
+    // the MCU may answer as one grouped 0x07 or as N separate ones and the
+    // protocol does not say which — so counting replies would be guessing.
+    // 🔴 RE-ASK WHEN THE MCU COMES BACK. Tuya specifies the status query is
+    // sent at TWO points: first power-on, AND whenever the module detects the
+    // MCU has rebooted or gone offline and returned. A first version of this
+    // asked once per boot, which would have missed exactly the case that
+    // matters on a bench — the MCU being re-plugged, or LockSim reconnecting
+    // its Web Serial — and left the census describing a device that had since
+    // been swapped.
+    static bool lastMcuUp = false;
+    const bool up = mcuLinkUp();
+    if (up && !lastMcuUp && g_dpListAsked) {
+      Serial.println("[DPQ] MCU link returned — re-querying its DP list");
+      memset(g_dpSeen, 0, sizeof(g_dpSeen)); // stale census describes the OLD device
+      g_dpListAsked = false;
+      g_dpListReported = false;
+    }
+    lastMcuUp = up;
+
+    // 🔴 NOT gated on g_pidLatched. A first version was, on the reasoning that
+    // the census is "only interesting once we know which profile to compare
+    // against" — which is wrong twice. The profile is pinned at BUILD time, so
+    // we always know it; and an MCU that never answers 0x01 (an older one, or a
+    // simulator that stays silent) would then never be asked 0x08 either,
+    // losing the more valuable of the two answers. Identity and capability are
+    // independent questions and neither should gate the other.
+    if (!g_dpListAsked && up) {
+      ozAskMcuDpList();
+    } else if (g_dpListAsked && !g_dpListReported &&
+               millis() - g_dpListAskedAt > OZ_DPQ_IDLE_MS) {
+      g_dpListReported = true;
+      ozReportDpListComparison();
+    }
   }
 
   // ── WiFi progress (Wi-Fi transport only) ─────────────────────────────────
@@ -7526,6 +7932,7 @@ void loop() {
     // unprompted, so the app can learn a lock's identity without anyone standing
     // at it. Same argument the `name` field above is here for.
     if (cfgMcuPid.length()) hb["tuya_pid"] = cfgMcuPid;
+    if (g_profileMismatch) hb["profile_mismatch"] = true;
     // Which DP map this lock is ACTUALLY running. Fleet-visible so a lock
     // still on the invented default is findable without a BLE session.
     hb["profile"] = ozProfileId();

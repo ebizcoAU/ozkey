@@ -48,6 +48,11 @@ FQBN_19      := esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=default_8MB,CDC
 # is exactly right and nothing is wasted.
 FQBN_GEEKC6  := esp32:esp32:esp32c6:FlashSize=16M,PartitionScheme=custom,CDCOnBoot=cdc
 FQBN_dlock19 := esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=cdc
+# SIMLOCK — ozkit's N8 test-master (bare ESP32-C6-DevKitC-1-N8, 8MB flash,
+# same part class as 147/19/dlock19). No LCD/touch, so no peripheral
+# conflicts; CDCOnBoot=cdc still required for native-USB serial to work at
+# all, same reason as every other board here.
+FQBN_SIMLOCK := esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=cdc
 # P4C6COMBO — reserved slot, NOT configured yet. The ESP32-P4 uses a
 # different Arduino core (esp32:esp32:esp32p4, not esp32c6) and this board's
 # actual flash/PSRAM/partition options aren't known without real hardware in
@@ -59,29 +64,55 @@ SKETCH_147     := doorlock
 SKETCH_19      := doorlock19
 SKETCH_GEEKC6  := bridge32
 SKETCH_dlock19 := dlock19
+SKETCH_SIMLOCK := simlock
 
 FQBN   := $(FQBN_$(BOARD))
 SKETCH := $(SKETCH_$(BOARD))
 
+# ── PROFILE — which DP map this BUILD speaks (operator, 2026-08-20) ──────────
+#
+# A lock is manufactured against ONE DL-MCU, so which DP list it speaks is a
+# fact about the hardware in the door and belongs in the build, not in a
+# runtime negotiation with whatever is on the far end of the UART. Firmware
+# used to adopt whatever the MCU's 0x01 reply claimed; on the bench that meant
+# it silently switched maps mid-session and read every DP under a profile for a
+# product that was not attached.
+#
+#   make flash BOARD=19 PORT=... PROFILE=tuya-ds013-t3
+#
+# Omit it and the build keeps OZ_PROFILE_DEFAULT_ID (ozkie-legacy-v0), which is
+# the historical behaviour. The id must match a profiles/products/*.json
+# profile_id — a typo is caught at boot with a loud [PROFILE] line, not
+# silently ignored.
+#
+# Valid ids: ozkie-legacy-v0  tuya-generic-lock  tuya-ds013-t3
+#            tuya-t3-videolock  ozsim-fullfeature
+PROFILE ?=
+ifneq ($(PROFILE),)
+PROFILE_FLAGS := --build-property "compiler.cpp.extra_flags=-DOZ_PROFILE_BUILD=\"$(PROFILE)\" -DOZ_PROFILE_PINNED=1"
+else
+PROFILE_FLAGS :=
+endif
+
 .PHONY: help compile flash monitor list-ports
 
 help:
-	@echo "Boards: 147  19  GEEKC6  dlock19  (P4C6COMBO reserved, not configured yet)"
-	@echo "  make compile BOARD=<board>"
+	@echo "Boards: 147  19  GEEKC6  dlock19  SIMLOCK  (P4C6COMBO reserved, not configured yet)"
+	@echo "  make compile BOARD=<board> [PROFILE=<dp-map>]"
 	@echo "  make flash   BOARD=<board> PORT=/dev/cu.usbmodemXXXX"
 	@echo "  make monitor PORT=/dev/cu.usbmodemXXXX"
 	@echo "  make list-ports"
 
 compile:
-	@test -n "$(BOARD)" || { echo "BOARD is required — one of: 147, 19, GEEKC6, dlock19"; exit 1; }
-	@test -n "$(FQBN)"  || { echo "unknown/unconfigured BOARD '$(BOARD)' — one of: 147, 19, GEEKC6, dlock19 (P4C6COMBO reserved, not configured yet)"; exit 1; }
-	$(ARDUINO_CLI) compile --fqbn "$(FQBN)" $(SKETCH)
+	@test -n "$(BOARD)" || { echo "BOARD is required — one of: 147, 19, GEEKC6, dlock19, SIMLOCK"; exit 1; }
+	@test -n "$(FQBN)"  || { echo "unknown/unconfigured BOARD '$(BOARD)' — one of: 147, 19, GEEKC6, dlock19, SIMLOCK (P4C6COMBO reserved, not configured yet)"; exit 1; }
+	$(ARDUINO_CLI) compile $(PROFILE_FLAGS) --fqbn "$(FQBN)" $(SKETCH)
 
 flash:
-	@test -n "$(BOARD)" || { echo "BOARD is required — one of: 147, 19, GEEKC6, dlock19"; exit 1; }
-	@test -n "$(FQBN)"  || { echo "unknown/unconfigured BOARD '$(BOARD)' — one of: 147, 19, GEEKC6, dlock19 (P4C6COMBO reserved, not configured yet)"; exit 1; }
+	@test -n "$(BOARD)" || { echo "BOARD is required — one of: 147, 19, GEEKC6, dlock19, SIMLOCK"; exit 1; }
+	@test -n "$(FQBN)"  || { echo "unknown/unconfigured BOARD '$(BOARD)' — one of: 147, 19, GEEKC6, dlock19, SIMLOCK (P4C6COMBO reserved, not configured yet)"; exit 1; }
 	@test -n "$(PORT)"  || { echo "PORT is required — e.g. PORT=/dev/cu.usbmodem14101 (see: make list-ports)"; exit 1; }
-	$(ARDUINO_CLI) compile --upload -p "$(PORT)" --fqbn "$(FQBN)" $(SKETCH)
+	$(ARDUINO_CLI) compile $(PROFILE_FLAGS) --upload -p "$(PORT)" --fqbn "$(FQBN)" $(SKETCH)
 
 monitor:
 	@test -n "$(PORT)" || { echo "PORT is required — see: make list-ports"; exit 1; }

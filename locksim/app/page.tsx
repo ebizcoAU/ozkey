@@ -5,7 +5,10 @@ import type { ByteArray, TuyaFrame } from "@/lib/tuya";
 import { fromHexString } from "@/lib/tuya";
 import { LOCKSIM_VERSION } from "@/lib/version";
 import ProfileSelector from "@/components/ProfileSelector";
-import { DEFAULT_PROFILE_ID, getProfile } from "@/lib/profileRegistry";
+import { DEFAULT_PROFILE_ID, PROFILE_IDS, getProfile } from "@/lib/profileRegistry";
+
+/** Where the chosen DP profile is remembered across a browser refresh. */
+const PROFILE_STORAGE_KEY = "locksim.profileId";
 import { useTuyaProtocol, type HardwareMode } from "@/hooks/useTuyaProtocol";
 import { useLockState } from "@/hooks/useLockState";
 import { useVirtualClock } from "@/hooks/useVirtualClock";
@@ -99,8 +102,39 @@ export default function Page() {
   // `ozkie-legacy-v0` — our invented map — because that is what doorlock-1.58
   // ships and what the current BANOI build constructs frames against, so it is
   // the profile under which this bench currently tells the truth.
+  // 🔴 STICKY ACROSS REFRESH (operator, 2026-08-20). This used to reset to
+  // DEFAULT_PROFILE_ID on every page load, and the default is the INVENTED map
+  // — so every browser refresh silently put the bench back on fiction, with
+  // nothing to say it had. It cost most of a bench session: firmware kept
+  // reporting a DP census full of legacy DPs while the operator believed
+  // LockSim was running the real supplier profile, and each round of
+  // "reconnect and try again" quietly reverted it once more.
+  //
+  // A simulator that forgets which product it is pretending to be is worse than
+  // one with no profiles at all, because the mismatch looks like a firmware bug.
   const [profileId, setProfileId] = useState<string>(DEFAULT_PROFILE_ID);
+  // Restored in an effect rather than in useState's initialiser: this renders on
+  // the server too, where `window` does not exist, and a value that differs
+  // between server and first client render is a hydration mismatch.
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(PROFILE_STORAGE_KEY);
+      if (saved && PROFILE_IDS.includes(saved)) setProfileId(saved);
+    } catch {
+      /* private mode / storage disabled — fall back to the default */
+    }
+  }, []);
   const profile = getProfile(profileId);
+
+  /** Change the profile AND remember it, so a refresh does not undo the choice. */
+  const chooseProfile = useCallback((id: string) => {
+    setProfileId(id);
+    try {
+      window.localStorage.setItem(PROFILE_STORAGE_KEY, id);
+    } catch {
+      /* not fatal: the session still works, it just will not be remembered */
+    }
+  }, []);
 
   const protocol = useTuyaProtocol({
     onFrame,
@@ -204,6 +238,8 @@ export default function Page() {
     // apart. Undefined (no `supplier.pid`) falls back to the fictional
     // OZSIM_PID — see useLockState's `tuyaPid`.
     tuyaPid: profile.tuya_pid,
+    // XF-118 P1c — LockSim emits only DPs this product selects.
+    profile,
     // ozkey-21 — Mode A: LockSim is emulating the missing Wi-Fi module too, so
     // it answers the MCU's time request like a real Tuya module would.
     // Mode B: null, because the module is a physical ESP32 and whether it
@@ -474,7 +510,7 @@ export default function Page() {
               </p>
             </div>
             <div className="w-[280px] shrink-0">
-              <ProfileSelector profile={profile} onChange={setProfileId} />
+              <ProfileSelector profile={profile} onChange={chooseProfile} />
             </div>
             {/*
               Settings and the UART control both used to live in panels that are

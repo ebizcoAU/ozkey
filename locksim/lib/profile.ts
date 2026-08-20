@@ -60,10 +60,22 @@ export interface DpEntry {
   type: DpValueType;
   dir: DpDirection;
   status: DpStatus;
-  /** OZKIE v1 verb this maps to (`ozkey-28`). */
+  /** OZKIE v1 verb this maps to (`ozkey-28`) — the UP/report direction. */
   verb?: string;
   /** Which arg/field of that verb the value lands in. */
   field?: string;
+  /**
+   * The DOWN/command verb, where commanding this DP makes sense (catalogue
+   * rev 2). A DP can be both: DP 76 reports `event.access` upward and accepts
+   * `lock.unlock` downward.
+   *
+   * Absence is MEANINGFUL — it means "we never command this DP". 32 of 36
+   * entries are `dir: both`, which reflects what the Tuya protocol permits,
+   * not what OZKIE should ever send; nothing should command a battery reading.
+   */
+  verb_down?: string;
+  /** Sub-type selecting between DPs that share a command verb ("pin", "ble"). */
+  field_down?: string;
   /** For `event.access`: which credential class produced it. */
   access_kind?: string;
   /** ENUM only: wire value (as a decimal string) -> stable name. */
@@ -131,6 +143,13 @@ export interface ResolvedProfile {
   byDp: Map<number, DpEntry>;
   /** verb -> entries. One verb can be served by several DPs (e.g. event.access). */
   byVerb: Map<string, DpEntry[]>;
+  /**
+   * Command verb -> entries, best status first — the same table firmware
+   * generates into PROGMEM and the same ordering `ozResolveVerb()` relies on.
+   * Kept here so LockSim and firmware cannot disagree about which DP a verb
+   * means, which is the entire reason `profiles/` exists.
+   */
+  byVerbDown: Map<string, DpEntry[]>;
 }
 
 export class ProfileError extends Error {}
@@ -197,6 +216,28 @@ export function resolveProfile(product: ProductProfile, catalogue?: Catalogue): 
     byVerb.set(e.verb, list);
   }
 
+  // Command index, ordered best-status-first — the SAME ordering
+  // gen_profile.py emits into PROGMEM and `ozResolveVerb()` depends on. A bare
+  // `lock.unlock` must land on DP 76 (confirmed), never DP 10 (reserved, no
+  // payload layout). Ordering here is policy, not presentation.
+  const STATUS_RANK: Record<string, number> = {
+    confirmed: 0, reserved: 1, unknown: 2, fiction: 3,
+  };
+  const byVerbDown = new Map<string, DpEntry[]>();
+  for (const e of entries) {
+    if (!e.verb_down) continue;
+    const list = byVerbDown.get(e.verb_down) ?? [];
+    list.push(e);
+    byVerbDown.set(e.verb_down, list);
+  }
+  for (const list of byVerbDown.values()) {
+    list.sort(
+      (a, b) =>
+        (STATUS_RANK[a.status] ?? 9) - (STATUS_RANK[b.status] ?? 9) ||
+        (a.field_down ?? "").localeCompare(b.field_down ?? "")
+    );
+  }
+
   return {
     profile_id: product.profile_id,
     rev: product.rev,
@@ -209,6 +250,7 @@ export function resolveProfile(product: ProductProfile, catalogue?: Catalogue): 
     in_lock: product.in_lock ?? {},
     byDp,
     byVerb,
+    byVerbDown,
   };
 }
 
@@ -284,4 +326,34 @@ export function usableEntries(profile: ResolvedProfile): DpEntry[] {
 
 export function blockedEntries(profile: ResolvedProfile): DpEntry[] {
   return profile.entries.filter((e) => e.status === "reserved" || e.status === "unknown");
+}
+
+/**
+ * Resolve an OZKIE command verb to a DP — the TypeScript twin of firmware's
+ * `ozResolveVerb()` in `blelock/common/ozprofile.h`.
+ *
+ * These two must agree, always. They read the same `profiles/` data and apply
+ * the same rule: no field named means take the best-status candidate; a field
+ * named must match exactly. `test/verbresolve.test.ts` asserts the agreement
+ * against the generated PROGMEM table so the two cannot silently diverge —
+ * which is the failure this whole layer exists to prevent (ozkey-27 §2.1).
+ *
+ * Returns undefined when the product has no such command. That is a real
+ * answer and callers must surface it, never substitute something close;
+ * substituting is exactly how DP 1 came to exist.
+ */
+export function resolveVerbDown(
+  profile: ResolvedProfile,
+  verb: string,
+  field?: string
+): DpEntry | undefined {
+  const list = profile.byVerbDown.get(verb);
+  if (!list || list.length === 0) return undefined;
+  if (!field) return list[0]; // best status first
+  return list.find((e) => e.field_down === field);
+}
+
+/** True if the verb resolves AND the payload is actually usable. */
+export function verbUsable(e: DpEntry | undefined): boolean {
+  return !!e && e.status === "confirmed";
 }

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ResolvedProfile } from "@/lib/profile";
 import {
   AccessResult,
   DpId,
@@ -112,6 +113,14 @@ interface UseLockStateOptions {
    */
   tuyaPid?: string;
   /**
+   * XF-118 P1c — the resolved product profile this bench is running as.
+   *
+   * LockSim emits only the DPs this product actually selects. Omit it and every
+   * emission goes out unconditionally, which is the pre-2026-08-20 behaviour
+   * and what the unit tests rely on.
+   */
+  profile?: ResolvedProfile;
+  /**
    * ozkey-21 — what the EMULATED MODULE knows, in ms, or null if no module is
    * emulating the time service.
    *
@@ -156,6 +165,7 @@ export function useLockState({
   mcuAckDelayMs,
   pushRxLog,
   tuyaPid,
+  profile,
   moduleTimeSource,
   receiveFromModule,
   linkReady,
@@ -201,6 +211,12 @@ export function useLockState({
   onHeartbeatRef.current = onHeartbeat;
   const pushRxLogRef = useRef(pushRxLog);
   pushRxLogRef.current = pushRxLog;
+  // XF-118 P1c — the active product, so emitDp() can refuse to send a DP this
+  // product does not carry. A ref, like every other option here, so the
+  // emission callbacks do not need to be rebuilt when the operator switches
+  // profile mid-session.
+  const profileRef = useRef(profile);
+  profileRef.current = profile;
   const moduleTimeSourceRef = useRef(moduleTimeSource);
   moduleTimeSourceRef.current = moduleTimeSource;
   const receiveFromModuleRef = useRef(receiveFromModule);
@@ -280,13 +296,52 @@ export function useLockState({
    * is how the remote-unlock path came to have no report at all: the third
    * caller simply never got written, and nothing pointed at its absence.
    */
-  const reportAccessResult = useCallback((result: AccessResult, note: string) => {
-    transmitRef.current(
-      TuyaCommand.DP_REPORT,
-      buildDpPayload(DpId.ACCESS_RESULT, DpType.ENUM, [result]),
-      note
-    );
-  }, []);
+  /**
+   * XF-118 P1c — EMIT ONLY WHAT THE ACTIVE PROFILE SELECTS.
+   *
+   * Every emission below goes through here. If the selected product does not
+   * carry the DP, LockSim says so on the console and sends NOTHING.
+   *
+   * WHY: a simulator that emits DPs the product does not have teaches everyone
+   * downstream the wrong thing. Under `tuya-generic-lock` the fiction DPs
+   * (1 unlock, 2 card, 3 fingerprint, 5 battery, 8 access-result, 21-24
+   * credential CRUD) are simply not in the product — and 21/23/24 are worse
+   * than absent, they are REAL DPs meaning navigation_volume, auto_lock and
+   * auto_lock_delay. Emitting our meaning on those numbers is not a
+   * simplification, it is a lie the console would render as truth.
+   *
+   * `lib/tuya.ts` already REJECTS inbound DPs outside the profile
+   * ("NOT IN PROFILE … rejected, never forwarded"). Until now the send side had
+   * no equivalent, so LockSim could emit frames its own decoder would refuse —
+   * see XF-118 §1. This closes that asymmetry.
+   *
+   * No profile passed (tests, older callers) = emit unconditionally, which is
+   * exactly the previous behaviour.
+   */
+  const emitDp = useCallback(
+    (dpId: DpId, type: DpType, value: number[], note: string) => {
+      const p = profileRef.current;
+      if (p && !p.byDp.has(dpId)) {
+        pushRxLogRef.current?.(
+          `DP ${dpId} NOT EMITTED — not selected by profile '${p.profile_id}'`,
+          [
+            `LockSim only emits DPs the active product actually carries.`,
+            `Select a profile that includes DP ${dpId}, or use the DP this product does have.`,
+          ]
+        );
+        return;
+      }
+      transmitRef.current(TuyaCommand.DP_REPORT, buildDpPayload(dpId, type, value), note);
+    },
+    []
+  );
+
+  const reportAccessResult = useCallback(
+    (result: AccessResult, note: string) => {
+      emitDp(DpId.ACCESS_RESULT, DpType.ENUM, [result], note);
+    },
+    [emitDp]
+  );
 
   const deny = useCallback(
     (reason: string, result: AccessResult) => {
@@ -319,13 +374,14 @@ export function useLockState({
    */
   const reportAccessEvent = useCallback(
     (dpId: DpId, credId: number, source: string) => {
-      transmitRef.current(
-        TuyaCommand.DP_REPORT,
-        buildDpPayload(dpId, DpType.VALUE, u32be(credId)),
+      emitDp(
+        dpId,
+        DpType.VALUE,
+        u32be(credId),
         `DP ${dpId} access event — cred_id=${credId} (${source}) [real T3 DP]`
       );
     },
-    []
+    [emitDp]
   );
 
   /**
@@ -674,22 +730,45 @@ export function useLockState({
    */
   const ringDoorbell = useCallback(() => {
     wake("DOORBELL PRESSED");
-    transmitRef.current(
-      TuyaCommand.DP_REPORT,
-      buildDpPayload(DpId.DOORBELL, DpType.BOOL, [0x01]),
+    emitDp(
+      DpId.DOORBELL,
+      DpType.BOOL,
+      [0x01],
       "DP 53 doorbell -> OZKIE MCU — visitor at the door"
     );
     setLastEvent("DOORBELL RUNG (DP 53)");
-  }, [wake]);
+  }, [wake, emitDp]);
 
+  /**
+   * ⚠️ NO LONGER TRANSMITS. XF-118 §5 / ozkey-39 §2.
+   *
+   * This used to emit DP 60 as a "pairing request", a number ozkey-22 §7 chose
+   * as a PLACEHOLDER pending manufacturer allocation. The first real supplier
+   * DP list answered that request and the answer is that **the number is
+   * taken**: on Luona DS013-T3, DP 60 is the door-lock ALARM channel — an
+   * 18-value enum carrying pry, wrong_password, wrong_finger, low_battery,
+   * system_lock and more. It is one of the busiest reports on the bus.
+   *
+   * Firmware deleted its DP 60 handler on 2026-08-13 for exactly that reason
+   * (ozdoorlock_core.h, "the number was already taken"). LockSim kept emitting
+   * it, so until now the simulator was sending a fiction on a channel the
+   * firmware had correctly stopped listening to — and on real hardware that
+   * frame would read as an ALARM.
+   *
+   * A simulator that emits traffic no real lock emits is worse than one that
+   * emits nothing: it lets consumers be written against a signal that will
+   * never arrive. That is the whole XF-114 failure mode, pointed the other way.
+   *
+   * The gesture stays in the UI because the underlying PRODUCT question is
+   * still open — on production hardware the keypad belongs to the DL MCU, so a
+   * member at the door has no way to make the lock advertise (the dev boards'
+   * own touch panel is not present in production). The doorbell (DP 53) is the
+   * real, confirmed channel firmware opens the window on; use that. This button
+   * now says so instead of putting a lie on the wire.
+   */
   const keypadPairingGesture = useCallback(() => {
-    wake("KEYPAD PAIRING GESTURE (DL MCU owns the keypad)");
-    transmitRef.current(
-      TuyaCommand.DP_REPORT,
-      buildDpPayload(DpId.PAIRING_REQUEST_PROPOSED, DpType.BOOL, [0x01]),
-      "PROPOSED DP 60 -> OZKIE MCU — user asked for the BLE pairing window"
-    );
-    setLastEvent("PAIRING GESTURE SENT (proposed DP 60 — firmware may ignore)");
+    wake("KEYPAD PAIRING GESTURE — not transmitted (DP 60 is the ALARM channel)");
+    setLastEvent("NOT SENT — DP 60 is alarm on real locks; ring the doorbell (DP 53)");
   }, [wake]);
 
   const mcuFactoryReset = useCallback(() => {
@@ -803,14 +882,93 @@ export function useLockState({
       // its DP profile from the product rather than a compiled-in default.
       //
       // The PID comes from the SELECTED profile so the MCU's self-description
-      // and the console's interpretation cannot drift apart. A profile with no
-      // `supplier.pid` — `ozkie-legacy-v0` (our invented map) and
-      // `tuya-generic-lock` (the maker we have no PID for, by definition) —
-      // falls back to the FICTIONAL OZSIM_PID, which exists so the discovery
-      // path is exercisable at all, since no real Tuya MCU has been on our
-      // wire.
+      // and the console's interpretation cannot drift apart.
+      //
+      // 🔴 2026-08-20 — NO PID MEANS SAY NOTHING. This used to fall back to the
+      // fictional OZSIM_PID, so a profile that legitimately has no
+      // `supplier.pid` — `ozkie-legacy-v0` (our invented map, and the DEFAULT)
+      // and `tuya-generic-lock` (the maker we have no PID for, by definition) —
+      // announced itself as a DIFFERENT PRODUCT. Firmware believed it and
+      // switched its whole DP map to `ozsim-fullfeature`.
+      //
+      // Observed on the bench: the operator issued a PIN, both ends reported
+      // nothing wrong, and it silently vanished — because firmware was running
+      // a profile that carries no credential DP at all, adopted from a PID the
+      // simulator invented (ozkey-42 §2.4, XF-118).
+      //
+      // Firmware already handles silence correctly and deliberately: an
+      // unanswered 0x01 leaves it on its current profile, with
+      // "[PID] MCU never answered 0x01 — staying on the compiled-in profile."
+      // That is the honest outcome for a device that has no product identity.
+      // Impersonating one is strictly worse than admitting we have none.
+      // ── 0x08 STATUS QUERY — report every DP this product has ─────────────
+      //
+      // Tuya: on 0x08 the MCU reports the status of all its datapoints, in one
+      // frame or several. That is how the module learns a lock's CAPABILITIES,
+      // as opposed to its identity (0x01).
+      //
+      // We answer from the SELECTED PROFILE, which is the whole value of doing
+      // it here: a simulator standing in for a DS013-T3 must report exactly the
+      // DPs a DS013-T3 has. Answering with everything we could encode would
+      // make firmware's census agree with us and disagree with real hardware —
+      // which is worse than not answering, because it would look verified.
+      //
+      // RESERVED DPs are reported too, deliberately. The payload layout being
+      // unsupplied does not mean the DP is absent from the device; firmware
+      // needs to know it EXISTS in order to say "known DP, unusable payload"
+      // rather than "unknown verb" (ozkey-42).
+      if (frame.command === TuyaCommand.QUERY_STATUS) {
+        const p = profileRef.current;
+        if (!p) {
+          pushRxLogRef.current?.("0x08 status query — no profile selected", [
+            "Nothing to report; select a DP profile first.",
+          ]);
+          return;
+        }
+        // A status report carries each DP's CURRENT VALUE. We have no real
+        // hardware state for most of these, so we report the type's zero —
+        // firmware's census reads the DP ID, not the value.
+        const zeroFor = (t: string): { type: DpType; val: number[] } => {
+          switch (t) {
+            case "bool":   return { type: DpType.BOOL,   val: [0x00] };
+            case "value":  return { type: DpType.VALUE,  val: [0, 0, 0, 0] };
+            case "enum":   return { type: DpType.ENUM,   val: [0x00] };
+            case "bitmap": return { type: DpType.BITMAP, val: [0x00] };
+            case "string": return { type: DpType.STRING, val: [] };
+            default:       return { type: DpType.RAW,    val: [] };
+          }
+        };
+        let n = 0;
+        for (const e of p.entries) {
+          const { type, val } = zeroFor(e.type);
+          transmitRef.current(
+            TuyaCommand.DP_REPORT,
+            buildDpPayload(e.dp, type, val),
+            `0x08 census: DP ${e.dp} ${e.name} (${e.status})`
+          );
+          n++;
+        }
+        pushRxLogRef.current?.(
+          `0x08 status query — reported ${n} DPs from '${p.profile_id}'`,
+          [`This is what a ${p.profile_id} actually implements.`]
+        );
+        setLastEvent(`DP CENSUS SENT — ${n} DPs (${p.profile_id})`);
+        return;
+      }
+
       if (frame.command === TuyaCommand.PRODUCT_INFO) {
-        const pid = tuyaPid || OZSIM_PID;
+        const pid = tuyaPid;
+        if (!pid) {
+          pushRxLogRef.current?.(
+            `0x01 product info — NOT ANSWERED (profile has no PID)`,
+            [
+              `'${profileRef.current?.profile_id ?? "this profile"}' has no supplier.pid, which is correct for it.`,
+              `Staying silent so the module keeps its own profile rather than adopting a fiction.`,
+            ]
+          );
+          setLastEvent("PRODUCT INFO — no PID to report (silent, by design)");
+          return;
+        }
         const fictional = pid === OZSIM_PID;
         const body = JSON.stringify({ p: pid, v: OZSIM_MCU_FW });
         transmitRef.current(

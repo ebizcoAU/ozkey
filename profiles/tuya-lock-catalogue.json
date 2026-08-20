@@ -1,7 +1,7 @@
 {
   "$comment": "Standard Tuya smart-lock DP catalogue. Add a DP here ONCE; products select from it. Names are Tuya's, verbatim. See profiles/README.md and ozkey-27 §3.",
   "catalogue_id": "tuya-lock-catalogue",
-  "rev": 1,
+  "rev": 2,
   "sources": [
     "docs/DPSuppliers/protocol_vr4iiuqtyh0q4nix_20260811.pdf (Smart Lock DS013-T3, PID vr4iiuqtyh0q4nix, 2026-08-11)",
     "docs/DPSuppliers/T3_Final_Customer_Version_EN.docx (T3-U module, Video Lock category)"
@@ -16,7 +16,9 @@
       "status": "reserved",
       "verb": "lock.settings.set",
       "field": "remote_no_pw_unlock",
-      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied"
+      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied",
+      "verb_down": "lock.settings.set",
+      "field_down": "remote_no_pw_unlock"
     },
     {
       "dp": 10,
@@ -26,7 +28,9 @@
       "max_len": 128,
       "status": "reserved",
       "verb": "lock.unlock",
-      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied. NOTE: this is the real remote-unlock DP; our fiction used DP 1 BOOL."
+      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied. NOTE: this is the real remote-unlock DP; our fiction used DP 1 BOOL.",
+      "verb_down": "lock.unlock",
+      "field_down": "remote"
     },
     {
       "dp": 11,
@@ -36,7 +40,14 @@
       "status": "confirmed",
       "verb": "lock.settings.set",
       "field": "conn_mode",
-      "enum": { "0": "keep", "1": "sleep", "2": "lock_keep", "3": "lock_sleep" }
+      "enum": {
+        "0": "keep",
+        "1": "sleep",
+        "2": "lock_keep",
+        "3": "lock_sleep"
+      },
+      "verb_down": "lock.settings.set",
+      "field_down": "conn_mode"
     },
     {
       "dp": 13,
@@ -48,7 +59,9 @@
       "verb": "cred.put",
       "field": "rfid|fingerprint",
       "codec": "bulk_method_v1",
-      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied"
+      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied",
+      "verb_down": "cred.put",
+      "field_down": "rfid"
     },
     {
       "dp": 14,
@@ -60,7 +73,9 @@
       "verb": "cred.delete",
       "field": "rfid|fingerprint",
       "codec": "bulk_method_v1",
-      "blocked_by": "ozkey-27 Q2"
+      "blocked_by": "ozkey-27 Q2",
+      "verb_down": "cred.delete",
+      "field_down": "rfid"
     },
     {
       "dp": 15,
@@ -71,7 +86,9 @@
       "status": "reserved",
       "verb": "cred.put",
       "codec": "bulk_method_v1",
-      "blocked_by": "ozkey-27 Q2"
+      "blocked_by": "ozkey-27 Q2",
+      "verb_down": "cred.modify",
+      "field_down": "rfid"
     },
     {
       "dp": 16,
@@ -83,7 +100,9 @@
       "verb": "cred.put",
       "field": "pin",
       "codec": "bulk_pw_v1",
-      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied. This is the real add-PIN DP; our fiction used DP 21."
+      "blocked_by": "ozkey-27 Q2 — RAW payload layout not supplied. This is the real add-PIN DP; our fiction used DP 21.",
+      "verb_down": "cred.put",
+      "field_down": "pin"
     },
     {
       "dp": 17,
@@ -95,7 +114,9 @@
       "verb": "cred.delete",
       "field": "pin",
       "codec": "bulk_pw_v1",
-      "blocked_by": "ozkey-27 Q2"
+      "blocked_by": "ozkey-27 Q2",
+      "verb_down": "cred.delete",
+      "field_down": "pin"
     },
     {
       "dp": 18,
@@ -107,7 +128,9 @@
       "verb": "cred.put",
       "field": "pin",
       "codec": "bulk_pw_v1",
-      "blocked_by": "ozkey-27 Q2"
+      "blocked_by": "ozkey-27 Q2",
+      "verb_down": "cred.modify",
+      "field_down": "pin"
     },
     {
       "dp": 19,
@@ -118,7 +141,8 @@
       "status": "reserved",
       "verb": "cred.sync",
       "codec": "bulk_method_v1",
-      "blocked_by": "ozkey-27 Q2. Supplier doc: mutually exclusive with synch_method."
+      "blocked_by": "ozkey-27 Q2. Supplier doc: mutually exclusive with synch_method.",
+      "verb_down": "cred.sync"
     },
     {
       "dp": 21,
@@ -128,8 +152,15 @@
       "status": "confirmed",
       "verb": "lock.settings.set",
       "field": "volume",
-      "enum": { "0": "mute", "1": "low", "2": "normal", "3": "high" },
-      "$comment": "🔴 OUR FICTION USED DP 21 FOR add_temp_pin. See ozkey-27 §2.1."
+      "enum": {
+        "0": "mute",
+        "1": "low",
+        "2": "normal",
+        "3": "high"
+      },
+      "$comment": "🔴 OUR FICTION USED DP 21 FOR add_temp_pin. See ozkey-27 §2.1.",
+      "verb_down": "lock.settings.set",
+      "field_down": "volume"
     },
     {
       "dp": 23,
@@ -139,7 +170,9 @@
       "status": "confirmed",
       "verb": "lock.settings.set",
       "field": "autolock",
-      "$comment": "🔴 OUR FICTION USED DP 23 FOR add_temp_rfid."
+      "$comment": "🔴 OUR FICTION USED DP 23 FOR add_temp_rfid.",
+      "verb_down": "lock.settings.set",
+      "field_down": "autolock"
     },
     {
       "dp": 24,
@@ -149,9 +182,14 @@
       "status": "confirmed",
       "verb": "lock.settings.set",
       "field": "autolock_delay",
-      "range": [5, 1800],
+      "range": [
+        5,
+        1800
+      ],
       "unit": "s",
-      "$comment": "🔴 OUR FICTION USED DP 24 FOR delete_rfid."
+      "$comment": "🔴 OUR FICTION USED DP 24 FOR delete_rfid.",
+      "verb_down": "lock.settings.set",
+      "field_down": "autolock_delay"
     },
     {
       "dp": 42,
@@ -161,7 +199,9 @@
       "status": "confirmed",
       "verb": "lock.settings.set",
       "field": "ble_enabled",
-      "$comment": "Cross-confirmed in BOTH supplier documents — evidence the catalogue is standard."
+      "$comment": "Cross-confirmed in BOTH supplier documents — evidence the catalogue is standard.",
+      "verb_down": "lock.settings.set",
+      "field_down": "ble_enabled"
     },
     {
       "dp": 45,
@@ -171,7 +211,10 @@
       "status": "confirmed",
       "verb": "event.battery",
       "field": "percent",
-      "range": [-1, 100],
+      "range": [
+        -1,
+        100
+      ],
       "$comment": "-1 = not yet read. Reported on every re-join."
     },
     {
@@ -207,7 +250,8 @@
       "max_len": 128,
       "status": "reserved",
       "verb": "device.info",
-      "blocked_by": "ozkey-27 Q2"
+      "blocked_by": "ozkey-27 Q2",
+      "verb_down": "device.info"
     },
     {
       "dp": 60,
@@ -248,7 +292,10 @@
       "verb": "event.access",
       "field": "cred_id",
       "access_kind": "pin",
-      "range": [0, 65535]
+      "range": [
+        0,
+        65535
+      ]
     },
     {
       "dp": 63,
@@ -259,7 +306,10 @@
       "verb": "event.access",
       "field": "cred_id",
       "access_kind": "fingerprint",
-      "range": [0, 65535]
+      "range": [
+        0,
+        65535
+      ]
     },
     {
       "dp": 64,
@@ -270,7 +320,10 @@
       "verb": "event.access",
       "field": "cred_id",
       "access_kind": "rfid",
-      "range": [0, 65535]
+      "range": [
+        0,
+        65535
+      ]
     },
     {
       "dp": 69,
@@ -281,7 +334,10 @@
       "verb": "event.access",
       "field": "cred_id",
       "access_kind": "temp_pin",
-      "range": [0, 65535]
+      "range": [
+        0,
+        65535
+      ]
     },
     {
       "dp": 72,
@@ -292,7 +348,10 @@
       "verb": "event.access",
       "field": "cred_id",
       "access_kind": "remote",
-      "range": [0, 999]
+      "range": [
+        0,
+        999
+      ]
     },
     {
       "dp": 73,
@@ -303,7 +362,10 @@
       "verb": "event.access",
       "field": "cred_id",
       "access_kind": "remote_voice",
-      "range": [0, 999]
+      "range": [
+        0,
+        999
+      ]
     },
     {
       "dp": 74,
@@ -324,8 +386,13 @@
       "verb": "event.access",
       "field": "cred_id",
       "access_kind": "ble",
-      "range": [0, 99999],
-      "$comment": "Cross-confirmed in BOTH supplier documents. T3 module doc: 'To enable Bluetooth lock control when the device is offline, select DP76 - unlock_ble.'"
+      "range": [
+        0,
+        99999
+      ],
+      "$comment": "Cross-confirmed in BOTH supplier documents. T3 module doc: 'To enable Bluetooth lock control when the device is offline, select DP76 - unlock_ble.'",
+      "verb_down": "lock.unlock",
+      "field_down": "ble"
     },
     {
       "dp": 86,
@@ -336,7 +403,9 @@
       "status": "reserved",
       "verb": "cred.put",
       "field": "offline_pin",
-      "blocked_by": "ozkey-27 Q2"
+      "blocked_by": "ozkey-27 Q2",
+      "verb_down": "cred.put",
+      "field_down": "offline_pin"
     },
     {
       "dp": 87,
@@ -346,7 +415,9 @@
       "max_len": 128,
       "status": "reserved",
       "verb": "event.cred_cleared",
-      "blocked_by": "ozkey-27 Q2"
+      "blocked_by": "ozkey-27 Q2",
+      "verb_down": "cred.clear",
+      "field_down": "one"
     },
     {
       "dp": 88,
@@ -356,7 +427,9 @@
       "max_len": 128,
       "status": "reserved",
       "verb": "event.cred_cleared",
-      "blocked_by": "ozkey-27 Q2"
+      "blocked_by": "ozkey-27 Q2",
+      "verb_down": "cred.clear",
+      "field_down": "all"
     },
     {
       "dp": 89,
@@ -393,8 +466,13 @@
       "status": "confirmed",
       "verb": "lock.settings.set",
       "field": "wifi_strategy",
-      "enum": { "0": "wifi_dtm20", "1": "wifi_dtm10" },
-      "$comment": "DTIM knob. The T3 module's 150-200uA keep-alive figure is quoted @ DTIM10."
+      "enum": {
+        "0": "wifi_dtm20",
+        "1": "wifi_dtm10"
+      },
+      "$comment": "DTIM knob. The T3 module's 150-200uA keep-alive figure is quoted @ DTIM10.",
+      "verb_down": "lock.settings.set",
+      "field_down": "wifi_strategy"
     },
     {
       "dp": 212,
