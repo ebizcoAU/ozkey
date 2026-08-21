@@ -670,8 +670,9 @@ async function initDatabase() {
   //   seq_highwater      last seq the lock has WRITTEN (its hb["seq_highwater"])
   //   dropped_before_seq oldest seq rotation destroyed (its hb["dropped_before_seq"])
   //   last_pulled_seq     highest seq any app has CONFIRMED pulling (ours —
-  //                       POST /locks/:id/events_ack, since there's no wire
-  //                       signal to observe: query_events never touches MQTT)
+  //                       PATCH /locks/:id `last_pulled_seq`, since there's
+  //                       no wire signal to observe: query_events never
+  //                       touches MQTT at all)
   // A lock is at risk exactly when dropped_before_seq has passed
   // last_pulled_seq — records were destroyed that nobody ever confirmed
   // reading. See eventsAtRisk() below.
@@ -928,9 +929,9 @@ const lastGrantSentByDevice = new Map(); // deviceId -> { grantId, queueId }
 
 // XF-125 P0/§3: a lock is AT RISK exactly when rotation has destroyed events
 // (`dropped_before_seq`) that no app has ever confirmed pulling
-// (`last_pulled_seq`, via POST /locks/:id/events_ack — there is no wire
-// signal to observe instead, since `query_events` is a BLE-only exchange
-// the server never sees, confirmed against ozdoorlock_core.h:6103-6161).
+// (`last_pulled_seq`, via PATCH /locks/:id — there is no wire signal to
+// observe instead, since `query_events` is a BLE-only exchange the server
+// never sees, confirmed against ozdoorlock_core.h:6103-6161).
 // This is the precise "silent data loss" case firmware's own comment names
 // (heartbeat handler, "a consumer whose cursor is below dropped_before_seq
 // has provably missed records") — not a fuzzy staleness threshold, an exact
@@ -2408,6 +2409,28 @@ api.patch('/locks/:id', async (req, res) => {
       sets.push('heartbeat_s = ?');
       params.push(hb < 60 ? 60 : hb > 600 ? 600 : hb);
     }
+    // XF-125 P0/G4: app-confirmed read progress on the lock's event log.
+    // `query_events`/`events_response` is BLE-only (ozdoorlock_core.h:6103-
+    // 6161, `ozNotifySealedTo()`) — invisible to this server by construction,
+    // same as the door events it carries — so the app must say how far it's
+    // gotten, there is no wire signal to observe instead. PATCH here rather
+    // than a dedicated route: app (2026-08-21) already shipped this shape
+    // best-effort against `PATCH /locks/:id`, and firmware endorsed it
+    // ("PATCH on the existing endpoint is sensible, I would not invent a new
+    // one") — converging on their existing contract beats introducing a
+    // second, competing one for the same fact.
+    const lastPulledSeq = req.body ? req.body.last_pulled_seq : undefined;
+    if (lastPulledSeq !== undefined) {
+      if (!Number.isFinite(Number(lastPulledSeq)) || Number(lastPulledSeq) < 0)
+        return res
+          .status(400)
+          .json({ ok: false, code: 'invalid_last_pulled_seq', error: 'last_pulled_seq must be an integer >= 0' });
+      // GREATEST, not a bare overwrite: idempotent and monotonic, so a
+      // stale/out-of-order retry can never un-confirm progress a fresher
+      // report already made.
+      sets.push('last_pulled_seq = GREATEST(COALESCE(last_pulled_seq, 0), ?)');
+      params.push(Number(lastPulledSeq));
+    }
     if (!sets.length)
       return res.status(400).json({ ok: false, code: 'nothing_to_update', error: 'nothing to update' });
     params.push(req.params.id);
@@ -2417,6 +2440,16 @@ api.patch('/locks/:id', async (req, res) => {
         .status(404)
         .json({ ok: false, code: 'lock_not_found', error: `Lock ${req.params.id} not found` });
     logEvent('info', `Lock ${req.params.id} settings updated (${sets.join(', ')})`);
+    if (lastPulledSeq !== undefined) {
+      const [[lock]] = await pool.query(
+        'SELECT dropped_before_seq, last_pulled_seq FROM locks WHERE id = ?',
+        [req.params.id]
+      );
+      if (!eventsAtRisk(lock) && eventsAtRiskLogged.has(req.params.id)) {
+        eventsAtRiskLogged.delete(req.params.id);
+        logEvent('info', `XF-125: ${req.params.id} events risk cleared — PATCH last_pulled_seq=${lock.last_pulled_seq}`);
+      }
+    }
     res.json({ ok: true, id: req.params.id });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -3353,56 +3386,6 @@ api.get('/locks/:id/log', (_req, res) => {
     since: '2026-07-31',
     ref: 'XF-48 §9.4',
   });
-});
-
-/** XF-125 P0/Ask #1: the server does NOT hold event content (see the 410
- * above and `XF-48 §9.4` — that boundary is unchanged, deliberately, and
- * this route respects it) but it does need to know how FAR an app's copy
- * has gotten, to tell "nobody is reading this lock's log" from "someone
- * is, just not this exact minute." There is no wire signal to observe
- * instead — `query_events`/`events_response` is a BLE-only exchange
- * (ozdoorlock_core.h:6103-6161, `ozNotifySealedTo()`), invisible to this
- * server by construction, same as the door events themselves. So the app
- * must say so explicitly, once, after a successful pull. Idempotent and
- * monotonic: an ack for a seq lower than what's already stored is a no-op,
- * never a regression (a stale/out-of-order retry cannot un-confirm progress
- * a fresher ack already reported). */
-api.post('/locks/:id/events_ack', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const deviceId = req.params.id;
-    const seq = Number(req.body && req.body.seq);
-    if (!Number.isFinite(seq) || seq < 0) {
-      return res
-        .status(400)
-        .json({ ok: false, code: 'missing_fields', error: 'seq (integer >= 0) is required' });
-    }
-    const [result] = await pool.query(
-      'UPDATE locks SET last_pulled_seq = GREATEST(COALESCE(last_pulled_seq, 0), ?) WHERE id = ?',
-      [seq, deviceId]
-    );
-    if (result.affectedRows === 0)
-      return res
-        .status(404)
-        .json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
-
-    const [[lock]] = await pool.query(
-      'SELECT dropped_before_seq, last_pulled_seq FROM locks WHERE id = ?',
-      [deviceId]
-    );
-    if (!eventsAtRisk(lock) && eventsAtRiskLogged.has(deviceId)) {
-      eventsAtRiskLogged.delete(deviceId);
-      logEvent('info', `XF-125: ${deviceId} events risk cleared — events_ack seq=${seq}`);
-    }
-    res.json({
-      ok: true,
-      device_id: deviceId,
-      last_pulled_seq: lock.last_pulled_seq,
-      events_at_risk: eventsAtRisk(lock),
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
 });
 
 /* -- Introspection + terminal feed --------------------------------------------- */
