@@ -328,22 +328,16 @@ function toSpacedHex(buf) {
 // envelope_hex now (A1-A5, ftpos shipped), the server only relays it opaque.
 // See migrations/S3_drop_raw_value.sql for the paired schema cut.
 
-// S10 (ozkey-17 §4/§9, XF-72..78): legacy-path only. This is the last
-// server-composed Tuya frame in the system — ozkey-17 names it explicitly
-// ("the one command still violating both [mailman] properties"). Delete
-// this the same way S3/S4 deleted buildCredentialFrame()/buildDeleteFrame()
-// once the app's sealed `{"kind":"unlock",...}` path is confirmed live —
-// acceptance per ozkey-17 §4: `grep -rn "55 AA" ozlockserv/` returns only
-// comments.
-/** Remote unlock request: DP_REPORT / DPID 1 (UNLOCK_CHANNEL) BOOL value 1.
- *  Byte-matches LockSim's SAMPLE_REMOTE_UNLOCK_FRAME; the lock's handleFrame
- *  runs unlockCycle() on receipt. */
-function buildUnlockFrame() {
-  return buildTuyaFrame(
-    TUYA_CMD.DP_REPORT,
-    buildDpPayload(DPID.UNLOCK_CHANNEL, DP_TYPE.BOOL, Buffer.from([0x01]))
-  );
-}
+// S10 (ozkey-17 §4/§9, XF-72..78, XF-120 §2 step 2): buildUnlockFrame()
+// removed 2026-08-21 — it built DP 1, an invented DP with no authentication
+// (XF-120 §1.2b: on a lock whose profile happened to carry DP 1, ANY sender
+// able to reach the command topic could open the door, no bond, no key
+// check). Deletable once both REST-unlock callers ship sealing: `unlock()`
+// (XF-120 §4/§8, bench-verified DP 76 opening a real lock) and
+// `assistedUnlock()`, the one caller that fix missed (XF-120 §9, caught
+// while scoping this exact deletion) — both landed `ftpos 34bc1e6`. This
+// was "the last server-composed Tuya frame in the system" (ozkey-17 §4);
+// deleting it makes `envelope_hex` unconditionally required below.
 
 /* ---------------------------------------------------------------------------
  * Identity helpers
@@ -3052,40 +3046,38 @@ api.post('/locks/:id/unlock', async (req, res) => {
     // sleeping lock wakes on its heartbeat timer too. The device-side check is
     // what makes "someone must be there" a requirement instead of a probability.
     //
-    // S10 (ozkey-17 §4, rollout): during rollout the app sends EITHER a
-    // pre-sealed `envelope_hex` (app already built + sealed
-    // `{"kind":"unlock",...}` — server relays opaque, never sees/builds a
-    // Tuya frame) OR nothing, in which case the server still builds the
-    // legacy frame with `buildUnlockFrame()`. Same accept-both shape S1
-    // used for grants; `buildUnlockFrame()` is deleted only once the app's
-    // sealed unlock path is confirmed live (ozkey-17 §4's own instruction,
-    // mirroring S3/S4's cutover — see migrations/S3_drop_raw_value.sql for
-    // the precedent this follows).
+    // XF-120 §2 step 2, 2026-08-21: `envelope_hex` is now REQUIRED. The
+    // accept-both rollout shim (S10) is gone — both REST-unlock callers
+    // (`unlock()`, `assistedUnlock()`) ship sealing as of `ftpos 34bc1e6`,
+    // so a request with no envelope is no longer a legacy client to shim
+    // for, it's exactly the unauthenticated-DP1 hole XF-120 §1.2b describes.
+    // Reject it outright rather than silently building a frame for it.
     const { envelope_hex } = req.body || {};
-    const sealed = Boolean(envelope_hex);
-    const payloadHex = sealed ? null : toSpacedHex(buildUnlockFrame());
+    if (!envelope_hex) {
+      return res.status(400).json({
+        ok: false,
+        code: 'envelope_hex_required',
+        error: 'envelope_hex is required',
+        detail:
+          'Unsealed unlock is no longer accepted — seal {"kind":"unlock"} client-side. ' +
+          'This closes the unauthenticated raw-DP path XF-120 §1.2b described.',
+        ref: 'XF-120 §2',
+      });
+    }
     const actionType = assisted ? 'assisted-unlock' : 'unlock';
     const windowMs = assisted ? ASSISTED_UNLOCK_MS : 60_000;
     const expiresAt = new Date(Date.now() + windowMs);
     const [queueResult] = await pool.query(
-      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, payload_hex, envelope_hex, msg_type, status, expires_at)
-       VALUES (?, ?, NULL, ?, ?, ?, ?, 'queued', ?)`,
-      [
-        deviceId,
-        lock.site_id,
-        actionType,
-        payloadHex,
-        sealed ? envelope_hex : null,
-        sealed ? 'sealed_envelope' : 'legacy_payload',
-        expiresAt,
-      ]
+      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, envelope_hex, msg_type, status, expires_at)
+       VALUES (?, ?, NULL, ?, ?, 'sealed_envelope', 'queued', ?)`,
+      [deviceId, lock.site_id, actionType, envelope_hex, expiresAt]
     );
 
     logEvent(
       'key',
       `${assisted ? 'ASSISTED' : 'Remote'} UNLOCK queued for "${lock.label}" ` +
         `(queue #${queueResult.insertId}, expires ${windowMs / 1000}s` +
-        `${assisted ? ', needs a keypad touch' : ''}, ${sealed ? 'sealed' : 'legacy'})`
+        `${assisted ? ', needs a keypad touch' : ''}, sealed)`
     );
     await recordAudit(lock.app_id, deviceId, 'unlock', 'remote unlock');
     const sent = await flushQueueForDevice(lock.site_id, deviceId);
@@ -3094,7 +3086,7 @@ api.post('/locks/:id/unlock', async (req, res) => {
       ok: true,
       device_id: deviceId,
       queue_id: queueResult.insertId,
-      ...(sealed ? { envelope_hex } : { payload_hex: payloadHex }),
+      envelope_hex,
       // In the lab LockSim keeps its MQTT link open, so delivery is immediate;
       // a real eco lock would report 'queued' until its next wake.
       // KEPT for compat — the app parses this today, still live-testing.
