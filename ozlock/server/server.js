@@ -145,6 +145,12 @@ const CONFIG = {
   // re-push utc to a given bridge — riding the mechanism that already
   // exists rather than adding a new timer.
   UTC_PUSH_REFRESH_MS: 10 * 60 * 1000,
+  // XF-125 P1: audit_log is the file header's "security events" class and was
+  // documented (2026-07-31) as retained per the Sovereign Edge whitepaper's
+  // 90-day target — but nothing ever enforced it; grepped clean, no cron, no
+  // age-based DELETE anywhere. This is that enforcement, finally wired up.
+  AUDIT_LOG_RETENTION_MS: 90 * 24 * 3600 * 1000,
+  AUDIT_LOG_PURGE_INTERVAL_MS: 24 * 3600 * 1000,
   // nexus-14 ask #3: DELETE /locks/:id tells Nexus's lock_registry to
   // tombstone the MAC, so a decommissioned lock's stored pubkey doesn't
   // silently go on serving as if it were still live. No baked-in default
@@ -654,6 +660,34 @@ async function initDatabase() {
         ADD COLUMN profile  VARCHAR(64) NULL
     `);
 
+  // XF-125 P0 (server half): the lock's audit ring is pull-only (F2/F9) —
+  // it keeps every event and waits for `query_events`, which is a BLE-only
+  // exchange the server never sees (confirmed by reading
+  // ozdoorlock_core.h:6103-6161 — the response goes out over
+  // ozNotifySealedTo(), not MQTT). Nothing anywhere checks that a reader
+  // still exists, and an app's MQTT session can die silently while events
+  // pile up unread. These three columns are what makes that detectable:
+  //   seq_highwater      last seq the lock has WRITTEN (its hb["seq_highwater"])
+  //   dropped_before_seq oldest seq rotation destroyed (its hb["dropped_before_seq"])
+  //   last_pulled_seq     highest seq any app has CONFIRMED pulling (ours —
+  //                       POST /locks/:id/events_ack, since there's no wire
+  //                       signal to observe: query_events never touches MQTT)
+  // A lock is at risk exactly when dropped_before_seq has passed
+  // last_pulled_seq — records were destroyed that nobody ever confirmed
+  // reading. See eventsAtRisk() below.
+  const [[{ hasSeqHighwater }]] = await pool.query(
+    `SELECT COUNT(*) AS hasSeqHighwater FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'seq_highwater'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasSeqHighwater)
+    await pool.query(`
+      ALTER TABLE locks
+        ADD COLUMN seq_highwater      INT UNSIGNED NULL,
+        ADD COLUMN dropped_before_seq INT UNSIGNED NULL,
+        ADD COLUMN last_pulled_seq    INT UNSIGNED NULL
+    `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bridges_presence (
       bridge_id   VARCHAR(64) PRIMARY KEY,
@@ -891,6 +925,27 @@ function publishRetainedTime(why) {
 // before any reply), so "this device's most recent unconfirmed grant" is
 // what a fresh outcome code is answering, not a guess dressed up as one.
 const lastGrantSentByDevice = new Map(); // deviceId -> { grantId, queueId }
+
+// XF-125 P0/§3: a lock is AT RISK exactly when rotation has destroyed events
+// (`dropped_before_seq`) that no app has ever confirmed pulling
+// (`last_pulled_seq`, via POST /locks/:id/events_ack — there is no wire
+// signal to observe instead, since `query_events` is a BLE-only exchange
+// the server never sees, confirmed against ozdoorlock_core.h:6103-6161).
+// This is the precise "silent data loss" case firmware's own comment names
+// (heartbeat handler, "a consumer whose cursor is below dropped_before_seq
+// has provably missed records") — not a fuzzy staleness threshold, an exact
+// check against a fact firmware already computes and reports.
+function eventsAtRisk(lock) {
+  return (
+    lock.dropped_before_seq != null &&
+    (lock.last_pulled_seq == null || lock.dropped_before_seq > lock.last_pulled_seq)
+  );
+}
+
+// Log once per episode, not once per heartbeat — a lock stuck at-risk would
+// otherwise re-log on every beat for as long as nobody reads it, which is
+// exactly the kind of noise that makes a real alert easy to tune out.
+const eventsAtRiskLogged = new Set(); // deviceId
 
 /** Drain queued actions for a device; expired unlock-style rows are skipped.
  * `onSent(job, msgId)`, if given, fires for each job actually published —
@@ -1739,6 +1794,12 @@ function initMqtt() {
         // above: absent leaves the column untouched, doesn't clobber a
         // last-known label to NULL.
         const name = typeof obj.name === 'string' && obj.name.length ? obj.name.slice(0, 255) : null;
+        // XF-125 P0 — opportunistic, same discipline as everything above:
+        // absent (a lock's `publishHeartbeat()` doesn't send these yet — only
+        // the Thread beacon, verbatim-relayed onto this same topic by
+        // bridge32, does today) leaves the columns untouched.
+        const seqHighwater = Number.isFinite(obj.seq_highwater) ? obj.seq_highwater : null;
+        const droppedBeforeSeq = Number.isFinite(obj.dropped_before_seq) ? obj.dropped_before_seq : null;
         await pool.query(
           `UPDATE locks
               SET last_seen_at    = NOW(),
@@ -1752,10 +1813,31 @@ function initMqtt() {
                   roster_epoch    = COALESCE(?, roster_epoch),
                   mcu_link_up     = COALESCE(?, mcu_link_up),
                   mcu_last_frame_s = COALESCE(?, mcu_last_frame_s),
-                  label           = COALESCE(?, label)
+                  label           = COALESCE(?, label),
+                  seq_highwater   = COALESCE(?, seq_highwater),
+                  dropped_before_seq = COALESCE(?, dropped_before_seq)
             WHERE id = ?`,
-          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, name, deviceId]
+          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, name, seqHighwater, droppedBeforeSeq, deviceId]
         );
+        if (droppedBeforeSeq !== null) {
+          const [[riskRow]] = await pool.query(
+            'SELECT dropped_before_seq, last_pulled_seq FROM locks WHERE id = ?',
+            [deviceId]
+          );
+          const atRisk = riskRow && eventsAtRisk(riskRow);
+          if (atRisk && !eventsAtRiskLogged.has(deviceId)) {
+            eventsAtRiskLogged.add(deviceId);
+            logEvent(
+              'warn',
+              `XF-125: ${deviceId} events AT RISK — rotation destroyed records up to ` +
+                `seq ${riskRow.dropped_before_seq}, no app has confirmed past ` +
+                `${riskRow.last_pulled_seq ?? '(never)'}`
+            );
+          } else if (!atRisk && eventsAtRiskLogged.has(deviceId)) {
+            eventsAtRiskLogged.delete(deviceId);
+            logEvent('info', `XF-125: ${deviceId} events risk cleared — a consumer caught up`);
+          }
+        }
         // ozkey-20 R5/R6: a heartbeat is direct proof of reachability for a
         // Wi-Fi-direct lock (no bridge_id) — set presence straight to
         // 'online' the way an R1 LWT eventually will, then let R6 compute
@@ -2189,12 +2271,13 @@ api.get('/locks', async (req, res) => {
     const [rows] = await pool.query(
       `SELECT id, site_id, app_id, mac, label, fw, status, power_profile, heartbeat_s,
               last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
-              presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s
+              presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s,
+              seq_highwater, dropped_before_seq, last_pulled_seq
          FROM locks ORDER BY enrolled_at DESC`
     );
     const locks = rows.map((l) => {
       const { caps, source } = effectiveCaps(l);
-      return { ...l, caps, caps_source: source };
+      return { ...l, caps, caps_source: source, events_at_risk: eventsAtRisk(l) };
     });
     res.json({ ok: true, locks });
   } catch (err) {
@@ -2274,7 +2357,8 @@ api.get('/locks/:id', async (req, res) => {
     const [[lock]] = await pool.query(
       `SELECT id, app_id, site_id, mac, label, status, power_profile, heartbeat_s,
               last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
-              presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s
+              presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s,
+              seq_highwater, dropped_before_seq, last_pulled_seq
          FROM locks WHERE id = ?`,
       [req.params.id]
     );
@@ -2287,7 +2371,10 @@ api.get('/locks/:id', async (req, res) => {
     // it from a bound bridge" — XF-48 §9.5 wants the device's own report to win
     // once the state uplink exists, and silently swapping one for the other would
     // be undiagnosable from the app side.
-    res.json({ ok: true, lock: { ...lock, caps, caps_source: source } });
+    res.json({
+      ok: true,
+      lock: { ...lock, caps, caps_source: source, events_at_risk: eventsAtRisk(lock) },
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -3268,6 +3355,56 @@ api.get('/locks/:id/log', (_req, res) => {
   });
 });
 
+/** XF-125 P0/Ask #1: the server does NOT hold event content (see the 410
+ * above and `XF-48 §9.4` — that boundary is unchanged, deliberately, and
+ * this route respects it) but it does need to know how FAR an app's copy
+ * has gotten, to tell "nobody is reading this lock's log" from "someone
+ * is, just not this exact minute." There is no wire signal to observe
+ * instead — `query_events`/`events_response` is a BLE-only exchange
+ * (ozdoorlock_core.h:6103-6161, `ozNotifySealedTo()`), invisible to this
+ * server by construction, same as the door events themselves. So the app
+ * must say so explicitly, once, after a successful pull. Idempotent and
+ * monotonic: an ack for a seq lower than what's already stored is a no-op,
+ * never a regression (a stale/out-of-order retry cannot un-confirm progress
+ * a fresher ack already reported). */
+api.post('/locks/:id/events_ack', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const deviceId = req.params.id;
+    const seq = Number(req.body && req.body.seq);
+    if (!Number.isFinite(seq) || seq < 0) {
+      return res
+        .status(400)
+        .json({ ok: false, code: 'missing_fields', error: 'seq (integer >= 0) is required' });
+    }
+    const [result] = await pool.query(
+      'UPDATE locks SET last_pulled_seq = GREATEST(COALESCE(last_pulled_seq, 0), ?) WHERE id = ?',
+      [seq, deviceId]
+    );
+    if (result.affectedRows === 0)
+      return res
+        .status(404)
+        .json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
+
+    const [[lock]] = await pool.query(
+      'SELECT dropped_before_seq, last_pulled_seq FROM locks WHERE id = ?',
+      [deviceId]
+    );
+    if (!eventsAtRisk(lock) && eventsAtRiskLogged.has(deviceId)) {
+      eventsAtRiskLogged.delete(deviceId);
+      logEvent('info', `XF-125: ${deviceId} events risk cleared — events_ack seq=${seq}`);
+    }
+    res.json({
+      ok: true,
+      device_id: deviceId,
+      last_pulled_seq: lock.last_pulled_seq,
+      events_at_risk: eventsAtRisk(lock),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 /* -- Introspection + terminal feed --------------------------------------------- */
 api.get('/queue', async (req, res) => {
   if (!guardDb(res)) return;
@@ -3304,6 +3441,28 @@ api.post('/sim/heartbeat', async (req, res) => {
   }
 });
 
+// XF-125 P1: audit_log ("security events", per the file header) was
+// documented as retained per the Sovereign Edge whitepaper's 90-day target
+// since 2026-07-31 — but nothing ever enforced it. Grepped clean before
+// writing this: no cron, no age-based DELETE, anywhere in the prior code.
+// `pending_queue` is deliberately NOT touched here — its rows already have
+// their own per-command `expires_at` governing whether they still FIRE, and
+// an `expired`/`sent` row is cheap, small, and useful for `GET /queue`
+// debugging; only `audit_log` is named in the whitepaper's retained-data
+// inventory, so only it gets a purge.
+async function purgeOldAuditLog() {
+  try {
+    const [result] = await pool.query(
+      'DELETE FROM audit_log WHERE created_at < (NOW() - INTERVAL ? SECOND)',
+      [CONFIG.AUDIT_LOG_RETENTION_MS / 1000]
+    );
+    if (result.affectedRows > 0)
+      logEvent('info', `XF-125 P1: purged ${result.affectedRows} audit_log row(s) past 90d retention`);
+  } catch (err) {
+    logEvent('error', `audit_log purge failed: ${err.message}`);
+  }
+}
+
 /* ---------------------------------------------------------------------------
  * Boot sequence
  * ------------------------------------------------------------------------- */
@@ -3326,6 +3485,13 @@ async function boot() {
   }
 
   initMqtt();
+
+  // Run once at boot (same "never leave it stale" reasoning as
+  // publishRetainedTime on connect), then on a daily cadence — retention
+  // enforcement, not a liveness signal, so it doesn't need MQTT-reconnect
+  // re-arming the way the time-push timer does.
+  await purgeOldAuditLog();
+  setInterval(purgeOldAuditLog, CONFIG.AUDIT_LOG_PURGE_INTERVAL_MS);
 
   app.listen(CONFIG.HTTP_PORT, () => {
     logEvent('info', `HTTP directory listening on http://localhost:${CONFIG.HTTP_PORT}/ozlockserv/api`);
