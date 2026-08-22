@@ -152,7 +152,7 @@ def resolve_verb(rows, verb, field):
     return None
 
 
-def derive_verbs_and_caps(rows):
+def derive_verbs(rows):
     """XF-123 §16/§17 — the manifest's advisory copy of what a model can do.
 
     DERIVED, never asserted, and by the same rule the firmware uses: a verb
@@ -174,23 +174,42 @@ def derive_verbs_and_caps(rows):
         row["dp"] = e["dp"]
         verbs.append(row)
 
-    can = lambda v, f: any(x["verb"] == v and x.get("field") == f for x in verbs)
-    caps = []
-    # 🔴 remote_unlock vs assisted_unlock is a TRANSPORT decision the firmware
-    # makes per unit (`isThread() ? "remote_unlock" : "assisted_unlock"`), and
-    # transport is not a property of the model. The manifest therefore reports
-    # the profile-derivable form; a Wi-Fi lock will report `assisted_unlock`
-    # for the same model. Flagged to Nexus in §18 so P1.4 does not read that
-    # legitimate difference as an import mismatch.
-    if can("lock.unlock", None):
-        caps.append("remote_unlock")
-    if can("cred.put", "pin"):
-        caps.append("pin_sync")
-    if can("cred.put", "rfid"):
-        caps.append("rfid_sync")
-    # Ours, not the MCU's: the txlog is written by firmware and depends on no DP.
-    caps.append("audit")
-    return verbs, caps
+    return verbs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔴 `caps` IS NO LONGER GENERATED (operator directive, 2026-08-23)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This function used to also emit a `caps` list into models.json. It was WRONG
+# IN SHAPE, not merely in value, and the wrongness reached Nexus's live API:
+#
+#     models.json  caps: ["remote_unlock", "audit"]
+#     live device  caps: ["assisted_unlock", "audit"]   (transport: wifi)
+#
+# `remote_unlock` vs `assisted_unlock` is a TRANSPORT decision the firmware
+# makes per UNIT (`isThread() ? ... : ...`), and transport is not a property of
+# a model — the same DS013-T3 body behind a Thread module and behind a Wi-Fi
+# module are different capabilities. Since doorlock-2.19 `assisted_unlock`
+# additionally requires DP 53 to be in the profile. A static manifest cannot
+# know either fact.
+#
+# The old code KNEW this — it carried a comment saying so and flagged the
+# difference to Nexus as "legitimate". That was the mistake: a field documented
+# as unreliable is still read as authoritative by whoever queries the API next,
+# and XF-58 §3.1.1 created these two names precisely because they make opposite
+# promises ("works with nobody home" vs "only opens when someone is at it").
+# Serving `remote_unlock` for this model invites exactly the dishonest
+# affordance the split exists to prevent.
+#
+# It was also the LAST place still ASSERTING a capability. Every other layer had
+# already converged on device-reported-only: server dropped inferred `pin_sync`
+# (XF-128 Ask 4), BANOI gates on `capsSource == 'device'`, firmware derives from
+# whether the verb resolves to a usable DP.
+#
+# `verbs` is still emitted and is still advisory: it is a pure DP-map fact
+# (which verb resolves to which DP), transport-independent, and legitimately a
+# property of the model. Capability is not.
 
 
 # XF-124 §4 — the registry keys every device type, not just locks. Everything
@@ -441,8 +460,7 @@ def generate_models():
 
         manufacturer = sup.get("manufacturer")
         product = sup.get("product")
-        model_verbs, model_caps = derive_verbs_and_caps(
-            verb_rows(resolve(prod, catalogue)))
+        model_verbs = derive_verbs(verb_rows(resolve(prod, catalogue)))
         models.append({
             # XF-123 §4 — the Nexus PRIMARY KEY, so it leads the object.
             "firmware_id": firmware_id(prod, int(catalogue.get("rev", 0))),
@@ -467,7 +485,6 @@ def generate_models():
             # is authoritative (§13.3/§14.1); these exist so Nexus has something
             # to import and so a mismatch is VISIBLE rather than assumed.
             "verbs": model_verbs,
-            "caps": model_caps,
             # The profile's own account of what its DP map is based on. Carried
             # verbatim so nobody has to infer the cause from a boolean.
             "source_note": (prod.get("source") or {}).get("note"),

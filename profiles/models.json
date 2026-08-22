@@ -24,9 +24,6 @@
         "blocked by ozkey-42 — Ladin has not supplied a DP reference"
       ],
       "verbs": [],
-      "caps": [
-        "audit"
-      ],
       "source_note": "Module integration overview, not a DP reference. Four DPs named in passing."
     },
     {
@@ -59,10 +56,6 @@
           "dp": 21
         }
       ],
-      "caps": [
-        "remote_unlock",
-        "audit"
-      ],
       "source_note": null
     },
     {
@@ -93,9 +86,6 @@
           "field": "autolock",
           "dp": 68
         }
-      ],
-      "caps": [
-        "audit"
       ],
       "source_note": "DP list is complete per the reference. RAW DPs are marked `reserved`: the reference names the FIELD ORDER (e.g. DP 49 Validity+KeyID+Times+Key) but not byte widths, so a frame still cannot be built without more detail."
     }
