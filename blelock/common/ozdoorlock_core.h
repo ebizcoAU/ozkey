@@ -73,8 +73,6 @@ bool isThread();
 bool mcuLinkUp();
 bool srdyAsserted();
 void serveMcuTimePush(); // 1.74: ozHarvestTime() calls it long before its body
-bool touchRead(int &tx, int &ty);
-char keyAt(int tx, int ty, int &r, int &c);
 void drawKeypad();
 void drawHexReadout();
 int hexNibble(char c);
@@ -111,7 +109,6 @@ static bool ozDpForwardable(uint8_t dp);
 static void ozReportOutcome(int slot, const char *code, const String &detail);
 static bool ozM4SelfTest();
 static bool ozTuyaFrameOk(const uint8_t *f, size_t n);
-static bool touchReadRegs(uint8_t *buf);
 static size_t ozBuildDpFrame(uint8_t dp, uint8_t type, const uint8_t *val, size_t vlen, uint8_t *out);
 static void addIdentity(JsonDocument &doc, bool full = false);
 static void bond0Accept(OzBondVerdict v, const uint8_t provPub[32]);
@@ -386,6 +383,9 @@ String cfgSsid, cfgPass, cfgBrokerHost, cfgServerIp, cfgSiteId, cfgName, cfgDevi
 // Broker credentials the server mints at enrollment. Persisted since the very
 // first enrollment_ack handler ("buser"/"bsecret") — and, until 1.57, NEVER
 // PRESENTED to the broker. See ensureMqtt().
+// Until 2.17 these were also populated ONLY by loadConfig() at boot, so the
+// session that enrolled kept connecting anonymously no matter what the server
+// minted. enrollment_ack now assigns them alongside the NVS write.
 String cfgBrokerUser, cfgBrokerSecret;
 uint16_t cfgBrokerPort = 1883, cfgServerPort = 4200;
 uint32_t cfgHeartbeatS = 300; // C9 §3 — was 60
@@ -778,7 +778,6 @@ String topicCommandLegacy; // S16 — pre-rename root, subscribed during migrati
 
 bool screenDirty = true;
 String joinLine1 = "", joinLine2 = "";
-bool touchWasDown = false;
 
 // XF-58: the assisted ("visitor at the door") unlock. The server may queue one,
 // but ONLY the lock can know whether anybody actually touched the keypad — so
@@ -790,8 +789,8 @@ bool touchWasDown = false;
 // time — ~25% at a 15 s window on a 60 s heartbeat, and ~100% once the window
 // reaches the interval. Lengthening the window to help the visitor would have
 // made an unattended open MORE likely, which is the opposite of the intent.
-unsigned long lastTouchAt = 0; // 0 = never touched since boot
-#define ASSISTED_TOUCH_MAX_MS 30000UL
+unsigned long lastPresenceAt = 0; // 0 = never touched since boot
+#define ASSISTED_PRESENCE_MAX_MS 30000UL
 
 // The command may arrive on EITHER side of the touch, and both orderings are real:
 //   press-then-touch — the owner taps "Mở cửa cho khách" and then tells the
@@ -819,6 +818,63 @@ String assistArmedSealedJson;
 int assistArmedSealedSlot = -1;
 bool assistArmedSealedViaBle = false;
 #define ASSISTED_ARM_MS 60000UL // matches ozlockserv's expires_at window
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2.18 — PROOF OF PRESENCE, FROM EITHER KEYPAD
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 🔴 THE XF-58 GATE WAS WIRED TO A SENSOR PRODUCTION DOES NOT HAVE.
+//
+// Until 2.18 `lastPresenceAt` was set in exactly ONE place: the CST816 poll on our
+// own LCD (`HARDWARE.md:27`). That panel is real for the SELF-CONTAINED lock
+// variant, where the LCD keypad IS the product's keypad. But on a lock with a
+// **DL MCU** — the Tuya-profile product, and the only variant `assisted_unlock`
+// is offered on — there is no touch panel on our board at all. The keypad
+// belongs to the MCU and talks to us over the Tuya UART.
+//
+// So on that variant an armed assisted unlock could NEVER be released. It would
+// arm, the visitor would do exactly what the app told them, and it would expire
+// after 60 s, every time. Verified-correct gate logic, wired to nothing.
+//
+// The operator asked the question that surfaced it: *"why touch the LCD? in
+// real life you only touch the keypad."*
+//
+// **DP 53 `doorbell` is the answer, and it already arrives.** `bool`,
+// `dir: both`, `status: confirmed`, verb `event.doorbell`, present in
+// `tuya-luona-ds013-t3`. Firmware has always received it — it opened the BLE
+// window and published a log — it simply never fed the presence gate. Producer
+// working, consumer not listening: the inverse of the usual failure here.
+//
+// It also makes BANOI's shipped copy correct: the app says "press the
+// doorbell", and now that is exactly what releases the door.
+//
+// Both call sites route through here so the two keypads cannot drift apart —
+// the touch path and the doorbell path must consume the arm identically, or the
+// single-shot guarantee holds on one and not the other.
+static void ozAssistPresence(const char *source) {
+  lastPresenceAt = millis();
+  if (!assistArmedUntil || (long)(millis() - assistArmedUntil) >= 0) return;
+  Serial.printf("[ASSIST] %s — armed assisted unlock ALLOWED\n", source);
+  const String payload = assistArmedPayload;
+  // XF-126 §5b — a SEALED arm replays the VERB, not raw bytes, so the bond is
+  // re-checked on the second pass rather than trusted from the first.
+  const String sealedJson = assistArmedSealedJson;
+  const int sealedSlot = assistArmedSealedSlot;
+  const bool sealedViaBle = assistArmedSealedViaBle;
+  // Cleared BEFORE dispatching, so a re-entry cannot re-arm from the same grant
+  // and loop.
+  assistArmedUntil = 0;
+  assistArmedPayload = "";
+  assistArmedSealedJson = "";
+  assistArmedSealedSlot = -1;
+  if (sealedSlot >= 0 && sealedJson.length()) {
+    ozSemanticDispatch(sealedSlot, sealedJson.c_str(), sealedJson.length(),
+                       sealedViaBle);
+  } else if (payload.length()) {
+    forwardHexToMcu(payload);
+  }
+  lastPresenceAt = 0; // consumed — one presence event must not satisfy a second
+}
 
 // ── §0.2/§0.3 power & wake state (persistent-power keep-alive) ──────────────
 // wake_sim=true (bench default; CP2102 exposes TX/RX only): SRDY assumed
@@ -1482,7 +1538,7 @@ void drawJoining() {
 // OPERATIONAL dashboard layout — four bands, stacked with NO overlap: status
 // bar, DOOR STATUS bar, hex-command readout, then the keypad fills the rest.
 // Defined here, before first use (drawOperational() is the first consumer;
-// keyAt()/drawKeypad() further down reuse the same macros).
+// drawKeypad() further down reuses the same macros.
 //
 // 2026-08-07 (operator-caught bug): the door-status block and the hex row
 // both started at the same y (STATUS_H), so each later draw call painted
@@ -2749,6 +2805,13 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
         ozRefreshInfoChar(); // info must stop saying false immediately
       }
       publishLog("doorbell", "MCU report");
+      // 2.18 — THE DOORBELL IS PROOF OF PRESENCE. On a lock with a DL MCU this
+      // is the ONLY presence signal that exists: our board has no touch panel
+      // there, so without this an armed assisted unlock can never be released
+      // and always expires. See ozAssistPresence's header. Placed after
+      // publishLog so the bell is recorded even if the release below dispatches
+      // and takes time.
+      ozAssistPresence("doorbell");
       const unsigned long now = millis();
       if (bleWindowOpen()) {
         g_bellOpenedWindow = true;
@@ -4442,6 +4505,33 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
     prefs.putString("buser", doc["broker_username"] | "");
     prefs.putString("bsecret", doc["broker_secret"] | "");
     prefs.end();
+    // ── 🔴 2.17 — ADOPT THE MINTED CREDENTIALS *LIVE*, NOT JUST INTO NVS ─────
+    //
+    // Since day one this handler persisted buser/bsecret and stopped there.
+    // cfgBrokerUser/cfgBrokerSecret are populated ONLY by loadConfig() at boot
+    // (see :1725), so for the entire remainder of the session that enrolled,
+    // ensureMqtt() saw two empty strings, took the !haveCreds branch, and
+    // printed "no broker credentials stored — connecting anonymously" — about
+    // a lock the server had just minted credentials FOR. It corrected itself on
+    // the next reboot and never in the session where it mattered, which is
+    // exactly why it survived: every deliberate power-cycle hid it.
+    //
+    // Measured on LockB, 2026-08-22: 48 connect attempts / 39 successes after
+    // an enrol, with the server-minted username 'ozk-xf127b-test' never
+    // presented. Any test run in the same session as an enrol was testing an
+    // anonymous, flapping session.
+    //
+    // The creds take effect on the NEXT dial, not this instant — the live
+    // session is mid-callback here and tearing it down inside PubSubClient's
+    // own dispatch is not worth the re-entrancy. ensureMqtt() re-reads these on
+    // every redial, so a flapping lock adopts them within seconds and a stable
+    // one adopts them at its next disconnect. Neither case needs a reboot.
+    cfgBrokerUser = String((const char *)(doc["broker_username"] | ""));
+    cfgBrokerSecret = String((const char *)(doc["broker_secret"] | ""));
+    Serial.printf("[ENROLL] broker credentials adopted live: user='%s' secret=%s"
+                  " (presented on next dial)\n",
+                  cfgBrokerUser.c_str(),
+                  cfgBrokerSecret.length() ? "set" : "EMPTY");
     saveConfig();
     notifyStatus("ENROLLED");
     state = ST_OPERATIONAL;
@@ -4514,7 +4604,7 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
   const char *action = doc["action"] | (const char *)nullptr;
   if (action && strcmp(action, "assisted-unlock") == 0) {
     const bool touched =
-        lastTouchAt != 0 && (millis() - lastTouchAt) <= ASSISTED_TOUCH_MAX_MS;
+        lastPresenceAt != 0 && (millis() - lastPresenceAt) <= ASSISTED_PRESENCE_MAX_MS;
     if (!touched) {
       // ARM, do not discard. The owner has authorised; nobody has arrived yet.
       // A second press replaces the first — two presses must never arm two
@@ -4523,19 +4613,19 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
         Serial.println("[ASSIST] replacing the previously armed unlock");
       assistArmedPayload = String(hex);
       assistArmedUntil = millis() + ASSISTED_ARM_MS;
-      Serial.printf("[ASSIST] ARMED %lus — waiting for a keypad touch "
+      Serial.printf("[ASSIST] ARMED %lus — waiting for the doorbell "
                     "(last touch %s)\n",
                     ASSISTED_ARM_MS / 1000,
-                    lastTouchAt ? String((millis() - lastTouchAt) / 1000).c_str()
+                    lastPresenceAt ? String((millis() - lastPresenceAt) / 1000).c_str()
                                 : "never");
       return;
     }
-    Serial.printf("[ASSIST] touch %lus ago — assisted unlock ALLOWED\n",
-                  (millis() - lastTouchAt) / 1000);
+    Serial.printf("[ASSIST] presence %lus ago — assisted unlock ALLOWED\n",
+                  (millis() - lastPresenceAt) / 1000);
     // Consume it. Without this one touch would satisfy every assisted unlock
     // arriving in the next 30 s, and the owner's second press would open the
     // door for whoever is there by then.
-    lastTouchAt = 0;
+    lastPresenceAt = 0;
   }
 
   forwardHexToMcu(String(hex));
@@ -6293,7 +6383,7 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
   const bool isAssisted = isUnlock && (doc["assisted"] | false);
   if (isAssisted) {
     const bool touched =
-        lastTouchAt != 0 && (millis() - lastTouchAt) <= ASSISTED_TOUCH_MAX_MS;
+        lastPresenceAt != 0 && (millis() - lastPresenceAt) <= ASSISTED_PRESENCE_MAX_MS;
     if (!touched) {
       // ARM and wait, exactly as the unsealed path did. Not a refusal: the
       // owner's grant is real, it is simply not permitted to fire until a
@@ -6304,15 +6394,15 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
       assistArmedSealedViaBle = viaBle;
       assistArmedPayload = ""; // a sealed arm supersedes any unsealed one
       assistArmedUntil = millis() + ASSISTED_ARM_MS;
-      Serial.printf("[ASSIST] sealed unlock ARMED %lus — waiting for a keypad touch "
+      Serial.printf("[ASSIST] sealed unlock ARMED %lus — waiting for the doorbell "
                     "(XF-58: someone must be AT the door)\n",
                     ASSISTED_ARM_MS / 1000);
       notifyStatus("ASSIST_ARMED");
       return; // do NOT open now
     }
-    Serial.printf("[ASSIST] touch %lus ago — sealed assisted unlock ALLOWED\n",
-                  (millis() - lastTouchAt) / 1000);
-    lastTouchAt = 0; // consume it; one touch must not satisfy a later command
+    Serial.printf("[ASSIST] presence %lus ago — sealed assisted unlock ALLOWED\n",
+                  (millis() - lastPresenceAt) / 1000);
+    lastPresenceAt = 0; // consume it; one touch must not satisfy a later command
   }
 
   if (isUnlock) {
@@ -7210,125 +7300,9 @@ void buildTopics() {
 // touchInit() — board-specific (RST/INT sequence vs pure I2C polling),
 // defined before this #include.
 
-static bool touchReadRegs(uint8_t *buf) {
-  Wire.beginTransmission(TOUCH_ADDR);
-  Wire.write((uint8_t)0x00);
-  if (Wire.endTransmission() != 0) return false;
-  if (Wire.requestFrom(TOUCH_ADDR, 7) < 7) return false;
-  for (int i = 0; i < 7; i++) buf[i] = Wire.read();
-  return true;
-}
 
 int lastTapX = 0, lastTapY = 0;
 uint8_t tapSamples = 0;
-
-// 1.70 — THREE WAYS A TAP USED TO VANISH WITHOUT A TRACE
-//
-// The operator reported taps taking 10-20 s to register after power-up, on both
-// boards. [MON]'s cadence (measured 2026-08-14: 10.003-10.016 s against a 10 s
-// tick) proves the loop is NOT starved — touch is polled at ~65 Hz — so the
-// taps were being lost inside this function or before it, and every one of the
-// three ways that can happen was SILENT:
-//
-//   1. touchReadRegs() returns false (I2C NACK). A controller that has gone to
-//      sleep, or a bus glitch, looked exactly like a finger that was never
-//      there. This is the one that would confirm or kill the auto-sleep theory,
-//      and it printed nothing at all.
-//   2. The controller reports count=0 forever. Same silence.
-//   3. OUR OWN two-sample rule threw the tap away — see below.
-//
-// [[silent-failures-rule]]: a diagnostic you cannot read is not a diagnostic.
-// All three now speak, on CHANGE only so an idle panel stays quiet.
-bool touchRead(int &tx, int &ty) {
-  uint8_t buf[7];
-
-  // (1) Does the digitizer answer at all?
-  static bool lastRegsOk = true;
-  const bool regsOk = touchReadRegs(buf);
-  if (regsOk != lastRegsOk) {
-    lastRegsOk = regsOk;
-    Serial.printf("[TOUCH] i2c %s\n",
-                  regsOk ? "answering again"
-                         : "NO ACK — controller not responding (asleep? bus?)");
-  }
-  if (!regsOk) return false;
-
-  // (2) What is it actually reporting? Edge-triggered: two lines per tap.
-  uint8_t count = buf[2];
-  static uint8_t lastCount = 0xFF;
-  if (count != lastCount) {
-    lastCount = count;
-    Serial.printf("[TOUCH] count=%u\n", count);
-  }
-
-  // (2b) …and a 5 s heartbeat, because edge-triggered ALONE is unreadable.
-  //
-  // 1.70 printed only on change, so the single most important failure state —
-  // the controller ACKing happily while reporting count=0 through a real
-  // finger press — produced NO output whatsoever. A 90 s capture during the
-  // operator's "3-5 s to respond" was therefore empty, and empty could mean
-  // either "no taps happened" or "every tap was invisible". That is the same
-  // silent-instrument trap as [[serial-capture-dead-use-ble]], rebuilt by hand.
-  //
-  // With a heartbeat, silence has exactly one meaning: this function is not
-  // running. Anything else prints a live count and the poll rate, so a capture
-  // is interpretable without knowing precisely when a finger landed.
-  static unsigned long lastTouchBeat = 0;
-  static uint32_t pollsSinceBeat = 0;
-  pollsSinceBeat++;
-  if (millis() - lastTouchBeat > 5000) {
-    lastTouchBeat = millis();
-    Serial.printf("[TOUCH] alive: count=%u polls=%lu in 5s (%lu Hz) down=%d\n",
-                  count, (unsigned long)pollsSinceBeat,
-                  (unsigned long)(pollsSinceBeat / 5), touchWasDown ? 1 : 0);
-    pollsSinceBeat = 0;
-  }
-
-  bool down = (count > 0 && count <= 5);
-  if (down) {
-    lastActivityAt = millis();
-    // Stamped on TOUCH-DOWN, not on the completed tap, so the clock starts the
-    // instant the visitor's finger lands — the wake, Wi-Fi reassociation and
-    // broker dial that follow all happen inside the window they just opened.
-    lastTouchAt = lastActivityAt;
-    // (3) SAMPLE ON THE FIRST DOWN POLL, not the second.
-    //
-    // This read used to sit behind `if (touchWasDown)`, so the first poll that
-    // saw a finger only armed the flag and discarded its coordinates. A tap had
-    // to span TWO consecutive polls to exist at all; one that spanned a single
-    // poll fell out of the `n == 0` return below having logged nothing.
-    //
-    // At 65 Hz a human finger clears two polls easily, so this is not the whole
-    // story — but it is a pure amplifier of anything upstream that makes the
-    // controller report only intermittently. If the digitizer emits exactly one
-    // frame on waking, the old code guaranteed that frame was thrown away, and
-    // the user's real tap became the SECOND one they made.
-    int rawX = ((buf[3] & 0x0F) << 8) | buf[4];
-    int rawY = ((buf[5] & 0x0F) << 8) | buf[6];
-    int x, y;
-    mapTouchRaw(rawX, rawY, x, y); // board-specific transform + clamp
-    lastTapX = x;
-    lastTapY = y;
-    if (tapSamples < 255) tapSamples++;
-    touchWasDown = true;
-    return false;
-  }
-  if (!touchWasDown) return false;
-  touchWasDown = false;
-  uint8_t n = tapSamples;
-  tapSamples = 0;
-  if (n == 0) {
-    // Unreachable via the path above now that one down poll always samples —
-    // kept as a live assertion rather than deleted. If this ever prints again
-    // it means a touch-down was seen with no usable coordinate read, which is a
-    // driver fault worth knowing about, not a user tapping too fast.
-    Serial.println("[TOUCH] down->up with NO samples — tap discarded");
-    return false;
-  }
-  tx = lastTapX;
-  ty = lastTapY;
-  return true;
-}
 
 // blelock's keypad grid — layout bands defined earlier in this file, right
 // before drawOperational() (which needs them first). row 2 col 0 = '*', row
@@ -7344,34 +7318,21 @@ const char KP_KEYS[2][4] = {
   {'*','5','6','#'},
 };
 
-char keyAt(int tx, int ty, int &r, int &c) {
-  r = ty <= KP_TOP ? 0 : (ty - KP_TOP) / KEY_H;
-  if (r > 1) r = 1;
-  if (r < 0) r = 0;
-  c = tx * 4 / PANEL_W;
-  if (c > 3) c = 3;
-  if (c < 0) c = 0;
-  return KP_KEYS[r][c];
-}
 
-// Currently-highlighted key (tap feedback) — drawn by drawKeypad() itself
-// (a full redraw already happens on every tap via openBleWindow()'s
-// screenDirty, so the highlight lives here rather than a separate partial-
-// redraw path) and cleared by the loop() timer check below.
-int litKeyR = -1, litKeyC = -1;
-unsigned long litKeySince = 0;
-#define KEY_LIGHT_MS 400
+// (2.19) Tap-highlight state REMOVED with the touch handler — nothing could
+// set it once the panel stopped being an input, so it was dead by
+// construction. The keypad is still DRAWN: it is the product's face and the
+// lock/unlock state block sits in the same layout.
 
 void drawKeypad() {
   // Filled blue keys (operator, 2026-08-07: "employ blue amber etc. ...to
   // improve your UI") — reads as an actual button instead of an outline on
   // black, same idea as the LOCKED/UNLOCKED block always had before it
   // became a thin bar. Green fill + black text on tap, same as before.
-  bool litActive = litKeyR >= 0 && millis() - litKeySince < KEY_LIGHT_MS;
   for (int r = 0; r < 2; r++) {
     for (int c = 0; c < 4; c++) {
       int x = c * KEY_W, y = KP_TOP + r * KEY_H;
-      bool lit = litActive && r == litKeyR && c == litKeyC;
+      const bool lit = false; // (2.19) no touch input — nothing can highlight
       // 1.70: the amber '#' is GONE, and that is not cosmetic. It existed to
       // say "this key, and only this key, opens the pairing window" — true from
       // 2026-08-11 until this version, false the moment any key started opening
@@ -7850,7 +7811,7 @@ void loop() {
     // came for alive in RAM, which is the opposite of what expiry is for.
     assistArmedSealedJson = "";
     assistArmedSealedSlot = -1;
-    Serial.printf("[ASSIST] armed window expired after %lus — nobody touched, "
+    Serial.printf("[ASSIST] armed window expired after %lus — nobody came, "
                   "command dropped\n",
                   ASSISTED_ARM_MS / 1000);
     txlogAppend("expired", "assisted unlock — nobody came to the door");
@@ -8237,124 +8198,15 @@ void loop() {
   // Physical presence is the whole security property here, and a tap is exactly
   // as physical as the BOOT press: nothing remote can open this window, and per
   // XF-52 §4 there must never be an MQTT or DPID verb that does.
-  {
-    int tx, ty;
-    if (touchRead(tx, ty)) {
-      int kr, kc;
-      char k = keyAt(tx, ty, kr, kc);
-      Serial.printf("[TOUCH] %d,%d -> key '%c'\n", tx, ty, k ? k : '-');
-      litKeyR = kr; litKeyC = kc; litKeySince = millis(); // visual tap feedback
-
-      // XF-58: somebody just arrived, and the owner already authorised. Fire the
-      // held command and CONSUME it — single-shot, exactly as in the immediate
-      // path, so one touch can never satisfy a second press.
-      //
-      // FIRST, before openBleWindow(). 1.7 had these the other way round, which
-      // put the ~43 KB Bluedroid allocation of a cold startBle() — ~230 ms on the
-      // bench — in front of the one action here that is time-critical and already
-      // authorised. Opening the door does not depend on BLE being up, and if
-      // startBle() ever stalled or failed outright it would have delayed or lost
-      // an unlock the owner had already granted. The window is the thing that can
-      // afford to wait.
-      if (assistArmedUntil && (long)(millis() - assistArmedUntil) < 0) {
-        Serial.println("[ASSIST] touch received — armed assisted unlock ALLOWED");
-        const String payload = assistArmedPayload;
-        // XF-126 §5b — a SEALED arm replays the verb, not raw bytes.
-        const String sealedJson = assistArmedSealedJson;
-        const int sealedSlot = assistArmedSealedSlot;
-        const bool sealedViaBle = assistArmedSealedViaBle;
-        assistArmedUntil = 0;
-        assistArmedPayload = "";
-        assistArmedSealedJson = "";
-        assistArmedSealedSlot = -1;
-        // Cleared BEFORE dispatching, so a re-entry cannot re-arm from the
-        // same grant and loop. lastTouchAt is deliberately NOT cleared yet:
-        // the sealed re-entry re-checks it, which is what keeps the gate
-        // honest on the second pass instead of trusting this one.
-        if (sealedSlot >= 0 && sealedJson.length()) {
-          ozSemanticDispatch(sealedSlot, sealedJson.c_str(), sealedJson.length(),
-                             sealedViaBle);
-          lastTouchAt = 0; // consumed by the dispatch above
-        } else {
-          lastTouchAt = 0; // consumed here too; do not also satisfy a later command
-          forwardHexToMcu(payload);
-        }
-      }
-
-      // ── BLE window: ANY key (operator, 2026-08-14) ─────────────────────
-      //
-      // WHY THIS PANEL IS NOT BENCH SCAFFOLDING — corrected after the operator
-      // pointed it out: this board is intended to work as a SELF-CONTAINED
-      // doorlock with no DL MCU and no LockSim attached. For that variant the
-      // LCD keypad is the product's real keypad, not a stand-in. So there are
-      // two legitimate pairing gestures, not one deprecated and one real:
-      //
-      //   • self-contained lock  -> the LCD keypad here
-      //   • lock with a DL MCU   -> the DL MCU's keypad -> DP 60 (ozkey-22 §7)
-      //
-      // 🔴 THIS REVERSES THE 2026-08-11 DECISION, deliberately and on the
-      // operator's instruction ("allow touching any key on the lcd will turn on
-      // BLE, not just the '#' key"). The reversed rule and its reasoning are
-      // kept here because the trade-off did not disappear, it was overruled:
-      //
-      //   2026-08-11, '#' only — "any tap re-arms a 60 s advertising window, so
-      //   a sleeve brushing the panel leaves the lock discoverable. The window
-      //   is a physical-presence CLAIM (XF-52 §4); it should cost a deliberate
-      //   act, not an accident."
-      //
-      // What changed is evidence about the other failure: the operator found
-      // the panel taking 10-20 s to respond after power-up, and a user who taps
-      // a key and gets nothing has no way to tell "this is the wrong key" from
-      // "this lock is broken". A designated key only works if the user knows
-      // which one, and at a door nobody does. Making every key work removes an
-      // entire class of "the lock ignored me" that we cannot otherwise
-      // distinguish from a real fault.
-      //
-      // The accidental-advertising cost is REAL and unmitigated by this change.
-      // What bounds it: the window is still 60 s and still self-closes, it is
-      // still local-radio only, and pairing still requires the bond ceremony —
-      // an open window is discoverability, not access. If accidental windows
-      // become a nuisance in the field, the fix is a deliberate gesture (two
-      // taps, or a long press), NOT a return to a secret key.
-      // ── 🔴 THE LCD KEYPAD NO LONGER TOUCHES BLE OR RESET ─────────────────
-      // (operator, 2026-08-16: "ignore doorlock esp32 1.9 lcd keypad.. we only
-      // use in the lab. 5s hold on boot is good enough")
-      //
-      // Two triggers used to fire from this panel and both fired by ACCIDENT:
-      //
-      //   • ANY key opened a 60 s BLE window. The 2026-08-14 comment above
-      //     justified that partly on the panel's 10-20 s lag making "wrong key"
-      //     indistinguishable from "broken lock" — but that lag was the
-      //     Serial.print() stall, fixed in 1.72 (worst case now 95 ms). The
-      //     premise expired; the cost did not. A sleeve on the panel left the
-      //     lock advertising, and an advertising window is a PRIVACY surface
-      //     readable from the footpath (same channel the DP 8 handler above
-      //     closed on the successful-unlock path) — and, once C9's Sleepy End
-      //     Device lands, one of the most expensive things the radio does.
-      //   • `*` armed a factory reset that any following `5` completed. On this
-      //     layout `5` sits directly under `*`: two adjacent taps wiped the
-      //     lock's identity and every bond. Far too cheap for an irreversible
-      //     action.
-      //
-      // Both are simply GONE rather than replaced with a keypad gesture. This
-      // panel is bench hardware, and the BOOT button already covers both jobs
-      // deliberately and physically: a short press opens the window, a 5 s hold
-      // factory-resets. A gesture on a lab-only panel would be machinery to
-      // maintain for no product surface.
-      //
-      // The keypad still lights and logs — it remains useful for exercising
-      // touch zones, which is what it is for.
-      if (k) Serial.printf("[KEY] '%c' (no BLE/reset side effect)\n", k);
-    }
-  }
-
-  // Clear the tap-highlight once its window elapses, even with no other
-  // activity to trigger a redraw — otherwise a lit key can stay lit
-  // indefinitely if nothing else marks the screen dirty in the meantime.
-  if (litKeyR >= 0 && millis() - litKeySince >= KEY_LIGHT_MS) {
-    litKeyR = litKeyC = -1;
-    screenDirty = true;
-  }
+  // ── LCD touch input REMOVED (2.19, operator directive 2026-08-23) ────────
+  //
+  // The panel was the SELF-CONTAINED variant's keypad. That variant is not in
+  // the active product line, and on a lock with a DL MCU our board has no
+  // touch panel at all — so this was the only presence source on a product
+  // that could never provide it (XF-126 §12.1). Presence now comes solely from
+  // DP 53 `doorbell`, which is what the shipping app already tells the visitor
+  // to press. The BLE window is unaffected: a short BOOT press and the doorbell
+  // both still open it, so pairing stays reachable without this panel.
 
   // ── status-line-only refresh, every 3s (operator spec, 2026-08-07) —
   // calls drawStatusLine() DIRECTLY rather than setting screenDirty, so this
@@ -8522,7 +8374,7 @@ void loop() {
   // GATT server on the next window — a bigger change than M3 should carry.)
   if (!isThread() && !wakeSim && state == ST_OPERATIONAL && enrolled &&
       !bleWindowOpen() && !bleClientConnected &&
-      doorStatus == "LOCKED" && !touchWasDown && !mrdyAsserted &&
+      doorStatus == "LOCKED" && !mrdyAsserted &&
       millis() - lastActivityAt > SLEEP_IDLE_MS) {
     enterKeepAliveSleep();
   }

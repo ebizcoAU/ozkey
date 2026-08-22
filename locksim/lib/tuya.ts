@@ -259,6 +259,28 @@ export enum DpId {
    * the DP our BLE unlock path should ultimately report on.
    */
   UNLOCK_BLE = 76,
+
+  /**
+   * The bolt itself. `bool`, `dir: both`, **status `confirmed`**, catalogue
+   * verb `event.bolt` field `locked` — and firmware already carries the same
+   * mapping (`ozprofile_gen.h:143`, `OZ_DIR_UP`), so this needs nothing new on
+   * the other side to be understood.
+   *
+   * 🔴 ADDED 2026-08-22 BECAUSE THE MODULE HAD NO WAY TO KNOW THE DOOR OPENED.
+   *
+   * LockSim reported every unlock on DP 8 `ACCESS_RESULT`, which is one of OUR
+   * FICTION DPs and is not carried by `tuya-luona-ds013-t3`. The profile gate
+   * (XF-118 P1c) correctly refused to emit it — so a verified-good DP 76 unlock
+   * cycled the bolt and told the module **nothing at all**. Firmware does not
+   * wait for an ack on unlock ("its proof is the bolt"), so it reported
+   * UNLOCK_OK into a void and every layer above believed an unlock it had no
+   * evidence for.
+   *
+   * POLARITY: the catalogue field is `locked`, so **1 = LOCKED, 0 = UNLOCKED**.
+   * The supplier does not state this in words; it is read off the field name
+   * and is the one assumption here worth re-checking against real silicon.
+   */
+  BOLT_STATE = 47,
 }
 
 /** Values carried by DP 8 (ACCESS_RESULT, ENUM). */
@@ -585,6 +607,7 @@ const DP_NAMES: Record<number, string> = {
   [DpId.FINGERPRINT]: "Fingerprint",
   [DpId.BATTERY_ALARM]: "Battery Alarm",
   [DpId.ACCESS_RESULT]: "Access Result",
+  [DpId.BOLT_STATE]: "Bolt State",
   [DpId.ADD_TEMP_PIN]: "Add Temporary PIN",
   [DpId.DELETE_PIN]: "Delete PIN",
   [DpId.ADD_TEMP_RFID]: "Add Temporary RFID",
@@ -661,6 +684,10 @@ function annotateDp(dp: TuyaDataPoint, profile?: ResolvedProfile): string {
       return `Action: PIN Entry Report, Value: ${dp.value}`;
     case DpId.ACCESS_RESULT:
       return `Action: Access Result, Value: ${AccessResult[dp.value] ?? dp.value}`;
+    case DpId.BOLT_STATE:
+      // Field is `locked`, so 1 = LOCKED. Spelled out because a bare "Value: 0"
+      // on a DP named bolt_state reads as "no bolt" to anyone skimming.
+      return `Action: Bolt State, Value: ${dp.value === 1 ? "LOCKED" : "UNLOCKED"}`;
     default:
       return `Action: ${name}, Type: ${DpType[dp.type] ?? dp.type}, Value: ${
         Number.isNaN(dp.value) ? toHexString(dp.raw) : dp.value

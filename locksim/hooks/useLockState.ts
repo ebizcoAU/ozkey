@@ -223,6 +223,12 @@ export function useLockState({
   receiveFromModuleRef.current = receiveFromModule;
   const onAccessRef = useRef(onAccess);
   onAccessRef.current = onAccess;
+  // unlockCycle() is declared ABOVE emitDp() and needs to report the bolt, so
+  // it reaches it through a ref rather than being reordered — same pattern as
+  // every other forward reference in this hook. Assigned just below emitDp().
+  const emitDpRef = useRef<
+    ((dpId: DpId, type: DpType, value: number[], note: string) => void) | null
+  >(null);
   const nowRef = useRef(virtualNow);
   nowRef.current = virtualNow;
   // Read through a ref, not a closure: the delay is edited live in Settings, and
@@ -278,11 +284,22 @@ export function useLockState({
       wake(`ACCESS GRANTED — ${source}`, UNLOCK_HOLD_MS + 1500);
       setLockState("UNLOCKED");
       fireMotor();
+      // 🔴 REPORT THE BOLT (2026-08-22). Without this the module has NO evidence
+      // the door ever moved: DP 8 ACCESS_RESULT is a fiction DP the real product
+      // does not carry, so the profile gate drops it and the only other report
+      // is the optional access event. A bolt that moves silently is exactly the
+      // silent-failure class this bench exists to catch — and firmware does not
+      // wait for an unlock ack, so nothing upstream would ever notice.
+      // Field is `locked`: 0 = UNLOCKED.
+      emitDpRef.current?.(DpId.BOLT_STATE, DpType.BOOL, [0], `DP 47 bolt_state — UNLOCKED (${source})`);
       if (relockTimer.current) clearTimeout(relockTimer.current);
       relockTimer.current = setTimeout(() => {
         if (mechanicalRef.current) return; // physical key holds the bolt open
         setLockState("LOCKED");
         fireMotor();
+        // The relock is a real state change and must be reported too, or the
+        // module's picture of the door stays UNLOCKED forever after one unlock.
+        emitDpRef.current?.(DpId.BOLT_STATE, DpType.BOOL, [1], "DP 47 bolt_state — LOCKED (auto-relock)");
         setLastEvent("AUTO-RELOCK (5s TIMEOUT)");
       }, UNLOCK_HOLD_MS);
     },
@@ -335,6 +352,7 @@ export function useLockState({
     },
     []
   );
+  emitDpRef.current = emitDp;
 
   const reportAccessResult = useCallback(
     (result: AccessResult, note: string) => {
@@ -1061,7 +1079,17 @@ export function useLockState({
            */
           case DpId.UNLOCK_BLE:
             if (dp.type === DpType.VALUE)
-              remoteUnlock(`BLE UNLOCK (DP 76, cred_id=${dp.value})`);
+              // 🔴 The `event` argument was MISSING here until 2026-08-22, while
+              // the DP 1 branch above has always passed one. So a real, fully
+              // specified DP 76 unlock reported no access event at all — the
+              // one DP whose payload the supplier documents completely was the
+              // one we stayed silent on. Echoing DP 76 back with the cred_id is
+              // what a real T3 does: the module commands on 76, the MCU reports
+              // the access on 76.
+              remoteUnlock(`BLE UNLOCK (DP 76, cred_id=${dp.value})`, {
+                dp: DpId.UNLOCK_BLE,
+                credId: dp.value,
+              });
             break;
           case DpId.ADD_TEMP_PIN:
           case DpId.ADD_TEMP_RFID: {
