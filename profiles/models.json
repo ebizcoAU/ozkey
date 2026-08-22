@@ -1,0 +1,103 @@
+{
+  "$comment": "GENERATED FILE — DO NOT EDIT. Source: profiles/*.json.\nRegenerate: python3 blelock/tools/gen_profile.py\nVerify current: python3 blelock/tools/gen_profile.py --check\n\nWHAT THIS IS. The app-facing model manifest (XF-122 §9): how to turn a `tuya_pid` reported by a lock into a model name a human recognises, and which models can be paired at all. Generated from the same load pass as the firmware's PROGMEM DP tables, so the app's model list cannot drift from the DP maps the firmware actually runs.\n\nWHAT THIS IS NOT. Not a DP map and not a capability list. The app learns what a specific lock can do from the `verbs` array in its enrol payload (XF-121) — from the lock itself, which is the only source that cannot go stale. Do not infer capability from a model name here.\n\n`pairable` IS DERIVED from whether a profile has a PID and a complete DP map — it is not a flag anyone sets. A profile with `pairable: false` must not be offered to a user; per XF-122 §7 an unrecognised PID is refused outright rather than manually overridden.",
+  "generated_from": "profiles/products/*.json",
+  "catalogue_rev": 2,
+  "unpinned_build_default_profile_id": "tuya-wifi-lock-pro",
+  "pairable_count": 1,
+  "models": [
+    {
+      "firmware_id": "fw-doorlock-tuya-ladin-f7-t3-r1",
+      "device_type": "doorlock",
+      "profile_id": "tuya-ladin-f7-t3",
+      "tuya_pid": null,
+      "manufacturer": "Ladin Tech",
+      "product": "F7-T3 (UNCONFIRMED — see $comment)",
+      "display_name": "Ladin Tech — F7-T3 (UNCONFIRMED — see $comment)",
+      "category": "video_lock",
+      "module": "T3-U / T3-U-IPEX (Beken BK7236)",
+      "rev": 1,
+      "dp_count": 4,
+      "pairable": false,
+      "not_pairable_because": [
+        "no tuya_pid — PID discovery has nothing to match, and XF-122 §7 allows no manual override, so this profile can never be proposed",
+        "DP map is marked incomplete — see `source_note`",
+        "blocked by ozkey-42 — Ladin has not supplied a DP reference"
+      ],
+      "verbs": [],
+      "caps": [
+        "audit"
+      ],
+      "source_note": "Module integration overview, not a DP reference. Four DPs named in passing."
+    },
+    {
+      "firmware_id": "fw-doorlock-tuya-luona-ds013-t3-r2",
+      "device_type": "doorlock",
+      "profile_id": "tuya-luona-ds013-t3",
+      "tuya_pid": "vr4iiuqtyh0q4nix",
+      "manufacturer": "Luona Smart",
+      "product": "Smart Lock DS013-T3",
+      "display_name": "Luona Smart — Smart Lock DS013-T3",
+      "category": "smart_lock",
+      "module": "T3-U (Beken BK7236)",
+      "rev": 2,
+      "dp_count": 34,
+      "pairable": true,
+      "not_pairable_because": null,
+      "verbs": [
+        {
+          "verb": "lock.unlock",
+          "dp": 76
+        },
+        {
+          "verb": "lock.settings.set",
+          "field": "autolock",
+          "dp": 23
+        },
+        {
+          "verb": "lock.settings.set",
+          "field": "volume",
+          "dp": 21
+        }
+      ],
+      "caps": [
+        "remote_unlock",
+        "audit"
+      ],
+      "source_note": null
+    },
+    {
+      "firmware_id": "fw-doorlock-tuya-wifi-lock-pro-r1",
+      "device_type": "doorlock",
+      "profile_id": "tuya-wifi-lock-pro",
+      "tuya_pid": null,
+      "manufacturer": null,
+      "product": "Tuya Wi-Fi Lock Pro (platform standard DP map)",
+      "display_name": "Tuya Wi-Fi Lock Pro (platform standard DP map)",
+      "category": "wifi_lock_pro",
+      "module": "any Tuya Wi-Fi module built to the standard Wi-Fi Lock Pro DP set",
+      "rev": 1,
+      "dp_count": 42,
+      "pairable": false,
+      "not_pairable_because": [
+        "no tuya_pid — PID discovery has nothing to match, and XF-122 §7 allows no manual override, so this profile can never be proposed",
+        "DP map is marked incomplete — see `source_note`"
+      ],
+      "verbs": [
+        {
+          "verb": "cred.delete",
+          "field": "pin",
+          "dp": 41
+        },
+        {
+          "verb": "lock.settings.set",
+          "field": "autolock",
+          "dp": 68
+        }
+      ],
+      "caps": [
+        "audit"
+      ],
+      "source_note": "DP list is complete per the reference. RAW DPs are marked `reserved`: the reference names the FIELD ORDER (e.g. DP 49 Validity+KeyID+Times+Key) but not byte widths, so a frame still cannot be built without more detail."
+    }
+  ]
+}

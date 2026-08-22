@@ -46,6 +46,12 @@ struct OzProfile {
   // lock identifies ITSELF instead of being told what it is.
   // nullptr where we have no PID (our own invented map).
   const char       *tuya_pid;
+  // XF-123 P3.4 — reported at enrol, the key Nexus stores a model under.
+  // `fw-{profile-id}-r{catalogue_rev}`: it identifies WHAT THIS LOCK IS.
+  // Deliberately NOT the build instant — that stays in `fw`, separately
+  // (P3.6), because an id that changes on every rebuild strands the
+  // firmware_id already stored against an enrolled lock (§13.1).
+  const char       *firmware_id;
   // Verb resolver table for THIS product — see OzVerbMap.
   const OzVerbMap  *verbs;
   uint16_t          verb_count;
@@ -257,9 +263,9 @@ static const OzVerbMap OZ_VERBS_tuya_wifi_lock_pro[] = {
 };
 
 static const OzProfile OZ_PROFILES[] = {
-  { "tuya-ladin-f7-t3", 1, OZ_DP_tuya_ladin_f7_t3, (uint16_t)(sizeof(OZ_DP_tuya_ladin_f7_t3) / sizeof(OzDpEntry)), false, nullptr, OZ_VERBS_tuya_ladin_f7_t3, 2 },
-  { "tuya-luona-ds013-t3", 2, OZ_DP_tuya_luona_ds013_t3, (uint16_t)(sizeof(OZ_DP_tuya_luona_ds013_t3) / sizeof(OzDpEntry)), false, "vr4iiuqtyh0q4nix", OZ_VERBS_tuya_luona_ds013_t3, 54 },
-  { "tuya-wifi-lock-pro", 1, OZ_DP_tuya_wifi_lock_pro, (uint16_t)(sizeof(OZ_DP_tuya_wifi_lock_pro) / sizeof(OzDpEntry)), false, nullptr, OZ_VERBS_tuya_wifi_lock_pro, 48 },
+  { "tuya-ladin-f7-t3", 1, OZ_DP_tuya_ladin_f7_t3, (uint16_t)(sizeof(OZ_DP_tuya_ladin_f7_t3) / sizeof(OzDpEntry)), false, nullptr, "fw-doorlock-tuya-ladin-f7-t3-r1", OZ_VERBS_tuya_ladin_f7_t3, 2 },
+  { "tuya-luona-ds013-t3", 2, OZ_DP_tuya_luona_ds013_t3, (uint16_t)(sizeof(OZ_DP_tuya_luona_ds013_t3) / sizeof(OzDpEntry)), false, "vr4iiuqtyh0q4nix", "fw-doorlock-tuya-luona-ds013-t3-r2", OZ_VERBS_tuya_luona_ds013_t3, 54 },
+  { "tuya-wifi-lock-pro", 1, OZ_DP_tuya_wifi_lock_pro, (uint16_t)(sizeof(OZ_DP_tuya_wifi_lock_pro) / sizeof(OzDpEntry)), false, nullptr, "fw-doorlock-tuya-wifi-lock-pro-r1", OZ_VERBS_tuya_wifi_lock_pro, 48 },
 };
 static const uint8_t OZ_PROFILE_COUNT = 3;
 

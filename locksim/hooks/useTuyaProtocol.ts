@@ -27,7 +27,7 @@ export interface SerialLogEntry {
 interface UseTuyaProtocolOptions {
   /** Invoked for every checksum-valid frame received on the simulated RX line. */
   onFrame: (frame: TuyaFrame) => void;
-  /** Active hardware pipeline (see HardwarePipelineToggle). */
+  /** Active hardware pipeline — the UART link controls live in app/page.tsx. */
   mode: HardwareMode;
   /** Fire raw bytes out the physical USB-UART wire (Mode B). */
   sendToWire: (bytes: ByteArray) => Promise<boolean> | boolean;

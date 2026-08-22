@@ -78,15 +78,23 @@ SKETCH := $(SKETCH_$(BOARD))
 # it silently switched maps mid-session and read every DP under a profile for a
 # product that was not attached.
 #
-#   make flash BOARD=19 PORT=... PROFILE=tuya-ds013-t3
+#   make flash BOARD=19 PORT=... PROFILE=tuya-luona-ds013-t3
 #
-# Omit it and the build keeps OZ_PROFILE_DEFAULT_ID (ozkie-legacy-v0), which is
-# the historical behaviour. The id must match a profiles/products/*.json
-# profile_id — a typo is caught at boot with a loud [PROFILE] line, not
-# silently ignored.
+# 🔴 OMITTING IT IS NOW A CONFIGURATION ERROR, not the historical default.
+# The build falls back to OZ_PROFILE_DEFAULT_ID, which since 2026-08-20 is
+# `tuya-wifi-lock-pro` — Tuya's published standard, chosen as the least-wrong
+# default when the invented map was deleted. It is still a GUESS for any
+# specific lock: DP 76 is `unlock_ble` on Luona and `fill_light` on that map,
+# so an unpinned build can answer an unlock by turning on a lamp. It warns
+# loudly at boot. Always pin.
 #
-# Valid ids: ozkie-legacy-v0  tuya-generic-lock  tuya-ds013-t3
-#            tuya-t3-videolock  ozsim-fullfeature
+# The id must match a profiles/products/*.json profile_id — a typo is caught
+# at boot with a loud [PROFILE] line, not silently ignored.
+#
+# Valid ids: `ls profiles/products/` — do not keep a copy of the list here.
+# The five ids this comment used to name were all deleted or renamed in
+# a6db8c3 and every one of them survived here as a bench instruction that
+# would have silently mispinned a board.
 PROFILE ?=
 ifneq ($(PROFILE),)
 PROFILE_FLAGS := --build-property "compiler.cpp.extra_flags=-DOZ_PROFILE_BUILD=\"$(PROFILE)\" -DOZ_PROFILE_PINNED=1"

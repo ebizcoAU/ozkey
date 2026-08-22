@@ -1,41 +1,50 @@
-# Generic Tuya smart-lock DP list
+# The Tuya smart-lock DP catalogue — and why there is no *generic* one
 
-**Status: 2026-08-18 — firmware team.** Supersedes nothing; this is the first
-version. The machine-readable form of this document is
-`profiles/tuya-lock-catalogue.json` + `profiles/products/tuya-generic-lock.json`,
-and **those are authoritative** — this file explains them and records where each
-row came from. If the two ever disagree, the JSON wins and this file is stale.
+**Status: 2026-08-20 — firmware team.** Rewritten. **Supersedes the 2026-08-18
+version of this file**, which was written one day before we established that a
+generic Tuya lock DP map cannot exist, and which described a profile layout
+(`tuya-generic-lock`, `ozkie-legacy-v0`) that has since been **deleted**.
+
+The machine-readable forms are `profiles/tuya-lock-catalogue.json`,
+`profiles/products/*.json` and `profiles/models.json`, and **those are
+authoritative** — this file explains them and records where each row came from.
+If the two ever disagree, the JSON wins and this file is stale.
+
+*(The filename still says "generic". It is kept so links and git history survive;
+the word is the error this document exists to correct. §1 is why.)*
 
 ---
 
-## 0. The premise
+## 0. The premise, and the correction that outlived it
 
 > *"90% of the makers talked about standard DP from the TUYA developer website.
 > We already have 2 makers' DP lists; the rest seem likely to buy directly from
 > TUYA pre-made, pre-flashed DL-MCU."* — operator, 2026-08-18
 
-**That premise is correct**, and it is the single most useful thing anyone has
-said about this problem. It is why `profiles/` is a *catalogue plus short
-selection files* and not one DP list per supplier (`ozkey-27 §3`): a maker who
-buys a pre-flashed Tuya DL-MCU does not invent DP numbers, they tick boxes on
-the Tuya IoT platform at PID creation, and Tuya generates their protocol
-document from those ticks. Both documents we hold are visibly machine-generated
-that way — the Luona PDF even carries its generation timestamp
-(`协议生成时间：2026年08月11日 16:42`).
+**The premise is correct and still load-bearing.** A maker who buys a pre-flashed
+Tuya DL-MCU does not invent DP numbers — they tick boxes on the Tuya IoT platform
+at PID creation, and Tuya generates their protocol document from those ticks.
+Both documents we hold are visibly machine-generated that way; the Luona PDF even
+carries its generation timestamp (`协议生成时间：2026年08月11日 16:42`).
 
-**But there is one correction, and it is load-bearing.** See §1.
+That is why `profiles/` is a *catalogue plus short selection files* rather than
+one hand-written DP list per supplier (`ozkey-27 §3`), and why onboarding
+supplier #3 should cost about twenty lines of JSON (§5).
+
+**But the scope of "standard" was wrong, and it was wrong in the direction that
+opens doors by accident.** See §1.
 
 ---
 
 ## 1. 🔴 "Standard" is per CATEGORY, not per Tuya
 
 Tuya does not publish *one* smart-lock instruction set. It publishes a different
-standard instruction set **per product category**, and the categories reuse the
-same low DP numbers for completely different things. Tuya's own category list
-names at least nine lock categories: `ms` (residential lock), `gyms` (business
-lock), `jtmspro` (residential lock pro), `hotelms` (hotel lock), `jtmsbh` (smart
-lock, keep-alive), `mk` (access control), `videolock`, `photolock`,
-`ms_category` (accessories).
+standard instruction set **per product category**, chosen at PID creation, and
+the categories reuse the same low DP numbers for completely different things.
+Tuya's own category list names at least nine lock categories: `ms` (residential
+lock), `gyms` (business lock), `jtmspro` (residential lock pro), `hotelms`
+(hotel lock), `jtmsbh` (smart lock, keep-alive), `mk` (access control),
+`videolock`, `photolock`, `ms_category` (accessories).
 
 Concretely — the same number, three published Tuya meanings:
 
@@ -48,22 +57,46 @@ Concretely — the same number, three published Tuya meanings:
 | **45** | **`battery_percentage` (−1..100)** | **palm-print unlock record** | — |
 | 50 | *(not selected)* | — | remote unlock/lock (raw) |
 | 61 | `unlock_password` (cred id) | one-time password (bool) | — |
+| **76** | **`unlock_ble` — opens the door** | — | **`fill_light` — turns on a lamp** |
 
-**DP 45 is the whole lesson in one row.** In our family it is the battery
-percentage. In Tuya's Zigbee residential lock it is a palm-print unlock record.
-Both are "the standard Tuya DP list". A firmware that treats "Tuya standard" as
-a single global table will read a palm print as a battery level.
+**Read the DP 76 row twice. We ship remote unlock on DP 76.** On a Luona lock it
+opens the door. On a lock built to Tuya's own Wi-Fi Lock Pro standard, the same
+command switches on a light.
+
+**DP 45 is the same lesson in a quieter register.** In our family it is battery
+percentage; in Tuya's Zigbee residential lock it is a palm-print unlock record.
+Both are "the standard Tuya DP list". Firmware that treats "Tuya standard" as one
+global table will read a palm print as a battery level and never notice.
 
 So the useful sentence is not *"use the Tuya standard list"*. It is:
 
 > **Use the Tuya standard list _for the category the module was provisioned
 > under_, and confirm the category before trusting a single number.**
 
+### 1.1 What this cost, and what it killed
+
+This finding is why, on 2026-08-20, three profiles were **deleted outright**:
+
+| deleted | what it was | why it had to go |
+|---|---|---|
+| `tuya-generic-lock` | "a standard pre-flashed Tuya DL-MCU" | never generic — it was **Luona's map with the PID stripped out**. As the fallback for an unidentified lock it could have "unlocked" a door by turning on a lamp |
+| `ozkie-legacy-v0` | our invented map — DP 1 unlock, DP 21–24 credentials | none of those DPs exist on any real product (`XF-110`) |
+| `ozsim-fullfeature` | bench PID-discovery target | fiction, and it was silently reverting LockSim's profile on refresh |
+
+**There is no `fiction` entry left anywhere in `profiles/`** — verified, zero
+occurrences. The status value survives in the schema only so an old header cannot
+quietly re-mean something else.
+
+The 2026-08-18 version of this file diagnosed all of this correctly in this
+section and then, four sections later, shipped `tuya-generic-lock` anyway. That
+gap between the finding and the artefact is the thing to watch for.
+
 *(Fidelity note: the "our family" column is transcribed from supplier documents
-we hold in this directory. The other two columns are from Tuya's public
-developer pages, read through a summariser — they are good enough to prove the
-collisions exist and are **not** good enough to build against. Do not copy them
-into a profile.)*
+we hold in this directory. The other columns are from Tuya's public developer
+pages, read through a summariser — good enough to prove the collisions exist,
+**not** good enough to build against. Do not copy them into a profile. The one
+exception is `tuya-wifi-lock-pro`, transcribed deliberately and completely as a
+reference map; it is still not a product — see §6.3.)*
 
 ---
 
@@ -92,23 +125,27 @@ audio/video superset that adds DP 212). Neither supplier states it. **Ask
 supplier #3 for their category slug** — it is one line in their PID definition
 and it settles this permanently.
 
+**This is what the catalogue is scoped to.** `tuya-lock-catalogue.json` is the
+standard list *for this family*, not for Tuya at large. A product from another
+category does not select from it — it gets a `standalone` profile with its own
+entries (§6.1).
+
 ---
 
-## 3. The generic DP list
+## 3. The catalogue — this family's DP list
 
-This is the union of both suppliers, which is what
-`profiles/tuya-lock-catalogue.json` holds. 34 of the 36 rows come from Luona's
-auto-generated table; DP 149 and 212 are named only by Ladin.
+The union of both suppliers, which is what `profiles/tuya-lock-catalogue.json`
+holds: **36 DPs — 19 `confirmed`, 15 `reserved`, 2 `unknown`.** 34 rows come from
+Luona's auto-generated table; DP 149 and 212 are named only by Ladin.
 
-🟢 **Independently cross-checked.** On 2026-08-18 the operator extracted the same
-table from the same PDF by hand, without reference to the catalogue, which had
-been built a week earlier. The two agree **row for row** — same 34 DPs, same
-types, same ranges, no contradictions and no extra rows on either side. That
-extraction has been merged into the tables below and its file deleted, so this
-document is the single copy: the plain-English function descriptions are the
-operator's, the codes, statuses and verbs are the catalogue's. Given how much of
-this project's pain came from a map that only ever agreed with itself, two
-independent readings landing identically is worth recording.
+🟢 **Independently cross-checked, twice.** On 2026-08-18 the operator extracted
+the same table from the same PDF by hand, without reference to the catalogue,
+which had been built a week earlier. The two agree **row for row** — same 34 DPs,
+same types, same ranges, no contradictions and no extra rows on either side. On
+2026-08-20 a **live DP census over Tuya command `0x08`** against the bench MCU
+returned **34/34 full match, DP 76 present**. Given how much of this project's
+pain came from a map that only ever agreed with itself, two independent readings
+and one hardware confirmation are worth recording.
 
 **Witness** — `L` = Luona *Smart Lock DS013-T3* (`protocol_vr4iiuqtyh0q4nix_20260811.pdf`,
 PID `vr4iiuqtyh0q4nix`) · `T` = Ladin *T3-U module* (`T3_Final_Customer_Version_EN.docx`).
@@ -138,6 +175,18 @@ omit these by accident — they declined to specify them.** That is a supplier
 gap, not a gap in our reading, and it is why the ask is *"send us the byte
 layouts of DP 9/10/13–19"*, not *"send us the protocol document"* (we have it).
 
+🔴 **This is the whole credential story, and it got worse, not better, when we
+adopted a real map** (`ozkey-42 §2.4.1`):
+
+| profile | issuing a PIN |
+|---|---|
+| `ozkie-legacy-v0` (fiction, deleted) | **worked** — because we made the DP up |
+| `tuya-luona-ds013-t3` (real) | **refused, with a reason** |
+
+On the real map, the invented credential DP 21 is `navigation_volume`. Firmware
+now refuses rather than writing a PIN onto the volume control. **Only the
+supplier can end this** — `ozkey-42` P0, 15 RAW layouts, sent to **Luona Smart**.
+
 ### 3.2 Commands
 
 | DP | Tuya code | What it does | Type / detail | Status | Wit. | OZKIE verb |
@@ -148,16 +197,28 @@ layouts of DP 9/10/13–19"*, not *"send us the protocol document"* (we have it)
 | 23 | `auto_lock` | Toggle auto-lock (off = permanently-open mode) | bool | confirmed | L | `lock.settings.set` |
 | 24 | `auto_lock_delay` | Delay from unlock to auto-relock | value 5–1800 s | confirmed | L | `lock.settings.set` |
 | 42 | `ble_switch` | Enable BLE control. **Ladin:** specifically governs whether BLE transmission is on when Wi-Fi is down, in dual-mode | bool | confirmed | **L + T** | `lock.settings.set` |
+| **76** | `unlock_ble` | **The DP we open the door with** — see below | value 0–99999 | **confirmed** | **L + T** | `lock.unlock` |
 | 156 | `wifi_connection_strategy` | Wi-Fi DTIM interval | enum `wifi_dtm20` `wifi_dtm10` | confirmed | L | `lock.settings.set` |
 
-🔴 **DP 10 is the hole in the middle of the product.** It is the real
-remote-unlock command, and it is `reserved` — the supplier never gave its
-payload layout. **There is currently no usable real DP that opens a door.**
-DP 72 is not a substitute: it is a *report* that a remote unlock happened, not
-a command. Our shipping firmware papers over this with an invented DP 1
-(`ozkie-legacy-v0`, and the bench-only `extra` in `ozsim-fullfeature`), which is
-exactly the fiction this document exists to retire. **Closing DP 10's payload
-layout is the highest-value question to put to any supplier.**
+🟢 **A real DP opens a door. This changed on 2026-08-20.** The previous version
+of this file said *"there is currently no usable real DP that opens a door"* —
+that is **no longer true**. `lock.unlock` resolves to **DP 76 `unlock_ble`**,
+which is `confirmed`, fully specified by the supplier (`0x4c`, VALUE, 4 bytes,
+range 0..99999) and witnessed by both vendors. Verified end to end twice on the
+bench: app seals `{"kind":"unlock"}` → firmware verifies the bond → DP 76 → the
+door opened (`XF-120 §8`).
+
+🔴 **DP 10 is still the hole, and it is still worth closing.** `remote_unlock` is
+the DP Tuya *designed* for a network-originated unlock, and it is `reserved` —
+the supplier never gave its payload layout. Using DP 76 instead works, but DP 76
+is defined as *"the id of the BLE credential used"*, so a network unlock reported
+through it **may distort the supplier's audit record**. That is the honest
+caveat, recorded in `doorlock-2.11`'s DP-selection note and in `XF-120 §8.1`.
+Consequence: `ozkey-42` Priority B (DP 10) drops from **blocking to
+informational** — remote unlock ships without waiting on a vendor round trip.
+
+**DP 72 is not a substitute for either.** It is a *report* that a remote unlock
+happened, not a command.
 
 ### 3.3 Access events — the ones that actually work
 
@@ -176,6 +237,10 @@ layout is the highest-value question to put to any supplier.**
 The value is a **credential id assigned by the lock hardware**, not a count —
 "fingerprint #7 opened the door". Select DP 74 instead of the `value` DPs only
 if credential ids must exceed 255.
+
+**Seven DPs legitimately report `event.access`.** That is not ambiguity: upward,
+the MCU hands us a DP number and we ask what it means, which has exactly one
+answer per DP. Ambiguity is a *downward* concern only — see §6.2.
 
 ### 3.4 State and alarms
 
@@ -202,6 +267,12 @@ if credential ids must exceed 255.
 **DP 98 must not be collapsed into DP 60.** It is duress — it needs its own
 escalation path (`ozkey-28 §3.4`).
 
+⚠️ **A DP report is not always safe to treat as an event.** During the 2026-08-20
+census, replies to a *query* were processed as live events: DP 53 latched
+`has_doorbell` and **opened the BLE pairing window**. A diagnostic with a
+security side effect, found only by running it. Solicited replies and unsolicited
+reports must be distinguished before dispatch.
+
 ### 3.5 Do not select
 
 | DP | Tuya code | Status | Wit. | Why |
@@ -213,6 +284,10 @@ escalation path (`ozkey-28 §3.4`).
 
 ## 4. What this list is NOT
 
+**It is not "the Tuya DP list".** It is the standard list for **one category**
+(§2), and the category slug is still unconfirmed. Applying it to a lock from
+another category is the DP 76 / DP 45 failure in §1.
+
 **It is not the complete category standard.** It is the union of two witnesses.
 There is direct internal evidence of DPs we have never seen a number for:
 **DP 60's alarm enum contains `wrong_finger_vein` and `wrong_hand`**, so this
@@ -221,9 +296,9 @@ category supports finger-vein and palm credentials — and therefore has
 (`wrong_face`). Treat an unrecognised DP from a new supplier as *"a standard DP
 we have not met yet"*, not as *"that vendor invented something"*.
 
-**It is not a payload specification.** 14 of 36 rows are `raw`/`string` with the
-layout undisclosed. A `reserved` row tells you the DP exists and its type — it
-does not let you build a frame.
+**It is not a payload specification.** 15 of 36 rows are `reserved` — `raw` or
+`string` with the layout undisclosed. A `reserved` row tells you the DP exists
+and its type; it does not let you build a frame.
 
 **It is not the transport.** These are all per-vendor and none of them are in
 this list:
@@ -246,34 +321,45 @@ guess has never met real hardware.
 
 ## 5. Onboarding supplier #3 (and #4, and #12)
 
-**A new supplier should cost about twenty lines of JSON.** That is the entire
-point of the catalogue split. The procedure:
+**A new supplier should still cost about twenty lines of JSON** — provided they
+are in this category. That is the point of the catalogue split, and §1 narrows
+it rather than cancelling it. The procedure:
 
 1. **Ask for the Tuya-generated protocol document, and for the PID.** Every
-   maker who buys a pre-flashed DL-MCU has one — Tuya generates it from their
-   PID definition. If they cannot produce it, they are not on a standard Tuya
-   module and none of this applies.
-2. **Run the fingerprint test.** Three questions, answerable in 30 seconds by
+   maker who buys a pre-flashed DL-MCU has one. If they cannot produce it, they
+   are not on a standard Tuya module and none of this applies.
+2. **Ask for the category slug** (§2). One line in their PID definition.
+3. **Run the fingerprint test.** Three questions, answerable in 30 seconds by
    looking at their table:
    - Is battery on **DP 45**? (Zigbee lock says 10 — wrong family.)
    - Are unlock records on **61/63/64**? (Zigbee lock says 1/2/5 — wrong family.)
    - Is `unlock_ble` on **DP 76**?
-   Three yeses ⇒ same family, our catalogue applies.
-3. **Write the selection file** — `profiles/products/<vendor>-<model>.json` with
-   a `selects` array. Only genuinely product-specific DPs go in `extra`.
-4. **Any DP in their table that is not in our catalogue is a catalogue addition**,
+   Three yeses ⇒ same family, our catalogue applies. **Any no ⇒ different
+   category: give them a `standalone` profile, do not let them select from this
+   catalogue.**
+4. **Write the selection file** — `profiles/products/<vendor>-<model>.json`, with
+   a `selects` array and `supplier.pid` filled in. Only genuinely
+   product-specific DPs go in `extra`. **Without a PID the profile cannot be
+   paired** (`XF-122 §9`).
+5. **Any DP in their table that is not in our catalogue is a catalogue addition**,
    not a product quirk. Add it to `tuya-lock-catalogue.json` **once**, with its
    witness recorded, and every future product can select it.
-5. **Regenerate and test:** `python3 blelock/tools/gen_profile.py` then
-   `npm test --prefix locksim`.
+6. 🔴 **Re-verify DPs 101–103.** Our in-lock bond channel (§6.4) is squatting on
+   numbers Tuya does **not** reserve. Check them against the new supplier's list
+   before assuming they are free.
+7. **Regenerate and test:** `python3 blelock/tools/gen_profile.py` then
+   `npm test --prefix locksim`. The generator refuses to build an ambiguous
+   command map, and `--check` fails the test run if the outputs are stale.
 
 ### The five questions our two suppliers left open
 
 Put these to every new supplier — they are the same five every time:
 
-1. **The byte layout of DP 10 `remote_unlock`.** Without it there is no real
-   remote unlock. *(Highest value. Ask first.)*
-2. **The byte layouts of DP 9 and DP 13–19** — every credential write.
+1. **The byte layouts of DP 9 and DP 13–19** — every credential write.
+   *(Now the highest-value ask: it is the only thing blocking PINs on real
+   hardware. Ask first.)*
+2. **The byte layout of DP 10 `remote_unlock`** — and whether reporting a
+   network unlock through DP 76 distorts their audit record (§3.2).
 3. **The wake handshake**: assert level, level-vs-pulse, minimum width, on which
    line, in each direction.
 4. **The command-word variant**: general (`0x06`/`0x07`) or low-power
@@ -284,37 +370,94 @@ Put these to every new supplier — they are the same five every time:
 
 ## 6. How this drives LockSim and the firmware
 
+### 6.1 One profile per real lock model
+
 ```
 profiles/
-  tuya-lock-catalogue.json          ← §3 of this document, machine-readable
+  tuya-lock-catalogue.json          §3 of this document, machine-readable (rev 2)
   products/
-    tuya-generic-lock.json          ← NEW: "a standard pre-flashed Tuya DL-MCU"
-    tuya-ds013-t3.json              ← Luona, selects 34
-    tuya-t3-videolock.json          ← Ladin, partial
-    ozsim-fullfeature.json          ← bench PID-discovery target (fictional)
-    ozkie-legacy-v0.json            ← our invented map. Still the default.
+    tuya-luona-ds013-t3.json        Luona Smart — selects 34. THE ONE WE SHIP ON
+    tuya-wifi-lock-pro.json         Tuya's own published standard — standalone, 42
+    tuya-ladin-f7-t3.json           Ladin — STUB, 4 DPs, unusable
+  models.json                       GENERATED — the app's PID → model manifest
 ```
 
-`tuya-generic-lock` selects **every catalogue DP except 149 and 212** — the two
-Tuya itself says not to select. It is therefore the maximal honest lock: the
-`confirmed` DPs behave, and the nine `reserved` credential DPs are present and
-**refuse loudly**, which is the behaviour a real supplier's lock would show us
-today. Running LockSim on this profile is how we find out what breaks *before* a
-real DL-MCU is on the wire, instead of after.
+| profile | what it is | DPs | PID | pairable |
+|---|---|---|---|---|
+| `tuya-luona-ds013-t3` | Luona Smart DS013-T3 | 34 | `vr4iiuqtyh0q4nix` | 🟢 yes |
+| `tuya-wifi-lock-pro` | Tuya's published standard map — a **category**, not a product | 42 | none | no |
+| `tuya-ladin-f7-t3` | **STUB** — no DP reference ever supplied (`ozkey-42`) | 4 | none | no |
 
-Both consumers read the same JSON — LockSim directly, the firmware via
-`blelock/tools/gen_profile.py` → `blelock/common/ozprofile_gen.h` (flat PROGMEM
-tables, no runtime parse). Neither can hold a different idea of what a DP number
-means.
+**Exactly one model is pairable today**, and that is correct rather than broken
+(`XF-122 §9.1`). Both consumers read the same JSON — LockSim directly, the
+firmware via `blelock/tools/gen_profile.py` → `blelock/common/ozprofile_gen.h`
+(flat PROGMEM tables, no runtime parse). Neither can hold a different idea of
+what a DP number means.
 
-🔴 **What this document deliberately does NOT do: switch the default.**
-`OZ_PROFILE_DEFAULT_ID` is still `ozkie-legacy-v0`, because BANOI and ozlockserv
-still seal raw **DP 1** frames and flipping the default would break every
-unlock on the next flash. That migration is tracked as **L-4** and is the
-operator's call, not a side effect of writing a DP list. Related: an unknown PID
-currently **keeps the current profile** (`ozProfileByTuyaPid()` returns
-`nullptr`, deliberately). Making `tuya-generic-lock` the unknown-PID fallback is
-a genuine firmware change and is not in this change.
+### 6.2 The DP map is pinned at BUILD time, and no DP number is left in C
+
+```
+make -C blelock flash BOARD=19 PROFILE=tuya-luona-ds013-t3
+```
+
+- **PID discovery CONFIRMS, never adopts.** An unknown PID no longer falls back —
+  it keeps the pinned profile, says so, and lets the verb resolver refuse. **There
+  is nothing safe to fall back to.**
+- **`ozResolveVerb(verb, field, dir)`** reads a generated PROGMEM table.
+  `if (isUnlock) { ozDpFind(76) ? 76 : 1 }` and `dp = grant_pin ? 21 : 23` are
+  gone. A second supplier whose unlock DP is not 76 needs **no firmware change**.
+- **Catalogue rev 2** adds `verb_down`/`field_down` for the 20 DPs a command may
+  target. 32 of 36 entries are `dir: both` — that is what Tuya *permits*, not
+  what OZKIE should send. **Absence of `verb_down` is meaningful.**
+- **`gen_profile.py` refuses to build on an ambiguous command.** Ordering is
+  policy, not luck: `(verb, STATUS, field)`, so a bare `lock.unlock` takes DP 76
+  (`confirmed`) and never DP 10 (`reserved`).
+- Uniqueness is enforced **downward only**. Upward, seven DPs may share
+  `event.access` (§3.3); requiring those to be distinguishable by verb was a
+  modelling error, not a catalogue defect.
+
+### 6.3 🔴 The unpinned default is a configuration error, not a model
+
+`OZ_PROFILE_DEFAULT_ID` is **`tuya-wifi-lock-pro`** — what a build falls back to
+when flashed without `PROFILE=`. It was chosen as the *least-wrong* default when
+the fiction was deleted: a real published standard beats an invented map. It is
+**not** the map we ship on, and adopting it as one would put remote unlock on
+`fill_light`.
+
+An unpinned build warns loudly at boot, because with no fiction left, "unpinned"
+means "we are guessing which lock is in the door". A lock that enrols reporting
+`profile: "tuya-wifi-lock-pro"` is **unconfigured firmware**, and the app must
+treat it as a pairing failure rather than a detected model (`XF-122 §9.3`).
+
+*(Open, operator's call: the honest alternative is a default of no profile at
+all, refusing every verb until pinned. It fails louder. Not changed.)*
+
+### 6.4 `in_lock` — DPs 101/102/103 belong to every profile
+
+`bond_revoke`, `invite_cancel`, `list_bonds`. These are **ours** — our BLE
+bond-management channel, not Tuya datapoints — handled entirely inside the module
+and **never forwarded to the MCU**. Being product-independent, they belong on
+every profile.
+
+🔴 **They lived only on `ozkie-legacy-v0`.** Deleting the fiction silently removed
+bond revoke from every product; the tests caught it. They are now on all three
+profiles. **101–103 are not reserved by Tuya**, so the allocation must be
+re-verified against every new supplier's DP list (§5.6).
+
+### 6.5 `models.json` — generated, for the app
+
+`XF-122 §7` has the app show *"Detected: <model> — is this correct?"* at pairing,
+so it must map a `tuya_pid` to a human model name. That is the same fact the DP
+tables encode, so it is **generated from the same load pass** rather than
+hand-copied into the app:
+
+- carries **identity only** — PID, names, `pairable`, `dp_count`. No DP numbers,
+  no capabilities: a specific lock's abilities come from the `verbs` array in its
+  enrol payload (`XF-121`), from the lock itself.
+- **`pairable` is derived** — a profile earns it by having a PID and a complete
+  DP map, not by carrying a flag someone set.
+- staleness is enforced: `gen_profile.py --check` covers both outputs and is the
+  first thing `npm test --prefix locksim` runs.
 
 ---
 
@@ -324,14 +467,20 @@ a genuine firmware change and is not in this change.
 |---|---|
 | `docs/DPSuppliers/protocol_vr4iiuqtyh0q4nix_20260811.pdf` | **Luona Smart** — Smart Lock DS013-T3, PID `vr4iiuqtyh0q4nix`, Tuya-generated 2026-08-11. 34 DPs with types, ranges and enums. The primary witness. |
 | `docs/DPSuppliers/T3_Final_Customer_Version_EN.docx` | **Ladin Tech** — T3-U module integration document. No DP table; names DP 42/76/149/212 and documents the wake handshake. |
-| *(merged, file deleted)* | The operator's independent hand extraction of the Luona table, 2026-08-18 — the source of the English function descriptions in §3. Agreed with the catalogue row for row; merged into this document and removed so there is only one copy to keep current. |
-| Tuya developer platform, public pages | Category list; Zigbee residential-lock and Wi-Fi Lock Pro DP references — used **only** to establish §1's per-category collisions. |
+| *(merged, file deleted)* | The operator's independent hand extraction of the Luona table, 2026-08-18 — the source of the English function descriptions in §3. Agreed with the catalogue row for row; merged here so there is only one copy to keep current. |
+| Tuya developer platform, public pages | [Wi-Fi Lock Pro DP Reference](https://developer.tuya.com/en/docs/iot/wifi-dp?id=K9fewhnlvk6by) · [Residential Lock DP Reference](https://developer.tuya.com/en/docs/iot/zigbee-doorlock-dp?id=K9fembhbeab0p) — §1's per-category collisions, and the transcribed `tuya-wifi-lock-pro` reference map. |
+| `XF-120` | Sealed unlock, and §8: DP 76 opening a real door end to end. |
+| `XF-122` | Lock-model selection at pairing; §9 the one-pairable-model finding and `models.json`. |
 | `docs/ozkey-27.md` | The findings behind the catalogue/selection design; §2.5 on `reserved`. |
 | `docs/ozkey-28.md` | OZKIE v1 verbs — the `verb`/`field` columns. |
 | `docs/ozkey-39.md` | 🔴 The two suppliers were previously conflated as one. Module identity, DP selection and the wake handshake are **per-vendor**. |
+| `docs/ozkey-42.md` | The supplier request. §2 is the Luona ask; P0 is the 15 RAW credential layouts. |
 | `profiles/README.md` | Resolution order, entry shape, the `status` field. |
 
-🔴 **The standing caveat.** No real Tuya DL-MCU has ever been on our wire.
-Everything here is read off supplier paper and cross-checked between two
-vendors; nothing in it has been confirmed against hardware. "Verified on the
-bench" means verified against our own assumptions until that changes.
+🔴 **The standing caveat, narrowed.** As of 2026-08-20 a **DP census over command
+`0x08` has been run against the bench MCU and matched 34/34**, and remote unlock
+on DP 76 has been driven end to end. That is real confirmation of the *catalogue*
+and of the *unlock path*. It is **not** confirmation of the supplier's own
+hardware: LockSim is still the MCU on our bench, and no real Tuya DL-MCU has ever
+been on our wire. Every `reserved` row — every credential write — remains
+unconfirmed by anything but supplier paper.

@@ -81,6 +81,28 @@ function rememberPort(info: RememberedPort): void {
   }
 }
 
+/**
+ * Forget the remembered adapter.
+ *
+ * Called ONLY on an explicit user disconnect. The distinction matters:
+ *
+ *   reload / crash / remount  -> memory kept, auto-reconnect restores the link
+ *   user clicked Disconnect   -> memory cleared, next Connect PROMPTS
+ *
+ * Without this, "Disconnect" could not move the simulator to a different
+ * adapter: the port closed, then the auto-reconnect effect immediately
+ * re-attached to the same remembered device, so choosing another one was
+ * impossible short of clearing site data.
+ */
+function forgetRememberedPort(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(PORT_MEMORY_KEY);
+  } catch {
+    /* storage disabled — nothing was persisted anyway */
+  }
+}
+
 export function useSerialLink({ onFrameBytes, baudRate = 9600 }: UseSerialLinkOptions) {
   const [status, setStatus] = useState<SerialStatus>("idle");
   const [portLabel, setPortLabel] = useState("");
@@ -93,6 +115,12 @@ export function useSerialLink({ onFrameBytes, baudRate = 9600 }: UseSerialLinkOp
   const writerRef = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null);
   const bufferRef = useRef<ByteArray>([]);
   const keepReading = useRef(false);
+  // The in-flight readLoop. disconnect() MUST await this before closing the
+  // port: the loop releases the reader lock in its own `finally`, and calling
+  // port.close() before that has run throws "port is already locked" — which
+  // used to be swallowed, leaving Chrome holding the OS handle while the UI
+  // said "idle". See disconnect().
+  const readLoopRef = useRef<Promise<void> | null>(null);
   const onFrameRef = useRef(onFrameBytes);
   onFrameRef.current = onFrameBytes;
 
@@ -147,7 +175,7 @@ export function useSerialLink({ onFrameBytes, baudRate = 9600 }: UseSerialLinkOp
       writerRef.current = port.writable?.getWriter() ?? null;
       keepReading.current = true;
       setStatus("connected");
-      void readLoop();
+      readLoopRef.current = readLoop();
     },
     [baudRate, readLoop]
   );
@@ -262,29 +290,83 @@ export function useSerialLink({ onFrameBytes, baudRate = 9600 }: UseSerialLinkOp
     }
   }, []);
 
+  /**
+   * Release the port so ANOTHER consumer can have it.
+   *
+   * 🔴 THIS USED TO LIE. The old version cancelled the reader, closed the
+   * writer, called port.close(), swallowed every error with `catch {}` and set
+   * the status to "idle" regardless. Two bugs meant the close usually FAILED:
+   *
+   *   1. `writer.releaseLock()` was never called anywhere. A closed writer
+   *      still holds the lock on `port.writable`, so port.close() rejects.
+   *   2. port.close() raced the read loop — `reader.cancel()` resolves before
+   *      the loop's `finally { reader.releaseLock() }` has run, so
+   *      `port.readable` was often still locked too.
+   *
+   * Both rejections were swallowed. The UI showed "idle" while Chrome still
+   * owned /dev/cu.usbserial-0001, so the adapter could not be handed to another
+   * board and a reconnect hit "port already open" with no explanation.
+   *
+   * Now: stop the loop, cancel, AWAIT the loop's own lock release, release the
+   * writer explicitly, then close — and if the close still fails, SAY SO
+   * instead of claiming success. A disconnect you cannot trust is worse than a
+   * button that admits it failed.
+   */
   const disconnect = useCallback(async () => {
+    // Explicit user intent: stop auto-reconnect from re-grabbing this adapter
+    // the moment the effect re-runs, which is what made switching boards
+    // impossible. Cleared FIRST so it happens even if the close below throws.
+    forgetRememberedPort();
     keepReading.current = false;
     try {
       await readerRef.current?.cancel();
     } catch {
-      /* noop */
+      /* cancelling an already-finished reader is fine */
     }
+    // Wait for readLoop()'s finally{} to release the reader lock. Without this
+    // the close below races it and fails.
     try {
-      await writerRef.current?.close();
+      await readLoopRef.current;
     } catch {
-      /* noop */
+      /* the loop reports its own errors */
     }
+    readLoopRef.current = null;
+
+    const writer = writerRef.current;
+    if (writer) {
+      try {
+        await writer.close();
+      } catch {
+        /* already closed/errored — still must release the lock below */
+      }
+      try {
+        writer.releaseLock(); // THE missing call: without it writable stays locked
+      } catch {
+        /* already released */
+      }
+    }
+
+    let closeError = "";
     try {
       await portRef.current?.close();
-    } catch {
-      /* noop */
+    } catch (e) {
+      closeError = e instanceof Error ? e.message : String(e);
     }
+
     portRef.current = null;
     writerRef.current = null;
     readerRef.current = null;
     bufferRef.current = [];
     setPortLabel("");
-    setStatus(supported ? "idle" : "unsupported");
+    if (closeError) {
+      // Deliberately NOT "idle": the port may still be held by this tab, and
+      // pretending otherwise sends the user hunting for a hardware fault.
+      setError(`port did not close: ${closeError} — reload the tab to force release`);
+      setStatus("error");
+    } else {
+      setError("");
+      setStatus(supported ? "idle" : "unsupported");
+    }
   }, [supported]);
 
   useEffect(

@@ -524,32 +524,46 @@ export default function Page() {
               ONE action (operator, 2026-08-10). Autoconnect handles every load
               after the first, so this button exists for exactly one job: the
               initial port authorization, which Web Serial will not do without a
-              user gesture. Once linked it stops being a control and just states
-              the fact — there is no disconnect, because nothing here wants one.
+              user gesture.
+
+              🔴 2026-08-22 — "there is no disconnect, because nothing here
+              wants one" stopped being true. Moving the one USB-TTL adapter
+              between LockA and LockB is routine bench work, and with the button
+              inert once linked there was NO way to release the port from the
+              UI: the tab held /dev/cu.usbserial-0001 until it was closed.
+              (A Disconnect did exist in HardwarePipelineToggle.tsx — a
+              component that was never imported. Deleted; dead affordances are
+              worse than missing ones, because they read as available.)
+
+              So it is a TOGGLE now: connect when idle, release when linked.
             */}
             <div className="flex shrink-0 items-center gap-2">
               <button
                 type="button"
-                onClick={() => void serial.connect()}
-                disabled={serial.status === "connected" || serial.status === "unsupported"}
+                onClick={() =>
+                  void (serial.status === "connected" ? serial.disconnect() : serial.connect())
+                }
+                disabled={serial.status === "unsupported" || serial.status === "connecting"}
                 title={
                   serial.status === "connected"
-                    ? serial.portLabel || "UART linked"
+                    ? `${serial.portLabel || "UART linked"} — click to release the port (forgets this adapter so you can pick another)`
                     : "Pick the CP2102 once — remembered and auto-connected on later loads"
                 }
                 className={`rounded border px-3 py-1 text-[11px] font-semibold transition-colors ${
                   serial.status === "connected"
-                    ? "cursor-default border-green-800/70 bg-green-950/40 text-green-400"
+                    ? "border-green-800/70 bg-green-950/40 text-green-400 hover:border-red-700 hover:bg-red-950/50 hover:text-red-300"
                     : serial.status === "connecting"
                       ? "animate-pulse border-amber-800 bg-amber-950/40 text-amber-300"
                       : "border-sky-800 bg-sky-950/50 text-sky-300 hover:bg-sky-900/50 disabled:opacity-40"
                 }`}
               >
                 {serial.status === "connected"
-                  ? "● UART Connected"
+                  ? "● UART Connected — Disconnect"
                   : serial.status === "connecting"
                     ? "Connecting…"
-                    : "Connect"}
+                    : serial.status === "error"
+                      ? "Retry Connect"
+                      : "Connect"}
               </button>
               <button
                 type="button"

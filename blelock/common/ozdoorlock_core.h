@@ -148,6 +148,7 @@ void handleMemberEnroll(JsonDocument &doc);
 void loadConfig();
 void loop();
 void markDoorUnlocked();
+void markDoorUnlockIssued();
 void mrdySet(bool assertLow);
 void notifyStatus(const char *wire);
 void onMqttMessage(char *topic, byte *payload, unsigned int length);
@@ -809,6 +810,14 @@ unsigned long lastTouchAt = 0; // 0 = never touched since boot
 // RAM only — a reboot drops it, which is correct.
 unsigned long assistArmedUntil = 0; // 0 = nothing armed
 String assistArmedPayload;
+// XF-126 §5b — the SEALED equivalent of assistArmedPayload. The unsealed path
+// re-sends raw MCU bytes on touch; a sealed one cannot, because the bytes were
+// never the command — the VERB was. So keep the opened plaintext and re-enter
+// the dispatcher once a touch has happened, which is also what keeps the bond
+// check in force on the second pass rather than trusting the first.
+String assistArmedSealedJson;
+int assistArmedSealedSlot = -1;
+bool assistArmedSealedViaBle = false;
 #define ASSISTED_ARM_MS 60000UL // matches ozlockserv's expires_at window
 
 // ── §0.2/§0.3 power & wake state (persistent-power keep-alive) ──────────────
@@ -1059,8 +1068,47 @@ bool mcuLinkUp() { return lastMcuFrameAt && millis() - lastMcuFrameAt < MCU_LINK
 String doorStatus = "LOCKED";
 unsigned long doorUnlockAt = 0;
 #define DOOR_UNLOCK_MS 5000UL
-void markDoorUnlocked() {
+
+// ── WHO SAID THE DOOR OPENED (operator, 2026-08-21) ─────────────────────────
+//
+// Every path that set doorStatus used to require the MCU to speak first: an
+// ACCESS_RESULT report, an access-event DP, or a mirror of a frame we sent. On
+// a bench board with no DL-MCU and no LockSim attached, none of those ever
+// arrive, so the panel sat on red LOCK through a successful unlock and the
+// operator had no way to see the door had opened at all.
+//
+// The module DOES know one thing for certain: that it authorised an unlock,
+// resolved the verb to a DP, and put a valid frame on the wire. That is not the
+// same fact as "the bolt moved" — the bolt belongs to the MCU — and the panel
+// must not blur them, which is exactly the objection recorded in
+// drawHexReadout(). So the state carries its PROVENANCE and the panel renders
+// the two differently:
+//
+//   CONFIRMED   the MCU reported it. We are mirroring a fact.   -> green OPEN
+//   ISSUED      we commanded it and nothing has confirmed it.   -> amber SENT
+//
+// An unconfirmed unlock holds longer than a confirmed one on purpose. The 5 s
+// revert exists to match LockSim's auto-relock; with no MCU attached there is
+// nothing to relock, so 5 s is not a mirror of anything — it is just a window
+// too short to notice, which is the complaint that prompted this.
+bool doorStateConfirmed = false;
+#define DOOR_UNLOCK_UNCONFIRMED_MS 15000UL
+
+void markDoorUnlocked() { // the MCU told us — authoritative
   doorStatus = "UNLOCKED";
+  doorStateConfirmed = true;
+  doorUnlockAt = millis();
+  screenDirty = true;
+}
+
+// We issued the command ourselves. Never downgrades a confirmed state: if the
+// MCU has already reported the bolt, its word outranks our echo of our own
+// command, and a later confirmation upgrades ISSUED -> CONFIRMED via the
+// function above.
+void markDoorUnlockIssued() {
+  if (doorStatus == "UNLOCKED" && doorStateConfirmed) return;
+  doorStatus = "UNLOCKED";
+  doorStateConfirmed = false;
   doorUnlockAt = millis();
   screenDirty = true;
 }
@@ -2915,7 +2963,41 @@ void publishHeartbeat() {
   // at it. Same argument the `name` field above is here for.
   if (cfgMcuPid.length()) doc["tuya_pid"] = cfgMcuPid;
   doc["profile"] = ozProfileId();
+  // XF-123 P3.4/P3.5 — the key Nexus stores this MODEL under. Sits beside
+  // `tuya_pid` and `profile` deliberately: the PID is what the MCU claims to
+  // be, the profile is the DP map this build speaks, and firmware_id is the
+  // registry key that ties both to a row the app can look up. `fw` above stays
+  // the BUILD (P3.6) — two different questions, two different fields.
+  doc["firmware_id"] = ozProfile()->firmware_id;
+  // XF-124 F1 — Nexus is a UNIVERSAL device registry now (doorlock/bridge/
+  // devkit/iot), so a firmware_id alone no longer says what kind of thing
+  // reported it. Defined per sketch, not per profile: the bridge runs no DP
+  // profile at all and declares its own.
+  doc["device_type"] = OZ_DEVICE_TYPE;
   doc["has_doorbell"] = ozHasDoorbell();
+  // ── 🔴 FIELDS THAT MUST MATCH THE THREAD BEACON ──────────────────────────
+  //
+  // There are TWO heartbeat builders — this one (Wi-Fi/MQTT) and the Thread
+  // beacon in loop(). Nothing enforces that they agree, and on 2026-08-22 that
+  // cost two bugs in one day, both found by SERVER reading this function rather
+  // than by anything here:
+  //
+  //   seq_highwater/dropped_before_seq — added to the beacon, missed here, so
+  //     the stale-consumer check (XF-125 P0) would silently never fire for a
+  //     Wi-Fi lock. Consumer built, producer half-built.
+  //   profile_mismatch — the reverse: it has ALWAYS been beacon-only, so a
+  //     DP-map disagreement could only ever reach the server from a BRIDGED
+  //     lock. On a direct Wi-Fi lock the warning existed and was unreportable
+  //     (XF-127 §9 audit).
+  //
+  // Anything added to one builder belongs in the other unless there is a
+  // stated reason it is transport-specific.
+  doc["seq_highwater"] = g_evtSeq;
+  doc["dropped_before_seq"] = g_evtDroppedBefore;
+  // XF-127 §9 — the hardware disagrees with the DP map we were built for. This
+  // is exactly the class XF-122 exists to catch, so it must not depend on the
+  // lock happening to be behind a bridge.
+  if (g_profileMismatch) doc["profile_mismatch"] = true;
 
   // ── ozkey-32 §5 Option A — THE LOCK IS AUTHORITATIVE FOR ITS OWN NAME ─────
   // (operator, 2026-08-14)
@@ -3112,10 +3194,17 @@ void publishUnpairedAnnounce() {
 void forwardFrameToMcu(const uint8_t *frame, size_t fn) {
   Serial.printf("[FWD] cmd -> MCU: %s\n", describeDpid(frame, fn).c_str());
   tuyaWireSend(frame, fn);
-  // remote unlock (DP 1 BOOL 01): LockSim unlocks on receipt — mirror it
-  if (fn >= 11 && frame[3] == 0x06 && frame[6] == 1 && frame[7] == 0x01 &&
-      frame[10] == 0x01)
-    markDoorUnlocked();
+  // 🔴 THIS TEST WAS DEAD (2026-08-21). It read `frame[6] == 1` — DP 1, the map
+  // we invented — so it stopped mirroring anything the moment unlock became a
+  // real DP, and on `tuya-luona-ds013-t3` an unlock is DP 76. Same hardcoded-DP
+  // trap the verb resolver was built to end; it survived here because this
+  // function is off the OZKIE path.
+  //
+  // Ask the profile which DP an unlock is, and mark it ISSUED rather than
+  // confirmed: this is us sending a command, not the MCU reporting a bolt.
+  const OzVerbMap *m = ozResolveVerb("lock.unlock", nullptr, OZ_DIR_DOWN);
+  if (m && fn >= 11 && frame[3] == 0x06 && frame[6] == m->dp)
+    markDoorUnlockIssued();
 }
 
 // ozkey-13 F2: decode a hex string (spaces/colons tolerated, same convention
@@ -6180,6 +6269,52 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
   // real question instead.
   const bool isUnlock = (strcmp(kind, "unlock") == 0);
 
+  // ── XF-126 §5b — THE KEYPAD-TOUCH GATE, ON THE SEALED PATH ───────────────
+  //
+  // 🔴 THIS RESTORES A SAFETY PROPERTY THAT WAS SILENTLY LOST.
+  //
+  // XF-58 defines assisted unlock as: the owner ARMS a window, and the door
+  // opens only when someone physically touches the keypad. That check lived
+  // exclusively on the unsealed `payload_hex` branch of onMqttMessage(), keyed
+  // on `action == "assisted-unlock"`.
+  //
+  // When the app began sealing assistedUnlock() (XF-120 §9) the sealed branch
+  // dispatched and RETURNED before `action` was ever read, so every assisted
+  // unlock became an immediate one — the door opened with nobody at it. Each
+  // team's change was correct alone; the requirement lived in the seam.
+  //
+  // The flag must be INSIDE the seal (`{"kind":"unlock","assisted":true}`,
+  // ftpos shipped 2026-08-22). A sibling of the envelope would be
+  // attacker-modifiable on the anon-open broker, and stripping it would be the
+  // first thing to try.
+  //
+  // Absent flag ⇒ plain owner unlock, unchanged. Backward-compatible by
+  // construction: an older app that does not send it behaves exactly as before.
+  const bool isAssisted = isUnlock && (doc["assisted"] | false);
+  if (isAssisted) {
+    const bool touched =
+        lastTouchAt != 0 && (millis() - lastTouchAt) <= ASSISTED_TOUCH_MAX_MS;
+    if (!touched) {
+      // ARM and wait, exactly as the unsealed path did. Not a refusal: the
+      // owner's grant is real, it is simply not permitted to fire until a
+      // human is at the door.
+      if (assistArmedUntil) Serial.println("[ASSIST] replacing the previously armed unlock");
+      assistArmedSealedJson = String(json, len);
+      assistArmedSealedSlot = slot;
+      assistArmedSealedViaBle = viaBle;
+      assistArmedPayload = ""; // a sealed arm supersedes any unsealed one
+      assistArmedUntil = millis() + ASSISTED_ARM_MS;
+      Serial.printf("[ASSIST] sealed unlock ARMED %lus — waiting for a keypad touch "
+                    "(XF-58: someone must be AT the door)\n",
+                    ASSISTED_ARM_MS / 1000);
+      notifyStatus("ASSIST_ARMED");
+      return; // do NOT open now
+    }
+    Serial.printf("[ASSIST] touch %lus ago — sealed assisted unlock ALLOWED\n",
+                  (millis() - lastTouchAt) / 1000);
+    lastTouchAt = 0; // consume it; one touch must not satisfy a later command
+  }
+
   if (isUnlock) {
     // ── DP 76 `unlock_ble` — the REAL command, when this is a BLE unlock ────
     //
@@ -6352,6 +6487,13 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
                 slot, g_bonds[slot].label,
                 g_bonds[slot].role == OZ_ROLE_ADMIN ? "admin" : "member");
   forwardFrameToMcu(frame, flen);
+
+  // The panel's only honest, MCU-independent unlock signal (operator,
+  // 2026-08-21). We have authorised the caller, resolved the verb to a DP and
+  // put a validated frame on the wire — so say SO, as ISSUED, not as a bolt we
+  // did not witness. Without this the panel stays red through a successful
+  // unlock on any board with no DL-MCU or LockSim attached.
+  if (isUnlock) markDoorUnlockIssued();
 
   // 1.61 — a CREDENTIAL operation must be confirmed by the MCU before we call
   // it a success. An unlock is exempt: its proof is the bolt, and it is the one
@@ -6943,6 +7085,17 @@ static void ozRefreshInfoChar() {
   // promising a doorbell every lock may not have. See ozHasDoorbell().
   doc["has_doorbell"] = ozHasDoorbell();
   doc["profile"] = ozProfileId();
+  // XF-123 P3.4/P3.5 — the key Nexus stores this MODEL under. Sits beside
+  // `tuya_pid` and `profile` deliberately: the PID is what the MCU claims to
+  // be, the profile is the DP map this build speaks, and firmware_id is the
+  // registry key that ties both to a row the app can look up. `fw` above stays
+  // the BUILD (P3.6) — two different questions, two different fields.
+  doc["firmware_id"] = ozProfile()->firmware_id;
+  // XF-124 F1 — Nexus is a UNIVERSAL device registry now (doorlock/bridge/
+  // devkit/iot), so a firmware_id alone no longer says what kind of thing
+  // reported it. Defined per sketch, not per profile: the bridge runs no DP
+  // profile at all and declares its own.
+  doc["device_type"] = OZ_DEVICE_TYPE;
   if (cfgMcuPid.length()) doc["tuya_pid"] = cfgMcuPid;
   if (cfgMcuVer.length()) doc["mcu_fw"] = cfgMcuVer;
   // BUG FIX (2026-07-26, caught during app-impact review): blecomm.ino never
@@ -7261,30 +7414,42 @@ void drawHexReadout() {
   static int lastBar = -1;
   static uint32_t barGen = (uint32_t)-1;
   if (barGen != panelGen) { barGen = panelGen; lastBar = -1; } // screen was cleared
-  const int barState = open ? 1 : 0;
+  // THREE states, not two (operator, 2026-08-21) — the provenance is part of
+  // the state, so a confirmed open and an unconfirmed one must not share a
+  // signature or the panel would keep showing the first one it saw.
+  //   0 = locked · 1 = open, MCU-confirmed · 2 = open, we issued it
+  const int barState = !open ? 0 : (doorStateConfirmed ? 1 : 2);
   if (barState != lastBar) {
     lastBar = barState;
-    gfx->fillRect(0, HEX_TOP + 2, barW, HEX_H - 4, open ? C_GREEN : C_RED);
     // 🟡 TEMPORARY, operator 2026-08-20: label the bar in words.
     //
     // The colour alone is easy to miss — during the first successful DP 76
     // unlock the operator was watching this panel and saw nothing, because a
-    // 40 px block changing hue is not what the eye catches. It also auto-relocks
-    // after 5 s, so the window to notice is short.
+    // 40 px block changing hue is not what the eye catches.
     //
     // REMOVE BEFORE THE REAL PCB SHIPS. On production the bolt state belongs to
     // the DL MCU and its own indicator; this is a bench affordance, not product
     // UI, and a lock that reports its own door state from the module's MIRROR of
     // MCU traffic would be asserting something it does not actually own.
     //
+    // 2026-08-21: which is precisely why SENT is a third state rather than a
+    // second green. "We authorised an unlock and put the frame on the wire" is
+    // a fact the module owns outright; "the bolt moved" is not. Amber says the
+    // command left, unwitnessed — on a bare bench board with no DL-MCU and no
+    // LockSim, that is the whole truth available, and showing it as green OPEN
+    // would be the module asserting a bolt it cannot see.
+    //
     // Drawn inside the existing bar so no other element moves: size 1 is 6 px
-    // per glyph, so "OPEN"/"LOCK" is 24 px in a 40 px bar. Painted only on a
-    // state CHANGE, preserving the 2026-08-11 flicker fix — repainting this row
-    // every tick was a visible strobe.
+    // per glyph, so "OPEN"/"SENT"/"LOCK" is 24 px in a 40 px bar. Painted only
+    // on a state CHANGE, preserving the 2026-08-11 flicker fix — repainting
+    // this row every tick was a visible strobe.
+    const uint16_t barCol = !open ? C_RED : (doorStateConfirmed ? C_GREEN : C_AMBER);
+    const char *barTxt = !open ? "LOCK" : (doorStateConfirmed ? "OPEN" : "SENT");
+    gfx->fillRect(0, HEX_TOP + 2, barW, HEX_H - 4, barCol);
     gfx->setTextSize(1);
-    gfx->setTextColor(C_BLACK, open ? C_GREEN : C_RED); // opaque, no clear step
+    gfx->setTextColor(C_BLACK, barCol); // opaque, no clear step
     gfx->setCursor(8, HEX_TOP + 6);
-    gfx->print(open ? "OPEN" : "LOCK");
+    gfx->print(barTxt);
   }
 
   // ── LEFT: the clock, size 2 ────────────────────────────────────────────
@@ -7680,6 +7845,11 @@ void loop() {
   if (assistArmedUntil && (long)(millis() - assistArmedUntil) >= 0) {
     assistArmedUntil = 0;
     assistArmedPayload = "";
+    // XF-126 §5b — expire the SEALED arm on the same edge. Leaving the opened
+    // plaintext behind after the window closed would keep a grant that nobody
+    // came for alive in RAM, which is the opposite of what expiry is for.
+    assistArmedSealedJson = "";
+    assistArmedSealedSlot = -1;
     Serial.printf("[ASSIST] armed window expired after %lus — nobody touched, "
                   "command dropped\n",
                   ASSISTED_ARM_MS / 1000);
@@ -7956,6 +8126,27 @@ void loop() {
     // Which DP map this lock is ACTUALLY running. Fleet-visible so a lock
     // still on the invented default is findable without a BLE session.
     hb["profile"] = ozProfileId();
+    hb["firmware_id"] = ozProfile()->firmware_id;
+    hb["device_type"] = OZ_DEVICE_TYPE;
+    // ── XF-125 P0 — let the server notice that NOBODY IS READING ────────────
+    //
+    // The audit ring is pull-only (F2/F9): the lock keeps every event and
+    // waits for `query_events`. Retention is sound, but nothing anywhere
+    // checked that a reader still exists — and the app's MQTT session can die
+    // silently. Events then accumulate perfectly and are collected by no one.
+    //
+    // The lock cannot detect this: it has no idea whether its log was read.
+    // The server can, because it is the always-online party — but only if it
+    // knows how far the log has advanced. That is these two numbers.
+    //
+    //   seq_highwater      last seq WRITTEN to the ring (g_evtSeq)
+    //   dropped_before_seq records below this are gone forever (rotation)
+    //
+    // Together they also make silent data loss detectable end to end: a
+    // consumer whose cursor is below dropped_before_seq has provably missed
+    // records, and can be told so instead of quietly resuming.
+    hb["seq_highwater"] = g_evtSeq;
+    hb["dropped_before_seq"] = g_evtDroppedBefore;
     hb["has_doorbell"] = ozHasDoorbell();
     hb["mcu_link_up"] = mcuLinkUp();          // ozkey-20 §5a
     hb["uptime_s"] = (uint32_t)(millis() / 1000);
@@ -8014,9 +8205,15 @@ void loop() {
 
   }
 
-  // ── door-status mirror auto-relock (matches LockSim's 5s) ────────────────
-  if (doorStatus == "UNLOCKED" && millis() - doorUnlockAt >= DOOR_UNLOCK_MS) {
+  // ── door-status mirror auto-relock ───────────────────────────────────────
+  // CONFIRMED reverts at 5 s because that is LockSim's auto-relock and we are
+  // mirroring it. ISSUED holds longer: nothing out there is relocking, so the
+  // dwell is a display choice, and a 5 s one was too short to see.
+  if (doorStatus == "UNLOCKED" &&
+      millis() - doorUnlockAt >=
+          (doorStateConfirmed ? DOOR_UNLOCK_MS : DOOR_UNLOCK_UNCONFIRMED_MS)) {
     doorStatus = "LOCKED";
+    doorStateConfirmed = false;
     screenDirty = true;
   }
 
@@ -8062,10 +8259,26 @@ void loop() {
       if (assistArmedUntil && (long)(millis() - assistArmedUntil) < 0) {
         Serial.println("[ASSIST] touch received — armed assisted unlock ALLOWED");
         const String payload = assistArmedPayload;
+        // XF-126 §5b — a SEALED arm replays the verb, not raw bytes.
+        const String sealedJson = assistArmedSealedJson;
+        const int sealedSlot = assistArmedSealedSlot;
+        const bool sealedViaBle = assistArmedSealedViaBle;
         assistArmedUntil = 0;
         assistArmedPayload = "";
-        lastTouchAt = 0; // consumed here too; do not also satisfy a later command
-        forwardHexToMcu(payload);
+        assistArmedSealedJson = "";
+        assistArmedSealedSlot = -1;
+        // Cleared BEFORE dispatching, so a re-entry cannot re-arm from the
+        // same grant and loop. lastTouchAt is deliberately NOT cleared yet:
+        // the sealed re-entry re-checks it, which is what keeps the gate
+        // honest on the second pass instead of trusting this one.
+        if (sealedSlot >= 0 && sealedJson.length()) {
+          ozSemanticDispatch(sealedSlot, sealedJson.c_str(), sealedJson.length(),
+                             sealedViaBle);
+          lastTouchAt = 0; // consumed by the dispatch above
+        } else {
+          lastTouchAt = 0; // consumed here too; do not also satisfy a later command
+          forwardHexToMcu(payload);
+        }
       }
 
       // ── BLE window: ANY key (operator, 2026-08-14) ─────────────────────

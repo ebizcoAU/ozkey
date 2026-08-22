@@ -228,7 +228,12 @@ Arduino_GFX *gfx = new Arduino_ST7789(
 // 1.94: BLE unlock issues real DP 76; BLE window 30s -> 60s (~15s of it is
 //       advertising-to-discovery latency). See
 //       doorlock.ino's changelog; both live in common/ozdoorlock_core.h.
-#define FW_VERSION "doorlock-2.14"
+#define FW_VERSION "doorlock-2.16"
+// XF-124 F1 — what KIND of device this build is, for Nexus's universal
+// registry (doorlock | bridge | devkit | iot). Per SKETCH, not per profile:
+// bridge32 runs no DP profile and declares "bridge" for itself. Must match
+// DEVICE_TYPE in blelock/tools/gen_profile.py, which builds firmware_id.
+#define OZ_DEVICE_TYPE "doorlock"
 
 // ── DERIVED, not a second literal (2026-08-12) — see doorlock.ino for the
 // full reasoning. The warning above ("Change both, every time") described the
