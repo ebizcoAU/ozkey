@@ -3144,7 +3144,38 @@ static void addIdentity(JsonDocument &doc, bool full) {
   const bool canPin    = ozVerbUsable(ozResolveVerb("cred.put", "pin", OZ_DIR_DOWN));
   const bool canRfid   = ozVerbUsable(ozResolveVerb("cred.put", "rfid", OZ_DIR_DOWN));
 
-  if (canUnlock) caps.add(isThread() ? "remote_unlock" : "assisted_unlock");
+  // ── 🔴 2.19 — `assisted_unlock` ALSO REQUIRES A PRESENCE SOURCE ──────────
+  //
+  // The same "a capability is a PROMISE" rule as `pin_sync` above, applied to
+  // the one capability that had escaped it.
+  //
+  // Since the LCD touch panel was removed (operator directive 2026-08-23),
+  // `ozAssistPresence()` has exactly ONE caller: DP 53 `doorbell`. That is now
+  // the sole proof-of-presence this firmware accepts — and **DP 53 is not
+  // universal.** It is a Tuya product tier (doorbell / video-intercom
+  // solutions); our catalogue derives from DS013-T3, which the T3-U doc
+  // classifies as a Video Lock, a category that has one by definition. See the
+  // DP 53 handler's own note and ozkey-36 §9.
+  //
+  // So on a Wi-Fi lock whose profile does NOT select DP 53 there is no way to
+  // release an armed assisted unlock at all: it would arm, the visitor would do
+  // whatever the app told them, and it would expire after 60s. Advertising
+  // `assisted_unlock` there promises something the hardware cannot do — exactly
+  // the dishonest affordance XF-58 §3.1.1 created a separate capability name to
+  // avoid, and exactly the shape of the `pin_sync` bug described above.
+  //
+  // Gated, not asserted. The app already keys off this cap
+  // (`supportsAssistedUnlock`), so a doorbell-less lock now correctly stops
+  // offering the button instead of offering one that can never complete.
+  const bool canAssist = canUnlock && ozDpFind(53) != nullptr;
+  if (isThread()) {
+    if (canUnlock) caps.add("remote_unlock");
+  } else if (canAssist) {
+    caps.add("assisted_unlock");
+  } else if (canUnlock) {
+    Serial.println("[CAPS] assisted_unlock WITHHELD — profile has no DP 53 "
+                   "doorbell, so an armed unlock could never be released");
+  }
   if (canPin) caps.add("pin_sync");
   if (canRfid) caps.add("rfid_sync");
   // Ours, not the MCU's: the txlog is written by this firmware and does not
