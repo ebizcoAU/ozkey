@@ -683,6 +683,37 @@ async function initDatabase() {
         ADD COLUMN last_pulled_seq    INT UNSIGNED NULL
     `);
 
+  // XF-127: the lock has reported `has_doorbell` on every heartbeat since
+  // XF-107, derived from its own DP map (`tuya-luona-ds013-t3` selects DP
+  // 53) — not a guess. Server never stored or served it, so the app (which
+  // has no other source and defaults to "no doorbell" on purpose — a false
+  // positive strands someone at the door, a false negative only costs a
+  // step) could never offer a remote wake for a Wi-Fi lock that actually
+  // has one. Blocked verifying XF-126's safety fix, which needs a wake path
+  // to even reach the assisted-unlock gate under test.
+  const [[{ hasDoorbellCol }]] = await pool.query(
+    `SELECT COUNT(*) AS hasDoorbellCol FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'has_doorbell'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasDoorbellCol)
+    await pool.query('ALTER TABLE locks ADD COLUMN has_doorbell TINYINT(1) NULL');
+
+  // XF-127 §8 ask 2 (the audit) turned this one up too, same shape as
+  // has_doorbell: already on the wire for Thread locks (bridge32's verbatim
+  // beacon relay), never ingested. `g_profileMismatch` is set when the Tuya
+  // 0x08 DP census finds hardware that disagrees with the pinned profile —
+  // exactly the "DP 76 means unlock on Luona, a lamp on Tuya-standard"
+  // class of danger XF-122 exists to prevent, so it's worth closing
+  // alongside has_doorbell rather than only reporting it.
+  const [[{ hasProfileMismatchCol }]] = await pool.query(
+    `SELECT COUNT(*) AS hasProfileMismatchCol FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'profile_mismatch'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasProfileMismatchCol)
+    await pool.query('ALTER TABLE locks ADD COLUMN profile_mismatch TINYINT(1) NULL');
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bridges_presence (
       bridge_id   VARCHAR(64) PRIMARY KEY,
@@ -1795,6 +1826,14 @@ function initMqtt() {
         // bridge32, does today) leaves the columns untouched.
         const seqHighwater = Number.isFinite(obj.seq_highwater) ? obj.seq_highwater : null;
         const droppedBeforeSeq = Number.isFinite(obj.dropped_before_seq) ? obj.dropped_before_seq : null;
+        // XF-127 — same opportunistic COALESCE discipline as everything
+        // above: absent leaves the column untouched, doesn't clobber a
+        // known `true` back to unknown.
+        const hasDoorbell = typeof obj.has_doorbell === 'boolean' ? (obj.has_doorbell ? 1 : 0) : null;
+        // XF-127 §8 ask 2 — same wire (Thread beacon, verbatim-relayed onto
+        // `heartbeat`) as seq_highwater/dropped_before_seq/has_doorbell;
+        // not yet sent on the direct-Wi-Fi publishHeartbeat() either.
+        const profileMismatch = typeof obj.profile_mismatch === 'boolean' ? (obj.profile_mismatch ? 1 : 0) : null;
         await pool.query(
           `UPDATE locks
               SET last_seen_at    = NOW(),
@@ -1810,9 +1849,11 @@ function initMqtt() {
                   mcu_last_frame_s = COALESCE(?, mcu_last_frame_s),
                   label           = COALESCE(?, label),
                   seq_highwater   = COALESCE(?, seq_highwater),
-                  dropped_before_seq = COALESCE(?, dropped_before_seq)
+                  dropped_before_seq = COALESCE(?, dropped_before_seq),
+                  has_doorbell    = COALESCE(?, has_doorbell),
+                  profile_mismatch = COALESCE(?, profile_mismatch)
             WHERE id = ?`,
-          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, name, seqHighwater, droppedBeforeSeq, deviceId]
+          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, name, seqHighwater, droppedBeforeSeq, hasDoorbell, profileMismatch, deviceId]
         );
         if (droppedBeforeSeq !== null) {
           const [[riskRow]] = await pool.query(
@@ -2267,7 +2308,7 @@ api.get('/locks', async (req, res) => {
       `SELECT id, site_id, app_id, mac, label, fw, status, power_profile, heartbeat_s,
               last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
               presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s,
-              seq_highwater, dropped_before_seq, last_pulled_seq
+              seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch
          FROM locks ORDER BY enrolled_at DESC`
     );
     const locks = rows.map((l) => {
@@ -2353,7 +2394,7 @@ api.get('/locks/:id', async (req, res) => {
       `SELECT id, app_id, site_id, mac, label, status, power_profile, heartbeat_s,
               last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
               presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s,
-              seq_highwater, dropped_before_seq, last_pulled_seq
+              seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch
          FROM locks WHERE id = ?`,
       [req.params.id]
     );
