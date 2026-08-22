@@ -962,8 +962,17 @@ const lastGrantSentByDevice = new Map(); // deviceId -> { grantId, queueId }
 // has provably missed records") — not a fuzzy staleness threshold, an exact
 // check against a fact firmware already computes and reports.
 function eventsAtRisk(lock) {
+  // XF directive S7, found live 2026-08-23: `!= null` is true for 0, but
+  // firmware's own wire contract (XFtposDecisions-126 §13.2 area /
+  // ozdoorlock_core.h `hb["dropped_before_seq"]`) documents 0 as the "no
+  // records lost yet" sentinel, not a real loss. `!= null` was flagging
+  // every healthy lock with a fresh ring buffer as at-risk on its very
+  // first heartbeat carrying the field — confirmed live: LockB logged
+  // "events AT RISK — rotation destroyed records up to seq 0" the instant
+  // it started reporting, having lost nothing. `> 0` is null-safe in JS
+  // (`null > 0` is false) and only trips on an actual positive loss count.
   return (
-    lock.dropped_before_seq != null &&
+    lock.dropped_before_seq > 0 &&
     (lock.last_pulled_seq == null || lock.dropped_before_seq > lock.last_pulled_seq)
   );
 }
