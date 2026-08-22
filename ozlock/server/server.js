@@ -1834,6 +1834,16 @@ function initMqtt() {
         // `heartbeat`) as seq_highwater/dropped_before_seq/has_doorbell;
         // not yet sent on the direct-Wi-Fi publishHeartbeat() either.
         const profileMismatch = typeof obj.profile_mismatch === 'boolean' ? (obj.profile_mismatch ? 1 : 0) : null;
+        // XF-127 §11 (reproduced on the bench, blocks XF-126 verification):
+        // flagged as a real gap in §9 and deliberately left out of that
+        // ticket's scope — XF-122 §5 ask 3 only wrote these at enrol. A
+        // Thread lock learns its PID from the MCU seconds AFTER enrolling,
+        // and a lock reflashed to a different profile without a full
+        // re-enrol keeps reporting the new one forever while this stayed
+        // frozen at NULL/stale. Same opportunistic COALESCE as every field
+        // above — a lock that stops reporting doesn't blank a known value.
+        const tuyaPidHb = typeof obj.tuya_pid === 'string' && obj.tuya_pid.length <= 32 ? obj.tuya_pid : null;
+        const profileHb = typeof obj.profile === 'string' && obj.profile.length <= 64 ? obj.profile : null;
         await pool.query(
           `UPDATE locks
               SET last_seen_at    = NOW(),
@@ -1851,9 +1861,11 @@ function initMqtt() {
                   seq_highwater   = COALESCE(?, seq_highwater),
                   dropped_before_seq = COALESCE(?, dropped_before_seq),
                   has_doorbell    = COALESCE(?, has_doorbell),
-                  profile_mismatch = COALESCE(?, profile_mismatch)
+                  profile_mismatch = COALESCE(?, profile_mismatch),
+                  tuya_pid        = COALESCE(?, tuya_pid),
+                  profile         = COALESCE(?, profile)
             WHERE id = ?`,
-          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, name, seqHighwater, droppedBeforeSeq, hasDoorbell, profileMismatch, deviceId]
+          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, name, seqHighwater, droppedBeforeSeq, hasDoorbell, profileMismatch, tuyaPidHb, profileHb, deviceId]
         );
         if (droppedBeforeSeq !== null) {
           const [[riskRow]] = await pool.query(
