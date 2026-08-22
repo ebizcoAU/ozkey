@@ -2959,9 +2959,23 @@ function effectiveCaps(lock) {
 
   // What we can deduce with no word from the device. Note `assisted_unlock` is
   // NOT here, and cannot be — see the rule below.
-  const inferred = bridged
-    ? ['remote_unlock', 'pin_sync', 'audit']
-    : ['pin_sync', 'audit'];
+  //
+  // XF-128 Ask 4 (firmware, 2026-08-22): `pin_sync` used to be asserted here
+  // too, for ANY enrolled lock, device caps or not. Firmware found the real
+  // failure mode this enables: on `tuya-luona-ds013-t3` the credential DP
+  // (16, `bulk_password_add`) is `reserved` — the supplier never gave us its
+  // payload layout — so PIN provisioning is not implementable on this
+  // product AT ALL today, by any layer. Asserting `pin_sync` here is exactly
+  // "with no word from the device," which is what let the app offer PIN
+  // entry, seal a legacy DP-21 frame, and silently corrupt
+  // `navigation_volume` while reporting success (XF-128 §1-4). Dropped —
+  // now the same rule §2990 already states for `assisted_unlock`: a
+  // capability whose enforcement/support lives in firmware is only ever
+  // device-reported, never inferred. No shipped profile currently
+  // advertises `pin_sync` (ozkey session-state, 2026-08-21: "every
+  // credential DP is reserved"), so this now correctly reads `false`
+  // everywhere until a real DP layout exists to back it.
+  const inferred = bridged ? ['remote_unlock', 'audit'] : ['audit'];
 
   let device = null;
   if (lock.caps) {
