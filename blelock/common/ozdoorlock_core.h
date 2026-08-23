@@ -1255,6 +1255,16 @@ static const char *ozEvtVerbFor(const char *result) {
   // handled correctly all along — only its verb was wrong, which is the kind of
   // mismatch that looks like a missing feature from the consumer's end.
   if (!strcmp(result, "doorbell")) return "event.doorbell";
+  // XF-130 — DP 47 `bolt_state`. The catalogue declares `verb: event.bolt`,
+  // field `locked`, and firmware has carried the mapping in ozprofile_gen.h all
+  // along; nothing ever produced the event. Until 2.20 an inbound DP 47 fell
+  // through to the UNCLASSIFIED default and was DISCARDED, which mattered more
+  // than it looks: XF-126's reason for not waiting on an MCU ack after an
+  // unlock is literally "its proof is the bolt" — and the bolt report was the
+  // one thing we threw away. `UNLOCK_OK` therefore meant "we wrote bytes to a
+  // UART", never "the door opened".
+  if (!strcmp(result, "bolt_locked") || !strcmp(result, "bolt_unlocked"))
+    return "event.bolt";
   // Roster changes are in-lock facts, not door events, but they belong in the
   // audit trail: "who was allowed to open this door, and when did that change"
   // is exactly the question an owner asks of a log.
@@ -2875,6 +2885,46 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
       return;
     }
 
+    // ── XF-130 (2.20) — DP 47 `bolt_state`: THE ONLY REPORT THAT THE DOOR
+    //    ACTUALLY MOVED ─────────────────────────────────────────────────────
+    //
+    // `bool`, `dir: both`, `status: confirmed`, verb `event.bolt`, field
+    // `locked`. Selected by tuya-luona-ds013-t3 and mapped in ozprofile_gen.h
+    // since rev 1 — but nothing ever produced the event, so an inbound DP 47
+    // fell through to the UNCLASSIFIED default below and was discarded.
+    //
+    // 🔴 WHY THIS IS NOT COSMETIC. An unlock is deliberately exempt from
+    // ozAwaitMcuAck() because it is latency-critical — the stated reasoning is
+    // "its proof is the bolt". We then binned the proof. Observed on hardware
+    // 2026-08-22: a correct DP 76 unlock produced two DP 47 reports (0 =
+    // unlocked, then 1 on auto-relock) and firmware logged both as
+    // "UNCLASSIFIED DP, NOT published". So UNLOCK_OK has always meant "bytes
+    // were written to a UART", never "the door opened".
+    //
+    // Gated on ozDpFind() for the same reason as the access events above: a
+    // report on a DP this product does not carry is a bug or a spoof, and the
+    // profile is the only thing that can tell.
+    //
+    // ⚠️ POLARITY IS AN ASSUMPTION. The catalogue field is `locked`, so 1 =
+    // LOCKED. The supplier states the DP's type and never this; it matches
+    // LockSim, which is OUR simulator and therefore not independent evidence.
+    // Flagged in XF-130 §4 for confirmation against real Luona silicon.
+    if (type == 0x01 && dpid == 47) {
+      if (ozDpFind(dpid) == nullptr) {
+        Serial.printf("[BOLT] DP 47 not selected by profile '%s' — ignored\n",
+                      ozProfileId());
+        return;
+      }
+      const bool locked = (vlen >= 1) && (v[0] != 0);
+      Serial.printf("[BOLT] %s (DP 47)\n", locked ? "LOCKED" : "UNLOCKED");
+      // Only an UNLOCK is evidence the door opened; a relock is not, and
+      // markDoorUnlocked() on both would keep the door permanently "open".
+      if (!locked) markDoorUnlocked();
+      publishLog(locked ? "bolt_locked" : "bolt_unlocked",
+                 locked ? "bolt LOCKED (DP 47)" : "bolt UNLOCKED (DP 47)");
+      return;
+    }
+
     // ── DP 104 `*NN#` KEYPAD COMMAND — REMOVED 2026-08-16 ─────────────────
     //
     // Built, verified on the bench, and deleted the same day once the operator
@@ -3060,7 +3110,21 @@ void publishHeartbeat() {
   // XF-127 §9 — the hardware disagrees with the DP map we were built for. This
   // is exactly the class XF-122 exists to catch, so it must not depend on the
   // lock happening to be behind a bridge.
-  if (g_profileMismatch) doc["profile_mismatch"] = true;
+  //
+  // 🔴 2.20 (XF-129 Ask 1) — ALWAYS EMITTED, including when false.
+  //
+  // Until now this was `if (g_profileMismatch)`, so a healthy lock said nothing
+  // and a consumer could not tell "this lock is correctly matched" from "this
+  // firmware is too old to report mismatches at all". Absence meant both, which
+  // makes silence useless as evidence — and this flag is the ONLY thing standing
+  // between a mispinned build and every DP on the wire being read under the
+  // wrong map. The profile is pinned at BUILD time; the PID is learned at
+  // RUNTIME; this is where those two are compared.
+  //
+  // Same reasoning as [[silent-failures-rule]]: a diagnostic you cannot
+  // distinguish from its own absence is not a diagnostic. Costs one bool on a
+  // 60s heartbeat.
+  doc["profile_mismatch"] = g_profileMismatch;
 
   // ── ozkey-32 §5 Option A — THE LOCK IS AUTHORITATIVE FOR ITS OWN NAME ─────
   // (operator, 2026-08-14)
@@ -8114,7 +8178,11 @@ void loop() {
     // unprompted, so the app can learn a lock's identity without anyone standing
     // at it. Same argument the `name` field above is here for.
     if (cfgMcuPid.length()) hb["tuya_pid"] = cfgMcuPid;
-    if (g_profileMismatch) hb["profile_mismatch"] = true;
+    // 2.20 (XF-129 Ask 1) — always emitted, matching publishHeartbeat(). See the
+    // reasoning there. Changed in BOTH builders deliberately: this file's own
+    // rule is that anything added to one belongs in the other, and the two
+    // diverging is what produced XF-127 and the missing `caps` on Thread.
+    hb["profile_mismatch"] = g_profileMismatch;
     // Which DP map this lock is ACTUALLY running. Fleet-visible so a lock
     // still on the invented default is findable without a BLE session.
     hb["profile"] = ozProfileId();
