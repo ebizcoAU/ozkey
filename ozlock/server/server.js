@@ -2427,7 +2427,7 @@ api.get('/locks/:id', async (req, res) => {
     // already inferred remote_unlock from bridge_id, we simply never published it.
     // This is XF-48 ask 1 (the capability field) landing on the read path.
     const [[lock]] = await pool.query(
-      `SELECT id, app_id, site_id, mac, label, status, power_profile, heartbeat_s,
+      `SELECT id, app_id, site_id, mac, label, fw, status, power_profile, heartbeat_s,
               last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
               presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s,
               seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch
