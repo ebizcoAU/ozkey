@@ -977,6 +977,21 @@ function eventsAtRisk(lock) {
   );
 }
 
+// XF-131 Ask 2: `eventsAtRisk` only fires once rotation has actually
+// destroyed something unread — the LATE warning. This is the EARLY one:
+// the lock has events (`seq_highwater > 0`) nobody has confirmed pulling
+// yet, whether or not any have been lost. A backlog nobody can see is the
+// same failure as no backlog at all (the ticket's own framing) — this is
+// what makes it visible before it becomes unrecoverable. `> 0` guard for
+// the same reason as eventsAtRisk: a lock with zero events ever written
+// and last_pulled_seq still null must read false, not true.
+function eventsPending(lock) {
+  return (
+    lock.seq_highwater > 0 &&
+    (lock.last_pulled_seq == null || lock.seq_highwater > lock.last_pulled_seq)
+  );
+}
+
 // Log once per episode, not once per heartbeat — a lock stuck at-risk would
 // otherwise re-log on every beat for as long as nobody reads it, which is
 // exactly the kind of noise that makes a real alert easy to tune out.
@@ -2334,7 +2349,7 @@ api.get('/locks', async (req, res) => {
     );
     const locks = rows.map((l) => {
       const { caps, source } = effectiveCaps(l);
-      return { ...l, caps, caps_source: source, events_at_risk: eventsAtRisk(l) };
+      return { ...l, caps, caps_source: source, events_at_risk: eventsAtRisk(l), events_pending: eventsPending(l) };
     });
     res.json({ ok: true, locks });
   } catch (err) {
@@ -2430,7 +2445,7 @@ api.get('/locks/:id', async (req, res) => {
     // be undiagnosable from the app side.
     res.json({
       ok: true,
-      lock: { ...lock, caps, caps_source: source, events_at_risk: eventsAtRisk(lock) },
+      lock: { ...lock, caps, caps_source: source, events_at_risk: eventsAtRisk(lock), events_pending: eventsPending(lock) },
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
