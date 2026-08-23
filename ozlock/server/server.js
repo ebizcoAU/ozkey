@@ -714,6 +714,22 @@ async function initDatabase() {
   if (!hasProfileMismatchCol)
     await pool.query('ALTER TABLE locks ADD COLUMN profile_mismatch TINYINT(1) NULL');
 
+  // XF-134: `bonds` is a device fact (count of entries in the lock's own
+  // NVS bond table), already live on the wire for Thread locks today —
+  // same verbatim-beacon-relay-onto-heartbeat mechanism as
+  // seq_highwater/has_doorbell/profile_mismatch, just never ingested.
+  // DIAGNOSTIC ONLY, per XF-133's own reply: a count has no per-member
+  // identity, so it can never answer "does member X hold a bond" — that
+  // still needs the membership roster XF-129 §10 established doesn't
+  // exist. This is "how many keys exist on this door right now," useful
+  // for an ops/support view, never a security decision input.
+  const [[{ hasBondsCol }]] = await pool.query(
+    `SELECT COUNT(*) AS hasBondsCol FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'bonds'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasBondsCol) await pool.query('ALTER TABLE locks ADD COLUMN bonds TINYINT UNSIGNED NULL');
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bridges_presence (
       bridge_id   VARCHAR(64) PRIMARY KEY,
@@ -1868,6 +1884,8 @@ function initMqtt() {
         // above — a lock that stops reporting doesn't blank a known value.
         const tuyaPidHb = typeof obj.tuya_pid === 'string' && obj.tuya_pid.length <= 32 ? obj.tuya_pid : null;
         const profileHb = typeof obj.profile === 'string' && obj.profile.length <= 64 ? obj.profile : null;
+        // XF-134: diagnostic-only device fact, see the migration comment.
+        const bonds = Number.isFinite(obj.bonds) ? obj.bonds : null;
         await pool.query(
           `UPDATE locks
               SET last_seen_at    = NOW(),
@@ -1887,9 +1905,10 @@ function initMqtt() {
                   has_doorbell    = COALESCE(?, has_doorbell),
                   profile_mismatch = COALESCE(?, profile_mismatch),
                   tuya_pid        = COALESCE(?, tuya_pid),
-                  profile         = COALESCE(?, profile)
+                  profile         = COALESCE(?, profile),
+                  bonds           = COALESCE(?, bonds)
             WHERE id = ?`,
-          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, name, seqHighwater, droppedBeforeSeq, hasDoorbell, profileMismatch, tuyaPidHb, profileHb, deviceId]
+          [fw, id.transport, id.caps, batteryPct, pendingUplinks, lastMechResult, lastMechResult, rosterEpoch, mcuLinkUp, mcuLastFrameS, name, seqHighwater, droppedBeforeSeq, hasDoorbell, profileMismatch, tuyaPidHb, profileHb, bonds, deviceId]
         );
         if (droppedBeforeSeq !== null) {
           const [[riskRow]] = await pool.query(
@@ -2344,7 +2363,7 @@ api.get('/locks', async (req, res) => {
       `SELECT id, site_id, app_id, mac, label, fw, status, power_profile, heartbeat_s,
               last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
               presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s,
-              seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch
+              seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch, bonds
          FROM locks ORDER BY enrolled_at DESC`
     );
     const locks = rows.map((l) => {
@@ -2430,7 +2449,7 @@ api.get('/locks/:id', async (req, res) => {
       `SELECT id, app_id, site_id, mac, label, fw, status, power_profile, heartbeat_s,
               last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
               presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s,
-              seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch
+              seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch, bonds
          FROM locks WHERE id = ?`,
       [req.params.id]
     );
