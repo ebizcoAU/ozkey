@@ -3066,6 +3066,9 @@ void publishHeartbeat() {
   // never reported liveness. Not fixed here; that is ozkey-20 R3 and it needs
   // the uplink path, not this one.
   doc["roster_epoch"] = g_rosterEpoch;
+  // XF-134 — the Thread beacon has always carried this (ozBondCount()); this
+  // builder never did. Same "fields that must match" rule below.
+  doc["bonds"] = ozBondCount();
   // XF-108 §5 — the PID rides the heartbeat too, not just BLE `info`.
   //
   // ftpos capture `tuya_pid` where a BLE session already reads `info`:
@@ -3102,6 +3105,12 @@ void publishHeartbeat() {
   //     DP-map disagreement could only ever reach the server from a BRIDGED
   //     lock. On a direct Wi-Fi lock the warning existed and was unreportable
   //     (XF-127 §9 audit).
+  //
+  // 2026-08-24 (XF-134/XF-135): `bonds` was Thread-beacon-only (fixed above,
+  // this builder now calls ozBondCount() too); `caps`/`transport` were
+  // Wi-Fi-only (fixed in the Thread beacon via addIdentity()) — the gap that
+  // silently dropped `remote_unlock` for every Thread lock once 29e9115
+  // removed the static Nexus fallback that had been masking it.
   //
   // Anything added to one builder belongs in the other unless there is a
   // stated reason it is transport-specific.
@@ -8210,6 +8219,14 @@ void loop() {
     hb["has_doorbell"] = ozHasDoorbell();
     hb["mcu_link_up"] = mcuLinkUp();          // ozkey-20 §5a
     hb["uptime_s"] = (uint32_t)(millis() / 1000);
+    // XF-135 — this beacon never carried `transport`/`caps`, which is the exact
+    // contract XF-57 §4 requires on EVERY heartbeat so effectiveCaps() can
+    // intersect device-reported caps with server-known bridge reachability. A
+    // static Nexus manifest entry quietly covered for the gap until 29e9115
+    // removed it (2026-08-24), which silently dropped `remote_unlock` for every
+    // Thread lock. Same helper Wi-Fi's publishHeartbeat() already uses, so the
+    // two builders can no longer disagree on this.
+    addIdentity(hb, false);
     // ── ozkey-21 — PULL, don't sit waiting (operator, 2026-08-11) ─────────
     //
     // The bridge's time beacon is multicast, so it has no link-layer ACK: if
