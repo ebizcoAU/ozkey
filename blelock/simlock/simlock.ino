@@ -35,12 +35,13 @@
 #include <ArduinoJson.h>
 
 #include "../common/ozprofile.h"
+#include "../common/oztime.h"
 #include "tuya_frame.h"
 #include "ozkit_crypto.h"
 
 // ── Firmware version ────────────────────────────────────────────────────────
 // BUMP ON EVERY FLASHED CHANGE (house convention, see doorlock.ino).
-static const char *FW_VERSION = "simlock-0.1";
+static const char *FW_VERSION = "simlock-0.2";
 
 // ── DL-MCU UART link ─────────────────────────────────────────────────────────
 // 🔴 CORRECTED 2026-08-22 — the earlier claim here (GPIO16/17 belong to an
@@ -85,6 +86,23 @@ static const char *FW_VERSION = "simlock-0.1";
 static bool dutHandshakeEnabled = false;
 
 HardwareSerial DutUart(1); // UART1 — UART0 stays the USB/console per house convention
+
+// SIMLOCK plays the WiFi-module role on this wire, same as bridge32/doorlock
+// do for the real DL MCU (blelock/common/oztime.h) — so it, not the DUT, is
+// the one that must answer 0x0C/0x1C time requests. `ozclock` is opportunistic:
+// seeded from SNTP once WiFi is up (see onWifiEvent's GOT_IP case and the STA
+// loop() block), floored/monotonic exactly like doorlock's copy. If it's
+// never known, ozTuyaBuildTimeReply() below still sends the well-formed
+// "I do not know" reply (flag=0) rather than nothing — see oztime.h's own
+// header comment on why silence here is the actual historical bug.
+static OzClock ozclock;
+
+// Guards the idle time-request pump below against the DUT UART reads
+// runTest()/waitForFrame() already do mid-test — set true/false around both
+// runTest() call sites (handleApiTestsRunOne, runFullTestSuite). Everything
+// here is single-threaded off one loop(), so this is just "don't also try to
+// consume DUT bytes meant for an in-flight test's response", not a real lock.
+static bool g_dutTestBusy = false;
 
 // ── MQTT ─────────────────────────────────────────────────────────────────────
 // Dedicated ozkit broker, deliberately separate from the lab broker
@@ -310,6 +328,62 @@ static bool waitForFrame(uint32_t timeoutMs, uint8_t *out, size_t *outLen) {
   return false;
 }
 
+// Answers a 0x0C/0x1C GET_TIME request from the DUT, byte-identical codec to
+// ozdoorlock_core.h's serveMcuTime() and locksim/lib/tuya.ts's
+// buildTimeReply() on the other side of the wire. tzOffsetMin pinned to 0 for
+// the same reason doorlock pins it: see oztime.h's header comment — the DP
+// windows this feeds are UTC, so serving true local time here would silently
+// shift every time-limited credential test by the offset.
+static void dutServeTime(bool local) {
+  const uint32_t now = ozClockNow(ozclock, millis());
+  const bool have = ozClockKnown(ozclock);
+  uint8_t out[16];
+  size_t n = ozTuyaBuildTimeReply(out, local, have, now, /*tzOffsetMin=*/0);
+  dutSendFrame(out, n, 200);
+  if (have) {
+    Serial.printf("[TIME] served %s time to DUT: %lu\n", local ? "LOCAL" : "GMT",
+                  (unsigned long)now);
+  } else {
+    Serial.printf("[TIME] DUT asked for %s time and WE DO NOT KNOW IT — replied honestly\n",
+                  local ? "LOCAL" : "GMT");
+  }
+}
+
+// Dispatches any DUT-initiated frame that arrives outside an active test —
+// today that's just the time service, but logged rather than silently
+// dropped for anything else so a future gap like this one shows up as a
+// visible [DUT] line instead of another multi-day silent-answer bug.
+static void dutHandleUnsolicitedFrame(const uint8_t *f, size_t n) {
+  if (n >= 7 && (f[3] == OZ_TUYA_GET_GMT_TIME || f[3] == OZ_TUYA_GET_LOCAL_TIME)) {
+    dutServeTime(f[3] == OZ_TUYA_GET_LOCAL_TIME);
+    return;
+  }
+  Serial.printf("[DUT] unsolicited frame outside a test (cmd=0x%02X, %u bytes) — ignored\n",
+                f[3], (unsigned)n);
+}
+
+// Drains DutUart when no test is running. Real hardware/LockSim can speak up
+// the moment the link comes alive (boot sync, a fresh Web Serial connect) —
+// long before any test issues a DP command — and until this existed nothing
+// was listening for that, so those requests went unanswered exactly like the
+// historical doorlock 0x1C bug oztime.h documents. Own small buffer, kept
+// separate from waitForFrame()'s rxBuf/rxLen; g_dutTestBusy keeps the two
+// from ever reading the same bytes.
+static void dutIdlePump() {
+  if (g_dutTestBusy) return;
+  static uint8_t buf[64];
+  static size_t len = 0;
+  while (DutUart.available() && len < sizeof(buf)) {
+    buf[len++] = (uint8_t)DutUart.read();
+    size_t flen = 0;
+    size_t off = ozkitScanForFrame(buf, len, &flen);
+    if (flen == 0) continue;
+    dutHandleUnsolicitedFrame(buf + off, flen);
+    len = 0;
+  }
+  if (len >= sizeof(buf)) len = 0; // overflow guard — drop and resync
+}
+
 // Issue one DP command down to the DUT and wait for its report/ack.
 static TestResult runTest(const SimTest &t) {
   TestResult r{t.id, TS_FAIL, 0, ""};
@@ -533,6 +607,7 @@ static String pageShell(const String &eyebrow, const String &subtitle, const Str
   h += ".btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:12px 20px;border:0;border-radius:6px;";
   h += "font-weight:700;font-size:.92em;letter-spacing:.02em;cursor:pointer}";
   h += ".btn-block{display:flex;width:100%;margin-top:20px}";
+  h += ".btn-sm{padding:5px 12px;font-size:.8em}";
   h += ".btn-accent{background:var(--accent);color:var(--accent-ink)}";
   h += ".btn-warn{background:var(--warn);color:#fff}.btn-danger{background:var(--fail);color:#fff}";
   h += ".btn[disabled]{opacity:.45;cursor:default}";
@@ -642,6 +717,12 @@ static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       Serial.printf("[WiFi event] GOT_IP %s, t=%lums\n", WiFi.localIP().toString().c_str(), millis());
+      // Best-effort only — [[ntp-is-not-a-dependable-time-source]] documents
+      // this lab blocking UDP 123 for doorlock's board on the same network.
+      // If it's blocked here too, loop()'s STA block just never sees
+      // ozClockKnown() go true and dutServeTime() keeps answering honestly
+      // with "unknown" rather than hanging — see oztime.h's header comment.
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       Serial.printf("[WiFi event] STA_DISCONNECTED reason=%d, t=%lums\n",
@@ -804,7 +885,9 @@ static void handleApiTestsRunOne() {
   uint16_t id = (uint16_t)webServer.arg("id").toInt();
   for (size_t i = 0; i < kSeedSuiteCount; i++) {
     if (kSeedSuite[i].id != id) continue;
+    g_dutTestBusy = true;
     TestResult r = runTest(kSeedSuite[i]);
+    g_dutTestBusy = false;
     mqttPublishTestResult(r, kSeedSuite[i].name); // same cadence as the full-suite path
     JsonDocument doc;
     doc["id"] = r.id;
@@ -881,14 +964,15 @@ static void handleLivePage() {
     rows += "<td class=mono>" + String(t.id) + "</td><td>" + t.name + "</td>";
     rows += "<td class='st'><span class='pill pill-idle'>waiting</span></td>";
     rows += "<td class='lat mono'>&mdash;</td>";
-    rows += "<td class='hex mono'>" + testHexPreview(t) + "</td></tr>";
+    rows += "<td class='hex mono'>" + testHexPreview(t) + "</td>";
+    rows += "<td><button class='btn btn-sm btn-accent runone' onclick='runSingle(" + String(t.id) + ")'>&#9654; Run</button></td></tr>";
   }
   String body;
   body += "<div class=row style='justify-content:space-between;align-items:baseline;margin-bottom:14px'>";
   body += "<div id=runStatus><label style='margin:0'>Status</label><p class=mono style='margin:2px 0 0'>idle</p></div>";
-  body += "<button class='btn btn-accent' id=runBtn onclick=runSuite()>&#9654; Run Test Suite</button>";
+  body += "<button class='btn btn-accent' id=runBtn onclick=runSuite()>&#9654; Run All</button>";
   body += "</div>";
-  body += "<div class=tablewrap><table><thead><tr><th>#</th><th>Test</th><th>Result</th><th>Latency</th><th>Frame</th></tr></thead><tbody id=tbody>";
+  body += "<div class=tablewrap><table><thead><tr><th>#</th><th>Test</th><th>Result</th><th>Latency</th><th>Frame</th><th></th></tr></thead><tbody id=tbody>";
   body += rows;
   body += "</tbody></table></div>";
   body += "<script>";
@@ -896,26 +980,38 @@ static void handleLivePage() {
   for (size_t i = 0; i < kSeedSuiteCount; i++) { if (i) body += ","; body += String(kSeedSuite[i].id); }
   body += "];";
   body += "function pill(cls,label){return \"<span class='pill pill-\"+cls+\"'>\"+label+\"</span>\";}";
-  body += "async function runSuite(){";
-  body += "document.getElementById('runBtn').disabled=true;";
-  body += "document.querySelector('#runStatus p').textContent='running';";
-  body += "let pass=0,fail=0,unsup=0;";
-  body += "for(const id of ids){";
+  body += "function setBusy(b){document.getElementById('runBtn').disabled=b;";
+  body += "document.querySelectorAll('.runone').forEach(btn=>btn.disabled=b);}";
+  // One test, one request — the row updates itself. This is now the single
+  // source of truth for both a lone click and a batch run, so a per-test
+  // result never drifts between the two paths.
+  body += "async function runOne(id){";
   body += "const row=document.getElementById('row'+id);row.classList.add('running');";
   body += "row.querySelector('.st').innerHTML=pill('warn','running');";
-  body += "try{const res=await fetch('/api/tests/run_one?id='+id,{method:'POST'});const d=await res.json();";
+  body += "let d;try{const res=await fetch('/api/tests/run_one?id='+id,{method:'POST'});d=await res.json();}";
+  body += "catch(e){d={status:'ERROR',duration_ms:0,detail:String(e)};}";
   body += "row.classList.remove('running');";
   body += "let cls=d.status==='PASS'?'pass':(d.status==='UNSUPPORTED'?'off':'fail');";
   body += "row.querySelector('.st').innerHTML=pill(cls,d.status)+' <span style=\"color:var(--muted);font-size:.85em\">'+(d.detail||'')+'</span>';";
-  body += "row.querySelector('.lat').textContent=d.duration_ms+' ms';";
-  body += "if(d.status==='PASS')pass++;else if(d.status==='UNSUPPORTED')unsup++;else fail++;";
-  body += "}catch(e){row.querySelector('.st').innerHTML=pill('fail','ERROR');fail++;}";
-  body += "}";
+  body += "row.querySelector('.lat').textContent=(d.duration_ms||0)+' ms';";
+  body += "return d;}";
+  // Runs on the DUT are inherently serial (one shared UART, one runTest() at
+  // a time server-side) — setBusy() during a lone run is what stops a second
+  // click, or a batch run starting mid-single-test, from racing it.
+  body += "async function runSingle(id){setBusy(true);";
+  body += "document.querySelector('#runStatus p').textContent='running test '+id;";
+  body += "const d=await runOne(id);";
+  body += "document.querySelector('#runStatus p').textContent='test '+id+': '+d.status+(d.detail?' — '+d.detail:'');";
+  body += "setBusy(false);}";
+  body += "async function runSuite(){setBusy(true);";
+  body += "document.querySelector('#runStatus p').textContent='running';";
+  body += "let pass=0,fail=0,unsup=0;";
+  body += "for(const id of ids){const d=await runOne(id);";
+  body += "if(d.status==='PASS')pass++;else if(d.status==='UNSUPPORTED')unsup++;else fail++;}";
   body += "document.querySelector('#runStatus p').textContent='done — '+pass+' pass / '+fail+' fail / '+unsup+' unsupported';";
-  body += "document.getElementById('runBtn').disabled=false;";
-  body += "}";
+  body += "setBusy(false);}";
   body += "</script>";
-  webServer.send(200, "text/html", pageShell("Live Execution", "Board <code>" + boardId + "</code> &middot; each row calls /api/tests/run_one in sequence", body));
+  webServer.send(200, "text/html", pageShell("Live Execution", "Board <code>" + boardId + "</code> &middot; run the whole suite, or click Run on any single row", body));
 }
 
 // Toggle at runtime rather than reflash — GET reports current state, POST
@@ -1202,7 +1298,9 @@ static TestSuiteSummary runFullTestSuite() {
 
   uint16_t passed = 0, failed = 0, unsupported = 0;
   for (size_t i = 0; i < kSeedSuiteCount; i++) {
+    g_dutTestBusy = true;
     TestResult r = runTest(kSeedSuite[i]);
+    g_dutTestBusy = false;
     mqttPublishTestResult(r, kSeedSuite[i].name);
     if (r.status == TS_PASS) passed++;
     else if (r.status == TS_UNSUPPORTED) unsupported++;
@@ -1359,6 +1457,16 @@ void setup() {
 
 void loop() {
   checkFactoryResetButton(); // works in AP mode too — the point is to not need the network at all
+
+  // DUT UART servicing — independent of WiFi/AP state and ahead of the
+  // apMode early-return below, because LockSim/a real DUT can speak the
+  // moment its own link comes up (boot sync), regardless of what SIMLOCK's
+  // network side is doing.
+  if (!ozClockKnown(ozclock)) {
+    time_t t = time(nullptr);
+    if ((uint32_t)t >= OZ_TIME_FLOOR) ozClockSet(ozclock, (uint32_t)t, millis());
+  }
+  dutIdlePump();
 
   if (millis() - lastBlink > 500) {
     blinkOn = !blinkOn;
