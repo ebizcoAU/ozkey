@@ -176,6 +176,8 @@ export function useLockState({
   const [pinBuffer, setPinBuffer] = useState("");
   const [countdown, setCountdown] = useState(hbSeconds);
   const [lowBattery, setLowBattery] = useState(false);
+  const [batteryLevel, setBatteryLevelState] = useState(100);
+  const batteryLevelRef = useRef(100);
   const [mechanicalKey, setMechanicalKeyState] = useState(false);
   const [motorActive, setMotorActive] = useState(false);
   const [alarm, setAlarm] = useState(false);
@@ -848,6 +850,29 @@ export function useLockState({
     });
   }, [wake]);
 
+  /** Sets the level the NEXT report will carry — does not transmit by itself. */
+  const setBatteryLevel = useCallback((percent: number) => {
+    const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+    batteryLevelRef.current = clamped;
+    setBatteryLevelState(clamped);
+  }, []);
+
+  /**
+   * DP 45 `battery_percentage` — report-only (`lib/profile.ts`'s
+   * `verb_down` doc: nothing should ever COMMAND a battery reading), so
+   * this is the operator manually standing in for what the real MCU does
+   * on every re-join: pushes its current reading, unprompted. Gated by
+   * `emitDp`'s XF-118 P1c profile check like every other real DP.
+   */
+  const reportBatteryLevel = useCallback(() => {
+    emitDp(
+      DpId.BATTERY_PERCENTAGE,
+      DpType.VALUE,
+      u32be(batteryLevelRef.current),
+      `Battery level report: ${batteryLevelRef.current}%`
+    );
+  }, [emitDp]);
+
   /** Physical mechanical key override — pure clutch mechanics, no radio auth. */
   const setMechanicalKey = useCallback(
     (engaged: boolean) => {
@@ -1177,6 +1202,7 @@ export function useLockState({
     pinBuffer,
     countdown,
     lowBattery,
+    batteryLevel,
     mechanicalKey,
     motorActive,
     alarm,
@@ -1187,6 +1213,8 @@ export function useLockState({
     tapRfid,
     scanFingerprint,
     triggerLowBattery,
+    setBatteryLevel,
+    reportBatteryLevel,
     mcuFactoryReset,
     keypadPairingGesture,
     setMechanicalKey,

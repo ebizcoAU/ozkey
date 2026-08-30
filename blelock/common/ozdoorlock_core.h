@@ -43,6 +43,7 @@
 #include <time.h>
 #include "driver/gpio.h"
 #include "esp_sleep.h"
+#include "esp_mac.h" // esp_read_mac(ESP_MAC_BT) — the ADVERTISED address, not WiFi's
 #include "ozcrypto.h" // member-ceremony crypto (XF-46 §7.1) + boot self-test
 #include "oztime.h"   // ozkey-21 T1/T2 — module clock + the MCU time service
 #include "ozprofile.h" // ozkey-27 §4.5 — the DP map as DATA, shared with LockSim
@@ -175,7 +176,27 @@ static bool ozUplinkSend(int slot, const String &json); // defined below ozEvtPu
 // defined by the per-board .ino before #include "../common/ozdoorlock_core.h" ──
 
 // ── GATT contract (blelock/CONTRACT.md — unchanged so BANOI/MAOI pair as-is) ─
-#define BLE_NAME "OZLOCK"
+#define BLE_NAME "OZLOCK"   // fallback only — see ozBleAdvName()
+#ifdef OZ_NO_MCU
+// ── UNIQUE ADVERTISED NAME (operator, 2026-08-30) ─────────────────────────
+//
+// 🔴 WHY THE NAME, AND NOT THE MAC: iOS NEVER EXPOSES BLE ADDRESSES. Core-
+// Bluetooth substitutes a UUID it generates itself (the operator saw
+// "388AB51C-1796-BBE7-2ABB166D2AD9"), and that UUID is PER-PHONE — a
+// different handset sees a different one for the same lock, with no
+// derivable relation to the MAC. So no MAC shown on the LCD can ever match
+// what an iOS user is picking from. The advertised NAME is the only
+// identifier both platforms read and we control.
+//
+// Every lock advertising the identical "OZLOCK" is what left the app with
+// nothing to show but that opaque UUID.
+//
+// Built from the BT MAC (= the address that is advertised) via
+// esp_read_mac(ESP_MAC_BT), NOT the Wi-Fi MAC: they differ by +2 in the last
+// byte, and the advertised one is what the user is matching against.
+static char g_advName[16] = BLE_NAME;
+static const char *ozBleAdvName() { return g_advName; }
+#endif
 #define SVC_UUID "4f5a4b31-0001-4c4f-434b-000000000001"
 #define CHR_PROVISION "4f5a4b31-0002-4c4f-434b-000000000001"
 #define CHR_STATUS "4f5a4b31-0003-4c4f-434b-000000000001"
@@ -187,6 +208,42 @@ static bool ozUplinkSend(int slot, const String &json); // defined below ozEvtPu
 #define CHR_CHALLENGE "4f5a4b31-0005-4c4f-434b-000000000001"
 #define CHR_CONTROL "4f5a4b31-0006-4c4f-434b-000000000001"
 #define CHR_MEMBER "4f5a4b31-0007-4c4f-434b-000000000001"
+#ifdef OZ_NO_MCU
+// ── P5.5 — THE `command` CHARACTERISTIC: BRIDGE-RELAYED, CHALLENGE-LESS ────
+//
+// UUID is the PM appendix's original `Command` (XFtposDecisions-138), kept
+// verbatim so the doc and the firmware finally agree.
+//
+// WHY IT HAS TO EXIST (found on a live app->server->bridge->lock test,
+// 2026-08-30): a server-originated sealed envelope relayed by the bridge was
+// being written to `control`, and `control` is the M4 path — it demands a
+// fresh challenge the app read from ...0005. The bridge holds NO key material
+// and cannot perform that handshake, so every relayed unlock died as
+// `plaintext is 24 B — too short for challenge + frame` -> UNLOCK_DENIED.
+//
+// 🔴 THE SPLIT IS THE ARCHITECTURE, NOT A WORKAROUND:
+//   control (...0006) = an APP talking DIRECTLY to the lock. Challenge
+//                       REQUIRED. Unchanged, still full M4.
+//   command (FFF1)    = the BRIDGE relaying a SERVER envelope. No challenge.
+//
+// Security is NOT weakened relative to what already shipped: this is exactly
+// the disposition the MQTT and Thread-UDP paths have always had
+// (`hasChallenge=false`), and the sealed envelope still carries its own
+// authentication (X25519 bond) and replay protection (counter_floor). What
+// the challenge uniquely covered — the revoke-then-reinvite window where the
+// floor resets to 0 — remains covered on `control`, which is where a
+// physically-present attacker would actually be.
+//
+// Guarded by OZ_NO_MCU on purpose: production doorlock/doorlock19 keep ONLY
+// the M4-gated control char. A challenge-less path is not something to hand
+// a shipping lock as a side effect of a simulator feature.
+#define CHR_COMMAND "0000FFF1-0000-1000-8000-00805F9B34FB"
+// Set by CommandCB under ctlMux, cleared once ozControlTry() consumes the
+// buffer. Both characteristics feed the SAME ctlBuf — reusing that machinery
+// (chunking, the GCM-tag completeness oracle, the idle timer) rather than
+// duplicating it is the whole point; the flag is the only thing that differs.
+static volatile bool ctlFromCommandChar = false;
+#endif
 
 // Advertising connectable/non-connectable selector for
 // BLEAdvertising::setAdvertisementType(uint8_t), which forwards the raw byte
@@ -394,12 +451,52 @@ String cfgMode = "ozkey-cloud", cfgRoomNo, cfgMacToken;
 bool isLocalMode() { return cfgMode == "ozkey-local"; }
 
 String deviceId, macStr;
+// ── THE BLE ID THE APP ACTUALLY SHOWS (operator, 2026-08-30) ──────────────
+//
+// `deviceId` is "ozk-" + the WI-FI MAC. The BLE address the app displays is
+// NOT that: the ESP32 derives it as MAC+2 (bench-confirmed — LockA is
+// ozk-acebe639f8c4 but advertises ac:eb:e6:39:f8:c6, LockB is ...5fd8 and
+// advertises ...5fda). So the panel and the app disagreed in the last byte,
+// which makes matching a physical lock to a row in the pairing list ambiguous
+// — exactly when you most need it to be unambiguous.
+//
+// Filled in by startBle() once BLEDevice::init() has run; empty before that.
+String bleIdHex;
+/** The 12 hex digits the app shows, uppercase, no separators. Falls back to
+ *  the WiFi-MAC form only if BLE is not up yet, and says so. */
+static String ozBleIdDisplay() {
+  if (bleIdHex.length()) return bleIdHex;
+  String m = macStr; m.replace(":", ""); m.toUpperCase();
+  return m.length() ? m : String("(no ble id)");
+}
 
 // ── Transport (2026-07-26, ozkey-10 unification) ────────────────────────────
 // "wifi" (blecomm's original path) or "thread" (ported from threadcomm.ino).
 // Selected once, at provisioning, by payload shape — see applyProvision().
 String cfgTransport = "wifi"; // NVS "xport"
+#ifdef OZ_NO_MCU
+// ── CH584M HAS NO 802.15.4 RADIO (ozkey-45, operator 2026-08-30) ───────────
+//
+// LockA's NVS still says `xport=thread` from its life as a production Thread
+// lock, and the shared core believed it: the boot path ran OpenThread, the
+// panel showed "Thread: joining…", and the MON line read `thread=Child`. A
+// CH584M simulator has no business on a mesh — the real part cannot join one,
+// so every Thread code path here is simulating hardware that will not exist.
+//
+// Forced false rather than rewriting the NVS value, deliberately: the stored
+// `xport` is the OPERATOR's provisioning record and this board is borrowed —
+// re-flashing `BOARD=19` must give LockA its Thread identity back untouched.
+// This is a build-time statement about the SILICON, not an edit to config.
+//
+// Every Thread call site in this file is already gated on isThread(), so this
+// one line disables the poll loop, the UDP relay, the beacons and the role
+// reporting together. The boot-time bring-up needs its own guard (see setup()),
+// because that branch tests `provisioned && isThread()` and would otherwise
+// fall through to the Wi-Fi branch — which CH584M does not have either.
+bool isThread() { return false; }
+#else
 bool isThread() { return cfgTransport == "thread"; }
+#endif
 
 // ── C9 §1/§2 — Thread SED (sleepy) mode + configurable poll interval ────────
 //
@@ -682,8 +779,35 @@ unsigned long bleBootAdvUntil = 0; // millis deadline for the post-boot grace
 
 // Single source of truth for "should we be discoverable right now".
 bool bleAdvertisingAllowed() {
+#ifdef OZ_NO_MCU
+  // ── CH584M: ALWAYS DISCOVERABLE, and this is a deliberate reversal ────────
+  //
+  // Everything above describes a lock whose BLE peer is a PHONE that connects
+  // occasionally — so advertising is gesture-gated and the lock is dark the
+  // rest of the time. A CH584M lock's peer is a WALL-POWERED BRIDGE that must
+  // be able to reach it at ANY moment (ozkey-45): remote unlock, command
+  // relay and uplink all depend on the bridge finding it without anyone
+  // standing at the door. A gesture-gated lock can never serve that, and the
+  // vendor's own 32µA figure is calculated FROM continuous periodic
+  // advertising, not despite it.
+  //
+  // 🔴 WHAT THIS GIVES UP, stated plainly rather than buried: the two
+  // properties the gesture gate was bought with. (1) "Three factory-reset
+  // locks in a hallway are indistinguishable" comes back — mitigated because a
+  // CH584M lock is claimed by its bridge, not hand-picked from a list in an
+  // app. (2) The lock becomes a continuously trackable beacon, which is
+  // exactly what RPA rotation (CONTRACT.md:104/569) exists to answer and is
+  // now a REQUIREMENT for this product rather than a nice-to-have.
+  //
+  // What it does NOT give up is security. Per [[threat-model-bond-and-physical]]
+  // visibility was never the defence: the lock already lets anyone connect and
+  // read `info` unauthenticated, and the bond/challenge/counter gate sits at
+  // the WRITE boundary. Being findable is not being openable.
+  return true;
+#else
   if (bleWindowOpen()) return true;                       // gesture, either state
   return !provisioned && millis() < bleBootAdvUntil;      // post-boot grace only
+#endif
 }
 bool bleWindowOpen();
 String provBuf;
@@ -931,6 +1055,18 @@ unsigned long lastTimePushAt = 0;
 #define SRDY_WAIT_TIMEOUT_MS 1500UL   // answer-before-transmit guard
 #define SLEEP_IDLE_MS 30000UL         // nap after 30 s with nothing to do
 
+#ifdef OZ_NO_MCU
+// No external MCU (ozkey-45) — SRDY_PIN/MRDY_PIN are defined (required by
+// this file's per-board contract) but wired to nothing on this board and
+// must not be touched. Both functions are no-ops here rather than guarding
+// every call site individually.
+bool srdyAsserted() { return true; } // never worth waiting on
+void mrdySet(bool assertLow) { (void)assertLow; }
+// SRDY_PIN was never pinMode()'d on this board — reading it would be a
+// floating pin, not a fact. Used in place of digitalRead(SRDY_PIN) in the
+// one debug printf that used to read it directly.
+const char *srdyPinDebugStr() { return "n/a"; }
+#else
 bool srdyAsserted() { return wakeSim || digitalRead(SRDY_PIN) == LOW; }
 
 void mrdySet(bool assertLow) {
@@ -940,6 +1076,11 @@ void mrdySet(bool assertLow) {
   Serial.printf("[WAKE] MRDY %s\n",
                 assertLow ? "LOW (awake/has data)" : "HIGH (idle release)");
 }
+
+const char *srdyPinDebugStr() {
+  return digitalRead(SRDY_PIN) == LOW ? "LOW" : "high";
+}
+#endif
 
 // §0.3: heartbeat_s doubles as the proactive-pull interval — user range is
 // 1-15 min (60-900 s); clamp whatever provisioning/ack delivers.
@@ -1506,7 +1647,13 @@ void drawAdvertising() {
   gfx->setTextSize(2);
   gfx->setTextColor(C_GREEN);
   gfx->setCursor(15, 121);
-  gfx->println(deviceId);
+  // 🔴 BLE ID, NOT device_id (operator, 2026-08-30). This is the PAIRING
+  // screen — this string exists so a human can match the lock in front of
+  // them to a row in the app's list, and the app lists the BLE address. The
+  // ESP32 derives that as WiFi-MAC+2, so showing `ozk-<wifi mac>` here
+  // differed from the app in the last byte and made the match ambiguous
+  // exactly when it had to be certain. See ozBleIdDisplay().
+  gfx->println(ozBleIdDisplay());
   gfx->setTextColor(C_WHITE);
   gfx->setTextSize(1);
   gfx->setCursor(15, 140);
@@ -1530,7 +1677,10 @@ void drawJoining() {
   gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE);
   gfx->setCursor(15, 36);
-  gfx->println(asciiOnly(cfgName.length() ? cfgName : deviceId));
+  // BLE ID, not device_id — see ozBleIdDisplay(). A named lock still shows
+  // its name; an UNPROVISIONED one (the pairing case, where this matters)
+  // shows the same 12 hex digits the app lists.
+  gfx->println(asciiOnly(cfgName.length() ? cfgName : ozBleIdDisplay()));
   gfx->setTextSize(1);
   gfx->setTextColor(C_GREY);
   gfx->setCursor(15, 70);
@@ -1539,6 +1689,9 @@ void drawJoining() {
   gfx->println(joinLine2);
   gfx->setCursor(15, 120);
   gfx->setTextColor(C_DIM);
+  gfx->print("ble id: ");
+  gfx->println(ozBleIdDisplay());
+  gfx->setCursor(15, 134);
   gfx->print("device_id: ");
   gfx->println(deviceId);
   gfx->setCursor(15, 152);
@@ -1667,8 +1820,15 @@ void drawStatusLine() {
   ot_device_role_t liveRole = isThread() ? OpenThread::otGetDeviceRole() : OT_ROLE_DISABLED;
   bool threadAttached = (liveRole == OT_ROLE_CHILD || liveRole == OT_ROLE_ROUTER ||
                          liveRole == OT_ROLE_LEADER);
+#ifdef OZ_NO_MCU
+  // CH584M simulator (ozkey-45): this lock's ONLY link to the world is BLE to
+  // the bridge — the real part has no Wi-Fi and no Thread radio at all. So the
+  // panel's health colour tracks the BLE link, not a mesh role.
+  bool netUp = bleClientConnected;
+#else
   bool netUp = isThread() ? threadAttached
                           : ((WiFi.status() == WL_CONNECTED) && mqtt.connected());
+#endif
   uint16_t border = netUp ? C_GREEN : C_RED;
 
   // ── DON'T REPAINT WHAT HASN'T CHANGED (operator, 2026-08-11) ────────────
@@ -1686,13 +1846,21 @@ void drawStatusLine() {
   if (seenGen != panelGen) { seenGen = panelGen; haveSig = false; } // screen was cleared
   uint32_t sig = (uint32_t)netUp | ((uint32_t)liveRole << 1) |
                  ((uint32_t)provisioned << 5) | ((uint32_t)mcuLinkUp() << 6) |
-                 ((uint32_t)bleWindowOpen() << 7) | ((uint32_t)isThread() << 8);
+                 ((uint32_t)bleWindowOpen() << 7) | ((uint32_t)isThread() << 8)
+                 // 🔴 WITHOUT THIS THE NEW BLE LINE WOULD NEVER REPAINT.
+                 // This gate skips the redraw whenever the signature is
+                 // unchanged, so a state the signature does not include is a
+                 // state the panel cannot show changing — it would sit on
+                 // "NOT CONNECTED" through a successful connect. (On a
+                 // non-OZ_NO_MCU build this bit is simply always 0 unless a
+                 // phone is connected, which is worth repainting for anyway.)
+                 | ((uint32_t)bleClientConnected << 9);
   {
     // Fold the variable-length text in too, so an IP or name change still
     // repaints. Cheap additive hash — collisions only cost a missed refresh
     // of a line that is redrawn on every real event anyway.
     String v = (isThread() ? String("") : WiFi.localIP().toString()) +
-               (cfgName.length() ? cfgName : deviceId) + cfgRoomNo;
+               (cfgName.length() ? cfgName : ozBleIdDisplay()) + cfgRoomNo;
     for (size_t i = 0; i < v.length(); i++) sig = sig * 31u + (uint8_t)v[i];
   }
   if (haveSig && sig == lastSig) {
@@ -1725,6 +1893,24 @@ void drawStatusLine() {
   // "wifi" (:572). Showing "WIFI" on a virgin lock renders a default as a
   // decision, which is how a factory-reset lock looked like a misconfigured one.
   // The app decides the mode, at provision time, by sending network_key or not.
+#ifdef OZ_NO_MCU
+  // ── CH584M: BLE IS THE TRANSPORT, so show the BLE LINK, not a mesh role ──
+  //
+  // Operator, 2026-08-29: "DL should remove THREAD: CHILD|LEADER with
+  // BLE:CONNECTED|NOT CONNECTED." A CH584M lock has no Wi-Fi and no 802.15.4
+  // radio — BLE to the bridge is its entire connectivity — so a Thread role
+  // on this panel is not merely redundant, it describes hardware the shipping
+  // part does not have. `dlch584m_19` still has Thread compiled in (it is
+  // doorlock19 + OZ_NO_MCU), which is exactly why this must be a DISPLAY
+  // decision: the panel should show what CH584M will be, not what the
+  // simulator's spare radios happen to be doing.
+  //
+  // Deliberately shown even when unprovisioned — unlike the transport below,
+  // "is the bridge talking to me" is meaningful at every stage, and it is the
+  // single fact this bench most needs to read off the panel.
+  gfx->print("BLE: ");
+  gfx->print(bleClientConnected ? "CONNECTED" : "NOT CONNECTED");
+#else
   if (!provisioned) {
     gfx->print("UNSET");
   } else if (isThread()) {
@@ -1738,6 +1924,7 @@ void drawStatusLine() {
     if (WiFi.status() == WL_CONNECTED) gfx->print(WiFi.localIP().toString());
     else gfx->print(" NO NETWORK");
   }
+#endif
   if (isLocalMode() && cfgRoomNo.length()) { // room lives in the header now
     gfx->print(" P.");
     gfx->print(cfgRoomNo);
@@ -2085,6 +2272,14 @@ static bool    g_ackSeen   = false;
 
 /** True if the MCU echoed `dp` within the window. Pumps the UART inline. */
 static bool ozAwaitMcuAck(uint8_t dp) {
+#ifdef OZ_NO_MCU
+  // No external MCU to wait on (ozkey-45) — tuyaWireSend() already applied
+  // this DP's effect synchronously, before this function was even called
+  // (see forwardFrameToMcu's call order). Waiting here would just delay for
+  // a wire event that can never arrive.
+  Serial.printf("[MCU-ACK] DP %u LOCAL — applied synchronously, no external MCU\n", dp);
+  return true;
+#else
   g_ackWaitDp = dp;
   g_ackSeen = false;
   const unsigned long t0 = millis();
@@ -2099,9 +2294,11 @@ static bool ozAwaitMcuAck(uint8_t dp) {
                 ok ? "CONFIRMED" : "NO ANSWER — credential NOT stored",
                 millis() - t0);
   return ok;
+#endif
 }
 
 void tuyaWireSend(const uint8_t *f, size_t n) {
+#ifndef OZ_NO_MCU
   // §0.2 module-initiated send: raise MRDY, wait for the MCU's answering
   // SRDY (wake_sim: assumed answered), then transmit — no bytes ever hit a
   // sleeping UART.
@@ -2115,11 +2312,28 @@ void tuyaWireSend(const uint8_t *f, size_t n) {
   Serial1.write(f, n);
   lastWireActivityAt = millis();
   mcuTxFrames++;
+#endif
   String hex; hex.reserve(n * 3);
   for (size_t i = 0; i < n; i++) {
     char b[4]; snprintf(b, sizeof(b), "%02X ", f[i]); hex += b;
   }
+#ifdef OZ_NO_MCU
+  // This board IS its own MCU (ozkey-45) — no external DL-MCU, no UART peer.
+  // Every DOWN frame that would have gone over the wire is applied LOCALLY,
+  // synchronously, right here, instead of being transmitted and awaited.
+  // Unlock is the one case worth a real local effect (bolt state, drawn on
+  // screen) — markDoorUnlocked() is the CONFIRMED/authoritative path, not
+  // the amber ISSUED one, because there is no separate MCU whose word could
+  // outrank ours: we ARE the thing that would have moved the bolt.
+  Serial.printf("[LOCAL] applied (no external MCU): %s\n", hex.c_str());
+  const OzVerbMap *unlockMap = ozResolveVerb("lock.unlock", nullptr, OZ_DIR_DOWN);
+  if (unlockMap && n >= 11 && f[6] == unlockMap->dp) {
+    markDoorUnlocked();
+  }
+  lastMcuFrameAt = millis(); // local peripherals just acted — "MCU" is up
+#else
   Serial.printf("[TUYA->] %s\n", hex.c_str());
+#endif
   lastMcuHex = hex;
   // screenDirty REMOVED 2026-08-11. It existed to refresh the hex readout, and
   // that readout is gone — this row shows the clock now, refreshed on its own
@@ -3015,6 +3229,11 @@ void handleMcuFrame(const uint8_t *f, size_t n) {
 
 // RX reassembly off the wire (LockSim frames arrive as raw bytes)
 void tuyaWirePump() {
+#ifdef OZ_NO_MCU
+  // No external MCU, no UART peer (ozkey-45) — nothing to drain. Every call
+  // site left calling this is harmless; it just returns immediately.
+  return;
+#else
   static uint8_t buf[128];
   static size_t bn = 0;
   while (Serial1.available()) {
@@ -3031,6 +3250,7 @@ void tuyaWirePump() {
       if (bn == total) { handleMcuFrame(buf, bn); bn = 0; }
     }
   }
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3186,7 +3406,29 @@ void publishHeartbeat() {
 // The server intersects this with its own bridge binding (effectiveCaps), so
 // neither side can over-promise alone.
 static void addIdentity(JsonDocument &doc, bool full) {
+#ifdef OZ_NO_MCU
+  // 🔴 REPORT WHAT THIS LOCK *IS*, NOT WHAT NVS REMEMBERS.
+  //
+  // `cfgTransport` is the stored provisioning record, and on a borrowed bench
+  // board it still says "thread" from that unit's production life. The app
+  // branches on THIS FIELD to choose its commissioning flow, so a CH584M lock
+  // was telling it "I am a Thread lock" and getting the Thread courier flow —
+  // "Khoá này dùng mạng Thread, sẽ vào mạng qua Bridge" — for a device with no
+  // 802.15.4 radio at all. Observed on the bench 2026-08-30; pairing could not
+  // complete because the app was waiting to courier a Thread dataset that this
+  // lock can never use.
+  //
+  // isThread() is already forced false on this build; this makes the WIRE say
+  // the same thing the code does. NVS is still deliberately left untouched so
+  // `make flash BOARD=19` restores the board's real identity.
+  //
+  // "ble" is a NEW value for the app. It is the honest one — the bridge is the
+  // only route off this device — but the app must learn it; until then it will
+  // fall to its non-Thread branch, which is the correct half of the choice.
+  doc["transport"] = "ble";
+#else
   doc["transport"] = cfgTransport;
+#endif
   JsonArray caps = doc["caps"].to<JsonArray>();
   // Wi-Fi/economy locks sleep and wake on the heartbeat interval, so they cannot
   // promise a live "open now" — unlock there is BLE-at-the-door, by design and
@@ -3241,6 +3483,41 @@ static void addIdentity(JsonDocument &doc, bool full) {
   // (`supportsAssistedUnlock`), so a doorbell-less lock now correctly stops
   // offering the button instead of offering one that can never complete.
   const bool canAssist = canUnlock && ozDpFind(53) != nullptr;
+#ifdef OZ_NO_MCU
+  // ── CH584M: `remote_unlock`, and NEVER `assisted_unlock` ─────────────────
+  //
+  // 🔴 THIS BRANCH EXISTS BECAUSE THE TWO TESTS BELOW BOTH GIVE THE WRONG
+  // ANSWER ON THIS BUILD, AND THE RESULT IS A LOCK THAT LIES ABOUT ITSELF.
+  //
+  // `isThread()` is forced false here (no 802.15.4 on CH584M), so without
+  // this a bridged lock would fall to the `canAssist` branch. And
+  // `canAssist` only asks "does the PROFILE carry DP 53" — it does
+  // (tuya-luona-ds013-t3 selects it) — not the question that actually
+  // matters: CAN DP 53 EVER ARRIVE? It cannot. `ozAssistPresence()` has
+  // exactly one caller, inside the DP 53 handler in handleMcuFrame(), and
+  // with OZ_NO_MCU tuyaWirePump() returns immediately so that path never
+  // runs. LCD touch — the other historical presence source — was removed in
+  // 2.19. So this build has NO proof-of-presence source at all.
+  //
+  // Advertising `assisted_unlock` here would arm, wait for a touch that can
+  // never be reported, and expire after 60 s — every time. That is exactly
+  // the dishonest affordance XF-58 §3.1.1 created a separate capability name
+  // to avoid, and the same shape as the 2.18 bug where the gate was wired to
+  // a sensor production does not have.
+  //
+  // What this lock CAN honestly promise is `remote_unlock`. The bridge holds
+  // a STANDING BLE connection to it (continuous advertising + the central's
+  // paired allowlist), so "reachable on demand, no one need be at the door"
+  // is true — which is precisely the property `isThread()` was standing in
+  // for before. The transport changed; the promise did not.
+  if (canUnlock) {
+    caps.add("remote_unlock");
+    if (canAssist)
+      Serial.println("[CAPS] assisted_unlock WITHHELD — CH584M build has no "
+                     "presence source (no DP 53 path, no LCD touch); "
+                     "advertising remote_unlock instead");
+  }
+#else
   if (isThread()) {
     if (canUnlock) caps.add("remote_unlock");
   } else if (canAssist) {
@@ -3249,6 +3526,7 @@ static void addIdentity(JsonDocument &doc, bool full) {
     Serial.println("[CAPS] assisted_unlock WITHHELD — profile has no DP 53 "
                    "doorbell, so an armed unlock could never be released");
   }
+#endif
   if (canPin) caps.add("pin_sync");
   if (canRfid) caps.add("rfid_sync");
   // Ours, not the MCU's: the txlog is written by this firmware and does not
@@ -5143,6 +5421,49 @@ void applyProvision(JsonDocument &doc) {
     return;
   }
 
+#ifdef OZ_NO_MCU
+  // ── CH584M: THE THIRD COMMISSIONING SHAPE — NO NETWORK AT ALL ────────────
+  //
+  // 🔴 WITHOUT THIS A CH584M LOCK CANNOT BE COMMISSIONED, FULL STOP.
+  // bond0Accept() is reached from exactly two places, both INSIDE the Thread
+  // and Wi-Fi branches above. A provision carrying an app_id but no
+  // network_key and no ssid — which is the only honest payload for a lock
+  // with neither radio — fell through to ENROLL_FAIL below and no bond was
+  // ever created. App team found this live (XFtposDecisions-138, "initial
+  // CH584M pairing has no path at all"); the wizard could not have succeeded
+  // down ANY branch, because the firmware had no branch to succeed down.
+  //
+  // The ceremony is the SAME ceremony minus the network join: same
+  // `provision` write, same ozBond0Evaluate() verdict, same bond0Accept()
+  // (which emits BOND_OK), same atomic refusal for a stranger. What differs
+  // is that there is nothing to join afterwards, so the ladder TERMINATES
+  // IMMEDIATELY rather than running WIFI_JOINING -> WIFI_OK -> BROKER_*.
+  //
+  // Terminal status is ENROLLED — an EXISTING wire string (used by the Wi-Fi
+  // path at :4874/:4918), deliberately not a new one, so the app has a
+  // termination state it already recognises. Answering App's Ask 1: it IS a
+  // provision write with a ladder, the ladder is just two rungs deep —
+  // BOND_OK then ENROLLED.
+  //
+  // ST_OPERATIONAL, not ST_JOINING: there is no join pending. The lock is
+  // fully functional the instant the bond exists — the bridge reaches it over
+  // BLE, which is already up.
+  if (!hasSsid && !hasNetworkKey) {
+    bond0Accept(bondVerdict, provPub);          // emits BOND_OK
+    // cfgName / cfgSiteId / broker fields are already parsed from `doc` above
+    // — only `mode` needs a default, since the Wi-Fi branch is where it is
+    // normally validated and we are deliberately not going through it.
+    cfgMode = mode.length() ? mode : String("ozkey-cloud");
+    provisioned = true;
+    saveConfig();
+    state = ST_OPERATIONAL;
+    screenDirty = true;
+    Serial.println("[PROV] CH584M enrolment complete — bond #0 set, no network "
+                   "to join (bridge is the uplink)");
+    notifyStatus("ENROLLED");
+    return;
+  }
+#endif
   if (!hasSsid) { notifyStatus("ENROLL_FAIL"); return; } // neither shape present
 
   // ── Wi-Fi transport (blecomm's original path, unchanged) ─────────────────
@@ -6992,6 +7313,22 @@ static bool ozControlTry(bool final) {
     return true;
   }
 
+#ifdef OZ_NO_MCU
+  // P5.5 — which characteristic did these bytes arrive on?
+  //   command -> bridge relay of a SERVER envelope: no challenge, and NOT
+  //              "viaBle" in the sense that flag means (a phone talking to us
+  //              directly). Origin is the network; the bridge is just wire.
+  //              Matches the MQTT/Thread call sites exactly.
+  //   control -> unchanged full M4.
+  const bool fromCmd = ctlFromCommandChar;
+  ctlFromCommandChar = false; // consumed with the buffer
+  if (fromCmd) {
+    Serial.println("[CMD] relayed envelope (challenge-less, bridge path)");
+    ozControlVerifyAndDispatch(slot, pt, ptLen, counter, false /*hasChallenge*/,
+                               false /*viaBle — server-originated, relayed*/);
+    return true;
+  }
+#endif
   ozControlVerifyAndDispatch(slot, pt, ptLen, counter, true /*hasChallenge*/,
                              true /*viaBle — the BLE control characteristic*/);
   return true;
@@ -7001,6 +7338,48 @@ static bool ozControlTry(bool final) {
 // ctlBuf comment for why. getData()/getLength(), never getValue().c_str(): the
 // payload is binary and a c_str() copy would truncate the whole message at the
 // first zero byte in the ciphertext, which one in 256 of them starts with.
+#ifdef OZ_NO_MCU
+// P5.5 — the bridge's relay inlet. Byte-for-byte the same append-only,
+// critical-section-guarded reassembly as ControlCB below (see its header for
+// why the BLE task may ONLY append) — the single difference is the flag,
+// which ozControlTry() reads to choose the challenge-less disposition.
+//
+// Sharing ctlBuf means a phone writing `control` and the bridge writing
+// `command` at the same instant would interleave into one buffer. That race
+// already existed between chunks of a single writer and is bounded the same
+// way (the GCM tag fails, the idle timer clears it, the sender retries).
+// Not introducing a second 512 B buffer for a case that resolves itself.
+class CommandCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    const uint8_t *data = c->getData();
+    const size_t n = c->getLength();
+    if (!data || !n) return;
+
+    bool overflow = false;
+    portENTER_CRITICAL(&ctlMux);
+    if (ctlLen + n > sizeof(ctlBuf)) {
+      overflow = true;
+      ctlLen = 0;
+      ctlFromCommandChar = false; // buffer dropped — flag must not outlive it
+    } else {
+      memcpy(ctlBuf + ctlLen, data, n);
+      ctlLen += n;
+      ctlFromCommandChar = true; // set WITH the bytes, under the same lock
+    }
+    portEXIT_CRITICAL(&ctlMux);
+
+    if (overflow) {
+      Serial.printf("[CMD] message exceeds %u B — dropped\n",
+                    (unsigned)sizeof(ctlBuf));
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    ctlLastChunkAt = millis();
+    ctlNewBytes = true;
+  }
+};
+#endif
+
 class ControlCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
     const uint8_t *data = c->getData();
@@ -7012,9 +7391,32 @@ class ControlCB : public BLECharacteristicCallbacks {
     if (ctlLen + n > sizeof(ctlBuf)) {
       overflow = true;
       ctlLen = 0;
+#ifdef OZ_NO_MCU
+      ctlFromCommandChar = false;
+#endif
     } else {
       memcpy(ctlBuf + ctlLen, data, n);
       ctlLen += n;
+#ifdef OZ_NO_MCU
+      // 🔴 CLEAR THE RELAY FLAG. Without this line a `control` write could be
+      // dispatched CHALLENGE-LESS, defeating M4 on the app-direct path.
+      //
+      // How (found by review, 2026-08-30, before it ever ran): ozControlTry()
+      // clears the flag only after ozControlOpen() SUCCEEDS — several early
+      // returns (incomplete message, open failure) leave it set. So a
+      // `command` write that failed or arrived partial would leave
+      // ctlFromCommandChar true, and the NEXT `control` write to complete a
+      // message would inherit it and skip the challenge check.
+      //
+      // That is the revoke-then-reinvite replay window the challenge exists
+      // to cover (counter_floor resets to 0 there, so the stale challenge is
+      // the only thing left stopping a captured frame).
+      //
+      // Setting it here — under the same lock as the bytes — makes the flag
+      // mean exactly "the characteristic that wrote the most recent bytes",
+      // which is the only reading that cannot be desynchronised from ctlBuf.
+      ctlFromCommandChar = false;
+#endif
     }
     portEXIT_CRITICAL(&ctlMux);
 
@@ -7309,7 +7711,34 @@ static void ozRefreshInfoChar() {
 }
 
 void startBle() {
+#ifdef OZ_NO_MCU
+  {
+    // Name must be set AT init — build it from the BT MAC first.
+    uint8_t bm[6] = {0};
+    if (esp_read_mac(bm, ESP_MAC_BT) == ESP_OK)
+      // 8 chars = 10 bytes of AD, which puts the packet at EXACTLY 31/31:
+      // flags(3) + 128-bit service UUID(18) + name(10). Zero spare — one more
+      // character overflows and the lock goes silently undiscoverable, which
+      // is how bridge32-1.31 broke. Verified on hardware, not calculated.
+      // Last 5 hex of the ADVERTISED address (e.g. ac:eb:e6:39:f8:c6 -> 9F8C6).
+      snprintf(g_advName, sizeof(g_advName), "OZ-%01X%02X%02X",
+               bm[3] & 0x0F, bm[4], bm[5]);
+    Serial.printf("[BLE] advertising as '%s'\n", g_advName);
+  }
+  BLEDevice::init(ozBleAdvName());
+#else
   BLEDevice::init(BLE_NAME);
+#endif
+  {
+    // Capture the address the app will see, so the panel can show the SAME
+    // identifier the user is picking from in the pairing list.
+    String a = BLEDevice::getAddress().toString();
+    a.replace(":", "");
+    a.toUpperCase();
+    bleIdHex = a;
+    Serial.printf("[ID] ble_id=%s (app shows this; device_id=%s is the WiFi MAC)\n",
+                  bleIdHex.c_str(), deviceId.c_str());
+  }
   bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new ServerCB());
   BLEService *svc = bleServer->createService(SVC_UUID);
@@ -7335,6 +7764,14 @@ void startBle() {
   // the capability signal the app probes for: its absence means a lock that
   // cannot authorise an unlock, and the app says so in Vietnamese rather than
   // writing into the void.
+#ifdef OZ_NO_MCU
+  // P5.5 — bridge relay inlet (write-only, challenge-less). See CHR_COMMAND.
+  BLECharacteristic *cmd = svc->createCharacteristic(CHR_COMMAND,
+                                                     BLECharacteristic::PROPERTY_WRITE);
+  cmd->setCallbacks(new CommandCB());
+  Serial.println("[BLE] `command` characteristic up (FFF1) — bridge relay inlet");
+#endif
+
   BLECharacteristic *ctl = svc->createCharacteristic(CHR_CONTROL, BLECharacteristic::PROPERTY_WRITE);
   ctl->setCallbacks(new ControlCB());
 
@@ -7574,7 +8011,9 @@ void enterKeepAliveSleep() {
   WiFi.mode(WIFI_OFF);
   digitalWrite(LCD_BL, LCD_BL_OFF); // dark panel = the visible "napping" cue
 
+#ifndef OZ_NO_MCU
   gpio_wakeup_enable((gpio_num_t)SRDY_PIN, GPIO_INTR_LOW_LEVEL);
+#endif
 #ifdef HAS_TOUCH_INT
   gpio_wakeup_enable((gpio_num_t)TOUCH_INT, GPIO_INTR_LOW_LEVEL);
 #endif
@@ -7697,6 +8136,13 @@ void setup() {
   // successful one. Firmware would have concluded the hardware lacks DP 76 and
   // refused to unlock, blaming the lock for our own dropped bytes.
   //
+#ifdef OZ_NO_MCU
+  // No external MCU (ozkey-45) — Serial1/SRDY/MRDY are never brought up on
+  // this board. TUYA_TX_PIN/TUYA_RX_PIN/SRDY_PIN/MRDY_PIN stay defined
+  // (per-board contract) but wired to nothing and untouched here.
+  Serial.println("[TUYA] disabled — this board IS its own MCU (ozkey-45)");
+  bootMark("banner + profile (no external MCU)");
+#else
   // Must precede begin(); setRxBufferSize() is ignored once the driver is up.
   Serial1.setRxBufferSize(2048);
   Serial1.begin(9600, SERIAL_8N1, TUYA_RX_PIN, TUYA_TX_PIN);
@@ -7707,6 +8153,7 @@ void setup() {
   pinMode(SRDY_PIN, INPUT_PULLUP);
   pinMode(MRDY_PIN, OUTPUT);
   digitalWrite(MRDY_PIN, HIGH);
+#endif
 
   // Transaction buffer (LittleFS, format on first mount)
   fsUp = LittleFS.begin(true);
@@ -7812,6 +8259,30 @@ void setup() {
   ozM4SelfTest();
   bootMark("crypto + M4 self-tests");
 
+#ifdef OZ_NO_MCU
+  // ── CH584M: NO TRANSPORT BRING-UP AT ALL — BLE IS THE UPLINK ─────────────
+  //
+  // isThread() is forced false on this build (see its definition), so the
+  // Thread branch below can never be taken — but WITHOUT this guard a
+  // provisioned lock would simply fall through to the Wi-Fi branch and start
+  // dialling an AP instead, which is the same mistake in a different radio.
+  // CH584M has neither. The bridge is the only route off this device, over the
+  // BLE link that startBle() below brings up.
+  //
+  // ST_OPERATIONAL because for this product that is the truth: with BLE
+  // advertising continuously there is nothing further to join or wait for.
+  // An unprovisioned lock still sits in ST_ADVERTISING so the commissioning
+  // ceremony reads the same as it always did.
+  state = provisioned ? ST_OPERATIONAL : ST_ADVERTISING;
+  joinLine1 = "";
+  joinLine2 = "";
+  Serial.println("[NET] CH584M mode — no Thread, no Wi-Fi. BLE to the bridge "
+                 "is the only uplink (ozkey-45).");
+  if (provisioned && cfgTransport == "thread")
+    Serial.println("[NET] NOTE: NVS still records xport=thread from this "
+                   "board's production life — left untouched on purpose, so "
+                   "re-flashing BOARD=19 restores it.");
+#else
   if (provisioned && isThread()) {
     // Thread resume (ported from threadcomm.ino): relies entirely on
     // OpenThread's own NVS-backed dataset (never stored in our "blelock"
@@ -7848,6 +8319,22 @@ void setup() {
     Serial.printf("[BLE] discoverable for %lus after boot, then press BOOT to pair\n",
                   BLE_BOOT_ADV_MS / 1000);
   }
+#endif // OZ_NO_MCU — transport bring-up
+#ifdef OZ_NO_MCU
+  // 🔴 WITHOUT THIS, bleAdvertisingAllowed()'s always-true above is INERT on a
+  // PROVISIONED lock. startBle() — which builds the GATT server — runs at boot
+  // only in the `else` branch above, i.e. only when UNPROVISIONED; a
+  // provisioned lock builds it lazily on the first openBleWindow(). So a
+  // commissioned CH584M lock would have claimed to be advertising with no GATT
+  // server behind it and no gesture ever coming, and the bridge would scan
+  // forever and find nothing. (That is precisely tonight's bench symptom.)
+  // Idempotent: startBle() is a no-op once bleServer exists.
+  if (bleServer == nullptr) {
+    startBle();
+    Serial.println("[BLE] CH584M mode — advertising continuously from boot "
+                   "(bridge must be able to reach this lock at any time)");
+  }
+#endif
   Serial.printf("[WAKE] wake_sim=%s hb=%us (SRDY=GPIO%d MRDY=GPIO%d)\n",
                 wakeSim ? "ON (bench: SRDY assumed, no sleep)" : "OFF (honest)",
                 cfgHeartbeatS, SRDY_PIN, MRDY_PIN);
@@ -8422,7 +8909,7 @@ void loop() {
                   (unsigned)mcuTxFrames, (unsigned)mcuRxFrames,
                   wakeSim ? "sim" : "real",
                   mrdyAsserted ? "LOW" : "high",
-                  digitalRead(SRDY_PIN) == LOW ? "LOW" : "high",
+                  srdyPinDebugStr(),
                   cfgHeartbeatS,
                   // C9: which radio duty cycle this lock is ACTUALLY running.
                   // Printed for the same reason the link-mode read-back exists

@@ -486,6 +486,9 @@ export default function Page() {
               onPairingGesture={lock.keypadPairingGesture}
               onDoorbell={lock.ringDoorbell}
               lowBattery={lock.lowBattery}
+              batteryLevel={lock.batteryLevel}
+              onBatteryLevelChange={lock.setBatteryLevel}
+              onReportBatteryLevel={lock.reportBatteryLevel}
               credentials={lock.credentials}
               mcuUnix={lock.mcuUnix}
             />

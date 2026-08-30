@@ -1,0 +1,65 @@
+# bridge32 — custom 16 MB partition table for the Waveshare ESP32-C6-GEEK (N16)
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The GEEK carries 16 MB of flash — confirmed on the silicon, not just the
+# marketing name:
+#
+#     $ esptool --chip esp32c6 flash_id
+#     Device:              4018            (0x18 = 2^24 = 16 MB)
+#     Detected flash size: 16MB
+#
+# But the build used `PartitionScheme=default_8MB`, whose table stops at
+# 0x800000. `FlashSize=16M` and `PartitionScheme` are INDEPENDENT settings —
+# the first configures the SPI controller, the second says where things live.
+# Declaring 16 MB does not create partitions in it. So the upper 8 MB of a part
+# we paid for was mapped by nothing and reachable by nothing.
+#
+# It also made the build look alarming for no reason: 1.99 MB against
+# default_8MB's 3.34 MB app slot reads 59%, which invites a hunt for bloat that
+# is not there. Measured, bridge32-1.6 (2026-08-07, 1287 lines) was 1,969,818
+# bytes and bridge32-1.36 (2426 lines) is 1,986,590 — a week of work added
+# 16 KB. The ~2 MB floor is Wi-Fi + BLE + OpenThread + lwIP + mbedTLS + the
+# Arduino core + GFX, all resident at once. There is no stale-code problem.
+#
+# UPGRADE SAFETY — the reason for these specific offsets
+# ------------------------------------------------------
+# `nvs` and `app0` keep the offsets and sizes default_8MB gave them:
+#
+#     nvs   @ 0x9000  size 0x5000   (unchanged)
+#     app0  @ 0x10000               (unchanged start)
+#
+# A USB flash writes only bootloader (0x0), the partition table (0x8000),
+# otadata (0xe000) and the app (0x10000). It does NOT erase 0x9000-0xe000, so
+# NVS survives this change — which matters more than it sounds:
+#
+#   • Wi-Fi credentials, broker host/port, site_id, owner app_id and cfgTzMin
+#     all live there, so the bridge does not need re-provisioning.
+#   • 🔴 OpenThread's dataset lives there too. Losing it would make the bridge
+#     self-form a NEW mesh and ORPHAN every lock attached to it — the failure
+#     recorded in `bridge-replacement-orphans-locks`. Keeping `nvs` byte-for-byte
+#     identical is what avoids that.
+#
+# Only app1 and the data partitions move, and neither holds live state today.
+#
+# WHAT CHANGED
+# ------------
+#   app0/app1  3.3 MB -> 4 MB each   (2x headroom over the current 1.99 MB)
+#   spiffs     1.5 MB -> 7.9 MB      (was 0 usable beyond 8 MB)
+#
+# The freed space is where the on-demand, signed Matter personality would live
+# (`bridge32-role-decisions`: two firmware personalities downloaded on demand) —
+# that needs somewhere to stage a second image, and there was nowhere.
+#
+# ⚠️ REPORTED PERCENTAGE IS NOW MISLEADING, IN THE OTHER DIRECTION.
+# The core defines `PartitionScheme.custom.upload.maximum_size = 16777216`, so
+# arduino-cli measures against the whole chip and prints ~12%. The real limit is
+# app0 = 4 MB (0x400000). Judge headroom against that, not against the 12%.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x400000,
+app1,       app,  ota_1,    0x410000, 0x400000,
+spiffs,     data, spiffs,   0x810000, 0x7E0000,
+coredump,   data, coredump, 0xFF0000, 0x10000,

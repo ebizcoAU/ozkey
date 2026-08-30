@@ -281,6 +281,21 @@ export enum DpId {
    * and is the one assumption here worth re-checking against real silicon.
    */
   BOLT_STATE = 47,
+
+  /**
+   * Battery level report. `value`, `dir: both` in the catalogue but
+   * `verb_down` absent — see `lib/profile.ts`'s `DpEntry.verb_down` doc:
+   * nothing should ever COMMAND a battery reading, this is report-only.
+   * Catalogue range -1..100, where -1 means "not yet read"; the real MCU
+   * reports it on every re-join.
+   *
+   * DP 45 on `tuya-luona-ds013-t3` (this LockSim's default profile). The
+   * number is per-product like every other real DP here — `tuya-wifi-lock-pro`
+   * carries the same catalogue entry on DP 12 instead. Under a mismatched
+   * profile `emitDp`'s XF-118 P1c gate logs "not selected" and sends nothing,
+   * same as any other DP pinned to one product's numbering.
+   */
+  BATTERY_PERCENTAGE = 45,
 }
 
 /** Values carried by DP 8 (ACCESS_RESULT, ENUM). */
@@ -608,6 +623,7 @@ const DP_NAMES: Record<number, string> = {
   [DpId.BATTERY_ALARM]: "Battery Alarm",
   [DpId.ACCESS_RESULT]: "Access Result",
   [DpId.BOLT_STATE]: "Bolt State",
+  [DpId.BATTERY_PERCENTAGE]: "Battery Percentage",
   [DpId.ADD_TEMP_PIN]: "Add Temporary PIN",
   [DpId.DELETE_PIN]: "Delete PIN",
   [DpId.ADD_TEMP_RFID]: "Add Temporary RFID",

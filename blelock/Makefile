@@ -21,6 +21,7 @@
 #   make flash   BOARD=147      PORT=/dev/cu.usbmodemXXXX
 #   make flash   BOARD=GEEKC6   PORT=/dev/cu.usbmodemXXXX
 #   make flash   BOARD=dlock19  PORT=/dev/cu.usbmodemXXXX  # UI-only demo, no BLE/crypto
+#   make flash   BOARD=dlch584m_19 PORT=/dev/cu.usbmodemXXXX # CH584M simulator (ozkey-45), baseline = doorlock19 behavior
 #   make monitor PORT=/dev/cu.usbmodemXXXX
 #
 # BOARD selects both the sketch folder and the FQBN — the two can never
@@ -53,6 +54,18 @@ FQBN_dlock19 := esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=default_8MB,CDC
 # conflicts; CDCOnBoot=cdc still required for native-USB serial to work at
 # all, same reason as every other board here.
 FQBN_SIMLOCK := esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=cdc
+# dlch584m_19 — CH584M doorlock simulator (XFtposDecisions-138, ozkey-45),
+# SAME physical board/part as 19/dlock19 (Waveshare ESP32-C6 Touch-LCD 1.9",
+# N8 8MB) — a firmware ROLE, not different hardware, hence default_8MB.
+FQBN_dlch584m_19 := esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=cdc
+# dlch584m_147 — same CH584M-simulator ROLE as dlch584m_19, on the 1.47"
+# board (LockB). Same N8 part, so same FQBN; the sketches differ only in
+# board-specific pins/panel (see dlch584m_147.ino's header).
+FQBN_dlch584m_147 := esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=cdc
+# bridgeBLE — BLE-central fork of bridge32 (ozkey-45), SAME physical board
+# as GEEKC6 (N16, 16MB) — bridge32 stays untouched/production; this is a
+# separate firmware, not a replacement. See file header for why.
+FQBN_bridgeBLE := esp32:esp32:esp32c6:FlashSize=16M,PartitionScheme=custom,CDCOnBoot=cdc
 # P4C6COMBO — reserved slot, NOT configured yet. The ESP32-P4 uses a
 # different Arduino core (esp32:esp32:esp32p4, not esp32c6) and this board's
 # actual flash/PSRAM/partition options aren't known without real hardware in
@@ -65,6 +78,9 @@ SKETCH_19      := doorlock19
 SKETCH_GEEKC6  := bridge32
 SKETCH_dlock19 := dlock19
 SKETCH_SIMLOCK := simlock
+SKETCH_dlch584m_19 := dlch584m_19
+SKETCH_dlch584m_147 := dlch584m_147
+SKETCH_bridgeBLE := bridgeBLE
 
 FQBN   := $(FQBN_$(BOARD))
 SKETCH := $(SKETCH_$(BOARD))
@@ -105,20 +121,20 @@ endif
 .PHONY: help compile flash monitor list-ports
 
 help:
-	@echo "Boards: 147  19  GEEKC6  dlock19  SIMLOCK  (P4C6COMBO reserved, not configured yet)"
+	@echo "Boards: 147  19  GEEKC6  dlock19  SIMLOCK  dlch584m_19  dlch584m_147  bridgeBLE  (P4C6COMBO reserved, not configured yet)"
 	@echo "  make compile BOARD=<board> [PROFILE=<dp-map>]"
 	@echo "  make flash   BOARD=<board> PORT=/dev/cu.usbmodemXXXX"
 	@echo "  make monitor PORT=/dev/cu.usbmodemXXXX"
 	@echo "  make list-ports"
 
 compile:
-	@test -n "$(BOARD)" || { echo "BOARD is required — one of: 147, 19, GEEKC6, dlock19, SIMLOCK"; exit 1; }
-	@test -n "$(FQBN)"  || { echo "unknown/unconfigured BOARD '$(BOARD)' — one of: 147, 19, GEEKC6, dlock19, SIMLOCK (P4C6COMBO reserved, not configured yet)"; exit 1; }
+	@test -n "$(BOARD)" || { echo "BOARD is required — one of: 147, 19, GEEKC6, dlock19, SIMLOCK, dlch584m_19, dlch584m_147, bridgeBLE"; exit 1; }
+	@test -n "$(FQBN)"  || { echo "unknown/unconfigured BOARD '$(BOARD)' — one of: 147, 19, GEEKC6, dlock19, SIMLOCK, dlch584m_19, dlch584m_147, bridgeBLE (P4C6COMBO reserved, not configured yet)"; exit 1; }
 	$(ARDUINO_CLI) compile $(PROFILE_FLAGS) --fqbn "$(FQBN)" $(SKETCH)
 
 flash:
-	@test -n "$(BOARD)" || { echo "BOARD is required — one of: 147, 19, GEEKC6, dlock19, SIMLOCK"; exit 1; }
-	@test -n "$(FQBN)"  || { echo "unknown/unconfigured BOARD '$(BOARD)' — one of: 147, 19, GEEKC6, dlock19, SIMLOCK (P4C6COMBO reserved, not configured yet)"; exit 1; }
+	@test -n "$(BOARD)" || { echo "BOARD is required — one of: 147, 19, GEEKC6, dlock19, SIMLOCK, dlch584m_19, dlch584m_147, bridgeBLE"; exit 1; }
+	@test -n "$(FQBN)"  || { echo "unknown/unconfigured BOARD '$(BOARD)' — one of: 147, 19, GEEKC6, dlock19, SIMLOCK, dlch584m_19, dlch584m_147, bridgeBLE (P4C6COMBO reserved, not configured yet)"; exit 1; }
 	@test -n "$(PORT)"  || { echo "PORT is required — e.g. PORT=/dev/cu.usbmodem14101 (see: make list-ports)"; exit 1; }
 	$(ARDUINO_CLI) compile $(PROFILE_FLAGS) --upload -p "$(PORT)" --fqbn "$(FQBN)" $(SKETCH)
 

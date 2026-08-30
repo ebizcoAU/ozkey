@@ -14,6 +14,11 @@ interface PeripheralControlsProps {
   /** DP 53 doorbell — REAL, confirmed Tuya DP. The gesture that ships. */
   onDoorbell: () => void;
   lowBattery: boolean;
+  /** DP 45 `battery_percentage` — the level the next report will carry. */
+  batteryLevel: number;
+  onBatteryLevelChange: (percent: number) => void;
+  /** Sends DP 45 with the current `batteryLevel` (report-only, never commanded). */
+  onReportBatteryLevel: () => void;
   credentials: StoredCredential[];
   /** ozkey-21 — the MCU's clock, null when the module never served time. */
   mcuUnix: number | null;
@@ -31,6 +36,9 @@ export default function PeripheralControls({
   onPairingGesture,
   onDoorbell,
   lowBattery,
+  batteryLevel,
+  onBatteryLevelChange,
+  onReportBatteryLevel,
   credentials,
   mcuUnix,
 }: PeripheralControlsProps) {
@@ -83,6 +91,36 @@ export default function PeripheralControls({
       >
         ⚠ {lowBattery ? "Clear Low Battery Event" : "Low Battery Event Trigger"}
       </button>
+
+      {/*
+        DP 45 `battery_percentage` — report-only (`lib/profile.ts`'s
+        `verb_down` doc: nothing should ever command this), so unlike the
+        alarm above there is no "read" gesture to simulate — a real MCU just
+        pushes its reading unprompted on every re-join. The slider sets what
+        the NEXT report carries; the button is that push.
+      */}
+      <div className="flex flex-col gap-1.5 rounded-lg border border-amber-800/60 bg-amber-950/20 px-3 py-2">
+        <div className="flex items-center justify-between text-[11px] font-medium text-amber-300">
+          <span>Battery Level</span>
+          <span className="tabular-nums">{batteryLevel}%</span>
+        </div>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          value={batteryLevel}
+          onChange={(e) => onBatteryLevelChange(Number(e.target.value))}
+          className="w-full accent-amber-500"
+        />
+        <button
+          type="button"
+          onPointerDown={onReportBatteryLevel}
+          title="DP 45 — a REAL Tuya DP (status: confirmed). Report-only, never commanded."
+          className={`${buttonBase} border-amber-800/60 bg-amber-950/40 text-amber-300 active:bg-amber-900/40`}
+        >
+          🔋 Report Battery Level <span className="opacity-60">(DP 45, real)</span>
+        </button>
+      </div>
 
       {/*
         DP 53 doorbell — the ONLY at-the-door pairing gesture that works on
