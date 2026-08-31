@@ -244,7 +244,7 @@ static char g_advName[16] = BLE_NAME;
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
 // Own namespace, forked from bridge32-1.44 (2026-08-29) — see file header.
-#define FW_VERSION "bridgeBLE-0.20"
+#define FW_VERSION "bridgeBLE-0.25"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -760,9 +760,19 @@ void drawStatus() {
       // would crowd the dot off the edge.
       gfx->setTextSize(2);
       gfx->setCursor(4, 112);
+      // 🔴 Live finding (2026-08-30): these three used to come from three
+      // SEPARATE global-state reads (ozBleConnectedCount(), ozBlePairedTotal(),
+      // ozBleMissingCount() — which itself calls ozBlePairedTotal() AGAIN). A
+      // BLE callback (pair/unpair, connect/disconnect) runs on a different
+      // FreeRTOS task and can mutate that state between any of the three
+      // reads, so the printed numbers could fail to add up mid-repaint —
+      // "BLE:1 ON:0 OFF:2" was reported live off this exact line. Deriving
+      // OFF from the two values actually printed makes TOTAL == ON + OFF true
+      // by construction; nTotal/nOn can still each be one tick stale, but the
+      // three numbers on screen can never again visibly contradict each other.
       const uint8_t nOn    = ozBleConnectedCount();
       const uint8_t nTotal = ozBlePairedTotal();
-      const uint8_t nOff   = ozBleMissingCount();
+      const uint8_t nOff   = (nTotal > nOn) ? (uint8_t)(nTotal - nOn) : 0;
       gfx->printf("BLE:%u ON:%u OFF:%u", nTotal, nOn, nOff);
       // No status dot (operator, 2026-08-30): the three numbers already carry
       // it, and more precisely — OFF>0 IS the outage. A dot that only
@@ -1314,6 +1324,7 @@ void uplinkRxBegin() {
 #define OZ_UPLINK_DRAIN_MAX 16
 
 static bool pollUplinkOne(); // fwd — defined below
+static bool ozBleLockConnected(const String &id); // fwd — defined in ozblecentral.h
 void pollUplinkUdp() {
   if (!uplinkRxReady || ozUplinkRxFd < 0) return;
   for (int drained = 0; drained < OZ_UPLINK_DRAIN_MAX; drained++) {
@@ -1670,6 +1681,20 @@ static void publishThreadLiveness() {
       for (uint8_t j = 0; j < seenN; j++)
         if (seen[j] == g_onlineLocks[i]) { stillHere = true; break; }
       if (stillHere) continue;
+
+      // 🔴 2026-08-31 live finding — g_onlineLocks[] is now shared between
+      // TWO producers: this Thread child-table sweep, and the BLE connect/
+      // disconnect presence publish added the same night. A BLE-routed lock
+      // is NEVER a Thread child (no Thread radio, ever) — absent-from-`seen`
+      // said NOTHING about whether it "left"; it was never there. Without
+      // this guard, this loop retracted a CH584M lock's freshly-published
+      // "online" state within one liveness tick of it landing, every time —
+      // caught live seconds after shipping the presence fix, from this
+      // exact log line firing right behind the new [BLE-PRESENCE] one.
+      // Skip anything the BLE side still holds a live connection to; the
+      // BLE disconnect handler (ozblecentral.h) already owns retracting
+      // those correctly, on its own real disconnect event.
+      if (ozBleLockConnected(g_onlineLocks[i])) continue;
 
       const String gone = g_onlineLocks[i];
       const String out = ozBuildLockPresence(gone, false, OZ_PRESENCE_LWT,

@@ -235,7 +235,23 @@ static const OzVerbMap *ozResolveVerb(const char *verb, const char *field,
   return nullptr;
 }
 
-/** True if the verb resolves AND is actually usable on this product. */
+/** True if the verb resolves AND is actually usable on this product.
+ *
+ *  🔴 CH584M live finding (2026-08-30): a "reserved" status means "we don't
+ *  know this DP's real byte layout for actual Tuya hardware" — a genuine
+ *  hazard when tuyaWireSend() serializes to a real UART. Under OZ_NO_MCU it
+ *  never does: DOWN frames are applied locally by comparing the DP NUMBER
+ *  against a frame this build synthesized itself (see tuyaWireSend()) — no
+ *  real wire format, no byte-layout risk, ever. The gate below was refusing
+ *  every unlock on every existing profile (all three are real Tuya products
+ *  whose unlock DP is "reserved" for exactly that undocumented-layout
+ *  reason), live-blocking the first bonded CH584M lock from ever opening.
+ *  No profile data changed — the hazard this checks for is simply absent
+ *  in this build, not something to route around with an invented DP. */
 static bool ozVerbUsable(const OzVerbMap *m) {
+#ifdef OZ_NO_MCU
+  return m != nullptr;
+#else
   return m && m->status == OZ_DP_CONFIRMED;
+#endif
 }

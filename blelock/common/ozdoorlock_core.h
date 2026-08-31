@@ -209,6 +209,26 @@ static const char *ozBleAdvName() { return g_advName; }
 #define CHR_CONTROL "4f5a4b31-0006-4c4f-434b-000000000001"
 #define CHR_MEMBER "4f5a4b31-0007-4c4f-434b-000000000001"
 #ifdef OZ_NO_MCU
+// ── BLE-relay time push (2026-08-31 live finding) ──────────────────────────
+//
+// A CH584M lock has no Thread beacon (no radio) and no NTP (no Wi-Fi, and
+// this lab blocks UDP 123 anyway — [[ntp-is-not-a-dependable-time-source]]).
+// The bridge has live UTC from MQTT and already beacons it to Thread locks
+// over `ff03::1`; nothing carried it to a BLE-held lock. Found live: a fully
+// bonded, fully routed LockA sat at `clock=UNKNOWN` indefinitely.
+//
+// WRITE-only, tiny payload (`{target,kind,utc,utc_src,tz}`, well under one
+// MTU — no chunking needed), no crypto: time correction is not a
+// security-sensitive value here (same trust model already documented on
+// ozHarvestTime() — monotonic-forward, floored, and this is no weaker than
+// the existing plain-mesh Thread beacon it mirrors). Deliberately a NEW
+// characteristic rather than overloading `member` or `command`: those already
+// have well-tested parsers for a different message shape each, and mixing a
+// third shape onto either is exactly the kind of thing that goes wrong
+// quietly.
+#define CHR_TIME "4f5a4b31-0008-4c4f-434b-000000000001"
+#endif
+#ifdef OZ_NO_MCU
 // ── P5.5 — THE `command` CHARACTERISTIC: BRIDGE-RELAYED, CHALLENGE-LESS ────
 //
 // UUID is the PM appendix's original `Command` (XFtposDecisions-138), kept
@@ -740,6 +760,9 @@ bool g_threadBeaconDue = false;
 // BLE
 BLEServer *bleServer = nullptr;
 BLECharacteristic *chrStatus = nullptr, *chrInfo = nullptr, *chrMember = nullptr;
+#ifdef OZ_NO_MCU
+BLECharacteristic *chrTime = nullptr;
+#endif
 volatile bool bleClientConnected = false;
 // XF-53 (Y). bleClientConnected used to be a plain bool that onDisconnect set
 // false unconditionally — so ANY link teardown cleared it, including a stale
@@ -749,6 +772,25 @@ volatile bool bleClientConnected = false;
 // its 150 ms settle, so the app never receives that rung of the ladder and sits
 // on a spinner. Count links instead of latching a bool; the flag is now derived.
 volatile int bleLinkCount = 0;
+// 🔴 CH584M pivot (2026-08-30 live finding): a bridge-paired lock holds ONE
+// persistent link to relay `command` writes. The pre-bridge policy below
+// went non-connectable the instant bleLinkCount left 0, which meant a lock
+// the bridge had successfully paired to could never ALSO accept the app's
+// direct connection to run the bond ceremony (`provision`/`challenge`/
+// `control`/`member`) — "busy" forever, from the phone's point of view.
+// Bridge routing worked, then every single bonding attempt failed, on
+// every lock, and this is why: bridge pairing was the thing making bonding
+// impossible. Cap raised to 2 — one for the bridge's `command` relay, one
+// transient slot for the app's own session — not opened further, since
+// unbounded connectability is a real DoS surface for a lock.
+// Safe to share: the bridge writes ONLY to `command` (P5.5, challenge-less
+// by design); the app's bond/M3/M4 state (bleChallenge/ctlReset()/
+// memberBuf) lives on `provision`/`challenge`/`control`/`member`, which the
+// bridge never touches. The one behavior change is that those buffers no
+// longer necessarily zero on every disconnect (only when links reach 0) —
+// harmless, since `challenge` is re-randomized on every READ regardless
+// (line ~7439), not reused from a prior session.
+#define OZ_BLE_MAX_LINKS 2
 // XF-52 (R) maintenance window. Declared HERE, not beside its helpers further
 // down, because drawStatus() reads it — and the IDE auto-prototypes functions
 // but NOT variables, so a later declaration compiles as "not declared in this
@@ -4288,10 +4330,41 @@ static void ozPublishResetOutcome(const char *reason, bool retain) {
       Serial.printf("[RESET->] thread relay, reason='%s'\n", reason);
       return;
     }
+#ifdef OZ_NO_MCU
+    // 2026-08-31, PM directive (XFtposDecisions-138) — reuses the generic
+    // BLE->MQTT relay already proven for list_bonds, not a new
+    // characteristic. Bridge forwards `member` notifications to `.../uplink`
+    // UNCONDITIONALLY, no branching (directive: "forward verbatim, no
+    // parsing") — the server's `handleUplinkReset()` (server.js:1155, P0,
+    // LIVE-VERIFIED against a real throwaway lock 2026-08-31) is what
+    // intercepts it, keyed on `type === "reset"` checked BEFORE the sealed-
+    // envelope path. Deliberately `type`, NOT `kind` — matches what server
+    // actually tested, not the Thread branch's own field name above (a
+    // different, unrelated payload shape that stays exactly as it was).
+    //
+    // Same residual limit as Thread's "off the mesh": if nobody currently
+    // holds a BLE link at the moment of a PHYSICAL (BOOT-button) reset, there
+    // is nobody to notify — a fact, not a bug, and the log below says so.
+    if (bleClientConnected) {
+      JsonDocument t;
+      t["type"] = "reset";
+      t["reason"] = reason;
+      const uint32_t now = ozClockNow(ozclock, millis());
+      if (now) t["timestamp"] = now;
+      if (g_cmdMsgId.length()) t["msg_id"] = g_cmdMsgId;
+      String out;
+      serializeJson(t, out);
+      ozNotifyChunked(out);
+      delay(150); // same settle reasoning as the MQTT/Thread branches
+      Serial.printf("[RESET->] ble relay, reason='%s'\n", reason);
+      return;
+    }
+#endif
     // Not silent: this is the REMAINING limit, and a limit you cannot see is
     // the failure mode this whole ticket is about (silent-failures rule). A
     // BLE-delivered reset to a Wi-Fi lock whose broker is down lands here, as
-    // does a Thread lock that is off the mesh.
+    // does a Thread lock that is off the mesh, or a CH584M lock reset by its
+    // own BOOT button with nobody currently connected to hear it.
     Serial.printf("[RESET->] '%s' NOT published — no mqtt, no thread (app cannot be told)\n",
                   reason);
     return;
@@ -4661,6 +4734,21 @@ static bool ozUplinkSend(int slot, const String &json) {
     sent = ozThreadUdpSend(out);
     via = "thread";
   }
+#ifdef OZ_NO_MCU
+  // 2026-08-31 live finding: every audit-log/event push a CH584M lock ever
+  // makes landed here and died — no MQTT session, no Thread radio, "nothing"
+  // forever. The bridge already has a generic BLE->MQTT relay for whatever it
+  // receives on `member` (built for list_bonds, but the drain loop forwards
+  // ANY complete JSON to `locks/<id>/uplink` verbatim) — this `out` is
+  // EXACTLY that shape already (`{from,to,code?,envelope_hex}`), so no new
+  // characteristic, no new bridge-side parsing. Reusing ozNotifyChunked()
+  // verbatim, same convention `list_bonds` already proved out.
+  else if (bleClientConnected) {
+    ozNotifyChunked(out);
+    sent = true; // same honesty level as the Thread branch: queued, not confirmed delivered
+    via = "ble";
+  }
+#endif
   Serial.printf("[UPLINK] bond %d counter %llu %u B -> %s%s\n", slot,
                 (unsigned long long)counter, (unsigned)out.length(), via,
                 sent ? "" : " (FAILED)");
@@ -7378,6 +7466,28 @@ class CommandCB : public BLECharacteristicCallbacks {
     ctlNewBytes = true;
   }
 };
+
+// `time` — WRITE-only, the bridge's counterpart to sendTimeBeacon() on the
+// Thread side. No chunking: `{target,kind,utc,utc_src,tz}` is well under one
+// MTU. Reuses ozHarvestTime() verbatim — that function is explicitly
+// documented as transport-agnostic ("Harvest utc/tz out of any inbound
+// message, from any transport"), so this is exactly the reuse it was
+// written for, not a new trust decision.
+class TimeCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    const uint8_t *data = c->getData();
+    const size_t n = c->getLength();
+    if (!data || !n || n > 200) return; // sanity bound, not a real limit
+    String js; js.reserve(n);
+    for (size_t i = 0; i < n; i++) js += (char)data[i];
+    JsonDocument doc;
+    if (deserializeJson(doc, js) != DeserializationError::Ok) {
+      Serial.println("[TIME] `time` write not valid JSON, dropped");
+      return;
+    }
+    ozHarvestTime(doc, "bridge-ble");
+  }
+};
 #endif
 
 class ControlCB : public BLECharacteristicCallbacks {
@@ -7592,11 +7702,14 @@ class ServerCB : public BLEServerCallbacks {
     bleClientConnected = (bleLinkCount > 0);
     Serial.printf("[BLE] connect  — links=%d\n", bleLinkCount);
     screenDirty = true;
-    // Keep advertising, but non-connectably, so the busy flag is observable.
+    // Keep advertising, but non-connectably once BOTH link slots are taken
+    // (OZ_BLE_MAX_LINKS, see its declaration) — a bridge relay hold must not
+    // also block the app's own direct session. Below the cap, stay
+    // connectable so the second slot is reachable.
     // Only where we were supposed to be discoverable in the first place —
     // a commissioned lock outside its window stays dark, exactly as before.
     if (bleAdvertisingAllowed()) {
-      bleRearmAdvertising(false, "client connected");
+      bleRearmAdvertising(bleLinkCount < OZ_BLE_MAX_LINKS, "client connected");
     }
     notifyStatus("BLE_OK");
   }
@@ -7705,7 +7818,23 @@ static void ozRefreshInfoChar() {
   // discussion this same field surfaced (fresh-commissioning transport
   // choice can't be auto-detected the way it could when two separate
   // firmwares existed).
+  //
+  // 🔴 SECOND INFO BUILDER, SAME OZ_NO_MCU OVERRIDE MISSING (2026-08-30 live
+  // finding). publishHeartbeat() got this fix already; this one is what the
+  // app actually reads on connect (chrInfo->setValue() below), and it was
+  // still unconditionally reporting cfgTransport's NVS default — "wifi" for
+  // any never-provisioned CH584M lock. App read that literally and correctly
+  // showed a Wi-Fi credential form instead of running the `ble` ceremony,
+  // for every single bonding attempt this session. Not an app bug, not a
+  // stale-flash issue (both were suspected first) — this line, alone, was
+  // the entire blocker. Exact "two builders diverge" pattern as the
+  // heartbeat/beacon split fixed in doorlock-2.21 (XF-127) — same lesson:
+  // grep every place a field gets set before trusting one fix covers it.
+#ifdef OZ_NO_MCU
+  doc["transport"] = "ble";
+#else
   doc["transport"] = cfgTransport;
+#endif
   String info; serializeJson(doc, info);
   chrInfo->setValue(info.c_str());
 }
@@ -7770,6 +7899,10 @@ void startBle() {
                                                      BLECharacteristic::PROPERTY_WRITE);
   cmd->setCallbacks(new CommandCB());
   Serial.println("[BLE] `command` characteristic up (FFF1) — bridge relay inlet");
+
+  // Bridge's time-push inlet (2026-08-31). See CHR_TIME's own comment.
+  chrTime = svc->createCharacteristic(CHR_TIME, BLECharacteristic::PROPERTY_WRITE);
+  chrTime->setCallbacks(new TimeCB());
 #endif
 
   BLECharacteristic *ctl = svc->createCharacteristic(CHR_CONTROL, BLECharacteristic::PROPERTY_WRITE);

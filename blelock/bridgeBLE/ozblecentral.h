@@ -71,6 +71,9 @@
 // challenge — the disposition MQTT/Thread always had. XFtposDecisions-138 P5.5.
 #define OZL_CHR_COMMAND    "0000FFF1-0000-1000-8000-00805F9B34FB"
 #define OZL_CHR_MEMBER     "4f5a4b31-0007-4c4f-434b-000000000001"
+// The bridge's time-push outlet — see the lock's CHR_TIME comment
+// (ozdoorlock_core.h) for the full reasoning. Write-only from here.
+#define OZL_CHR_TIME       "4f5a4b31-0008-4c4f-434b-000000000001"
 
 // ── CEILING RAISED TO 10 BY A REBUILT LIB SET (P6, 2026-08-30) ────────────
 //
@@ -157,6 +160,8 @@ struct OzBleLock {
   BLERemoteCharacteristic *chrCommand = nullptr; // OUR relay inlet (P5.5)
   BLERemoteCharacteristic *chrMember  = nullptr;
   BLERemoteCharacteristic *chrStatus  = nullptr;
+  BLERemoteCharacteristic *chrTime    = nullptr;
+  bool timePushed = false;             // one push per connection is enough
   String   rxBuf;                      // chunked-notify reassembly (see below)
   unsigned long rxLastChunkAt = 0;     // for the stalled-reassembly timeout
   unsigned long connectedAt = 0;
@@ -304,7 +309,23 @@ static bool ozBlePairRemove(const String &deviceId) {
   return false;
 }
 
-/** F3 — note a lock we saw but are not paired to, for the app's pairing UI. */
+/** F3 — note a lock we saw but are not paired to, for the app's pairing UI.
+ *
+ *  🔴 MUST re-publish the roster on a genuinely NEW entry. The only other
+ *  publish trigger is ozBleCentralTick()'s ON/TOTAL repaint gate, and
+ *  discovering-but-not-pairing a lock changes neither number — so before
+ *  this call existed, `g_seenUnpaired` filled correctly in RAM (confirmed
+ *  live in the serial log's repeated "offered for pairing" lines) while the
+ *  app's `locks` characteristic stayed frozen at whatever it read at boot
+ *  (empty), forever. The app reported "no unpaired lock nearby" while the
+ *  bridge's own console `seen` command showed every lock, and both were
+ *  telling the truth about two different things. Observed live 2026-08-30
+ *  blocking App's first end-to-end pairing retry after dlch584m-0.12.
+ *
+ *  Not called on the refresh branch above — that fires every scan cycle
+ *  for an already-known device (rssi/age churn only) and would notify BLE
+ *  continuously for no new information the app doesn't already have. */
+static void ozBlePublishRoster(); // defined below; forward decl for the new-entry branch
 static void ozBleNoteUnpaired(const String &deviceId, const String &addr, int rssi) {
   for (auto &s : g_seenUnpaired) {
     if (s.deviceId == deviceId) { s.addr = addr; s.rssi = rssi; s.at = millis(); return; }
@@ -317,6 +338,7 @@ static void ozBleNoteUnpaired(const String &deviceId, const String &addr, int rs
   }
   victim->deviceId = deviceId; victim->addr = addr; victim->rssi = rssi;
   victim->at = millis();
+  ozBlePublishRoster();
 }
 
 /** Record a probe that FAILED before we learned an identity, so it gets the
@@ -404,6 +426,14 @@ static OzBleLock *ozBleFindByDeviceId(const String &id) {
 }
 static bool ozBleConnected(const OzBleLock &l) {
   return l.inUse && l.client && l.client->isConnected();
+}
+/** For the Thread liveness sweep's g_onlineLocks[] guard (bridgeBLE.ino) —
+ *  true if we currently hold a live BLE link to this device_id, so a lock
+ *  that was never a Thread child in the first place doesn't get retracted
+ *  as "left the child table" every liveness tick. */
+static bool ozBleLockConnected(const String &id) {
+  OzBleLock *l = ozBleFindByDeviceId(id);
+  return l && ozBleConnected(*l);
 }
 /** How many locks this bridge currently holds a live BLE link to — drawn on
  *  the panel, so the central role is observable without a serial cable. */
@@ -607,6 +637,8 @@ static bool ozBleConnectOne(const String &addr) {
   slot->chrCommand = svc->getCharacteristic(BLEUUID(OZL_CHR_COMMAND));
   slot->chrMember  = svc->getCharacteristic(BLEUUID(OZL_CHR_MEMBER));
   slot->chrStatus  = svc->getCharacteristic(BLEUUID(OZL_CHR_STATUS));
+  slot->chrTime    = svc->getCharacteristic(BLEUUID(OZL_CHR_TIME));
+  slot->timePushed = false;
 
   // IDENTITY. This is the BLE equivalent of the Thread path's ozNoteLockExt()
   // join: MQTT addresses locks by device_id ("ozk-…"), the radio addresses them
@@ -614,12 +646,14 @@ static bool ozBleConnectOne(const String &addr) {
   // `info` and keep the mapping — without it a downlink can never be routed.
   BLERemoteCharacteristic *info = svc->getCharacteristic(BLEUUID(OZL_CHR_INFO));
   g_lastInfoRaw = info ? String("(read pending)") : String("(no info char)");
+  String lockFw; // captured for the presence publish below when available
   if (info && info->canRead()) {
     const String js = info->readValue();
     g_lastInfoRaw = js;   // kept for the failure log — diagnosis beats guessing
     JsonDocument d;
     if (deserializeJson(d, js) == DeserializationError::Ok) {
       slot->deviceId = (const char *)(d["device_id"] | "");
+      lockFw = (const char *)(d["fw"] | "");
       Serial.printf("[BLE] %s: identified as %s (fw=%s)\n", addr.c_str(),
                     slot->deviceId.c_str(), (const char *)(d["fw"] | "?"));
     } else {
@@ -702,6 +736,60 @@ static bool ozBleConnectOne(const String &addr) {
     Serial.printf("[BLE] %s has NO `command` char — pre-P5.5 firmware; "
                   "relayed unlocks WILL be denied (needs dlch584m-0.5+)\n",
                   slot->deviceId.c_str());
+
+  // 2026-08-31 — push time once per connection. Same payload shape as
+  // sendTimeBeacon() (bridgeBLE.ino), the Thread equivalent, deliberately —
+  // the lock's ozHarvestTime() is transport-agnostic and expects this exact
+  // field set regardless of which radio carried it.
+  if (slot->chrTime && slot->chrTime->canWrite()) {
+    const uint32_t utc = ozBridgeUtc();
+    if (utc) {
+      JsonDocument doc;
+      doc["target"] = "*";
+      doc["kind"] = "time";
+      doc["utc"] = utc;
+      doc["utc_src"] = g_utcFromServer ? "server" : "nvs";
+      doc["tz"] = cfgTzMin;
+      String out;
+      serializeJson(doc, out);
+      const bool ok = slot->chrTime->writeValue((uint8_t *)out.c_str(), out.length(), true);
+      slot->timePushed = ok;
+      Serial.printf("[BLE-TIME] %s <- utc=%lu tz=%+d%s\n", slot->deviceId.c_str(),
+                    (unsigned long)utc, (int)cfgTzMin, ok ? "" : " WRITE FAILED");
+    } else {
+      Serial.printf("[BLE-TIME] %s: bridge itself has no clock yet — skipped\n",
+                    slot->deviceId.c_str());
+    }
+  }
+
+  // ── 2026-08-31, PM directive — the BRIDGE reports presence, not the lock ──
+  //
+  // Confirmed live: a bonded+routed CH584M lock was refused as unreachable
+  // (409) even with `caps.remote_unlock=true`, because R6's queue-time check
+  // reads `.../presence`, and no CH584M lock has ever published there — the
+  // lock-side periodic Thread beacon that normally does this is hardcoded
+  // `if (isThread() ...)`, forced false under OZ_NO_MCU, so that whole path
+  // never ran. Rather than build the lock-side equivalent (new BLE traffic,
+  // battery cost, periodic-timer latency), the bridge already knows this
+  // lock's connection state in real time — it's the one holding the link —
+  // so it reports on the lock's behalf, event-driven off this very connect.
+  //
+  // ozBuildLockPresence()/ozPresenceShouldRetain() reused verbatim: this is
+  // the SAME topic Thread locks already publish to via the SAME builder
+  // (ozpresence.h's whole reason for existing — two producers, one shape,
+  // after XF-115 taught this codebase what happens when that's not true).
+  // ozClaimLockOnline() is the SAME de-dup table Thread's beacon already
+  // shares, keyed only on device_id — publishing here is exactly the "any
+  // transport, same online-transition tracking" case it was built for.
+  if (ozClaimLockOnline(slot->deviceId.c_str())) {
+    const String out = ozBuildLockPresence(slot->deviceId, true, OZ_PRESENCE_ONLINE,
+                                           String(""), lockFw.c_str());
+    const String ptopic = "ozkie/" + cfgSiteId + "/locks/" + slot->deviceId + "/presence";
+    const bool ok = mqttClient.publish(ptopic.c_str(), out.c_str(),
+                                       ozPresenceShouldRetain(true));
+    Serial.printf("[BLE-PRESENCE] %s -> %s online%s\n", slot->deviceId.c_str(),
+                  ptopic.c_str(), ok ? "" : " PUBLISH FAILED");
+  }
   return true;
 }
 
@@ -788,6 +876,21 @@ static void ozBleCentralTick() {
       Serial.printf("[BLE] %s DISCONNECTED after %lus\n",
                     l.deviceId.length() ? l.deviceId.c_str() : l.addr.c_str(),
                     (millis() - l.connectedAt) / 1000);
+      // 2026-08-31 — the offline half of the bridge-reports-presence fix
+      // above. Read l.deviceId BEFORE the reset below wipes it. Retained
+      // (ozPresenceShouldRetain(false)==true) so a late subscriber learns
+      // this lock went away rather than reading stale "online" — same rule
+      // Thread's own disconnect path already follows via OZ_PRESENCE_LWT,
+      // reused here for the identical situation on a different transport.
+      if (l.deviceId.length()) {
+        ozForgetLockOnline(l.deviceId.c_str());
+        const String out = ozBuildLockPresence(l.deviceId, false, OZ_PRESENCE_LWT, String(""));
+        const String ptopic = "ozkie/" + cfgSiteId + "/locks/" + l.deviceId + "/presence";
+        const bool ok = mqttClient.publish(ptopic.c_str(), out.c_str(),
+                                           ozPresenceShouldRetain(false));
+        Serial.printf("[BLE-PRESENCE] %s -> %s offline%s\n", l.deviceId.c_str(),
+                      ptopic.c_str(), ok ? "" : " PUBLISH FAILED");
+      }
       delete l.client;
       l = OzBleLock();                    // full reset — pointers included
     }
@@ -814,6 +917,15 @@ static void ozBleCentralTick() {
                     deviceId.c_str(), (unsigned)payload.length());
       continue;
     }
+    // 2026-08-31, PM directive — forward EVERYTHING notified on `member`
+    // verbatim to `.../uplink`, no branching here. An earlier draft of this
+    // fix special-cased `reset_outcome` onto `.../presence` (matching
+    // Thread's own reset path); superseded — server built and LIVE-VERIFIED
+    // `handleUplinkReset()` on THIS topic instead, keyed on `type==="reset"`
+    // checked before the sealed-envelope path (server.js:1155/1778,
+    // XFtposDecisions-138 2026-08-31 08:49:09). Match what's actually
+    // running, not what was designed before that existed.
+    //
     // U3's rule, unchanged: the LOCK's own topic, so ozlockserv stays a
     // mailman and needs no change to accept a BLE lock (confirmed by server
     // in XFtposDecisions-138 S1-S3: every path is keyed on bridge_id + caps,
