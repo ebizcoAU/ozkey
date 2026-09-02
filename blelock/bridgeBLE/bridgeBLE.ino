@@ -244,7 +244,7 @@ static char g_advName[16] = BLE_NAME;
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
 // Own namespace, forked from bridge32-1.44 (2026-08-29) — see file header.
-#define FW_VERSION "bridgeBLE-0.41"
+#define FW_VERSION "bridgeBLE-0.43"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -305,6 +305,9 @@ static unsigned long g_lastRosterBroadcastAt = 0; // XF-144 Phase 2, declared he
 static void ozBleStartTargetedScan(const String &target, uint32_t durationS);
 static void ozBlePairConsoleCmd(const String &cmd); // paired/seen/pair/unpair, see ozBridgeConsolePoll()
 static bool ozBleAtCapacity(); // true when ozBleConnectedCount() == OZ_BLE_MAX_LOCKS
+static bool ozBleScanSlotFree(); // XF-144 Phase 2 retry fix, added 2026-09-02 — fwd, defined in ozblecentral.h
+static bool ozBleScanIsFor(const String &target);   // ditto
+static bool ozBleScanFoundFor(const String &target); // ditto
 String cfgSsid, cfgPass;
 String cfgMode, cfgBrokerHost, cfgSiteId; // F1: parsed from provision JSON
 uint16_t cfgBrokerPort = 0;
@@ -2532,13 +2535,24 @@ static bool sendTimeBeacon() {
 #define OZ_PEER_TIMEOUT_MS 50000UL          // ~3.3 missed intervals -> presumed down
 #define OZ_PEER_MAX 4                       // bench has 2 bridges; headroom, not a real limit
 #define OZ_PEER_ROSTER_LOCKS_MAX 9           // matches OZ_BLE_MAX_LOCKS
+// 2026-09-02: was a single-shot check at the 50s mark — a lock not yet in
+// g_seenUnpaired's 30s window at that exact instant was missed FOREVER, no
+// retry, even though our own background scanning keeps refreshing that cache
+// every few seconds. Confirmed live, twice, on the real bench: every lock
+// behind a killed peer came back "0 taken over locally" and only recovered
+// minutes later via Phase 1's server sweep — defeating Phase 2's whole
+// reason to exist. This bounds a retry window instead of a single check.
+#define OZ_PEER_TAKEOVER_RETRY_MS 60000UL   // keep re-checking visibility this long past first detection
 
 struct OzPeerBridge {
   String bridgeId;
   String locks[OZ_PEER_ROSTER_LOCKS_MAX];
   uint8_t lockCount = 0;
   unsigned long lastSeen = 0;
-  bool takenOver = false; // latched so a sustained timeout doesn't re-fire every tick
+  bool takenOver = false;     // latched once resolved (every lock accounted for, or retry window expired) — stops the sweep
+  bool downAnnounced = false; // latched separately, on first detection only — gates the one-time peer_down publish
+  unsigned long downAt = 0;   // when the 50s timeout first fired, for bounding the retry window
+  int8_t scanIdx = -1;        // index into locks[] of an in-flight targeted scan we armed, or -1 if none (2026-09-02)
 };
 static OzPeerBridge g_peerBridges[OZ_PEER_MAX];
 // g_lastRosterBroadcastAt declared near the top forward-declarations —
@@ -2571,7 +2585,10 @@ static void ozPeerRosterReceived(const String &peerId, JsonArrayConst locks) {
     slot->locks[slot->lockCount++] = v.as<const char *>();
   }
   slot->lastSeen = millis();
-  slot->takenOver = false; // a fresh report means the peer is alive again
+  slot->takenOver = false;     // a fresh report means the peer is alive again
+  slot->downAnnounced = false; // re-arm the one-time peer_down publish for next time
+  slot->downAt = 0;
+  slot->scanIdx = -1;          // abandon bookkeeping for any in-flight retry scan — the radio scan itself, if any, still completes and self-clears on its own deadline
   if (!wasKnown) {
     Serial.printf("[PEER] new peer %s, %u lock(s)\n", peerId.c_str(),
                   (unsigned)slot->lockCount);
@@ -2587,21 +2604,47 @@ static void ozPeerRosterReceived(const String &peerId, JsonArrayConst locks) {
  *  bridges_presence reflects reality before our takeover's `via` claim
  *  arrives — otherwise the reject-gate built in Phase 1 would see the dead
  *  peer's locks as still "online" (server hasn't heard the LWT yet) and
- *  wrongly refuse a takeover that is actually legitimate this time. */
+ *  wrongly refuse a takeover that is actually legitimate this time.
+ *
+ *  Runs a BOUNDED RETRY using an ACTIVE targeted scan, not a single passive
+ *  check (2026-09-02 fix, second pass). The first version of this fix just
+ *  re-checked ozBleCurrentlyVisible()'s cache on every tick — live-tested on
+ *  the real bench and found NOT to work: that cache (g_seenUnpaired) is only
+ *  refreshed by ozBleNoteUnpaired(), reached after a full connect+identify,
+ *  and ozBleRecentlyRejected() then throttles re-probing the SAME address to
+ *  once per 5 MINUTES. A lock last identified back at boot (the ordinary
+ *  case right after this bridge itself reboots) will not refresh that cache
+ *  again for up to 5 minutes — re-checking it in a 60s window gains nothing,
+ *  confirmed live: two real bridge-down tests, zero takeovers, zero retries
+ *  ever fired. A targeted scan (ozBleStartTargetedScan()) bypasses this —
+ *  onResult()'s target-match check runs BEFORE ozBleRecentlyRejected()'s
+ *  early return, so it still sees the lock's advertisement even mid-cooldown.
+ *  One lock scanned at a time (g_scanReq is a single shared slot, the same
+ *  one the server's own {"op":"scan"} command uses) — never steal it
+ *  mid-flight, and respect the same busy guards that command already does
+ *  (claim window open, at BLE capacity). */
 static void ozPeerTimeoutTick() {
   for (auto &p : g_peerBridges) {
     if (!p.bridgeId.length() || p.takenOver) continue;
     if (millis() - p.lastSeen < OZ_PEER_TIMEOUT_MS) continue;
 
-    p.takenOver = true; // latch first — do not re-fire every tick while still dark
-    Serial.printf("[PEER] %s timed out (%lus since last roster) — checking BLE visibility\n",
-                  p.bridgeId.c_str(), (millis() - p.lastSeen) / 1000);
+    const bool firstDetection = !p.downAnnounced;
+    if (firstDetection) {
+      p.downAnnounced = true;
+      p.downAt = millis();
+      p.scanIdx = -1;
+      Serial.printf("[PEER] %s timed out (%lus since last roster) — checking BLE visibility\n",
+                    p.bridgeId.c_str(), (millis() - p.lastSeen) / 1000);
+    }
 
     uint8_t taken = 0;
+
+    // Free pass first: anything already visible right now (a live connection,
+    // or a cache entry someone else's activity happened to refresh) costs
+    // nothing to take — no scan needed.
     for (uint8_t i = 0; i < p.lockCount; i++) {
       const String &lockId = p.locks[i];
-      if (ozBleIsPaired(lockId)) continue; // already ours, nothing to do
-      if (!ozBleCurrentlyVisible(lockId)) continue;
+      if (ozBleIsPaired(lockId) || !ozBleCurrentlyVisible(lockId)) continue;
       if (ozBlePairAdd(lockId)) {
         taken++;
         Serial.printf("[PEER] took over %s (was %s's, now visible here)\n",
@@ -2609,21 +2652,72 @@ static void ozPeerTimeoutTick() {
       }
     }
 
-    if (mqttClient.connected()) {
-      JsonDocument doc;
-      doc["event"] = "peer_down";
-      doc["peer"] = p.bridgeId;
-      String out;
-      serializeJson(doc, out);
-      const String topic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/peer_status";
-      const bool ok = mqttClient.publish(topic.c_str(), out.c_str());
-      Serial.printf("[PEER] %s -> %s (%u lock(s) taken over locally)%s\n",
-                    topic.c_str(), out.c_str(), (unsigned)taken,
-                    ok ? "" : " PUBLISH FAILED");
-    } else {
-      Serial.printf("[PEER] %s down, %u lock(s) taken over locally, "
-                    "MQTT not connected — peer_down not sent\n",
-                    p.bridgeId.c_str(), (unsigned)taken);
+    // Resolve our own in-flight targeted scan, if any, before considering a
+    // new one this tick.
+    if (p.scanIdx >= 0) {
+      const String &lockId = p.locks[p.scanIdx];
+      if (ozBleIsPaired(lockId)) {
+        p.scanIdx = -1; // already got it (the free pass above, or a real connect)
+      } else if (ozBleScanFoundFor(lockId)) {
+        if (ozBlePairAdd(lockId)) {
+          taken++;
+          Serial.printf("[PEER] took over %s via targeted scan (was %s's)\n",
+                        lockId.c_str(), p.bridgeId.c_str());
+        }
+        p.scanIdx = -1;
+      } else if (!ozBleScanIsFor(lockId)) {
+        p.scanIdx = -1; // our scan's deadline passed (not found) and its slot self-cleared
+      }
+      // else: still mid-flight, leave it running, check again next tick
+    }
+
+    // Arm a scan for the next not-yet-paired lock, one at a time.
+    if (p.scanIdx < 0 && ozBleScanSlotFree() && !claimWindowOpen() && !ozBleAtCapacity()) {
+      for (uint8_t i = 0; i < p.lockCount; i++) {
+        if (ozBleIsPaired(p.locks[i])) continue;
+        ozBleStartTargetedScan(p.locks[i], 5);
+        p.scanIdx = i;
+        break;
+      }
+    }
+
+    uint8_t remaining = 0;
+    for (uint8_t i = 0; i < p.lockCount; i++) {
+      if (!ozBleIsPaired(p.locks[i])) remaining++;
+    }
+
+    // peer_down publishes once, on first detection only — the server only
+    // needs to hear this once to fast-track its own reachability gate;
+    // republishing every retry tick would just flood the topic.
+    if (firstDetection) {
+      if (mqttClient.connected()) {
+        JsonDocument doc;
+        doc["event"] = "peer_down";
+        doc["peer"] = p.bridgeId;
+        String out;
+        serializeJson(doc, out);
+        const String topic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/peer_status";
+        const bool ok = mqttClient.publish(topic.c_str(), out.c_str());
+        Serial.printf("[PEER] %s -> %s (%u lock(s) taken over locally, %u still checking)%s\n",
+                      topic.c_str(), out.c_str(), (unsigned)taken, (unsigned)remaining,
+                      ok ? "" : " PUBLISH FAILED");
+      } else {
+        Serial.printf("[PEER] %s down, %u lock(s) taken over locally, %u still checking, "
+                      "MQTT not connected — peer_down not sent\n",
+                      p.bridgeId.c_str(), (unsigned)taken, (unsigned)remaining);
+      }
+    } else if (taken) {
+      Serial.printf("[PEER] %s: %u more lock(s) taken over on retry (%u still not visible)\n",
+                    p.bridgeId.c_str(), (unsigned)taken, (unsigned)remaining);
+    }
+
+    // Stop retrying once every lock is accounted for, or the bounded retry
+    // window has elapsed — a lock still invisible to a real targeted scan
+    // this whole window is Phase 1's job now (the scan-confirm fallback),
+    // not ours to keep polling for indefinitely.
+    if (remaining == 0 || millis() - p.downAt > OZ_PEER_TAKEOVER_RETRY_MS) {
+      p.scanIdx = -1; // any radio scan still running completes and self-clears on its own deadline, harmless
+      p.takenOver = true;
     }
   }
 }

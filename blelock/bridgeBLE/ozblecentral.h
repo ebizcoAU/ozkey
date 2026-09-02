@@ -714,6 +714,30 @@ static void ozBleStartTargetedScan(const String &target, uint32_t durationS) {
                 (unsigned)durationS);
 }
 
+// 2026-09-02 — three small accessors so ozPeerTimeoutTick() (bridgeBLE.ino)
+// can drive a sequential per-lock targeted scan without reaching into
+// g_scanReq's fields directly, matching this file's existing
+// accessor-function convention (ozBleAtCapacity() etc. above).
+//
+// Why the peer-takeover retry needed this at all, not just a longer wait:
+// ozBleCurrentlyVisible() only reads g_seenUnpaired, which is written by
+// ozBleNoteUnpaired() — reached only after a full connect+identify, which
+// ozBleRecentlyRejected() then throttles to once per 5 MINUTES per address.
+// A lock last identified at boot (the common case right after a bridge
+// reboots and re-discovers everyone) will not refresh that cache again for
+// up to 5 minutes — a passive retry loop checking the same cache gains
+// nothing. A targeted scan bypasses this: onResult()'s target-match check
+// runs before ozBleRecentlyRejected()'s early return (see onResult() above),
+// so it still sees the advertisement even while that address is in its
+// rejection cooldown.
+static bool ozBleScanSlotFree() { return !g_scanReq.active; }
+static bool ozBleScanIsFor(const String &target) {
+  return g_scanReq.active && g_scanReq.target == target;
+}
+static bool ozBleScanFoundFor(const String &target) {
+  return ozBleScanIsFor(target) && g_scanReq.found;
+}
+
 /** Connect + discover + subscribe. Main task only. */
 static bool ozBleConnectOne(const String &addr) {
   OzBleLock *slot = nullptr;
