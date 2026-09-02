@@ -5,7 +5,8 @@
  *  Role     : Market-A personal cloud, per ozkey-05: MQTT rendezvous + mini
  *             directory that holds doorlock <-> owner-account pairing.
  *  Port     : 4200  (REST base /ozlockserv/api)
- *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.20:1883 (lab stand-in for EMQX)
+ *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.42:1883 (lab stand-in for EMQX;
+ *             2026-09-01: moved from 10.1.1.20, old host went unreachable)
  *  Database : MySQL (localhost / ozlock)
  *
  *  Responsibilities (ozkey-04 §6, ozkey-05 §6)
@@ -140,10 +141,10 @@ const CONFIG = {
   // fired only on the presence 'online' transition — a server restart while
   // a bridge was already online, a missed presence message, or a reconnect
   // not classified as fresh 'online' all permanently lose that bridge's
-  // time source (no NTP fallback since bridge32-1.36). This is how often
-  // handleThreadLiveness()'s already-existing heartbeat is allowed to
-  // re-push utc to a given bridge — riding the mechanism that already
-  // exists rather than adding a new timer.
+  // time source (no NTP fallback since bridge32-1.36). This is the cadence
+  // `refreshOnlineBridgeTimePushes()` re-pushes utc to every online bridge
+  // on (XF-138 P5: previously piggybacked on the now-retired Thread
+  // liveness heartbeat; now its own explicit periodic sweep).
   UTC_PUSH_REFRESH_MS: 10 * 60 * 1000,
   // XF-125 P1: audit_log is the file header's "security events" class and was
   // documented (2026-07-31) as retained per the Sovereign Edge whitepaper's
@@ -168,9 +169,9 @@ const CONFIG = {
     connectionLimit: 10,
     queueLimit: 0,
   },
-  MQTT_URL: 'mqtt://10.1.1.20:1883',
+  MQTT_URL: 'mqtt://10.1.1.42:1883',
   BROKER: {
-    host: '10.1.1.20',
+    host: '10.1.1.42',
     tcp_port: 1883,
     ws_port: 9001,
     ws_path: '/mqtt',
@@ -233,17 +234,25 @@ const CONFIG = {
   SUB_PRESENCE_LOCKS_LEGACY: 'ozkey/lab/locks/+/presence',
   SUB_PRESENCE_BRIDGES: 'ozkie/lab/bridges/+/presence',
   SUB_PRESENCE_BRIDGES_LEGACY: 'ozkey/lab/bridges/+/presence',
-  // ozkey-20 R2 (bridge Thread-liveness table). Topic is firmware's actual
-  // shipped shape (§14.2, 2026-08-11): `bridges/<id>/liveness`, NOT
-  // `thread_liveness` — this server's own earlier proposal guessed wrong.
-  // Fixed after discovering, via live traffic, that the original name was
-  // never received at all.
-  SUB_THREAD_LIVENESS: 'ozkie/lab/bridges/+/liveness',
-  SUB_THREAD_LIVENESS_LEGACY: 'ozkey/lab/bridges/+/liveness',
+  // XF-144 (2026-09-01): bridge-side targeted scan, proposed by operator,
+  // "no objection" from firmware on this shape. Deliberately NOT folded
+  // into `.../uplink` — that topic is lock-scoped by every existing
+  // consumer, and a scan result is the bridge reporting on itself, not
+  // something a lock said. Structurally the same shape as
+  // `.../bridges/<id>/presence`, one more thing a bridge publishes about
+  // itself. The request direction needs no new topic — it rides the
+  // existing `topicBridgeCommand()` below, same as pairctl/time/unlock.
+  SUB_BRIDGE_SCAN_RESULT: 'ozkie/lab/bridges/+/scan_result',
+  // XF-144 Phase 2 (2026-09-02, PM-approved): a Thread-detecting bridge
+  // reports a DIFFERENT (dead) peer bridge's id in the payload's `peer`
+  // field — the wildcard here is the REPORTING bridge, not the subject.
+  // Same "bridge reporting on itself/its own observation" shape as
+  // scan_result, one more thing a bridge publishes unprompted.
+  SUB_PEER_STATUS: 'ozkie/lab/bridges/+/peer_status',
   topicCommand: (site, deviceId) => `ozkie/${site}/locks/${deviceId}/command`,
-  // A Thread lock has no MQTT client of its own — bridge32 is its gateway and
-  // subscribes to its OWN topic (blelock/bridge32/bridge32.ino:489), then
-  // demuxes onto the mesh by `target`. ozkey-11 §3.
+  // A bridged lock has no MQTT client of its own — the bridge is its gateway
+  // and subscribes to its OWN topic, then demuxes onto its BLE link by
+  // `target`. ozkey-11 §3.
   topicBridgeCommand: (site, bridgeId) => `ozkie/${site}/bridges/${bridgeId}/command`,
   // ozkey-33: site-wide retained clock, for Wi-Fi-direct locks — they have
   // no bridge to relay ozkey-27 §9's `utc` push and NTP is blocked on this
@@ -510,10 +519,11 @@ async function initDatabase() {
   );
   if (!hasAppId) await pool.query('ALTER TABLE locks ADD COLUMN app_id VARCHAR(80) NULL AFTER site_id');
 
-  // bridge_id = the bridge32 gateway a Thread lock is reached through (ozkey-11
-  // §3). NULL = the lock is its own MQTT client (direct Wi-Fi, modes 2b/3/4).
-  // Only the app learns this — it read the bridge's Thread dataset over BLE at
-  // commissioning — so it must tell us at /pairings or the lock is unreachable.
+  // bridge_id = the bridge gateway a bridged (BLE-native) lock is reached
+  // through (ozkey-11 §3). NULL = the lock is its own MQTT client (direct
+  // Wi-Fi, modes 2b/3/4). Only the app learns this — it paired the lock to
+  // the bridge over BLE at commissioning — so it must tell us at /pairings
+  // or the lock is unreachable.
   const [[{ hasBridgeId }]] = await pool.query(
     `SELECT COUNT(*) AS hasBridgeId FROM information_schema.columns
       WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'bridge_id'`,
@@ -535,8 +545,9 @@ async function initDatabase() {
   // transport, reported on every enroll and heartbeat. Before this the server
   // never knew — it inferred capability from `bridge_id`, and the app kept a
   // private copy written at commissioning that nothing corrected, so a lock
-  // converted Thread -> Wi-Fi stayed "Thread" in the app permanently and every
-  // remote unlock was refused. `wifi` | `thread`, NULL until the device reports.
+  // whose real transport changed stayed misreported in the app permanently
+  // and every remote unlock was refused. `wifi` | `ble`, NULL until the
+  // device reports (XF-138 P5: `thread` retired along with Thread support).
   const [[{ hasTransport }]] = await pool.query(
     `SELECT COUNT(*) AS hasTransport FROM information_schema.columns
       WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'transport'`,
@@ -551,10 +562,10 @@ async function initDatabase() {
   // (computeFaultAttribution() below writes them), not a raw signal —
   // `presence_reason` holds one of the R6 table's verdict strings
   // (bridge_offline, lock_unreachable, battery_low, ...). Inputs feeding it
-  // (R1 presence topics, R2 thread_liveness, R4 heartbeat health fields)
-  // don't fully exist on the wire yet — this is the receiving side built
-  // ahead of the sender, same pattern as SUB_UPLINK before V1 shipped, so
-  // it lights up with zero further server change once firmware catches up.
+  // (R1 presence topics, R4 heartbeat health fields) don't fully exist on
+  // the wire yet — this is the receiving side built ahead of the sender,
+  // same pattern as SUB_UPLINK before V1 shipped, so it lights up with zero
+  // further server change once firmware catches up.
   const [[{ hasPresence }]] = await pool.query(
     `SELECT COUNT(*) AS hasPresence FROM information_schema.columns
       WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'presence'`,
@@ -571,14 +582,77 @@ async function initDatabase() {
         ADD COLUMN roster_epoch     INT UNSIGNED NOT NULL DEFAULT 0
     `);
 
-  // last_mech_result/last_mech_at and thread_age_s are NOT in ozkey-20's own
-  // R5 schema block, even though R6's attribution table references
-  // last_mech_result and a threshold on age_s — a real gap between R5 and R6
-  // as specified. Filling it rather than silently working around it:
-  // last_mech_result/at store R4's heartbeat field once it exists;
-  // thread_age_s stores the most recent per-lock age_s from an R2
-  // thread_liveness report, kept for observability — it's what actually lets
-  // §10 Q1's threshold be tuned from real data instead of guessed.
+  // XF-146 (2026-09-01, found live on LockA — real bug, not theoretical):
+  // `presence` used to serve two purposes that turned out to conflict —
+  // the RAW signal `handleLockPresence()` writes directly, and the DERIVED
+  // verdict `recomputeAndStorePresence()` computes from it — sharing one
+  // column. A bridge's own brief MQTT reconnect blip (its LWT firing and
+  // clearing seconds later, nothing to do with the actual BLE link to the
+  // lock) triggered two re-verdicts back to back: the first correctly read
+  // `bridge_offline` and wrote `presence='offline'`; the second, once the
+  // bridge recovered, re-read `lock.presence` for its "is there still a
+  // direct signal" check — and got back its OWN prior write, misread as a
+  // fresh direct report, permanently re-confirming `lock_unreachable` with
+  // no path back except a brand-new physical reconnect (which, confirmed
+  // on firmware's own serial log, never even happened — the real BLE link
+  // was healthy throughout). `direct_presence` is the fix: the raw signal
+  // now lives in its own column, written ONLY by `handleLockPresence()`,
+  // never touched by the derivation step — so a transient bridge-level
+  // blip can no longer permanently poison what the lock itself last
+  // reported. Backfilled from `presence` so no lock reads as spuriously
+  // unknown right after this migration runs.
+  const [[{ hasDirectPresence }]] = await pool.query(
+    `SELECT COUNT(*) AS hasDirectPresence FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'direct_presence'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasDirectPresence) {
+    await pool.query(`
+      ALTER TABLE locks
+        ADD COLUMN direct_presence ENUM('online','offline','unknown') NOT NULL DEFAULT 'unknown'
+    `);
+    await pool.query(`UPDATE locks SET direct_presence = presence`);
+  }
+
+  // XF-144 (2026-09-01, PM directive): multi-bridge failover. Deliberately
+  // NOT replacing `locks.bridge_id` — per this session's own recommendation
+  // (agreed by PM): every reachability/queue/caps code path already keys
+  // off that single column, tested and working live. `bridge_id` stays the
+  // denormalized "currently active" pointer; this table is the additive
+  // ranked-candidate list failover reads from. Composite PK (lock_id,
+  // bridge_id) — a lock can appear once per bridge it's ever been paired
+  // to, priority 0 = current/primary, higher = older/fallback.
+  const [[{ hasLockBridges }]] = await pool.query(
+    `SELECT COUNT(*) AS hasLockBridges FROM information_schema.tables
+      WHERE table_schema = ? AND table_name = 'lock_bridges'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasLockBridges) {
+    await pool.query(`
+      CREATE TABLE lock_bridges (
+        lock_id                      VARCHAR(64) NOT NULL,
+        bridge_id                    VARCHAR(64) NOT NULL,
+        priority                     SMALLINT NOT NULL DEFAULT 0,
+        last_confirmed_reachable_at  DATETIME NULL,
+        PRIMARY KEY (lock_id, bridge_id),
+        INDEX idx_lock_priority (lock_id, priority)
+      ) ENGINE=InnoDB
+    `);
+    // Non-destructive backfill (XF-144's own migration requirement):
+    // every lock's CURRENT bridge_id becomes its priority-0 row — existing
+    // single-bridge assignments are represented exactly as they are today,
+    // nothing is inferred or guessed for locks that have never had a
+    // second bridge.
+    await pool.query(`
+      INSERT INTO lock_bridges (lock_id, bridge_id, priority, last_confirmed_reachable_at)
+      SELECT id, bridge_id, 0, presence_at FROM locks WHERE bridge_id IS NOT NULL
+    `);
+  }
+
+  // last_mech_result/last_mech_at are NOT in ozkey-20's own R5 schema block,
+  // even though R6's attribution table references last_mech_result — a real
+  // gap between R5 and R6 as specified. Filling it rather than silently
+  // working around it: these store R4's heartbeat field once it exists.
   // Guarded separately from the block above: an earlier restart could have
   // already added `presence` before this block existed, which would leave
   // this guard permanently false if it shared the `hasPresence` flag.
@@ -591,15 +665,14 @@ async function initDatabase() {
     await pool.query(`
       ALTER TABLE locks
         ADD COLUMN last_mech_result VARCHAR(16) NULL,
-        ADD COLUMN last_mech_at     DATETIME NULL,
-        ADD COLUMN thread_age_s     SMALLINT NULL
+        ADD COLUMN last_mech_at     DATETIME NULL
     `);
 
   // ozkey-20 §5a (added 2026-08-11 on firmware review) — the DL MCU link was
   // missing from the whole model. mcu_link_up is the R6 verdict input
   // (mcu_link_down ranks above battery_low); mcu_last_frame_s is kept for
-  // observability only, same role thread_age_s plays for R2. Own guard, same
-  // reason as hasMechResult above — do not fold into an existing flag.
+  // observability only. Own guard, same reason as hasMechResult above — do
+  // not fold into an existing flag.
   const [[{ hasMcuLink }]] = await pool.query(
     `SELECT COUNT(*) AS hasMcuLink FROM information_schema.columns
       WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'mcu_link_up'`,
@@ -945,6 +1018,9 @@ function mqttPublish(topic, payload, opts = {}) {
 // the existing bridge `utc` push (CONFIG.UTC_PUSH_REFRESH_MS) so there is
 // one clock-freshness budget across both paths, not two to keep in sync.
 let timeRefreshTimer = null;
+// XF-144 (2026-09-01): the multi-bridge failover sweep's own timer —
+// deliberately separate from timeRefreshTimer, see its arming site for why.
+let bridgeFailoverTimer = null;
 
 function publishRetainedTime(why) {
   const nowUtc = Math.floor(Date.now() / 1000);
@@ -1152,6 +1228,113 @@ function logMemberRelay(targetDeviceId, kind, payload) {
   }
 }
 
+/** XF-138 P5 relay channel (2026-08-31): a CH584M lock's physical/local
+ * factory reset has no other delivery path — no Thread, no MQTT of its own —
+ * so it rides the bridge's relay of the lock's `member` characteristic onto
+ * this same uplink topic, as a plaintext `{"type":"reset",...}` message
+ * rather than the usual sealed `envelope_hex` wrapper (a reset lock has no
+ * bond left to seal anything with anyway, same reasoning as the plaintext
+ * `code` field elsewhere on this pipeline). Deliberately NOT
+ * `DELETE /locks/:id`'s `purgeLockRows()` — this must keep the row and its
+ * history (including this very event), just clear ownership so the lock is
+ * re-commissionable. Returns true if the payload was a reset message
+ * (handled either way, including "unknown device"), false otherwise, so the
+ * caller knows whether to fall through to the normal sealed-uplink path.
+ */
+async function handleUplinkReset(deviceId, payloadStr) {
+  let obj;
+  try {
+    obj = JSON.parse(payloadStr);
+  } catch (_) {
+    return false;
+  }
+  if (obj.type !== 'reset') return false;
+
+  const [[lock]] = await pool.query('SELECT app_id, bridge_id FROM locks WHERE id = ?', [
+    deviceId,
+  ]);
+  if (!lock) {
+    logEvent('warn', `Reset notification from unknown lock ${deviceId} — ignored`);
+    return true;
+  }
+  await pool.query(
+    "UPDATE locks SET app_id = NULL, bridge_id = NULL, status = 'registered' WHERE id = ?",
+    [deviceId]
+  );
+  logEvent(
+    'key',
+    `Lock ${deviceId} reported factory reset via relay channel — ownership cleared ` +
+      `(was app=${lock.app_id || '(none)'}, bridge=${lock.bridge_id || '(none)'})`
+  );
+  await recordAudit(
+    lock.app_id,
+    deviceId,
+    'reset',
+    'device-reported factory reset via relay channel — ownership cleared'
+  );
+  return true;
+}
+
+/** XF-138/139 P5 (2026-08-31, PM decision): the durable fix for
+ * `caps_source` staying permanently `'inferred'` on a CH584M lock —
+ * `publishEnroll()`'s full identity/capability document (the same shape
+ * `handleEnroll()` already parses via `deviceIdentity()`), relayed by the
+ * bridge over the reused `member` characteristic onto this same uplink
+ * topic, since a CH584M lock has no MQTT session of its own to publish it
+ * on directly.
+ *
+ * Deliberately NOT `handleEnroll()` — reaching that function has always
+ * meant "the lock itself spoke MQTT," proof of being un-bridged, and it
+ * unconditionally sets `bridge_id = NULL` on that basis (its own header
+ * comment). Calling it here would silently unpair every bridged lock the
+ * instant it reported its capabilities. This only ever touches
+ * `caps`/`transport` on an already-bonded (`app_id` set) lock — it does
+ * not enroll, does not touch `bridge_id`/`status`/broker credentials.
+ *
+ * Detected by content shape (`caps` present as an array), not a `type`
+ * field — firmware's payload is `addIdentity()`'s existing document, which
+ * (like the enroll payload it's shared with) carries no `type`
+ * discriminator of its own.
+ */
+async function handleUplinkCaps(deviceId, payloadStr) {
+  let obj;
+  try {
+    obj = JSON.parse(payloadStr);
+  } catch (_) {
+    return false;
+  }
+  if (!Array.isArray(obj.caps)) return false;
+
+  const [[lock]] = await pool.query('SELECT app_id FROM locks WHERE id = ?', [deviceId]);
+  if (!lock) {
+    logEvent('warn', `Capability report from unknown lock ${deviceId} — ignored`);
+    return true;
+  }
+  // Directive: "this report should only come from bonded locks anyway" — an
+  // unbonded lock has no owner to attribute the audit record to, and
+  // nothing server-side should trust a capability claim from a lock that
+  // isn't paired to anyone yet.
+  if (!lock.app_id) {
+    logEvent('warn', `Capability report from unbonded lock ${deviceId} — ignored`);
+    return true;
+  }
+
+  const ident = deviceIdentity(obj);
+  if (!ident.caps) {
+    logEvent('warn', `Capability report from ${deviceId} — no recognised caps in payload, ignored`);
+    return true;
+  }
+
+  await pool.query('UPDATE locks SET caps = ?, transport = COALESCE(?, transport) WHERE id = ?', [
+    ident.caps,
+    ident.transport,
+    deviceId,
+  ]);
+  logEvent('info', `Lock ${deviceId} capability report via relay channel: caps=${ident.caps}`);
+  await recordAudit(lock.app_id, deviceId, 'caps_update', `device-reported caps=${ident.caps}`);
+  return true;
+}
+
 /** V1 (ozkey-17 §6a/§6c, normative wire wrapper corrected 2026-08-10):
  * lock->app uplink's wrapper is `{from, to, envelope_hex}` — "read by the
  * bridge for routing only" per §6c, i.e. addressing metadata, same as a
@@ -1172,16 +1355,34 @@ function logMemberRelay(targetDeviceId, kind, payload) {
 async function logUplinkMetadata(fromDeviceId, payloadBuf, payloadStr) {
   const size = payloadBuf.length;
   let to = null;
+  let isRealUplink = false;
   try {
     const obj = JSON.parse(payloadStr);
     if (typeof obj.to === 'string') to = obj.to;
+    // XF-138 P5 (2026-08-31): the bridge now relays EVERY notification on the
+    // lock's `member` characteristic here, not just genuine uplink content —
+    // ordinary phone<->lock chatter (e.g. a `list_bonds` reply) rides the
+    // same BLE notify broadcast and lands on this same topic as a side
+    // effect, since BLE notify goes to every subscriber, not just the
+    // requester (found live, firmware's own post above). Only the normative
+    // §6c wrapper actually carries `envelope_hex` — anything else reaching
+    // here is overheard chatter, not real uplink content, and must stay
+    // `logEvent()`-only per this function's own long-standing rule (see
+    // above: "unlike S8/S9's member-relay observation which is deliberately
+    // ephemeral-only"). Without this check, every overheard exchange would
+    // silently pollute the compliance-purposed audit_log table.
+    isRealUplink = typeof obj.envelope_hex === 'string';
   } catch (_) {
     // Not JSON — fine, log size/from anyway. Not a warn like the other
     // topics: firmware/bridge versions may still be settling on this
     // still-new wire shape.
   }
-  logEvent('info', `Uplink from ${fromDeviceId} to ${to || '(unresolved)'}: ${size}B (content sealed, not read)`);
-  await recordAudit(to, fromDeviceId, 'uplink', `size=${size}B`);
+  logEvent(
+    'info',
+    `Uplink from ${fromDeviceId} to ${to || '(unresolved)'}: ${size}B (content sealed, not read)` +
+      (isRealUplink ? '' : ' — no envelope_hex, treating as overheard chatter, not persisting')
+  );
+  if (isRealUplink) await recordAudit(to, fromDeviceId, 'uplink', `size=${size}B`);
 }
 
 /** ozkey-31 §2. The uplink wrapper's `code` field is plaintext by design
@@ -1234,24 +1435,6 @@ async function handleUplinkOutcome(fromDeviceId, payloadStr) {
  * verdicts with zero further server change the moment firmware catches up.
  * ------------------------------------------------------------------------- */
 
-// XF-117 (2026-08-19, firmware's measurement): `age_s` is OpenThread's MLE
-// age — time since last contact — which climbs precisely because a healthy
-// child beacons every 300s and doesn't chatter in between. A fixed age
-// threshold therefore measures SILENCE, not reachability: firmware measured
-// a healthy, attached, rx_on:true lock reading `lock_unreachable` 59% of the
-// time under the previous 90s threshold (ozkey-20 §10 Q1's number, picked
-// before any real thread_liveness data existed to check it against).
-// THREAD_UNREACHABLE_AGE_S is retired — see THREAD_AGE_LOST_SENTINEL below,
-// which is the actual reachability signal: OpenThread's own child-table
-// eviction, verified live (firmware powered a lock off, watched it leave the
-// bridge's child table at ~240s, well-defined and far sharper than guessing
-// at an age cutoff).
-// Sentinel for thread_liveness `"state":"lost"` (aged out of the table
-// entirely, per the absence-inference in handleThreadLiveness) — the one
-// value that means "not currently a child of the bridge", as opposed to any
-// real reported age, however high, which means the lock IS in the table and
-// therefore reachable right now.
-const THREAD_AGE_LOST_SENTINEL = 32767; // SMALLINT max — thread_age_s is a SMALLINT column
 const BATTERY_LOW_PCT = 15; // ozkey-20 R6 table's own figure, not derived here.
 
 /** ozkey-20 R6, evaluated exactly as the doc's table specifies — top-down,
@@ -1261,19 +1444,30 @@ const BATTERY_LOW_PCT = 15; // ozkey-20 R6 table's own figure, not derived here.
  * discipline). Q2 (flap damping) is NOT implemented here — server-side
  * hysteresis is agreed (ozkey-20 reply) but is a separate, later addition;
  * this is the bare attribution logic the doc calls "the deliverable".
+ *
+ * XF-138 P5 (2026-08-31): every lock now carries its own direct presence
+ * signal into this function — Wi-Fi-direct locks via their own LWT, bridged
+ * (BLE-native) locks via the bridge's connect/disconnect relay onto
+ * `.../presence` — both written by `handleLockPresence()` before this
+ * runs. The old Thread-specific `isThread`/`thread_age_s` branch (dead
+ * reckoning a specific lock's reachability from a Thread mesh child-table
+ * age, since a Thread lock had no direct signal of its own) is gone along
+ * with Thread support itself: `bridgePresence === 'offline'` still catches
+ * "the whole bridge is down" as the stronger, bridge-level fault, and
+ * `direct_presence === 'offline'` now uniformly catches "this specific
+ * lock says it's unreachable," for bridged and direct locks alike.
+ *
+ * XF-146 (2026-09-01): reads `lock.direct_presence`, NOT `lock.presence` —
+ * see the schema migration's comment for why sharing one column between
+ * "raw signal" and "derived verdict" created a self-reinforcing stuck-
+ * offline bug the moment a bridge had any transient blip unrelated to the
+ * actual lock link.
  */
 function computeFaultAttribution(lock, bridgePresence) {
-  const isThread = !!lock.bridge_id;
+  const isBridged = !!lock.bridge_id;
 
-  if (isThread) {
-    if (bridgePresence === 'offline') return 'bridge_offline';
-    // XF-117: gate on child-table membership (the lost sentinel), not on
-    // age_s — a lock still present in the last authoritative report is
-    // reachable regardless of how long it has been quiet.
-    if (lock.thread_age_s === THREAD_AGE_LOST_SENTINEL) return 'lock_unreachable';
-  } else {
-    if (lock.presence === 'offline') return 'lock_offline_wifi';
-  }
+  if (isBridged && bridgePresence === 'offline') return 'bridge_offline';
+  if (lock.direct_presence === 'offline') return isBridged ? 'lock_unreachable' : 'lock_offline_wifi';
 
   // "either" rows — only reached once the lock is confirmed reachable over
   // its own transport (the checks above). mcu_link_down sits above
@@ -1291,11 +1485,23 @@ function computeFaultAttribution(lock, bridgePresence) {
 /** Re-derives `presence`/`presence_reason` for one lock from whatever raw
  * inputs are currently in its row + its bridge's row, and writes both.
  * Called after any event that could change the verdict (presence,
- * thread_liveness, heartbeat). `presence` (the simple online/offline/
- * unknown the app can branch on for "should I fall back to BLE") is
- * derived from the R6 reason, not a separate signal, for Thread locks —
- * they never get their own LWT (no MQTT session of their own), so their
- * only reachability evidence IS the bridge's report.
+ * heartbeat, a bridged lock's own connect/disconnect relay).
+ *
+ * XF-138 P5 (2026-08-31): `presence` used to be re-DERIVED for any bridged
+ * lock (the Thread case had no direct signal of its own to preserve — see
+ * computeFaultAttribution's header). Now every lock, bridged or not, gets a
+ * direct presence write from `handleLockPresence()` before this runs, so
+ * this simply trusts that direct signal unless a stronger, independently-
+ * computed fault (bridge_offline, etc.) overrides it to 'offline'.
+ *
+ * XF-146 (2026-09-01): falls back to `lock.direct_presence`, NOT
+ * `lock.presence` — this function's own OUTPUT column must never also be
+ * its input, or a transient bridge-level fault (which clears on its own
+ * seconds later) permanently overwrites the real, still-healthy direct
+ * signal with no way back short of a brand-new physical reconnect. See the
+ * schema migration and `computeFaultAttribution()` for the full story —
+ * found live on LockA, confirmed against firmware's own serial log
+ * showing the actual BLE link never dropped at all.
  */
 async function recomputeAndStorePresence(deviceId) {
   const [[lock]] = await pool.query('SELECT * FROM locks WHERE id = ?', [deviceId]);
@@ -1311,16 +1517,7 @@ async function recomputeAndStorePresence(deviceId) {
 
   const reason = computeFaultAttribution(lock, bridgePresence);
   const unreachable = reason === 'bridge_offline' || reason === 'lock_unreachable' || reason === 'lock_offline_wifi';
-  // Wi-Fi locks already had a direct presence signal (LWT) written before
-  // this runs; only *derive* presence from the reason for the Thread case,
-  // where there is no such direct signal to preserve.
-  const presence = lock.bridge_id
-    ? unreachable
-      ? 'offline'
-      : lock.thread_age_s != null
-        ? 'online'
-        : 'unknown'
-    : lock.presence;
+  const presence = unreachable ? 'offline' : lock.direct_presence;
 
   await pool.query('UPDATE locks SET presence = ?, presence_reason = ?, presence_at = NOW() WHERE id = ?', [
     presence,
@@ -1347,20 +1544,154 @@ async function handleLockPresence(deviceId, payload) {
     return;
   }
   const state = obj.state === 'online' || obj.state === 'offline' ? obj.state : 'unknown';
-  // XF-119 §6/§9.3 ask 2: raw reason, not the derived R6 one — cleared to
-  // NULL by the canonical online message (no `reason` field, ozpresence.h),
-  // so this can never outlive a re-pair.
-  await pool.query('UPDATE locks SET presence = ?, last_reset_reason = ? WHERE id = ?', [
-    state,
-    obj.reason || null,
-    deviceId,
-  ]);
-  const result = await recomputeAndStorePresence(deviceId);
-  if (result)
+
+  // XF-144 (2026-09-02): reconciliation-on-connect. `via` (bridge's own
+  // device_id, added to ozBuildLockPresence() this session) is stamped on
+  // BOTH the online and offline publish for audit symmetry — Firmware's own
+  // caveat, respected here: gate strictly on `state === 'online'`. A bridge
+  // reporting `via` on an OFFLINE message is saying "I lost this lock," not
+  // "I now own it" — treating that as a claim would misfire on every normal
+  // disconnect. Closes the race found live tonight: a recovering bridge
+  // silently reclaiming a lock the server had already failed over
+  // elsewhere, with nobody telling the DB the ground truth changed.
+  // Fetched unconditionally now (not just inside the online branch below) —
+  // the new ownership gate a few lines down needs `bridge_id` for OFFLINE
+  // `via` reports too (a non-owning bridge's own disconnect/lwt as it
+  // complies with `release_lock`), not just online claims.
+  const [[lock]] = await pool.query('SELECT bridge_id, presence FROM locks WHERE id = ?', [deviceId]);
+  let effectiveBridgeId = lock ? lock.bridge_id : null;
+
+  if (obj.via && state === 'online') {
+    if (lock && lock.bridge_id !== obj.via) {
+      const oldBridgeId = lock.bridge_id;
+      // XF-144 (2026-09-02, second pass): the naive "most recent connect
+      // wins" version of this check caused a real, confirmed dual-BLE-slot
+      // collision live tonight — a recovering Bridge 1 silently reclaimed
+      // LockA/LockC from a healthy, actively-working Bridge 2 (both bridges
+      // held real live connections simultaneously, verified via both
+      // bridges' own logs, see XF-151). Firmware's proposed fix, built here:
+      // gate on the LOCK's own current presence, not the bridge's general
+      // health. `presence === 'online'` means the CURRENT bridge_id is
+      // confirmed still working right now — a new claimant in that state is
+      // racing a healthy assignment, not recovering a dead one, and gets
+      // rejected + told to let go. `presence !== 'online'` (offline/unknown,
+      // e.g. bridge_offline) means the current assignment is already
+      // known-bad — this is the legitimate-failover case, unaffected,
+      // same accept-and-reconcile behavior as before.
+      //
+      // Deliberately does NOT touch `PATCH /locks/:id` (manual "Ghép khoá
+      // vào Bridge" re-pairing) — that's a separate, explicit, human-driven
+      // code path that unconditionally overwrites `bridge_id` today and
+      // still should; this gate only governs automatic reconciliation
+      // triggered by a bridge's own presence report.
+      if (lock.presence === 'online') {
+        mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, obj.via), {
+          op: 'release_lock',
+          id: deviceId,
+        });
+        logEvent(
+          'key',
+          `XF-144 reconciliation REJECTED: lock ${deviceId} claim from ${obj.via} refused — ` +
+            `current bridge ${oldBridgeId} still confirmed healthy (presence=online). ` +
+            `release_lock sent to ${obj.via} to prevent a dual-connection collision.`
+        );
+        await recordAudit(
+          null,
+          deviceId,
+          'bridge_reconcile_rejected',
+          `claim from ${obj.via} rejected — ${oldBridgeId} still healthy; release_lock sent to ${obj.via}`
+        );
+      } else {
+        await pool.query(
+          'UPDATE locks SET bridge_id = ?, mcu_link_up = NULL, mcu_last_frame_s = NULL WHERE id = ?',
+          [obj.via, deviceId]
+        );
+        await pool.query('UPDATE lock_bridges SET priority = priority + 1 WHERE lock_id = ? AND bridge_id != ?', [
+          deviceId,
+          obj.via,
+        ]);
+        await pool.query(
+          `INSERT INTO lock_bridges (lock_id, bridge_id, priority, last_confirmed_reachable_at)
+             VALUES (?, ?, 0, NOW())
+           ON DUPLICATE KEY UPDATE priority = 0, last_confirmed_reachable_at = NOW()`,
+          [deviceId, obj.via]
+        );
+        logEvent(
+          'key',
+          `XF-144 reconciliation-on-connect: lock ${deviceId} bridge_id corrected from ` +
+            `${oldBridgeId || '(none)'} to ${obj.via} (current bridge was not confirmed healthy)`
+        );
+        await recordAudit(
+          null,
+          deviceId,
+          'bridge_reconcile',
+          `bridge_id corrected to ${obj.via} via reconciliation-on-connect (was ${oldBridgeId || '(none)'})`
+        );
+        effectiveBridgeId = obj.via;
+      }
+    }
+  }
+
+  // XF-151 (2026-09-02): found live, real hardware — a rejected (or simply
+  // non-owning) bridge's own report was still overwriting `direct_presence`
+  // unconditionally below, poisoning the raw signal for a lock it doesn't
+  // actually hold. Exact sequence that happened: Bridge 2's stale claim got
+  // correctly REJECTED above (bridge_id stayed on the real owner, Bridge 1),
+  // but the code still fell through and wrote `direct_presence='online'`
+  // from Bridge 2's rejected message; moments later Bridge 2 complied with
+  // `release_lock` and disconnected, publishing its OWN offline/lwt — which
+  // ALSO got written unconditionally, flipping the lock to a false
+  // stale-offline read even though Bridge 1 (the real, working owner) never
+  // lost the connection. A remote unlock was refused as a result.
+  //
+  // Fix: only trust a presence report for the raw signal if it either
+  // carries no `via` at all (Wi-Fi-direct locks, or firmware predating this
+  // field — unconditional write preserved exactly as before, no regression)
+  // or `via` matches the lock's EFFECTIVE bridge_id (the current owner,
+  // already updated above if this message just legitimately won the
+  // reconciliation). A report from any other bridge — rejected, or a
+  // straggler from a bridge that was never the owner — is real signal
+  // about THAT bridge, but not about this lock's actual reachability, and
+  // must not overwrite it.
+  // Only the raw-signal write is gated — `pendingLockResets` below still
+  // runs regardless of which bridge relayed the message. A reset outcome is
+  // a fact about the LOCK itself (device-initiated), not about a bridge's
+  // reachability, and whoever currently holds the connection when a reset
+  // fires is the one that relays it — that isn't necessarily the bridge_id
+  // on record if it's already stale (the exact class of gap XF-150 found).
+  // Not skipping it here would risk a real reset waiter hanging on a
+  // timeout instead of resolving cleanly.
+  const ownershipMismatch = !!(obj.via && lock && effectiveBridgeId && obj.via !== effectiveBridgeId);
+  if (ownershipMismatch) {
     logEvent(
       'info',
-      `Presence: lock ${deviceId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}, verdict=${result.reason}`
+      `Presence report for lock ${deviceId} from non-owning bridge ${obj.via} ` +
+        `(current owner: ${effectiveBridgeId}) — ignored, raw signal not overwritten`
     );
+  } else {
+    // XF-119 §6/§9.3 ask 2: raw reason, not the derived R6 one — cleared to
+    // NULL by the canonical online message (no `reason` field, ozpresence.h),
+    // so this can never outlive a re-pair.
+    //
+    // XF-146 (2026-09-01): writes `direct_presence`, NOT the public
+    // `presence` column — that one belongs exclusively to
+    // `recomputeAndStorePresence()`'s derived verdict now. This is the raw
+    // signal only; see that function and the schema migration for why
+    // sharing one column between "what was directly reported" and "what we
+    // last concluded" created a stuck-offline bug on a transient bridge
+    // blip.
+    await pool.query('UPDATE locks SET direct_presence = ?, last_reset_reason = ? WHERE id = ?', [
+      state,
+      obj.reason || null,
+      deviceId,
+    ]);
+    const result = await recomputeAndStorePresence(deviceId);
+    if (result)
+      logEvent(
+        'info',
+        `Presence: lock ${deviceId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}, verdict=${result.reason}`
+      );
+  }
 
   // ozkey-41 §5.2: `no_bond` means the sender's request couldn't even be
   // decrypted — the lock is ALREADY unowned, which for a removal is the
@@ -1394,8 +1725,8 @@ async function handleLockPresence(deviceId, payload) {
 const pendingBridgeResets = new Map(); // bridgeId -> Set<(verdict) => void>
 
 // ozkey-27 §9: last time we successfully published `utc` to a given bridge
-// (ms, Date.now()), so the liveness heartbeat can tell "recently confirmed"
-// from "stale" without a new timer.
+// (ms, Date.now()), so a caller can tell "recently confirmed" from "stale"
+// without a new timer.
 const lastUtcPushAt = new Map(); // bridgeId -> ms
 
 function pushUtcToBridge(bridgeId, why) {
@@ -1403,6 +1734,115 @@ function pushUtcToBridge(bridgeId, why) {
   mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, bridgeId), { utc: nowUtc });
   lastUtcPushAt.set(bridgeId, Date.now());
   logEvent('info', `Pushed utc=${nowUtc} to bridge ${bridgeId} (${why})`);
+}
+
+// XF-138 P5 (2026-08-31): `pushUtcToBridge()` used to get its ongoing
+// refresh cadence for free by piggybacking on the Thread-liveness message
+// each bridge sent periodically — removed along with Thread support (no
+// lock uses it anymore, and that message was Thread-mesh-specific). A
+// bridge still needs fresh time on an ongoing basis (it's what relays a
+// connected lock's clock, per today's whole time-sync fix), so this is now
+// its own explicit periodic sweep of every currently-online bridge, run on
+// the same `timeRefreshTimer` cadence as the retained-time-topic refresh
+// rather than a second independent timer.
+async function refreshOnlineBridgeTimePushes() {
+  const [bridges] = await pool.query("SELECT bridge_id FROM bridges_presence WHERE presence = 'online'");
+  for (const { bridge_id } of bridges) {
+    pushUtcToBridge(bridge_id, 'periodic refresh sweep, ozkey-27 §9');
+  }
+}
+
+// XF-144 (2026-09-01, PM directive): grace period before a lock's assigned
+// bridge is treated as failed enough to fail over. Deliberately NOT
+// instant — the entire reason this feature exists (XF-146, same session)
+// is that a transient ~9s bridge-level MQTT blip, completely unrelated to
+// the actual BLE link, produced a false `bridge_offline` reading. Reacting
+// to that instantly here would have started a real failover — connecting
+// a backup bridge to a lock whose original bridge was fine seconds later
+// — on the exact class of signal already proven unreliable this session.
+// 2 minutes is comfortably longer than every transient blip observed
+// tonight (the worst was ~17s of confusion end-to-end) while still being
+// fast enough to matter for an actually-dead bridge.
+const FAILOVER_GRACE_MS = 2 * 60 * 1000;
+
+/** Periodic sweep, same cadence as the time-refresh timer. For any lock
+ * whose CURRENT bridge has read `bridge_offline` for at least
+ * `FAILOVER_GRACE_MS` (a real, sustained outage — not a blip), looks up
+ * the next-priority candidate in `lock_bridges` that is itself currently
+ * online, and — only then, on-demand, never speculatively — promotes it
+ * to be the new active `bridge_id`, exactly the same effect as a manual
+ * `PATCH /locks/:id {bridge_id:...}` would have. Does nothing if no
+ * online candidate exists — a lock with no working fallback just stays
+ * `bridge_offline`, honestly, rather than routing to a bridge nobody has
+ * confirmed can actually reach it.
+ */
+async function runBridgeFailoverSweep() {
+  const [stuck] = await pool.query(
+    `SELECT id, bridge_id FROM locks
+      WHERE bridge_id IS NOT NULL AND presence_reason = 'bridge_offline'
+        AND presence_at <= DATE_SUB(NOW(), INTERVAL ? SECOND)`,
+    [FAILOVER_GRACE_MS / 1000]
+  );
+  for (const lock of stuck) {
+    const [[next]] = await pool.query(
+      `SELECT lb.bridge_id FROM lock_bridges lb
+         JOIN bridges_presence bp ON bp.bridge_id = lb.bridge_id AND bp.presence = 'online'
+        WHERE lb.lock_id = ? AND lb.bridge_id != ?
+        ORDER BY lb.priority ASC
+        LIMIT 1`,
+      [lock.id, lock.bridge_id]
+    );
+    if (!next) continue; // no confirmed-online fallback candidate — nothing safe to do
+    const oldBridgeId = lock.bridge_id;
+    await pool.query(
+      `UPDATE locks SET bridge_id = ?, mcu_link_up = NULL, mcu_last_frame_s = NULL,
+         direct_presence = 'unknown', presence = 'unknown', presence_reason = NULL
+       WHERE id = ?`,
+      [next.bridge_id, lock.id]
+    );
+    // Same demote-then-promote shape PATCH /locks/:id already uses (XF-138
+    // P5) — without this, the old bridge is left stuck at priority 0
+    // alongside the new one (found live on real hardware, XF-144
+    // 2026-09-02: a real auto-failover left BOTH ozb-98a316a7e638 and
+    // ozb-206ef116f390 at priority 0 for LockA), and a future sweep's
+    // `ORDER BY priority ASC LIMIT 1` could arbitrarily re-pick the
+    // already-failed bridge on a tie.
+    await pool.query('UPDATE lock_bridges SET priority = priority + 1 WHERE lock_id = ? AND bridge_id != ?', [
+      lock.id,
+      next.bridge_id,
+    ]);
+    await pool.query(
+      `INSERT INTO lock_bridges (lock_id, bridge_id, priority, last_confirmed_reachable_at)
+         VALUES (?, ?, 0, NOW())
+       ON DUPLICATE KEY UPDATE priority = 0, last_confirmed_reachable_at = NOW()`,
+      [lock.id, next.bridge_id]
+    );
+    // XF-144 (2026-09-02): the DB write above updates routing INTENT only —
+    // Firmware confirmed the new bridge never actually adopts the lock
+    // without this, so a "successful" failover was reachable-looking
+    // (caps still said remote_unlock:true) while genuinely broken
+    // (forwardOverBle() requires the lock in the bridge's own g_bleLocks
+    // allowlist first). Same shape as unpair_lock (XF-147): fire-and-
+    // forget, no result topic — the real confirmation is the subsequent
+    // BLE connect + presence-online event this sweep/server already
+    // watches for, same as a manual "Ghép khoá vào Bridge" pairing.
+    mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, next.bridge_id), {
+      op: 'pair_lock',
+      id: lock.id,
+    });
+    logEvent(
+      'key',
+      `XF-144 auto-failover: lock ${lock.id} moved from bridge ${oldBridgeId} ` +
+        `(bridge_offline ${FAILOVER_GRACE_MS / 1000}s+) to bridge ${next.bridge_id}, ` +
+        `pair_lock dispatched`
+    );
+    await recordAudit(
+      null,
+      lock.id,
+      'bridge_failover',
+      `auto-failover from ${oldBridgeId} to ${next.bridge_id} after sustained bridge_offline (pair_lock dispatched)`
+    );
+  }
 }
 
 function waitForBridgeResetVerdict(bridgeId, timeoutMs) {
@@ -1425,6 +1865,81 @@ function waitForBridgeResetVerdict(bridgeId, timeoutMs) {
     if (!pendingBridgeResets.has(bridgeId)) pendingBridgeResets.set(bridgeId, new Set());
     pendingBridgeResets.get(bridgeId).add(settle);
   });
+}
+
+/** XF-144 (2026-09-01): a lock has no opinion on which bridge is "best" for
+ * it — only a bridge's own targeted BLE scan measures real bridge-to-lock
+ * link quality (RSSI), which is what routing should actually be based on,
+ * per the operator's reasoning for this feature (replacing the phone's own
+ * BLE-scan RSSI ranking, which only ever measured "can the PHONE hear the
+ * bridge"). Keyed by the TARGET device_id being scanned for, not by
+ * bridge_id — several bridges each report back about the same target, and
+ * every response arriving inside the window is collected, not just the
+ * first, so the caller can compare all candidates that actually answered.
+ */
+const pendingLockScans = new Map(); // deviceId -> Array<{bridge_id, found, rssi}>
+
+function handleBridgeScanResult(bridgeId, payloadStr) {
+  let obj;
+  try {
+    obj = JSON.parse(payloadStr);
+  } catch (_) {
+    logEvent('warn', `Non-JSON payload on bridges/${bridgeId}/scan_result: "${payloadStr.slice(0, 60)}"`);
+    return;
+  }
+  const deviceId = typeof obj.target === 'string' ? obj.target : null;
+  if (!deviceId) return;
+  const pending = pendingLockScans.get(deviceId);
+  if (!pending) {
+    // Not an error — a bridge answering after the window closed (or a scan
+    // nobody requested) is expected under real network timing, not a bug.
+    logEvent(
+      'info',
+      `Scan result from bridge ${bridgeId} for ${deviceId} arrived with no pending request — dropped`
+    );
+    return;
+  }
+  pending.push({
+    bridge_id: bridgeId,
+    found: obj.found === true,
+    rssi: Number.isFinite(obj.rssi) ? obj.rssi : null,
+  });
+}
+
+// XF-144 (2026-09-01, post-live-verification): a real bridge's scan_result
+// consistently arrived ~150-170ms AFTER a bare `timeoutMs`-length wait here —
+// confirmed via `/api/events` timestamps against BOTH real bench bridges,
+// twice, not a one-off ("... arrived with no pending request — dropped").
+// The requested `duration_s` is a scan-hardware budget on the bridge's side;
+// it does not include the MQTT publish round-trip or the bridge's own
+// processing before it publishes. Waiting exactly `timeoutMs` here raced
+// every real response and silently dropped 100% of them — this margin is
+// the fix, not a new discovery of "responses are slow."
+const SCAN_RESULT_GRACE_MS = 3000;
+
+/** Broadcasts a targeted scan request to every currently-online bridge,
+ * waits `timeoutMs` (plus SCAN_RESULT_GRACE_MS network/processing margin)
+ * for whatever `scan_result` responses arrive, and returns all of them (not
+ * just the best) so the caller applies its own ranking. Verified live
+ * against real firmware (`bridgeBLE-0.34`) on both bench bridges as of
+ * 2026-09-01 — see XF-144 for the dropped-response bug this margin fixes.
+ */
+async function scanForLockAcrossBridges(deviceId, timeoutMs = 8000) {
+  const [bridges] = await pool.query("SELECT bridge_id FROM bridges_presence WHERE presence = 'online'");
+  if (!bridges.length) return { requested: 0, results: [] };
+
+  pendingLockScans.set(deviceId, []);
+  for (const { bridge_id } of bridges) {
+    mqttPublish(CONFIG.topicBridgeCommand(CONFIG.SITE_ID, bridge_id), {
+      op: 'scan',
+      target: deviceId,
+      duration_s: Math.ceil(timeoutMs / 1000),
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, timeoutMs + SCAN_RESULT_GRACE_MS));
+  const results = pendingLockScans.get(deviceId) || [];
+  pendingLockScans.delete(deviceId);
+  return { requested: bridges.length, results };
 }
 
 function notifyBridgeResetWaiters(bridgeId, verdict, cause) {
@@ -1563,130 +2078,41 @@ async function handleBridgePresence(bridgeId, payload) {
     logEvent('info', `Presence: re-verdicted ${locks.length} lock(s) behind bridge ${bridgeId}`);
 }
 
-/** ozkey-20 R2. Real payload per §14.2/§15.3 (2026-08-11, firmware —
- * differs from §3's original example in three ways firmware flagged, §14.3):
- * {"kind":"thread_liveness","bridge_id":...,"role":...,"authoritative":bool,
- *  "children":n,"locks":[{"id"?,"ext","age_s","rssi","lqi","rx_on","state":"child"}]}
- * One Wi-Fi message covers every lock behind the bridge — that's the whole
- * point (§3's table: 255 mesh messages avoided, 1 Wi-Fi message instead).
+/** XF-144 Phase 2 (2026-09-02, PM-approved): a Thread-detecting bridge's
+ * fast-path report that a DIFFERENT bridge (`peer`, in the payload — NOT
+ * `reportingBridgeId`, the topic's own wildcard) has gone dark, ~45-60s
+ * after last heard rather than waiting out MQTT's own LWT+timeout chain
+ * (typically ~2 minutes). Deliberately just a thin wrapper around the
+ * SAME `handleBridgePresence()` an LWT-driven offline already calls — zero
+ * new state machine, reuses every downstream effect that function already
+ * has (writes `bridges_presence`, re-verdicts every lock behind that
+ * bridge) for free. This is the whole point of Phase 2's fast-path fix:
+ * once `bridges_presence` reflects reality this early, the Phase-1 reject-
+ * gate (`handleLockPresence()`'s `via` check) naturally sees an accurate
+ * `lock.presence` by the time the Thread-triggered takeover's own claim
+ * arrives, instead of incorrectly refusing it as "current bridge still
+ * healthy" against stale data.
+ *
+ * A false positive (Thread mesh partition, not an actual dead bridge) is
+ * self-limiting, not a lasting corruption — `bridges_presence` gets
+ * overwritten by any subsequent REAL report from that bridge, same
+ * self-correcting shape every other presence signal in this system
+ * already has.
  */
-async function handleThreadLiveness(bridgeId, payload) {
+async function handlePeerStatus(reportingBridgeId, payloadStr) {
   let obj;
   try {
-    obj = JSON.parse(payload);
+    obj = JSON.parse(payloadStr);
   } catch (_) {
-    logEvent('warn', `Non-JSON payload on bridges/${bridgeId}/liveness: "${payload.slice(0, 60)}"`);
+    logEvent('warn', `Non-JSON payload on bridges/${reportingBridgeId}/peer_status: "${payloadStr.slice(0, 60)}"`);
     return;
   }
-
-  // ozkey-27 §9: this heartbeat proves the bridge is reachable regardless of
-  // Thread role, so it's the right place to keep `utc` fresh — checked
-  // before the `authoritative` gate below, which is about Thread mesh data
-  // only and has nothing to do with clock delivery.
-  const lastPush = lastUtcPushAt.get(bridgeId) || 0;
-  if (Date.now() - lastPush > CONFIG.UTC_PUSH_REFRESH_MS) {
-    pushUtcToBridge(bridgeId, 'liveness heartbeat refresh, ozkey-27 §9');
-  }
-
-  // §15.3 (2026-08-11, firmware's live finding): the bridge can be a Thread
-  // Child, not a Router/Leader — in which case its child table is
-  // structurally empty regardless of mesh health, because a Child node has
-  // no child table at all. `authoritative` is the gate. Deriving
-  // `lock_unreachable` from a non-authoritative report would have marked
-  // every lock behind this bridge unreachable on a bridge working
-  // perfectly — exactly what firmware's first live report would have
-  // caused without this check. Non-authoritative says nothing about any
-  // lock; leave every prior verdict untouched, per their explicit
-  // instruction (§15.4 point 2).
-  if (obj.authoritative !== true) {
-    logEvent(
-      'info',
-      `Thread liveness from bridge ${bridgeId}: role=${obj.role || 'unknown'}, NOT authoritative — ignored, no verdict changed (§15.3)`
-    );
-    return;
-  }
-
-  // §14.3 point 1: there is no "lost" state on the wire — a lock that aged
-  // out is simply absent from the array. `state` is always "child" for
-  // whatever IS present, so it carries no information here.
-  const reported = Array.isArray(obj.locks) ? obj.locks : [];
-  const reportedIds = new Set();
-  let updated = 0;
-  let unidentified = 0;
-  let noRow = 0;
-  for (const entry of reported) {
-    if (!entry) continue;
-    // §14.3 point 3: `id` is absent until the lock has sent its first
-    // uplink (the bridge only learns device_id↔extended-address from
-    // traffic it has seen) — or, per firmware's live finding 2026-08-11,
-    // until the bridge's learned map survives a restart at all (it's
-    // RAM-only today, wiped on every flash/reboot). Either way this entry
-    // is a real, present node the bridge just can't name yet.
-    if (typeof entry.id !== 'string') {
-      unidentified++;
-      continue;
-    }
-    reportedIds.add(entry.id);
-    const ageS = Number(entry.age_s);
-    if (!Number.isFinite(ageS)) continue;
-    // `updated` must count rows actually matched, not attempts — an id the
-    // bridge correctly resolved but that has no corresponding `locks` row
-    // (never enrolled, or removed) previously still incremented this and
-    // logged "N updated", which reads as a live signal reaching the app when
-    // nothing landed anywhere. Found live 2026-08-11 when firmware's real,
-    // correctly-identified traffic produced this exact misleading line
-    // against an empty `locks` table.
-    // ozkey-32 §7 (firmware, 2026-08-14): this entry is bridge32's own
-    // Thread-neighbour-table view, never the lock's `name` — a bridged
-    // lock's heartbeat topic already carries `name` via the bridge's
-    // verbatim beacon republish (the `kind === 'heartbeat'` handler
-    // above), so reconciling here too would be a second copy of the same
-    // fact with its own chance to go stale. An earlier version of this
-    // code read `entry.name` here; removed on firmware's confirmation it
-    // will never be sent.
-    const [result] = await pool.query('UPDATE locks SET thread_age_s = ? WHERE id = ?', [
-      ageS,
-      entry.id,
-    ]);
-    if (result.affectedRows > 0) {
-      await recomputeAndStorePresence(entry.id);
-      updated++;
-    } else {
-      noRow++;
-    }
-  }
-
-  // 🔴 Bug found live 2026-08-11 (firmware's report): an unidentified entry
-  // was being silently dropped from `reportedIds`, so a lock that was
-  // actually present but not-yet-named looked identical to a lock that was
-  // genuinely absent — every expected lock got marked lost the moment the
-  // bridge's join map was empty, which is exactly the false alarm
-  // `authoritative` was built to prevent, just tripped by a different gap
-  // in the same payload. Absence is only a safe inference when the server
-  // can see EVERY reported entry's identity — if any entry is unidentified,
-  // it could be any one of the "missing" locks, so skip the whole
-  // inference rather than guess. Prior verdicts are left untouched, same
-  // discipline as the non-authoritative case above.
-  const [expected] = await pool.query('SELECT id FROM locks WHERE bridge_id = ?', [bridgeId]);
-  let lost = 0;
-  if (unidentified === 0) {
-    for (const { id } of expected) {
-      if (reportedIds.has(id)) continue;
-      await pool.query('UPDATE locks SET thread_age_s = ? WHERE id = ?', [THREAD_AGE_LOST_SENTINEL, id]);
-      await recomputeAndStorePresence(id);
-      lost++;
-    }
-  }
-
+  if (obj.event !== 'peer_down' || !obj.peer) return;
   logEvent(
-    'info',
-    `Thread liveness from bridge ${bridgeId}: ${reported.length} reported (${unidentified} unidentified` +
-      (noRow > 0 ? `, ${noRow} identified but no matching locks row` : '') +
-      `), ${updated} updated, ` +
-      (unidentified === 0
-        ? `${lost} inferred lost (absent from an authoritative, fully-identified report)`
-        : `absence-inference SKIPPED — unidentified entries present, cannot safely tell which lock they are`)
+    'key',
+    `XF-144 peer_down: bridge ${reportingBridgeId} reports peer ${obj.peer} down — fast-tracking bridges_presence`
   );
+  await handleBridgePresence(obj.peer, JSON.stringify({ state: 'offline', reason: 'peer_down' }));
 }
 
 function initMqtt() {
@@ -1718,8 +2144,8 @@ function initMqtt() {
         CONFIG.SUB_PRESENCE_LOCKS_LEGACY,
         CONFIG.SUB_PRESENCE_BRIDGES,
         CONFIG.SUB_PRESENCE_BRIDGES_LEGACY,
-        CONFIG.SUB_THREAD_LIVENESS,
-        CONFIG.SUB_THREAD_LIVENESS_LEGACY,
+        CONFIG.SUB_BRIDGE_SCAN_RESULT,
+        CONFIG.SUB_PEER_STATUS,
       ],
       { qos: 1 },
       (err) => {
@@ -1730,7 +2156,8 @@ function initMqtt() {
             `Subscribed: ${CONFIG.SUB_ENROLL} + ${CONFIG.SUB_HEARTBEAT} + ` +
               `${CONFIG.SUB_MEMBER_REQUEST_REMOVE} + ${CONFIG.SUB_MEMBER_ACK_REMOVE} + ` +
               `${CONFIG.SUB_UPLINK} + ${CONFIG.SUB_PRESENCE_LOCKS} + ` +
-              `${CONFIG.SUB_PRESENCE_BRIDGES} + ${CONFIG.SUB_THREAD_LIVENESS}` +
+              `${CONFIG.SUB_PRESENCE_BRIDGES} + ${CONFIG.SUB_BRIDGE_SCAN_RESULT} + ` +
+              `${CONFIG.SUB_PEER_STATUS}` +
               ' (+ legacy ozkey/ roots during S16 migration)' +
               ' (door-event topic deliberately NOT subscribed — see header)'
           );
@@ -1744,10 +2171,25 @@ function initMqtt() {
     // reconnects don't stack intervals.
     publishRetainedTime('MQTT connect');
     if (timeRefreshTimer) clearInterval(timeRefreshTimer);
-    timeRefreshTimer = setInterval(
-      () => publishRetainedTime('periodic refresh'),
-      CONFIG.UTC_PUSH_REFRESH_MS
-    );
+    timeRefreshTimer = setInterval(() => {
+      publishRetainedTime('periodic refresh');
+      refreshOnlineBridgeTimePushes();
+    }, CONFIG.UTC_PUSH_REFRESH_MS);
+
+    // XF-144: a separate, much shorter-period timer than the UTC refresh
+    // above — the failover sweep's own condition (FAILOVER_GRACE_MS, 2 min)
+    // already provides the real debounce against reacting to a blip;
+    // running the SWEEP itself only every 10 minutes (the UTC cadence)
+    // would add up to 10 more minutes of delay on top of that grace period
+    // for an actually-dead bridge, which defeats the point. 30s is frequent
+    // enough to fail over promptly once the grace period genuinely elapses
+    // without being a meaningful DB load.
+    if (bridgeFailoverTimer) clearInterval(bridgeFailoverTimer);
+    bridgeFailoverTimer = setInterval(() => {
+      runBridgeFailoverSweep().catch((err) =>
+        logEvent('error', `XF-144 failover sweep failed: ${err.message}`)
+      );
+    }, 30_000);
   });
 
   mqttClient.on('reconnect', () => logEvent('warn', 'MQTT reconnecting...'));
@@ -1777,6 +2219,8 @@ function initMqtt() {
         // exactly like grant/revoke/unlock already are.
         const um = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/locks\/([^/]+)\/uplink$/);
         if (um) {
+          if (await handleUplinkReset(um[2], payload)) return;
+          if (await handleUplinkCaps(um[2], payload)) return;
           await logUplinkMetadata(um[2], payloadBuf, payload);
           await handleUplinkOutcome(um[2], payload);
           return;
@@ -1794,10 +2238,14 @@ function initMqtt() {
           await handleBridgePresence(pbm[2], payload);
           return;
         }
-        // ozkey-20 R2: bridge's aggregated Thread liveness table.
-        const tlm = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/bridges\/([^/]+)\/liveness$/);
-        if (tlm) {
-          await handleThreadLiveness(tlm[2], payload);
+        const bsm = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/bridges\/([^/]+)\/scan_result$/);
+        if (bsm) {
+          handleBridgeScanResult(bsm[2], payload);
+          return;
+        }
+        const psm = topic.match(/^(?:ozkey|ozkie)\/([^/]+)\/bridges\/([^/]+)\/peer_status$/);
+        if (psm) {
+          await handlePeerStatus(psm[2], payload);
           return;
         }
         return;
@@ -1933,13 +2381,18 @@ function initMqtt() {
         // Wi-Fi-direct lock (no bridge_id) — set presence straight to
         // 'online' the way an R1 LWT eventually will, then let R6 compute
         // whatever reason applies (battery/mech/pending) on top of that. A
-        // Thread lock's presence is NOT touched here — Thread heartbeats
-        // don't exist yet (R3), and even once they do, reachability for a
-        // Thread lock comes from the bridge's report (R2), not its own
-        // heartbeat, per §3's "liveness is observed, not reported".
+        // bridged lock's presence is NOT touched here — its reachability
+        // comes from the bridge's own connect/disconnect relay, not its
+        // heartbeat.
+        //
+        // XF-146 (2026-09-01): writes `direct_presence`, not `presence` —
+        // same fix as `handleLockPresence()`, same reason: this is a raw
+        // signal, and `recomputeAndStorePresence()` (called right below)
+        // now reads `direct_presence` exclusively for that check, never
+        // its own prior derived output.
         const [[hbLockRow]] = await pool.query('SELECT bridge_id FROM locks WHERE id = ?', [deviceId]);
         if (hbLockRow && !hbLockRow.bridge_id) {
-          await pool.query("UPDATE locks SET presence = 'online' WHERE id = ?", [deviceId]);
+          await pool.query("UPDATE locks SET direct_presence = 'online' WHERE id = ?", [deviceId]);
         }
         if (hbLockRow) await recomputeAndStorePresence(deviceId);
         const sent = await flushQueueForDevice(siteId, deviceId);
@@ -2135,7 +2588,7 @@ async function registerPairing(appId, deviceId, label, bridgeId) {
     'pair',
     `Pairing registered: app ${appId || '(anon)'} ⇄ device ${deviceId}` +
       (bridgeId
-        ? ` via bridge ${bridgeId} (Thread — no self-enroll, see ozkey-11 §3)`
+        ? ` via bridge ${bridgeId} (bridged — no self-enroll, see ozkey-11 §3)`
         : ' — awaiting doorlock contact')
   );
   await recordAudit(appId, deviceId, 'pair', 'registered pairing');
@@ -2348,6 +2801,23 @@ api.post('/enroll/begin', async (req, res) => {
 });
 
 /* -- Locks (the owner's fleet) ----------------------------------------------- */
+/** XF-144 (2026-09-02, PM-approved): "does this lock have a confirmed-online
+ * fallback bridge on record" — deterministic and cheap (`lock_bridges` +
+ * `bridges_presence` only), not scan-confirmed (PM's own call: a live scan
+ * per `GET /locks` call is too heavy for a list endpoint). Lets the app show
+ * a "no backup bridge" warning without guessing reachability itself.
+ */
+async function backupAvailableSet(lockIds = null) {
+  const [rows] = await pool.query(
+    `SELECT DISTINCT lb.lock_id
+       FROM lock_bridges lb
+       JOIN bridges_presence bp ON bp.bridge_id = lb.bridge_id AND bp.presence = 'online'
+      WHERE lb.priority > 0` + (lockIds ? ' AND lb.lock_id IN (?)' : ''),
+    lockIds ? [lockIds] : []
+  );
+  return new Set(rows.map((r) => r.lock_id));
+}
+
 api.get('/locks', async (req, res) => {
   if (!guardDb(res)) return;
   try {
@@ -2362,13 +2832,21 @@ api.get('/locks', async (req, res) => {
     const [rows] = await pool.query(
       `SELECT id, site_id, app_id, mac, label, fw, status, power_profile, heartbeat_s,
               last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
-              presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s,
+              presence, direct_presence, presence_reason, presence_at, battery_pct, mcu_link_up, mcu_last_frame_s,
               seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch, bonds
          FROM locks ORDER BY enrolled_at DESC`
     );
+    const backupSet = await backupAvailableSet();
     const locks = rows.map((l) => {
       const { caps, source } = effectiveCaps(l);
-      return { ...l, caps, caps_source: source, events_at_risk: eventsAtRisk(l), events_pending: eventsPending(l) };
+      return {
+        ...l,
+        caps,
+        caps_source: source,
+        events_at_risk: eventsAtRisk(l),
+        events_pending: eventsPending(l),
+        backup_available: backupSet.has(l.id),
+      };
     });
     res.json({ ok: true, locks });
   } catch (err) {
@@ -2448,7 +2926,7 @@ api.get('/locks/:id', async (req, res) => {
     const [[lock]] = await pool.query(
       `SELECT id, app_id, site_id, mac, label, fw, status, power_profile, heartbeat_s,
               last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
-              presence, presence_reason, presence_at, battery_pct, thread_age_s, mcu_link_up, mcu_last_frame_s,
+              presence, direct_presence, presence_reason, presence_at, battery_pct, mcu_link_up, mcu_last_frame_s,
               seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch, bonds
          FROM locks WHERE id = ?`,
       [req.params.id]
@@ -2462,10 +2940,54 @@ api.get('/locks/:id', async (req, res) => {
     // it from a bound bridge" — XF-48 §9.5 wants the device's own report to win
     // once the state uplink exists, and silently swapping one for the other would
     // be undiagnosable from the app side.
+    const backupSet = await backupAvailableSet([lock.id]);
     res.json({
       ok: true,
-      lock: { ...lock, caps, caps_source: source, events_at_risk: eventsAtRisk(lock), events_pending: eventsPending(lock) },
+      lock: {
+        ...lock,
+        caps,
+        caps_source: source,
+        events_at_risk: eventsAtRisk(lock),
+        events_pending: eventsPending(lock),
+        backup_available: backupSet.has(lock.id),
+      },
     });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/** XF-144 (2026-09-01): "scan advisor," not a full pairer — deliberately
+ * does NOT trigger pairing itself. Today's only pairing mechanism
+ * (`pairctl`) is a BLE GATT write the PHONE performs directly against a
+ * bridge; there is no MQTT-triggered pairing command on a bridge today
+ * (flagged, not assumed, in this endpoint's own XF-144 thread — building
+ * that is a separate, not-yet-agreed piece). This endpoint answers "which
+ * bridge should you pair with," ranked by the bridge's own measured
+ * reachability instead of the phone's BLE radio — the app still performs
+ * the actual `pairctl` write itself, same mechanism as its already-shipped
+ * RSSI-ranked flow, just fed a better signal.
+ */
+api.post('/locks/:id/scan-bridges', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const deviceId = req.params.id;
+    const [[lock]] = await pool.query('SELECT id FROM locks WHERE id = ?', [deviceId]);
+    if (!lock)
+      return res
+        .status(404)
+        .json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
+
+    const { requested, results } = await scanForLockAcrossBridges(deviceId);
+    const candidates = results
+      .filter((r) => r.found)
+      .sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
+    logEvent(
+      'info',
+      `Scan-bridges for ${deviceId}: asked ${requested} online bridge(s), ` +
+        `${results.length} responded, ${candidates.length} report reachability`
+    );
+    res.json({ ok: true, device_id: deviceId, bridges_asked: requested, candidates });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -2474,7 +2996,7 @@ api.get('/locks/:id', async (req, res) => {
 api.patch('/locks/:id', async (req, res) => {
   if (!guardDb(res)) return;
   try {
-    const { label, power_profile, heartbeat_s } = req.body || {};
+    const { label, power_profile, heartbeat_s, bridge_id } = req.body || {};
     const sets = [];
     const params = [];
     if (label !== undefined) {
@@ -2488,6 +3010,46 @@ api.patch('/locks/:id', async (req, res) => {
           .json({ ok: false, code: 'invalid_power_profile', error: 'invalid power_profile' });
       sets.push('power_profile = ?');
       params.push(power_profile);
+    }
+    // XF-138 P5, S6/S7: `bridge_id` used to be write-once (POST /pairings'
+    // `COALESCE(VALUES(bridge_id), bridge_id)` — first value wins, never
+    // clearable). That left no way to re-pair an already-registered lock to a
+    // different bridge or unpair it, which the P5 allowlist flow needs.
+    // `undefined` = field omitted, leave untouched; explicit `null` = unpair;
+    // a non-empty string = (re)pair. No COALESCE here — this route is the one
+    // place allowed to overwrite, including back to NULL.
+    let bridgeIdChanged = false;
+    let newBridgeId;
+    if (bridge_id !== undefined) {
+      if (bridge_id !== null && (typeof bridge_id !== 'string' || !bridge_id.trim()))
+        return res.status(400).json({
+          ok: false,
+          code: 'invalid_bridge_id',
+          error: 'bridge_id must be a non-empty string (to pair) or null (to unpair)',
+        });
+      newBridgeId = bridge_id === null ? null : bridge_id.trim().slice(0, 64);
+      sets.push('bridge_id = ?');
+      params.push(newBridgeId);
+      bridgeIdChanged = true;
+      // XF-138 (2026-08-31): `mcu_link_up`/`mcu_last_frame_s` are only ever
+      // meaningful relative to the specific bridge relationship that
+      // produced them — clear both on ANY bridge_id change (pair or
+      // unpair), so stale telemetry from a previous bridge relationship can
+      // never be misread as current under a new one.
+      //
+      // XF-146 (2026-09-01): `direct_presence`/`presence` reset to
+      // 'unknown' for the same reason — a bridge_id change is exactly the
+      // moment any prior reachability signal stops being trustworthy
+      // (found live: LockA got permanently stuck `lock_unreachable` after
+      // an unrelated bridge MQTT blip, with no way back short of a brand-
+      // new physical reconnect; the underlying derivation bug is fixed,
+      // but this endpoint is also a legitimate, reviewed way to force a
+      // fresh signal for a row already stuck from before the fix existed).
+      // Safe direction to err in either way: under-claiming reachability
+      // until a real signal arrives beats trusting a stale one.
+      sets.push(
+        "mcu_link_up = NULL, mcu_last_frame_s = NULL, direct_presence = 'unknown', presence = 'unknown', presence_reason = NULL"
+      );
     }
     if (heartbeat_s !== undefined) {
       // Clamp to the SAME 60–600 the firmware enforces (clampHeartbeatS,
@@ -2530,6 +3092,44 @@ api.patch('/locks/:id', async (req, res) => {
         .status(404)
         .json({ ok: false, code: 'lock_not_found', error: `Lock ${req.params.id} not found` });
     logEvent('info', `Lock ${req.params.id} settings updated (${sets.join(', ')})`);
+    if (bridgeIdChanged) {
+      logEvent(
+        'pair',
+        newBridgeId
+          ? `Lock ${req.params.id} paired to bridge ${newBridgeId} via PATCH (XF-138 P5)`
+          : `Lock ${req.params.id} unpaired (bridge_id cleared) via PATCH (XF-138 P5)`
+      );
+      await recordAudit(
+        null,
+        req.params.id,
+        newBridgeId ? 'pair' : 'unpair',
+        newBridgeId ? `bridge_id set to ${newBridgeId}` : 'bridge_id cleared'
+      );
+      // XF-144 (2026-09-01): keep `lock_bridges` in sync with every real
+      // pair/re-pair, not just at migration time — otherwise the candidate
+      // list is a frozen snapshot from whenever the table was created,
+      // useless for any lock paired after that moment. A newly-active
+      // bridge always becomes priority 0; every other known candidate for
+      // this lock shifts down one, so the most recently proven-working
+      // bridge is always tried first on failover, and older ones remain
+      // available as fallback rather than being discarded. Only runs when
+      // actually PAIRING (newBridgeId truthy) — unpairing removes the
+      // active pointer but deliberately leaves history in this table, so a
+      // later re-pair to a previously-known bridge doesn't lose its place
+      // in the ranking.
+      if (newBridgeId) {
+        await pool.query('UPDATE lock_bridges SET priority = priority + 1 WHERE lock_id = ? AND bridge_id != ?', [
+          req.params.id,
+          newBridgeId,
+        ]);
+        await pool.query(
+          `INSERT INTO lock_bridges (lock_id, bridge_id, priority, last_confirmed_reachable_at)
+             VALUES (?, ?, 0, NOW())
+           ON DUPLICATE KEY UPDATE priority = 0, last_confirmed_reachable_at = NOW()`,
+          [req.params.id, newBridgeId]
+        );
+      }
+    }
     if (lastPulledSeq !== undefined) {
       const [[lock]] = await pool.query(
         'SELECT dropped_before_seq, last_pulled_seq FROM locks WHERE id = ?',
@@ -2540,7 +3140,29 @@ api.patch('/locks/:id', async (req, res) => {
         logEvent('info', `XF-125: ${req.params.id} events risk cleared — PATCH last_pulled_seq=${lock.last_pulled_seq}`);
       }
     }
-    res.json({ ok: true, id: req.params.id });
+    // Return the updated row (with recomputed caps) so a bridge_id change is
+    // immediately visible without a second GET — the whole point of S6/S7 is
+    // that remote_unlock flips the instant bridge_id does (effectiveCaps()).
+    const [[updatedLock]] = await pool.query(
+      `SELECT id, app_id, site_id, mac, label, fw, status, power_profile, heartbeat_s,
+              last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
+              presence, direct_presence, presence_reason, presence_at, battery_pct, mcu_link_up, mcu_last_frame_s,
+              seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch, bonds
+         FROM locks WHERE id = ?`,
+      [req.params.id]
+    );
+    const { caps, source } = effectiveCaps(updatedLock);
+    res.json({
+      ok: true,
+      id: req.params.id,
+      lock: {
+        ...updatedLock,
+        caps,
+        caps_source: source,
+        events_at_risk: eventsAtRisk(updatedLock),
+        events_pending: eventsPending(updatedLock),
+      },
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -2772,6 +3394,28 @@ api.delete('/locks/:id', async (req, res) => {
       return res.status(404).json({ ok: false, code: 'lock_not_found', error: `Lock ${id} not found` });
     if (lock && lock.mac) nexusDecommission(lock.mac); // fire-and-forget, see nexusDecommission()
 
+    // XF-147: tell the currently-assigned bridge to drop this lock from its
+    // own BLE allowlist too — without this, a decommissioned lock silently
+    // reconnects on the bridge's next scan and keeps occupying a connection
+    // slot as if still owned. Fire-and-forget, same as nexusDecommission()
+    // above: the row is already gone server-side regardless of whether the
+    // bridge is currently reachable to receive this. Deliberately
+    // `unpair_lock`, NOT `unpair` — firmware confirmed bare `op:"unpair"` on
+    // this topic already means "wipe the whole bridge" (bridgeOwnershipCheck
+    // + factoryReset()), a real naming collision caught before this shipped.
+    // Only known limitation, not solved here: if this lock was ever paired
+    // to an earlier bridge that `bridge_id` no longer points to, that older
+    // bridge never hears about this and keeps a stale allowlist entry — the
+    // same single-column limitation XF-144's `lock_bridges` table exists
+    // for elsewhere, not re-solved as a one-off here (see XF-147 Q3).
+    if (lock && lock.bridge_id) {
+      mqttPublish(CONFIG.topicBridgeCommand(lock.site_id || CONFIG.SITE_ID, lock.bridge_id), {
+        op: 'unpair_lock',
+        id,
+      });
+      logEvent('key', `XF-147: sent unpair_lock for ${id} to bridge ${lock.bridge_id}`);
+    }
+
     // ozkey-41 §5/§6: wait for the real wire-level outcome — done after the
     // commit above (this server's own bookkeeping is unconditional, same as
     // before) rather than gating the DB delete on it, since how the app
@@ -2961,8 +3605,27 @@ const ENFORCE_CAPS = process.env.OZLOCK_ENFORCE_CAPS !== '0';
  * about our schema — and this arrives over an MQTT broker that is anonymous-open
  * on the bench, so anything unrecognised is dropped rather than stored.
  */
-const KNOWN_TRANSPORTS = ['wifi', 'thread'];
-const KNOWN_CAPS = ['remote_unlock', 'assisted_unlock', 'pin_sync', 'audit'];
+// XF-138 P5 (2026-08-31): CH584M locks are BLE-native and self-report
+// transport:"ble" (firmware bridgeBLE-0.20). Thread support is fully
+// retired — no lock uses it any more — so `'thread'` is no longer a known
+// value here; a stray legacy report of it is treated the same as any other
+// unrecognised value (dropped to NULL, not stored) rather than accepted.
+const KNOWN_TRANSPORTS = ['wifi', 'ble'];
+// XF-138/139 P5 (2026-08-31): `cred_pin` deliberately NOT here — firmware
+// confirmed it never sends that literal string, only `pin_sync`
+// (`if (canPin) caps.add("pin_sync")`, the actual source). `cred_pin` is
+// the app's own name for the same fact (`directory_client.dart:268/273`),
+// translated at the `effectiveCaps()` response layer, not accepted here as
+// if the device might say it — this list is meant to reflect what firmware
+// can actually report on the wire. `rfid_sync` alongside `pin_sync` for the
+// same reason — `if (canRfid) caps.add("rfid_sync")`, same source. Missing
+// it caused a real live bug: `deviceIdentity()`'s filter requires EVERY
+// reported value to be recognised or the whole array is dropped as "nothing
+// said" (its own documented all-or-nothing behavior) — a `pin_sync`-only
+// whitelist silently rejected a real, otherwise-valid report the moment
+// firmware's actual payload included `rfid_sync` too. Caught live before
+// firmware's own flash-and-verify pass, not after.
+const KNOWN_CAPS = ['remote_unlock', 'assisted_unlock', 'pin_sync', 'rfid_sync', 'audit'];
 
 // XF-58. The "visitor at the door" unlock: the owner authorises remotely while on
 // the phone, and the visitor's keypad touch completes it. 60 s — operator's call,
@@ -3060,6 +3723,24 @@ function effectiveCaps(lock) {
   if (device.includes('assisted_unlock')) caps.push('assisted_unlock');
 
   for (const cap of ['pin_sync', 'audit']) if (device.includes(cap)) caps.push(cap);
+
+  // XF-138/139 P5 (2026-08-31, firmware's correction): `cred_pin` is NOT a
+  // name firmware has ever sent or ever will — the device only ever reports
+  // `pin_sync` (`if (canPin) caps.add("pin_sync")`, confirmed against the
+  // actual source, not assumed). `cred_pin` exists ONLY in the app's own
+  // gate (`directory_client.dart:268/273`, `banoi_doorlock.dart:5700`) —
+  // the two names were never the same field, just two different teams'
+  // words for the same fact, and nothing before this relay ever put them
+  // in the same room to notice. Translating here, not in storage: `caps`
+  // above stays the raw, unmolested truth of what the device said (`caps`
+  // storage is meant to be auditable device fact, not a translation), and
+  // this is the one place — building the API response — where the two
+  // vocabularies actually need to agree. No RFID-side translation yet:
+  // firmware confirmed `cred_pin`'s existence but explicitly could not
+  // confirm an app-facing name for RFID's equivalent — guessing one here
+  // would just be a third instance of this exact bug, not a fix.
+  if (device.includes('pin_sync')) caps.push('cred_pin');
+
   return { caps, source: 'device' };
 }
 
