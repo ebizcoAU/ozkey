@@ -52,10 +52,22 @@
  *                  inventing one would be worse than saying nothing.
  * @param fw        optional firmware version, for the `online` case. Empty to
  *                  omit.
+ * @param via       the BRIDGE's own device_id, when this report is a bridge
+ *                  relaying a BLE-paired lock's connect/disconnect on its
+ *                  behalf — empty/null for every other producer (a Thread
+ *                  lock's own beacon, a Wi-Fi lock's own direct publish, the
+ *                  broker's LWT). XF-144 2026-09-02: server needs to know
+ *                  WHICH bridge a presence report came from to correct
+ *                  `locks.bridge_id` when it drifts from reality (a bridge
+ *                  recovering and silently reclaiming a lock the server had
+ *                  since reassigned elsewhere) — nothing in the payload
+ *                  carried that before. Omitted, not empty-string, when not
+ *                  applicable — same convention `reason`/`msg_id` already use.
  */
 static String ozBuildLockPresence(const String &deviceId, bool online,
                                   const char *reason, const String &msgId,
-                                  const char *fw = nullptr) {
+                                  const char *fw = nullptr,
+                                  const String &via = String()) {
   JsonDocument doc;
   doc["state"] = online ? "online" : "offline";
   doc["id"] = deviceId;
@@ -65,6 +77,7 @@ static String ozBuildLockPresence(const String &deviceId, bool online,
   if (reason && *reason) doc["reason"] = reason;
   if (msgId.length()) doc["msg_id"] = msgId;
   if (fw && *fw) doc["fw"] = fw;
+  if (via.length()) doc["via"] = via;
   String out;
   serializeJson(doc, out);
   return out;
@@ -73,12 +86,20 @@ static String ozBuildLockPresence(const String &deviceId, bool online,
 /**
  * Should this outcome be published RETAINED?
  *
- * Retain iff the lock actually went away. The distinction is bridge32's original
- * rule and it matters: a refusal is an EVENT, not a liveness state — retaining
- * one would replay "I refused" to every future subscriber long after the request
- * that caused it is gone.
+ * 🔴 2026-09-01, XF-146 — was `!online` (retain offline only). Found live on
+ * the bench: a late/reconnecting subscriber that misses the one-shot online
+ * transition has nothing to fall back to except the last RETAINED message on
+ * the topic — which, under the old rule, could only ever be an old offline.
+ * Bridge 1 held a lock for hours, its last (retained) word on the topic was
+ * "offline"; a different bridge later took over and published a genuinely
+ * successful "online" — not retained, so it never overwrote the stale
+ * snapshot. Confirmed against the live rig, not theoretical (XF-146).
  *
- * Derived from `online` rather than passed in, so the rule lives in one place
- * and a caller cannot get it wrong.
+ * Retain BOTH transitions now: presence is a liveness state either
+ * direction, and a subscriber should never be able to read a stale opposite
+ * state just because it wasn't listening at the exact moment things changed
+ * back. Server confirmed this is purely additive on their side —
+ * `handleLockPresence()` already treats a retained redelivery identically to
+ * a live push (XF-146).
  */
-static inline bool ozPresenceShouldRetain(bool online) { return !online; }
+static inline bool ozPresenceShouldRetain(bool online) { (void)online; return true; }

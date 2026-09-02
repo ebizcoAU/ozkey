@@ -168,6 +168,36 @@ struct OzBleLock {
 };
 static OzBleLock g_bleLocks[OZ_BLE_MAX_LOCKS];
 
+// ── XF-144 P2 — server-requested targeted scan ──────────────────────────────
+//
+// "Can THIS bridge reach lock X right now" — a one-shot, bounded scan, not the
+// adaptive discovery loop above. Scoped deliberately narrow for v1: a raw BLE
+// advertisement carries only the MAC + RSSI, never the device_id (that only
+// comes from a full connect + `info` GATT read, done today in
+// ozBleConnectOne()). Connecting to every stranger seen during a scan window
+// just to identify it would be the exact kind of extra central-role radio
+// activity XF-143 already showed can hurt a concurrent peripheral/central op —
+// worse here, since it could run while OTHER paired locks are actively
+// connected, not just during an idle claim window.
+//
+// So v1 matches ONLY against identity this bridge already knows: the
+// currently-paired table (g_bleLocks) and the seen-but-unpaired cache
+// (g_seenUnpaired) both already map deviceId -> last-known address. If the
+// target has never been seen by this specific bridge, the honest answer is
+// "not found" — no stranger-connecting. This is the useful case anyway: the
+// failover ask is "which of my ALREADY-associated candidate bridges can best
+// reach this lock", not cold discovery of a lock this bridge has zero history
+// with.
+struct OzScanRequest {
+  bool active = false;
+  String target;         // device_id being hunted
+  String knownAddr;       // resolved once at request time; "" = never seen here
+  unsigned long deadlineMs = 0;
+  bool found = false;
+  int rssi = 0;
+};
+static OzScanRequest g_scanReq;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // P5 F1-F3 — PAIRING: which locks is this bridge actually responsible for?
 //
@@ -424,6 +454,15 @@ static OzBleLock *ozBleFindByDeviceId(const String &id) {
   for (auto &l : g_bleLocks) if (l.inUse && l.deviceId == id) return &l;
   return nullptr;
 }
+// XF-144 P2 — last-known address for a device_id, from either identity source
+// this bridge has: a currently-held slot, or the seen-but-unpaired cache
+// (P5 F2). "" means this bridge has no record of ever hearing from it.
+static String ozBleLastKnownAddr(const String &deviceId) {
+  OzBleLock *l = ozBleFindByDeviceId(deviceId);
+  if (l) return l->addr;
+  for (auto &s : g_seenUnpaired) if (s.deviceId == deviceId) return s.addr;
+  return String("");
+}
 static bool ozBleConnected(const OzBleLock &l) {
   return l.inUse && l.client && l.client->isConnected();
 }
@@ -434,6 +473,59 @@ static bool ozBleConnected(const OzBleLock &l) {
 static bool ozBleLockConnected(const String &id) {
   OzBleLock *l = ozBleFindByDeviceId(id);
   return l && ozBleConnected(*l);
+}
+/** XF-144 Phase 2 — is deviceId currently visible over BLE (seen in a recent
+ *  scan, whether or not paired here)? Reuses g_seenUnpaired, the same
+ *  visibility data ozBleStartTargetedScan()'s match logic already reads.
+ *  Lives here, not in bridgeBLE.ino's peer-takeover code, because
+ *  g_seenUnpaired is only in scope after this header's include point — same
+ *  reason ozBleLockConnected() above is forward-declared and defined here.
+ *  30s freshness window: long enough to survive one scan gap, short enough
+ *  that a lock that walked out of range does not look reachable forever. */
+static bool ozBleCurrentlyVisible(const String &deviceId) {
+  for (auto &s : g_seenUnpaired) {
+    if (s.deviceId == deviceId && s.at && millis() - s.at < 30000UL) return true;
+  }
+  return ozBleLockConnected(deviceId); // already connected also counts as visible
+}
+
+/** XF-144 Phase 2 — our own roster, broadcast periodically so peers know
+ *  what to take over if we go dark. Lives here, not in bridgeBLE.ino's
+ *  peer-roster code, because g_pairedIds/g_pairedCount (the allowlist —
+ *  the same source pair_lock/unpair_lock already maintain, not a second
+ *  notion of "what do I hold") are only in scope after this header's
+ *  include point. threadUdp/deviceId/OZ_THREAD_UDP_PORT are all declared
+ *  in bridgeBLE.ino BEFORE the #include, so still visible here. */
+static bool sendBridgeRosterBeacon() {
+  if (!threadUdpReady) return false;
+  JsonDocument doc;
+  doc["from"] = deviceId;
+  doc["kind"] = "bridge_roster";
+  JsonArray locks = doc["locks"].to<JsonArray>();
+  for (uint8_t i = 0; i < g_pairedCount; i++) locks.add(g_pairedIds[i]);
+  String out;
+  serializeJson(doc, out);
+
+  IPAddress all;
+  if (!all.fromString("ff03::1")) return false;
+  // 🔴 PORT 5053, NOT 5052. Found live 2026-09-02 on the first real-hardware
+  // test of this feature: rosters were transmitting correctly every 15s and
+  // NOBODY was receiving them. sendTimeBeacon() — which this was modelled on —
+  // sends to OZ_THREAD_UDP_PORT (5052) because its audience is LOCKS, which
+  // listen there. Bridges listen on OZ_THREAD_UPLINK_PORT (5053), the uplink
+  // RX socket pollUplinkOne() reads. A bridge-to-bridge message sent to 5052
+  // is transmitted perfectly and lands where no bridge is listening — the
+  // send-side log line looks completely healthy, which is exactly why this
+  // took a real two-bridge test to catch rather than a code read.
+  if (!threadUdp.beginPacket(all, OZ_THREAD_UPLINK_PORT)) return false;
+  threadUdp.write((const uint8_t *)out.c_str(), out.length());
+  if (!threadUdp.endPacket()) {
+    Serial.println("[PEER] roster beacon endPacket failed");
+    return false;
+  }
+  g_lastRosterBroadcastAt = millis();
+  Serial.printf("[PEER] roster -> ff03::1 (%u lock(s))\n", (unsigned)g_pairedCount);
+  return true;
 }
 /** How many locks this bridge currently holds a live BLE link to — drawn on
  *  the panel, so the central role is observable without a serial cable. */
@@ -570,6 +662,16 @@ class OzBleScanCb : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) override {
     if (!dev.haveServiceUUID() || !dev.isAdvertisingService(BLEUUID(OZL_SVC_UUID))) return;
     const String addr = dev.getAddress().toString();
+
+    // XF-144 P2 — a targeted scan is watching for one specific address this
+    // tick, independent of (and not gated by) the normal pairing/discovery
+    // bookkeeping below, since the target may well be a lock this bridge does
+    // NOT hold and never will.
+    if (g_scanReq.active && g_scanReq.knownAddr.length() && addr == g_scanReq.knownAddr) {
+      g_scanReq.found = true;
+      g_scanReq.rssi = dev.getRSSI();
+    }
+
     if (ozBleFindByAddr(addr)) return;            // already known/connected
     // P5 F2 — a stranger we probed recently. Re-connecting would cost a full
     // connect+GATT-discover just to re-learn an identity we already rejected,
@@ -584,6 +686,33 @@ class OzBleScanCb : public BLEAdvertisedDeviceCallbacks {
   }
 };
 static OzBleScanCb g_bleScanCb;
+
+// XF-144 P2 — single source of truth for the scan-request capacity guard,
+// forward-declared in bridgeBLE.ino (same reason as forwardOverBle()).
+static bool ozBleAtCapacity() { return ozBleConnectedCount() >= OZ_BLE_MAX_LOCKS; }
+
+// XF-144 P2 — arm a bounded, targeted scan. Caller (mqttMessageReceived())
+// already applied the busy/capacity guard; this just does the mechanics.
+// Forward-declared in bridgeBLE.ino (same reason as forwardOverBle()).
+static void ozBleStartTargetedScan(const String &target, uint32_t durationS) {
+  g_scanReq = OzScanRequest();
+  g_scanReq.active = true;
+  g_scanReq.target = target;
+  g_scanReq.knownAddr = ozBleLastKnownAddr(target);
+  g_scanReq.deadlineMs = millis() + durationS * 1000UL;
+
+  BLEScan *scan = BLEDevice::getScan();
+  if (scan) {
+    if (scan->isScanning()) scan->stop();
+    scan->setAdvertisedDeviceCallbacks(&g_bleScanCb, false);
+    scan->setActiveScan(true);
+    scan->start(durationS, nullptr, false);
+  }
+  Serial.printf("[SCAN] started target=%s known_addr=%s duration=%us\n",
+                target.c_str(),
+                g_scanReq.knownAddr.length() ? g_scanReq.knownAddr.c_str() : "(never seen)",
+                (unsigned)durationS);
+}
 
 /** Connect + discover + subscribe. Main task only. */
 static bool ozBleConnectOne(const String &addr) {
@@ -782,8 +911,11 @@ static bool ozBleConnectOne(const String &addr) {
   // shares, keyed only on device_id — publishing here is exactly the "any
   // transport, same online-transition tracking" case it was built for.
   if (ozClaimLockOnline(slot->deviceId.c_str())) {
+    // `via` = this bridge's own id — see ozBuildLockPresence()'s doc comment
+    // (XF-144, 2026-09-02): lets the server correct locks.bridge_id off a
+    // real connect event instead of trusting whatever it last wrote.
     const String out = ozBuildLockPresence(slot->deviceId, true, OZ_PRESENCE_ONLINE,
-                                           String(""), lockFw.c_str());
+                                           String(""), lockFw.c_str(), deviceId);
     const String ptopic = "ozkie/" + cfgSiteId + "/locks/" + slot->deviceId + "/presence";
     const bool ok = mqttClient.publish(ptopic.c_str(), out.c_str(),
                                        ozPresenceShouldRetain(true));
@@ -836,6 +968,29 @@ static void ozBleCentralTick() {
   if (!g_bleCentralReady) return;
   ozBleSerialConsole(); // bench pairing tool — see its header
 
+  // XF-144 P2 — close out a targeted scan once its window elapses. Checked
+  // every tick rather than on a dedicated timer; the request is short-lived
+  // (duration_s, typically single-digit seconds) so tick-granularity latency
+  // here is negligible next to the scan itself.
+  if (g_scanReq.active && millis() >= g_scanReq.deadlineMs) {
+    BLEScan *scan = BLEDevice::getScan();
+    if (scan && scan->isScanning()) scan->stop();
+    JsonDocument doc;
+    doc["target"] = g_scanReq.target;
+    doc["found"] = g_scanReq.found;
+    if (g_scanReq.found) doc["rssi"] = g_scanReq.rssi;
+    String out;
+    serializeJson(doc, out);
+    const String topic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/scan_result";
+    const bool ok = mqttClient.publish(topic.c_str(), out.c_str());
+    Serial.printf("[SCAN] %s -> %s found=%s%s%s\n", g_scanReq.target.c_str(),
+                  topic.c_str(), g_scanReq.found ? "y" : "n",
+                  g_scanReq.found ? " rssi=" : "",
+                  g_scanReq.found ? String(g_scanReq.rssi).c_str() : "");
+    if (!ok) Serial.println("[SCAN] result publish FAILED");
+    g_scanReq = OzScanRequest();
+  }
+
   // ── REPAINT THE PANEL WHEN THE LOCK COUNT CHANGES ────────────────────────
   //
   // 🔴 drawStatus() runs on EVENTS ONLY — state transitions, notifyStatus(),
@@ -884,7 +1039,13 @@ static void ozBleCentralTick() {
       // reused here for the identical situation on a different transport.
       if (l.deviceId.length()) {
         ozForgetLockOnline(l.deviceId.c_str());
-        const String out = ozBuildLockPresence(l.deviceId, false, OZ_PRESENCE_LWT, String(""));
+        // `via` set here too, for audit symmetry with the online publish —
+        // but server's reconciliation logic should gate on the ONLINE
+        // transition specifically (a bridge losing its own connection is
+        // not a claim of ownership, so an offline `via` must not get read
+        // as "this bridge now owns the lock").
+        const String out = ozBuildLockPresence(l.deviceId, false, OZ_PRESENCE_LWT,
+                                               String(""), nullptr, deviceId);
         const String ptopic = "ozkie/" + cfgSiteId + "/locks/" + l.deviceId + "/presence";
         const bool ok = mqttClient.publish(ptopic.c_str(), out.c_str(),
                                            ozPresenceShouldRetain(false));
@@ -964,6 +1125,19 @@ static void ozBleCentralTick() {
   //
   // The flaw was conflating two states that share a number: "everything I own
   // is connected" (idle is right) and "I own nothing yet" (hunt).
+  // CLAIM WINDOW TAKES THE RADIO (2026-09-01, XF-143). A freshly-reset/unowned
+  // bridge is simultaneously the exact state that wants aggressive lock
+  // discovery (comment above, 2026-08-30) AND the state a phone is most
+  // likely trying to connect over BLE to actually CLAIM the bridge — the
+  // ESP32-C6 has one shared 2.4GHz radio for both central scan and peripheral
+  // GATT, and an active scan measurably hurts a concurrent peripheral
+  // connection attempt. Two bridges on the bench both failed to receive a
+  // claim/provision write while sitting in FAST discovery-scan mode; pausing
+  // scanning for the ~60s the window is open is a narrow, reversible trade —
+  // discovery just resumes on the next tick once the window closes, and
+  // already-paired locks are unaffected (they don't need scanning to work).
+  if (claimWindowOpen()) return;
+
   const uint8_t missing = ozBleMissingCount();
   const bool discovering = (ozBlePairedTotal() == 0);
   const unsigned long scanEvery =
@@ -1014,12 +1188,16 @@ static void ozBleCentralTick() {
 // When F4 lands this stays useful for exactly the case it was written for:
 // recovering a bridge whose app is unavailable.
 // ═══════════════════════════════════════════════════════════════════════════
-static void ozBleSerialConsole() {
-  if (!Serial.available()) return;
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (!line.length()) return;
-
+// 🔴 2026-09-01 — the actual command logic, extracted so bridgeBLE.ino's
+// ozBridgeConsolePoll() can call it too. That function reads raw Serial
+// input every loop tick and, being called first, ALWAYS drains the whole
+// buffer before ozBleSerialConsole() below ever runs — meaning these five
+// commands have been silently unreachable since ozBridgeConsolePoll() was
+// added earlier tonight. Caught live trying to run `pair all` for a bench
+// test. ozBleSerialConsole() itself is kept below as a second (now
+// harmless, never-first) reader in case call order ever changes, but the
+// real entry point for these commands today is ozBridgeConsolePoll().
+static void ozBlePairConsoleCmd(const String &line) {
   if (line == "paired") {
     Serial.printf("[PAIR] %u paired lock(s):\n", g_pairedCount);
     for (uint8_t i = 0; i < g_pairedCount; i++)
@@ -1027,7 +1205,6 @@ static void ozBleSerialConsole() {
                     ozBleFindByDeviceId(g_pairedIds[i]) ? "  (connected)" : "");
     return;
   }
-
   if (line == "seen") {
     bool any = false;
     for (auto &s : g_seenUnpaired) {
@@ -1040,7 +1217,6 @@ static void ozBleSerialConsole() {
                              "identified since boot)");
     return;
   }
-
   if (line == "pair all") {
     uint8_t n = 0;
     for (auto &s : g_seenUnpaired)
@@ -1048,22 +1224,27 @@ static void ozBleSerialConsole() {
     Serial.printf("[PAIR] pair all -> %u added\n", n);
     return;
   }
-
   if (line.startsWith("pair ")) {
     const String id = line.substring(5);
     Serial.printf("[PAIR] pair %s -> %s\n", id.c_str(),
                   ozBlePairAdd(id) ? "OK" : "REFUSED");
     return;
   }
-
   if (line.startsWith("unpair ")) {
     const String id = line.substring(7);
     Serial.printf("[PAIR] unpair %s -> %s\n", id.c_str(),
                   ozBlePairRemove(id) ? "OK" : "not in list");
     return;
   }
-
   Serial.println("[PAIR] commands: paired | seen | pair <id> | pair all | unpair <id>");
+}
+
+static void ozBleSerialConsole() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (!line.length()) return;
+  ozBlePairConsoleCmd(line);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

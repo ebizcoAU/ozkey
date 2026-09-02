@@ -244,7 +244,7 @@ static char g_advName[16] = BLE_NAME;
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
 // Own namespace, forked from bridge32-1.44 (2026-08-29) — see file header.
-#define FW_VERSION "bridgeBLE-0.25"
+#define FW_VERSION "bridgeBLE-0.41"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -294,6 +294,17 @@ static void ozBleCentralBegin();
 static uint8_t ozBleConnectedCount(); // drawStatus() paints these, and sits
 static uint8_t ozBlePairedTotal();    // above ozblecentral.h's include point
 static uint8_t ozBleMissingCount();
+// XF-144 P2 / XF-147 — same reason as forwardOverBle() above: defined in
+// ozblecentral.h, called from mqttMessageReceived() above its include point.
+static bool ozBlePairRemove(const String &deviceId);
+static bool ozBlePairAdd(const String &deviceId); // XF-144 pair_lock op, added 2026-09-02
+static bool ozBleIsPaired(const String &deviceId); // XF-144 Phase 2 peer-takeover, added 2026-09-02
+static bool ozBleCurrentlyVisible(const String &deviceId); // fwd — defined in ozblecentral.h
+static bool sendBridgeRosterBeacon(); // fwd — defined in ozblecentral.h (reads g_pairedIds/g_pairedCount)
+static unsigned long g_lastRosterBroadcastAt = 0; // XF-144 Phase 2, declared here so ozblecentral.h's def can write it
+static void ozBleStartTargetedScan(const String &target, uint32_t durationS);
+static void ozBlePairConsoleCmd(const String &cmd); // paired/seen/pair/unpair, see ozBridgeConsolePoll()
+static bool ozBleAtCapacity(); // true when ozBleConnectedCount() == OZ_BLE_MAX_LOCKS
 String cfgSsid, cfgPass;
 String cfgMode, cfgBrokerHost, cfgSiteId; // F1: parsed from provision JSON
 uint16_t cfgBrokerPort = 0;
@@ -383,6 +394,14 @@ void checkFactoryResetButton() {
     if (held >= 60UL && held < FACTORY_RESET_HOLD_MS) {
       claimWindowUntil = millis() + BRIDGE_CLAIM_WINDOW_MS;
       Serial.printf("[CLAIM] window OPEN %lus (short BOOT press)\n", BRIDGE_CLAIM_WINDOW_MS / 1000);
+      // XF-143: hand the radio to the peripheral side right now rather than
+      // waiting out whatever's left of an in-progress discovery scan — see
+      // ozBleCentralTick()'s claimWindowOpen() gate for why this matters.
+      BLEScan *activeScan = BLEDevice::getScan();
+      if (activeScan && activeScan->isScanning()) {
+        activeScan->stop();
+        Serial.println("[CLAIM] stopped in-progress BLE scan to free the radio");
+      }
     }
   }
   buttonWasDown = down;
@@ -610,17 +629,43 @@ void drawStatus() {
     gfx->fillScreen(LCD_C_WHITE);
     gfx->setTextWrap(false);
     gfx->setTextColor(LCD_C_BLACK);
+    // 2026-09-01, operator's ask, multi-bridge bench testing (XF-142): a
+    // generic "OZBRIDGE" title cannot tell two physical bridges apart by
+    // looking at them. g_advName ("OZB-" + last 2 BT MAC bytes) is the same
+    // short name the app's own BLE scan already shows, so the panel now
+    // agrees with what's on the phone instead of requiring a MAC lookup to
+    // match them up. No "BOOT" label here — this is the ALL-UP panel, the
+    // bridge is finished booting; that word belongs on the coming-up panel
+    // only, where it names a real transient state instead of going stale
+    // the moment this one renders.
+    // ── 2026-09-01, operator: 6 rows read as cramped — down to 5. Title and
+    // version now share one row (freeing a row), and g_advName moves to the
+    // footer beside the BLE count instead of keeping its own row up here —
+    // still on screen, just not spending a whole row on a value that never
+    // changes while the panel is up.
+    //
+    // Operator's follow-up: merging two size2 rows into one left a 15px dead
+    // gap before the WIFI row below (that row didn't move). Bumped this row
+    // to size3 and dropped down 5px to close the gap.
+    //
+    // Second follow-up: "OZBRIDGE" stays size3, version drops to size2 —
+    // mixed sizes on one row, not a uniform bump. This also fixes the width
+    // problem from the first pass for free: "OZBRIDGE" alone is 8*18=144px,
+    // version at size2 is ~5*12=60px, well inside 240px even with the space
+    // back. y is nudged +8 on the version so its (shorter) glyph cell sits
+    // roughly baseline-aligned with the big title instead of top-aligned
+    // against it — flag if that reads as misaligned rather than intentional.
+    gfx->setTextSize(3);
+    gfx->setCursor(4, 11);
+    gfx->print("OZBRIDGE");
     gfx->setTextSize(2);
-    gfx->setCursor(170, 10);
+    gfx->setCursor(4 + 8 * 18 + 4, 19);
     gfx->println(FW_DISPLAY_VERSION);
-    gfx->setTextSize(3); // reverted from 3 (2026-07-27) — too big
-    gfx->setCursor(4, 12);
-    gfx->println("OZBRIDGE");
-    gfx->setTextSize(2);
     // ── WIFI: show the ADDRESS, not "OK" (operator layout, 2026-08-11) ────
     // "OK" is not actionable. The IP is the thing you actually need when
     // pointing a bench tool or a broker at this bridge, and its absence is a
     // more honest failure indication than a green word.
+    gfx->setTextSize(2); // row1 above is size3 now — reset for every row after it
     gfx->setCursor(4, 44);
     if (WiFi.status() == WL_CONNECTED) {
       gfx->print("WIFI: ");
@@ -770,13 +815,14 @@ void drawStatus() {
       // OFF from the two values actually printed makes TOTAL == ON + OFF true
       // by construction; nTotal/nOn can still each be one tick stale, but the
       // three numbers on screen can never again visibly contradict each other.
-      const uint8_t nOn    = ozBleConnectedCount();
-      const uint8_t nTotal = ozBlePairedTotal();
-      const uint8_t nOff   = (nTotal > nOn) ? (uint8_t)(nTotal - nOn) : 0;
-      gfx->printf("BLE:%u ON:%u OFF:%u", nTotal, nOn, nOff);
-      // No status dot (operator, 2026-08-30): the three numbers already carry
-      // it, and more precisely — OFF>0 IS the outage. A dot that only
-      // re-encodes OFF!=0 is redundant ink on a 240 px row.
+      // 2026-09-01: down to ON only, plus g_advName — the row now carries
+      // identity too (freed off the title row above), and "BLE:%u ON:%u
+      // OFF:%u OZB-xxxx" no longer fits a 240px row at size2. ON, not the
+      // paired total, kept as the one number: it is the live, moving fact
+      // (see the ozBleConnectedCount() history above) — TOTAL/OFF are still
+      // in the serial log and the app for anyone who needs the breakdown.
+      const uint8_t nOn = ozBleConnectedCount();
+      gfx->printf("BLE:%u %s", nOn, g_advName);
     }
     return;
   }
@@ -784,26 +830,50 @@ void drawStatus() {
   // Reworked (2026-07-27, user pass): dropped the separate header line and
   // the factory-reset hint (screen real estate) and the device_id line ("no
   // use") — version now lives on the title line instead of its own row.
+  //
+  // 🔴 2026-09-01, operator's ask — the device_id line is back, deliberately
+  // reversing the above. "No use" was true for a single-bridge bench; it
+  // stopped being true the moment a SECOND bridge existed and someone needed
+  // to tell them apart by looking at the panel rather than cross-referencing
+  // a MAC (XF-142, multi-bridge testing). g_advName, not a raw MAC — same
+  // short form the app's own BLE scan already shows.
   gfx->fillScreen(LCD_C_BLACK);
   gfx->drawRect(0, 0, 240, 135, LCD_C_RED);
   gfx->setTextWrap(false);
+  // ── 2026-09-01, operator: layout was "messy" — lastStatus + g_advName
+  // sharing one size2 line overflowed the 240px panel the moment the string
+  // was long (e.g. "BRIDGE_CLAIM_REQUIRED" is 21 chars = 252px at size2).
+  // Gave it its own row — but size1 (operator's next pass) read too small.
+  // Kept size2 (readable) and truncate instead: 19 chars is the most that
+  // fits a 240px row at size2 from cursor x=6 (19*12 + 6 = 234px), so this
+  // clips rather than overflows past the border. version/identity each get
+  // their own row below instead of doubling up with status.
   gfx->setTextColor(LCD_C_RED);
-  gfx->setTextSize(2); // bumped from 1 — was unreadable
-  gfx->setCursor(6, 10);
-  gfx->println(lastStatus); // no "STATUS: " label — longest value (17 chars)
-                             // already fills the width at size2 with it
+  gfx->setTextSize(2);
+  gfx->setCursor(6, 8);
+  char statusTrunc[20]; // 19 visible chars + NUL — see width note above
+  // "BOOT" is the static init value (line ~108), never re-sent by
+  // notifyStatus() — it's only ever on screen before the first real ladder
+  // event, i.e. exactly when a short BOOT press is the useful next step.
+  // Display-only substitution: the wire/BLE value stays the literal "BOOT"
+  // in case anything downstream keys off it.
+  snprintf(statusTrunc, sizeof(statusTrunc), "%s",
+           lastStatus == "BOOT" ? "Press Boot to pair" : lastStatus.c_str());
+  gfx->println(statusTrunc);
   gfx->setTextColor(LCD_C_WHITE);
-  gfx->setCursor(6, 44);
+  gfx->setTextSize(2);
+  gfx->setCursor(6, 28);
   gfx->print("OZBRIDGE ");
   gfx->println(FW_DISPLAY_VERSION);
-  gfx->setTextSize(2);
+  gfx->setCursor(6, 48);
+  gfx->println(g_advName);
   gfx->setTextColor(LCD_C_RED);
-  gfx->setCursor(6, 90);
+  gfx->setCursor(6, 80);
   if (WiFi.status() == WL_CONNECTED) {
     gfx->print("IP ");
     gfx->println(WiFi.localIP().toString());
   }
-  gfx->setCursor(6, 112);
+  gfx->setCursor(6, 104);
   if (cfgSiteId.length()) {
     gfx->print("site ");
     gfx->println(cfgSiteId);
@@ -1131,6 +1201,100 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
         mqttClient.publish(t.c_str(), "{\"state\":\"offline\",\"reason\":\"factory_reset\"}", true);
       }
       factoryReset(); // never returns
+      return;
+    }
+  }
+
+  // ── XF-144 P2 / XF-147 — server-triggered scan & per-lock unpair ─────────
+  //
+  // Deliberately checked here, before the generic target/forward relay below,
+  // and NOT folded into the factory_reset/unpair block above even though the
+  // literal word "unpair" appears in both. THAT "unpair" (op == "unpair", no
+  // `id` field) is bridgeOwnershipCheck()-gated and calls factoryReset() —
+  // it wipes THIS ENTIRE BRIDGE (WiFi/broker/allowlist/everything), because
+  // it means "unpair this bridge from the app/account". XF-147's ask is a
+  // single lock leaving this bridge's own BLE allowlist while the bridge
+  // keeps running everything else — a completely different, far less
+  // destructive action. Reusing the same op name for both would mean
+  // whichever caller sends `{"op":"unpair","id":"<lock_id>"}` (as first
+  // drafted in XF-147/PM's directive) accidentally wipes the whole bridge
+  // instead of releasing one lock — named `unpair_lock` specifically to make
+  // that collision impossible, not just unlikely.
+  {
+    const char *op2 = doc["op"] | (const char *)nullptr;
+    if (op2 && strcmp(op2, "unpair_lock") == 0) {
+      const String id = (const char *)(doc["id"] | doc["target"] | "");
+      const bool ok = id.length() && ozBlePairRemove(id);
+      Serial.printf("[UNPAIR-LOCK] %s -> %s\n", id.length() ? id.c_str() : "(no id)",
+                    ok ? "OK" : "not paired here / no id");
+      return;
+    }
+    // XF-144 — the missing half of auto-failover: the sweep only ever wrote
+    // `locks.bridge_id` in the DB, it never told the NEW bridge to actually
+    // add the lock to its own allowlist, so forwardOverBle() kept returning
+    // false for a lock the server believed was already moved (found live,
+    // 2026-09-02, LockA silently unreachable through its "new" bridge).
+    // Deliberately its own op, not folded into `pair`/`pair all`'s console
+    // command — this one is server-triggered over MQTT, that one is a bench
+    // human at the serial console; same underlying ozBlePairAdd(), different
+    // caller, worth keeping distinguishable in the log.
+    if (op2 && strcmp(op2, "pair_lock") == 0) {
+      const String id = (const char *)(doc["id"] | doc["target"] | "");
+      const bool ok = id.length() && ozBlePairAdd(id);
+      Serial.printf("[PAIR-LOCK] %s -> %s\n", id.length() ? id.c_str() : "(no id)",
+                    ok ? "OK — will connect on the next scan" : "REFUSED / no id");
+      return;
+    }
+    // XF-144 — closes the collision found live 2026-09-02: Bridge 1
+    // recovering after an outage reloaded its own persisted allowlist and
+    // silently reconnected to locks the server had since failed over to
+    // Bridge 2 — real dual-BLE-slot collision, `bridge_id` caught
+    // flip-flopping between both bridges mid-test. Server's reconciliation
+    // gate now rejects a reclaim from a bridge while the CURRENT bridge
+    // still reports the lock online, and dispatches this to the LOSING
+    // (claiming) bridge instead of accepting its claim. Same underlying
+    // call as `unpair_lock` — this needs no new bridge-side logic, only a
+    // distinguishable op name: unpair_lock is a permanent app-driven
+    // release, this is a server-driven "you lost the race, let go."
+    if (op2 && strcmp(op2, "release_lock") == 0) {
+      const String id = (const char *)(doc["id"] | doc["target"] | "");
+      const bool ok = id.length() && ozBlePairRemove(id);
+      Serial.printf("[RELEASE-LOCK] %s -> %s\n", id.length() ? id.c_str() : "(no id)",
+                    ok ? "OK — dropped and removed from allowlist" : "not paired here / no id");
+      return;
+    }
+    if (op2 && strcmp(op2, "scan") == 0) {
+      const String tgt = (const char *)(doc["target"] | doc["id"] | "");
+      uint32_t durS = (uint32_t)(doc["duration_s"] | 5);
+      if (durS < 1) durS = 1;
+      if (durS > 30) durS = 30; // bound it — this is a bounded probe, not a mode
+
+      // Guard (PM directive, XF-144 P2): refuse rather than pile more radio
+      // activity onto a bridge that's either mid-claim or already at its
+      // connection ceiling. Same shape as XF-143's claim-window scan pause —
+      // a new trigger, not a reuse of that gate, since this one can fire any
+      // time, not just while unclaimed.
+      String busyReason;
+      if (claimWindowOpen()) busyReason = "claim_window_open";
+      else if (ozBleAtCapacity()) busyReason = "at_capacity";
+
+      const String resultTopic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/scan_result";
+      if (!tgt.length() || busyReason.length()) {
+        JsonDocument rd;
+        rd["target"] = tgt;
+        rd["status"] = "busy";
+        if (!tgt.length()) rd["status"] = "bad_request";
+        else rd["reason"] = busyReason;
+        String rout;
+        serializeJson(rd, rout);
+        mqttClient.publish(resultTopic.c_str(), rout.c_str());
+        Serial.printf("[SCAN] refused target=%s reason=%s\n",
+                      tgt.length() ? tgt.c_str() : "(none)",
+                      tgt.length() ? busyReason.c_str() : "bad_request");
+        return;
+      }
+
+      ozBleStartTargetedScan(tgt, durS);
       return;
     }
   }
@@ -1864,6 +2028,20 @@ static bool pollUplinkOne() {
     return true; // consumed one; keep draining
   }
 
+  // XF-144 Phase 2 — bridge-to-bridge roster, handled and returned BEFORE any
+  // of the lock-specific ext/IP6 learning below, which assumes `from` names a
+  // LOCK, not a bridge. Self-filtered: bridges are on the same `ff03::1`
+  // group they broadcast to, so every bridge hears its own beacon back.
+  {
+    const char *k = doc["kind"] | "";
+    if (strcmp(k, "bridge_roster") == 0) {
+      if (String(from) != deviceId) {
+        ozPeerRosterReceived(String(from), doc["locks"].as<JsonArrayConst>());
+      }
+      return true; // consumed one; keep draining
+    }
+  }
+
   // ozkey-20 R2 — learn which Thread node this device_id lives on.
   //
   // THIS IS THE JOIN, and it is the whole difficulty of R2. The child table
@@ -2333,6 +2511,123 @@ static bool sendTimeBeacon() {
   return true;
 }
 
+// ── XF-144 Phase 2 — bridge-to-bridge roster broadcast + peer-down takeover ─
+//
+// Operator-approved 2026-09-02, following Phase 1's real-hardware proof that
+// pair_lock/via/release_lock work. This closes the two gaps named at
+// approval time: (1) today's failover trigger is MQTT-LWT + 2-min grace,
+// slow next to what Thread already proves live on this bench (Bridge 2
+// auto-promoted to Leader the instant Bridge 1's role vanished, no custom
+// code); (2) today's sweep only fails a lock over to a bridge with prior
+// `lock_bridges` history — LockB had none and stayed stranded all night.
+// Grounding takeover in real BLE visibility instead of recorded history
+// closes that second gap for free.
+//
+// No new transport: reuses the same `ff03::1` multicast group and
+// threadUdp socket sendTimeBeacon() already sends on, and the same
+// kind-dispatched RX path pollUplinkOne() already reads (`"reset_outcome"`,
+// `"presence"`, `"time"` already live there — this adds `"bridge_roster"`).
+
+#define OZ_PEER_ROSTER_INTERVAL_MS 15000UL  // how often we tell peers our roster
+#define OZ_PEER_TIMEOUT_MS 50000UL          // ~3.3 missed intervals -> presumed down
+#define OZ_PEER_MAX 4                       // bench has 2 bridges; headroom, not a real limit
+#define OZ_PEER_ROSTER_LOCKS_MAX 9           // matches OZ_BLE_MAX_LOCKS
+
+struct OzPeerBridge {
+  String bridgeId;
+  String locks[OZ_PEER_ROSTER_LOCKS_MAX];
+  uint8_t lockCount = 0;
+  unsigned long lastSeen = 0;
+  bool takenOver = false; // latched so a sustained timeout doesn't re-fire every tick
+};
+static OzPeerBridge g_peerBridges[OZ_PEER_MAX];
+// g_lastRosterBroadcastAt declared near the top forward-declarations —
+// sendBridgeRosterBeacon() itself lives in ozblecentral.h (needs
+// g_pairedIds/g_pairedCount), this file's main loop() reads the timestamp.
+
+/** Record/refresh a peer's roster from an incoming bridge_roster datagram.
+ *  Self-filtered by the caller (pollUplinkOne) before this runs. */
+static void ozPeerRosterReceived(const String &peerId, JsonArrayConst locks) {
+  OzPeerBridge *slot = nullptr;
+  for (auto &p : g_peerBridges) {
+    if (p.bridgeId == peerId) { slot = &p; break; }
+  }
+  if (!slot) {
+    for (auto &p : g_peerBridges) {
+      if (!p.bridgeId.length()) { slot = &p; break; }
+    }
+  }
+  if (!slot) {
+    Serial.printf("[PEER] roster from %s dropped — peer table full (max %d)\n",
+                  peerId.c_str(), OZ_PEER_MAX);
+    return;
+  }
+  const bool wasKnown = slot->bridgeId.length() > 0;
+  const bool wasTakenOver = slot->takenOver;
+  slot->bridgeId = peerId;
+  slot->lockCount = 0;
+  for (JsonVariantConst v : locks) {
+    if (slot->lockCount >= OZ_PEER_ROSTER_LOCKS_MAX) break;
+    slot->locks[slot->lockCount++] = v.as<const char *>();
+  }
+  slot->lastSeen = millis();
+  slot->takenOver = false; // a fresh report means the peer is alive again
+  if (!wasKnown) {
+    Serial.printf("[PEER] new peer %s, %u lock(s)\n", peerId.c_str(),
+                  (unsigned)slot->lockCount);
+  } else if (wasTakenOver) {
+    Serial.printf("[PEER] %s is back — takeover latch cleared\n", peerId.c_str());
+  }
+}
+
+/** Sweep the peer table for anyone timed out, and for each of THEIR locks we
+ *  can currently see over BLE, take it over locally — same ozBlePairAdd()
+ *  pair_lock already calls, just triggered by our own observation instead of
+ *  an MQTT dispatch. Also tells the server directly (peer_down) so its
+ *  bridges_presence reflects reality before our takeover's `via` claim
+ *  arrives — otherwise the reject-gate built in Phase 1 would see the dead
+ *  peer's locks as still "online" (server hasn't heard the LWT yet) and
+ *  wrongly refuse a takeover that is actually legitimate this time. */
+static void ozPeerTimeoutTick() {
+  for (auto &p : g_peerBridges) {
+    if (!p.bridgeId.length() || p.takenOver) continue;
+    if (millis() - p.lastSeen < OZ_PEER_TIMEOUT_MS) continue;
+
+    p.takenOver = true; // latch first — do not re-fire every tick while still dark
+    Serial.printf("[PEER] %s timed out (%lus since last roster) — checking BLE visibility\n",
+                  p.bridgeId.c_str(), (millis() - p.lastSeen) / 1000);
+
+    uint8_t taken = 0;
+    for (uint8_t i = 0; i < p.lockCount; i++) {
+      const String &lockId = p.locks[i];
+      if (ozBleIsPaired(lockId)) continue; // already ours, nothing to do
+      if (!ozBleCurrentlyVisible(lockId)) continue;
+      if (ozBlePairAdd(lockId)) {
+        taken++;
+        Serial.printf("[PEER] took over %s (was %s's, now visible here)\n",
+                      lockId.c_str(), p.bridgeId.c_str());
+      }
+    }
+
+    if (mqttClient.connected()) {
+      JsonDocument doc;
+      doc["event"] = "peer_down";
+      doc["peer"] = p.bridgeId;
+      String out;
+      serializeJson(doc, out);
+      const String topic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/peer_status";
+      const bool ok = mqttClient.publish(topic.c_str(), out.c_str());
+      Serial.printf("[PEER] %s -> %s (%u lock(s) taken over locally)%s\n",
+                    topic.c_str(), out.c_str(), (unsigned)taken,
+                    ok ? "" : " PUBLISH FAILED");
+    } else {
+      Serial.printf("[PEER] %s down, %u lock(s) taken over locally, "
+                    "MQTT not connected — peer_down not sent\n",
+                    p.bridgeId.c_str(), (unsigned)taken);
+    }
+  }
+}
+
 // DIAGNOSTIC (2026-07-28, temporary): who is actually attached to THIS mesh?
 // The doorlock's own LCD/MON "JOINED" comes from a latched flag that is never
 // cleared, so it keeps claiming JOINED after the bridge re-forms the network
@@ -2532,6 +2827,81 @@ void mqttBegin() {
   // larger again (ver+counter+nonce+ciphertext+tag, hex-encoded).
   mqttClient.setBufferSize(1024);
   mqttConnect();
+}
+
+// ── Bench console (2026-09-01, XF-142) ──────────────────────────────────────
+// bridgeBLE has never had a serial console — everything about it (WiFi creds,
+// broker host) comes from the phone's provisioning ceremony (NVS `bhost`/
+// `bport`, written once at `cfgBrokerHost = brokerHost;` near the provision
+// handler). That's fine for a normal deploy, but there is no re-provisioning
+// UI flow to move an ALREADY-PAIRED bridge to a new broker host without
+// wiping and re-pairing it — and the lab broker itself just moved
+// (10.1.1.20 -> 10.1.1.42, confirmed by Server on XF-142; same Mosquitto
+// instance, different host). `setbroker` is the one command here, deliberately
+// narrow and mirroring the lock side's `pushcaps` precedent (ozdoorlock_core.h)
+// — it changes network config only, never touches a bond, credential, or
+// access-control decision.
+static void ozBridgeConsolePoll() {
+  static String line;
+  while (Serial.available()) {
+    const char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') {
+      if (line.length() < 64) line += c;   // bounded: never grow on noise
+      continue;
+    }
+    line.trim();
+    const String cmd = line;
+    line = "";
+    if (!cmd.length()) continue;
+
+    if (cmd == "id") {
+      Serial.printf("[BENCH] device_id=%s fw=%s broker=%s:%u mode=%s\n",
+                    deviceId.c_str(), FW_VERSION, cfgBrokerHost.c_str(),
+                    cfgBrokerPort, cfgMode.c_str());
+    } else if (cmd.startsWith("setbroker ")) {
+      String arg = cmd.substring(10);
+      arg.trim();
+      uint16_t newPort = cfgBrokerPort;
+      int colon = arg.lastIndexOf(':');
+      if (colon > 0) {
+        newPort = (uint16_t)arg.substring(colon + 1).toInt();
+        arg = arg.substring(0, colon);
+      }
+      if (!arg.length() || newPort == 0) {
+        Serial.println("[BENCH] setbroker: usage 'setbroker <host>[:<port>]'");
+      } else {
+        Serial.printf("[BENCH] setbroker: %s:%u -> %s:%u\n",
+                      cfgBrokerHost.c_str(), cfgBrokerPort, arg.c_str(), newPort);
+        cfgBrokerHost = arg;
+        cfgBrokerPort = newPort;
+        saveConfig();
+        if (mqttClient.connected()) mqttClient.disconnect();
+        mqttClient.setServer(cfgBrokerHost.c_str(), cfgBrokerPort);
+        mqttLastAttempt = 0; // force the retry loop to dial immediately
+        Serial.println("[BENCH] setbroker: saved, reconnecting now");
+      }
+    } else if (cmd == "paired" || cmd == "seen" || cmd == "pair all" ||
+               cmd.startsWith("pair ") || cmd.startsWith("unpair ")) {
+      // 🔴 2026-09-01 — these five commands used to live in
+      // ozBleSerialConsole() (ozblecentral.h), which has ALWAYS been
+      // unreachable dead code since this function was added earlier
+      // tonight: both read raw Serial input every loop tick, this one runs
+      // first and greedily drains the WHOLE buffer (`while
+      // (Serial.available())`), so ozBleSerialConsole() never sees a byte,
+      // regardless of call order elsewhere. Found live tonight trying to
+      // run `pair all` for a multi-connection bench test and getting
+      // "[BENCH] unknown command" instead. Delegated to
+      // ozBlePairConsoleCmd() (ozblecentral.h) rather than duplicating the
+      // pairing-table access here — one console, one place that touches
+      // g_pairedIds/g_seenUnpaired directly.
+      ozBlePairConsoleCmd(cmd);
+    } else {
+      Serial.printf("[BENCH] unknown command '%s' (try: id, setbroker <host>[:<port>], "
+                    "paired, seen, pair <id>, pair all, unpair <id>)\n",
+                    cmd.c_str());
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3201,6 +3571,7 @@ void setup() {
 
 void loop() {
   checkFactoryResetButton();
+  ozBridgeConsolePoll(); // bench-only: id, setbroker (see definition above)
 
   // P3 — BLE central servicing: reap dropped links, drain the uplink queue to
   // MQTT, connect anything the scanner queued, rescan on a slow timer. ALL of
@@ -3242,6 +3613,16 @@ void loop() {
     // 24 h, which is the exact failure this flag exists to prevent.
     if (sendTimeBeacon()) g_timeBeaconDue = false;
   }
+
+  // XF-144 Phase 2 — bridge-to-bridge roster + peer-down takeover. Same
+  // threadFormed/threadUdpReady gate as the time beacon above; independent
+  // of MQTT/broker state on purpose — this is the fast local path, not a
+  // fallback for the server-driven sweep.
+  if (threadFormed && threadUdpReady &&
+      millis() - g_lastRosterBroadcastAt > OZ_PEER_ROSTER_INTERVAL_MS) {
+    sendBridgeRosterBeacon();
+  }
+  if (threadFormed) ozPeerTimeoutTick();
 
   if (threadFormed &&
       (g_livenessPushDue ||
@@ -3352,8 +3733,20 @@ void loop() {
     }
   }
 
+  // 🔴 2026-09-02, operator live: LCD kept showing the old IP/"connected"
+  // after WiFi actually dropped. Root cause — this branch only ever logged
+  // to Serial; the REGAINED branch right below it (already correct) is the
+  // only one of the pair that calls notifyStatus()+drawStatus(). This sketch
+  // has no screenDirty flag (see the comment on the regained branch) — a
+  // repaint IS an event, and this transition was never one. Mirrors the
+  // regained branch exactly. New status string, not WIFI_FAIL: that name
+  // already means "initial join attempt failed" elsewhere in this file;
+  // this is a different case — a link that WAS up, mid-operation, no join
+  // attempt involved.
   if (state == ST_OPERATIONAL && wasWifiConnected && !wifiConnected) {
     Serial.println("[WiFi] link dropped — Thread mesh keeps running independently");
+    notifyStatus("WIFI_LOST");
+    if (lcdOn) drawStatus();
   }
   // P2 — the other half of that transition, which had no logging at all: say
   // so when Wi-Fi comes BACK, and name the uplink change, so the serial log
