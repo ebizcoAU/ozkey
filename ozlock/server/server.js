@@ -1784,7 +1784,7 @@ async function runBridgeFailoverSweep() {
     [FAILOVER_GRACE_MS / 1000]
   );
   for (const lock of stuck) {
-    const [[next]] = await pool.query(
+    let [[next]] = await pool.query(
       `SELECT lb.bridge_id FROM lock_bridges lb
          JOIN bridges_presence bp ON bp.bridge_id = lb.bridge_id AND bp.presence = 'online'
         WHERE lb.lock_id = ? AND lb.bridge_id != ?
@@ -1792,7 +1792,23 @@ async function runBridgeFailoverSweep() {
         LIMIT 1`,
       [lock.id, lock.bridge_id]
     );
-    if (!next) continue; // no confirmed-online fallback candidate — nothing safe to do
+    let viaScanConfirm = false;
+    // XF-144 (2026-09-02): a lock that has only ever lived on one bridge has
+    // no `lock_bridges` candidate row at all — confirmed live (LockB) to get
+    // stuck here forever otherwise, even with other healthy bridges in range
+    // that can actually see it. Fall back to a live scan-confirm before
+    // giving up; still on-demand only, no speculative hot standbys.
+    if (!next) {
+      const { results } = await scanForLockAcrossBridges(lock.id);
+      const candidates = results
+        .filter((r) => r.found && r.bridge_id !== lock.bridge_id)
+        .sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
+      if (candidates.length) {
+        next = { bridge_id: candidates[0].bridge_id };
+        viaScanConfirm = true;
+      }
+    }
+    if (!next) continue; // no confirmed-reachable fallback candidate — nothing safe to do
     const oldBridgeId = lock.bridge_id;
     await pool.query(
       `UPDATE locks SET bridge_id = ?, mcu_link_up = NULL, mcu_last_frame_s = NULL,
@@ -1834,13 +1850,14 @@ async function runBridgeFailoverSweep() {
       'key',
       `XF-144 auto-failover: lock ${lock.id} moved from bridge ${oldBridgeId} ` +
         `(bridge_offline ${FAILOVER_GRACE_MS / 1000}s+) to bridge ${next.bridge_id}, ` +
-        `pair_lock dispatched`
+        `pair_lock dispatched${viaScanConfirm ? ' (via scan-confirm, no lock_bridges history)' : ''}`
     );
     await recordAudit(
       null,
       lock.id,
       'bridge_failover',
-      `auto-failover from ${oldBridgeId} to ${next.bridge_id} after sustained bridge_offline (pair_lock dispatched)`
+      `auto-failover from ${oldBridgeId} to ${next.bridge_id} after sustained bridge_offline (pair_lock dispatched` +
+        `${viaScanConfirm ? ', candidate found via scan-confirm — no prior lock_bridges history)' : ')'}`
     );
   }
 }
@@ -2000,7 +2017,30 @@ function notifyLockResetWaiters(deviceId, msgId, verdict, cause) {
   }
 }
 
-async function handleBridgePresence(bridgeId, payload) {
+// XF-152 (2026-09-02): mqttClient.on('message', async ...) fires one
+// listener invocation per incoming packet without awaiting the previous
+// one — no per-bridge ordering guarantee. A rapid offline/online flap pair
+// for the SAME bridge (confirmed live: 11+ brief MQTT reconnect cycles on
+// one bridge in a single session) can have their handleBridgePresenceImpl()
+// DB writes complete out of delivery order, leaving `bridges_presence`
+// stuck on the stale value even though the bridge is genuinely healthy —
+// confirmed live twice: once via a stuck sweep candidate, once via
+// GET /bridges showing a healthy bridge as offline for 4.5+ minutes.
+// Fix: chain every call for a given bridgeId onto the tail of that
+// bridge's own promise queue, so overlapping calls process strictly in
+// arrival (enqueue) order instead of racing on the event loop. The
+// `.catch(() => {})` keeps one failed call from wedging the queue for
+// every future presence report on that bridge.
+const bridgePresenceQueues = new Map(); // bridgeId -> Promise (tail of chain)
+
+function handleBridgePresence(bridgeId, payload) {
+  const prev = bridgePresenceQueues.get(bridgeId) || Promise.resolve();
+  const next = prev.catch(() => {}).then(() => handleBridgePresenceImpl(bridgeId, payload));
+  bridgePresenceQueues.set(bridgeId, next);
+  return next;
+}
+
+async function handleBridgePresenceImpl(bridgeId, payload) {
   let obj;
   try {
     obj = JSON.parse(payload);
@@ -2189,6 +2229,33 @@ function initMqtt() {
       runBridgeFailoverSweep().catch((err) =>
         logEvent('error', `XF-144 failover sweep failed: ${err.message}`)
       );
+      // XF-152 (2026-09-03): a THIRD incident, distinct from the write-
+      // ordering race fixed above — a bridge's own retained presence topic
+      // was already correctly 'online' at the broker, but this server's
+      // subscription silently never delivered it, with no reconnect/error/
+      // offline event logged anywhere in between. Root cause not confirmed
+      // (transport-level — QoS/broker/network, not app code); republishing
+      // the same payload fixed it live. Mitigation, root-cause-agnostic:
+      // a bare re-SUBSCRIBE to an already-active topic filter does NOT
+      // force retained redelivery in practice against this broker
+      // (verified live — a duplicate subscribe produced zero redelivered
+      // messages). UNSUBSCRIBE then SUBSCRIBE is unambiguously a fresh
+      // subscription from the broker's point of view, so it does — this
+      // self-heals a silently dropped presence message within ~30s instead
+      // of sitting stale indefinitely. Not a diagnosis of why the original
+      // delivery was missed.
+      const presenceTopics = [
+        CONFIG.SUB_PRESENCE_LOCKS,
+        CONFIG.SUB_PRESENCE_LOCKS_LEGACY,
+        CONFIG.SUB_PRESENCE_BRIDGES,
+        CONFIG.SUB_PRESENCE_BRIDGES_LEGACY,
+      ];
+      mqttClient.unsubscribe(presenceTopics, (err) => {
+        if (err) return logEvent('error', `XF-152 presence unsubscribe (resync) failed: ${err.message}`);
+        mqttClient.subscribe(presenceTopics, { qos: 1 }, (err2) => {
+          if (err2) logEvent('error', `XF-152 presence re-subscribe (resync) failed: ${err2.message}`);
+        });
+      });
     }, 30_000);
   });
 
@@ -2849,6 +2916,26 @@ api.get('/locks', async (req, res) => {
       };
     });
     res.json({ ok: true, locks });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/** XF-144 Phase 3 (2026-09-02, App's own ask): a bridge with zero currently-
+ * assigned locks (e.g. every lock behind it already failed over elsewhere)
+ * is invisible to `GET /locks` — nothing there mentions a `bridge_id` no
+ * lock currently points at. App derives all its bridge-health UI by joining
+ * its own locally-known bridge list against this, by `bridge_id` — so this
+ * exists purely to expose `bridges_presence` directly, not to be a bridge
+ * registry (deliberately not what the `bridges` table is either — see its
+ * own header comment). No new columns, no new derivation — same raw rows
+ * `computeFaultAttribution()` already reads.
+ */
+api.get('/bridges', async (req, res) => {
+  if (!guardDb(res)) return;
+  try {
+    const [rows] = await pool.query('SELECT bridge_id, presence, presence_at FROM bridges_presence ORDER BY bridge_id');
+    res.json({ ok: true, bridges: rows });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -4266,6 +4353,21 @@ async function boot() {
 
 process.on('unhandledRejection', (err) => {
   logEvent('error', `Unhandled rejection: ${err && err.message ? err.message : err}`);
+});
+
+// 2026-09-03: two silent crashes tonight left `node --watch` stuck at "Failed
+// running 'server.js'. Waiting for file changes before restarting..." with
+// NO stack trace anywhere in the captured log — `unhandledRejection` above
+// only covers a rejected promise; a synchronous throw with no catch anywhere
+// on its call stack was reaching neither this file's own try/catches nor any
+// handler at all, so Node's default uncaught-exception path was firing with
+// its output apparently not making it into the log capture intact. Logging
+// explicitly, then exiting, so the NEXT crash (if this is even the cause —
+// could also be an OS-level kill, e.g. OOM, which this can't catch) at least
+// leaves a real reason in `logEvent`'s own file, not just silence.
+process.on('uncaughtException', (err) => {
+  logEvent('error', `Uncaught exception: ${err && err.stack ? err.stack : err}`);
+  process.exit(1);
 });
 
 if (require.main === module) {
