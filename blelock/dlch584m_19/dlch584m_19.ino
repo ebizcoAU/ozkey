@@ -90,6 +90,15 @@
 // see that file's own `#ifdef OZ_NO_MCU` sites for exactly what changes.
 #define OZ_NO_MCU 1
 
+// 2026-09-01, bench PIN-entry testing (operator's ask) — SEPARATE from
+// OZ_NO_MCU on purpose. dlch584m_147 shares OZ_NO_MCU but has a different
+// touch controller entirely (CST816@0x63/GPIO20-21 vs this board's
+// CST8xx@0x15, no RST/INT) and no `touchRead()` of its own — gating the new
+// keypad-polling code on OZ_NO_MCU alone would either fail to link on that
+// board or, worse, compile against the wrong chip's assumptions. This board
+// only.
+#define OZ_KEYPAD_LIVE 1
+
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
 
@@ -146,7 +155,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(
     35 /* col offset 1 */, 0 /* row offset 1 */, 35 /* col offset 2 */, 0 /* row offset 2 */);
 
 // ── Firmware version — own namespace, see file header for why ─────────────
-#define FW_VERSION "dlch584m-0.16"
+#define FW_VERSION "dlch584m-0.26"
 // XF-124 F1 — device kind for Nexus's registry. Nexus's N1-N5 (XFtposDecisions-138)
 // already registered device_type="doorlock", firmware_id="fw-doorlock-ch584m-r1"
 // for the real CH584M model; this simulator identifies as the same device_type
@@ -203,6 +212,50 @@ void mapTouchRaw(int rawX, int rawY, int &x, int &y) {
   y = (int)sy;
   if (x < 0) x = 0; if (x > PANEL_W - 1) x = PANEL_W - 1;
   if (y < 0) y = 0; if (y > PANEL_H - 1) y = PANEL_H - 1;
+}
+
+// ── touchRead() — 2026-09-01, bench-only PIN-entry work (operator's ask) ────
+//
+// touchInit()/mapTouchRaw() above have existed since before touch input was
+// globally removed at firmware 2.19 (see ozdoorlock_core.h's own header on
+// why: the gesture that removal killed had been wired to a panel PRODUCTION
+// DOES NOT HAVE, the same class of mistake XF-58's presence gate made once
+// already). Neither of them ever actually READ a touch point — init only
+// pings the controller into "normal mode", and the coordinate transform has
+// nothing to transform without a raw reading feeding it. This function is
+// the piece that was never there: the actual I2C register read.
+//
+// UPDATE 2026-09-03 (XFtposDecisions-153): this register layout is stronger
+// than "modeled on a sibling chip" — checked git history, and this exact
+// byte layout (byte[2] = touch count, X packed 4-bit-high/8-bit-low across
+// byte[3:4], Y the same across byte[5:6]) is the SAME shared touchReadRegs()/
+// touchRead() that lived in ozdoorlock_core.h and ran on THIS EXACT BOARD
+// (CST8xx@0x15, pure I2C polling, this unit's own doorlock19.ino) for months
+// before being removed at doorlock-2.19 (2026-08-23) — not a guess ported
+// from the 1.47" board's chip, a driver this physical unit already ran.
+// `git show de99d97^:blelock/common/ozdoorlock_core.h` has the original,
+// including edge-triggering and a "silent failure" heartbeat this simpler
+// bench version leaves out — level-triggered is enough for ozKeypadPoll()'s
+// own edge-detection one layer up. Still worth a real-finger bench pass to
+// confirm nothing about this board's specific wiring drifted since 2.19,
+// but this is no longer an unverified guess.
+//
+// Returns true with rawX/rawY populated while a finger is down; false
+// otherwise (no touch, or the controller didn't ACK — same "touch dead"
+// condition touchInit() already detects at boot).
+bool touchRead(int &rawX, int &rawY) {
+  Wire.beginTransmission(TOUCH_ADDR);
+  Wire.write((uint8_t)0x00);
+  if (Wire.endTransmission() != 0) return false; // no ACK — same as touchInit()'s failure case
+  Wire.requestFrom(TOUCH_ADDR, 7);
+  if (Wire.available() < 7) return false;
+  uint8_t buf[7];
+  for (int i = 0; i < 7; i++) buf[i] = Wire.read();
+  const uint8_t touchCount = buf[2];
+  if (touchCount == 0 || touchCount > 5) return false; // 0 = no finger; >5 = garbage frame
+  rawX = ((buf[3] & 0x0F) << 8) | buf[4];
+  rawY = ((buf[5] & 0x0F) << 8) | buf[6];
+  return true;
 }
 
 #include "../common/ozdoorlock_core.h"

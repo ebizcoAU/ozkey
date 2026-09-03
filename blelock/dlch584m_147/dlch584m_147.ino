@@ -44,6 +44,13 @@
 // (ozkey-45). Must be defined BEFORE including ozdoorlock_core.h.
 #define OZ_NO_MCU 1
 
+// 2026-09-03 — ported from dlch584m_19.ino, same reasoning (XFtposDecisions-153):
+// this board's own touch driver (touchInit()/mapTouchRaw() above) predates the
+// 2.19 removal and was never missing — only the actual register read was. See
+// touchRead() below, right before the shared-core include, for why it's now
+// filled in with real confidence rather than a guess.
+#define OZ_KEYPAD_LIVE 1
+
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
 
@@ -96,7 +103,7 @@ Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_DIN);
 Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 34, 0, 34, 0);
 
 // ── Firmware version — SHARED with dlch584m_19.ino, see the header ────────
-#define FW_VERSION "dlch584m-0.16"
+#define FW_VERSION "dlch584m-0.26"
 #define OZ_DEVICE_TYPE "doorlock"
 
 static const char *fwDisplayVersion() {
@@ -135,6 +142,37 @@ void mapTouchRaw(int rawX, int rawY, int &x, int &y) {
   y = 180 - (rawX * 6) / 5;
   if (y < 0) y = 0;
   if (y > PANEL_H - 1) y = PANEL_H - 1;
+}
+
+// ── touchRead() — 2026-09-03, ported (XFtposDecisions-153), not written fresh.
+//
+// This exact register layout (buf[2]=touch count, X packed 4-bit-high/8-bit-low
+// across buf[3:4], Y the same across buf[5:6]) is not a guess or a port from a
+// sibling chip — it is the SAME shared `touchReadRegs()`/`touchRead()` that
+// lived in this file's own `ozdoorlock_core.h` and ran on THIS EXACT BOARD
+// (CST816@0x63, real TOUCH_RST/TOUCH_INT) for months before being removed at
+// doorlock-2.19 (2026-08-23, operator directive — the removal was about the
+// gesture's WIRING to a since-replaced presence gate, not about the driver
+// being wrong). `git show de99d97^:blelock/common/ozdoorlock_core.h` has the
+// original, including edge-triggering and a "silent failure" heartbeat this
+// simpler bench version deliberately leaves out for now — level-triggered is
+// enough for ozKeypadPoll()'s own edge-detection (g_kpWasDown) one layer up.
+//
+// Returns true with rawX/rawY populated while a finger is down; false
+// otherwise (no touch, or the controller didn't ACK).
+bool touchRead(int &rawX, int &rawY) {
+  Wire.beginTransmission(TOUCH_ADDR);
+  Wire.write((uint8_t)0x00);
+  if (Wire.endTransmission() != 0) return false; // no ACK — same as touchInit()'s failure case
+  Wire.requestFrom(TOUCH_ADDR, 7);
+  if (Wire.available() < 7) return false;
+  uint8_t buf[7];
+  for (int i = 0; i < 7; i++) buf[i] = Wire.read();
+  const uint8_t touchCount = buf[2];
+  if (touchCount == 0 || touchCount > 5) return false; // 0 = no finger; >5 = garbage frame
+  rawX = ((buf[3] & 0x0F) << 8) | buf[4];
+  rawY = ((buf[5] & 0x0F) << 8) | buf[6];
+  return true;
 }
 
 #include "../common/ozdoorlock_core.h"

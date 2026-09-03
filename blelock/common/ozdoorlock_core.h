@@ -23,6 +23,13 @@
  *              void drawSplash() (no-op is fine if the board doesn't want one)
  *   Optional:  #define HAS_TOUCH_INT if the board wires a real touch INT/RST
  *              pair usable as a light-sleep wake source (only the 1.47" does)
+ *   Optional:  bool touchRead(int &rawX, int &rawY) — an actual I2C touch-
+ *              point read (2026-09-01, dlch584m_19 only, bench PIN-entry
+ *              testing). touchInit()/mapTouchRaw() above never needed this:
+ *              nothing called them with a real point after touch input was
+ *              removed at 2.19. Guarded by OZ_KEYPAD_LIVE below — a board
+ *              that doesn't define it just doesn't get a working keypad,
+ *              same as every board today.
  */
 
 
@@ -482,9 +489,32 @@ String deviceId, macStr;
 //
 // Filled in by startBle() once BLEDevice::init() has run; empty before that.
 String bleIdHex;
-/** The 12 hex digits the app shows, uppercase, no separators. Falls back to
- *  the WiFi-MAC form only if BLE is not up yet, and says so. */
+/** 2026-09-01, operator's ask (multi-bridge/multi-lock bench testing) —
+ *  shortened to g_advName ("OZ-" + 5 hex chars), the SAME string already
+ *  used for this lock's BLE advertising name, so what's on the panel is
+ *  exactly what the app's BLE scan shows, not just the same MAC in a
+ *  longer format. This does NOT reopen the 2026-08-30 bug above:
+ *  g_advName is computed from the same corrected BLE MAC (`bm`, read via
+ *  ESP_MAC_BT) bleIdHex was introduced to fix, not from `macStr`/deviceId's
+ *  Wi-Fi MAC — the offset-by-2 mismatch that comment describes is still
+ *  avoided, only the DISPLAY LENGTH changed, not which MAC it's derived
+ *  from. Falls back to the old 12-hex form if g_advName is still at its
+ *  BLE_NAME default (BLE not up yet), same honesty the old fallback had.
+ *
+ *  🔴 Caught 2026-09-03, unrelated to that day's own change: g_advName only
+ *  exists under OZ_NO_MCU (its own definition above is guarded the same
+ *  way) but this function compiles unconditionally for every board,
+ *  including doorlock/doorlock19 which never define it — an unconditional
+ *  reference here fails to compile on exactly those two boards. Nobody had
+ *  recompiled that line since 09-01 landed; caught only because tonight's
+ *  unrelated keypad work triggered a full rebuild of all four boards to
+ *  confirm it hadn't broken anything. Gated below to match the definition's
+ *  own guard — production boards fall through to the pre-09-01 behavior
+ *  unchanged, CH584M boards keep the shortened-name display. */
 static String ozBleIdDisplay() {
+#ifdef OZ_NO_MCU
+  if (strcmp(g_advName, BLE_NAME) != 0) return String(g_advName);
+#endif
   if (bleIdHex.length()) return bleIdHex;
   String m = macStr; m.replace(":", ""); m.toUpperCase();
   return m.length() ? m : String("(no ble id)");
@@ -1858,6 +1888,16 @@ void drawBleBadge() {
   gfx->printf("BLE %lus", (bleWindowUntil - millis()) / 1000);
 }
 
+#ifdef OZ_KEYPAD_LIVE
+// 2026-09-03 — declared here, not at its owning ozKeypadPoll() block further
+// down, because drawStatusLine() (right below) needs to read its length to
+// draw the entry-progress dots. Same forward-reference pattern this file
+// already uses elsewhere for exactly this reason (see the comment above
+// touchRead()'s own forward declaration). The actual buffer still lives with
+// the rest of ozKeypadPoll()'s state below — only the declaration moved.
+static String g_kpBuf;
+#endif
+
 void drawStatusLine() {
   ot_device_role_t liveRole = isThread() ? OpenThread::otGetDeviceRole() : OT_ROLE_DISABLED;
   bool threadAttached = (liveRole == OT_ROLE_CHILD || liveRole == OT_ROLE_ROUTER ||
@@ -1896,7 +1936,18 @@ void drawStatusLine() {
                  // "NOT CONNECTED" through a successful connect. (On a
                  // non-OZ_NO_MCU build this bit is simply always 0 unless a
                  // phone is connected, which is worth repainting for anyway.)
-                 | ((uint32_t)bleClientConnected << 9);
+                 | ((uint32_t)bleClientConnected << 9)
+#ifdef OZ_KEYPAD_LIVE
+                 // Same reason as the BLE-connected bit above: the entry
+                 // dots are drawn from g_kpBuf's length, so that length has
+                 // to be part of what "changed" means here, or the dots
+                 // would freeze at whatever count happened to be on screen
+                 // the last time something ELSE changed. Capped at 15 (4
+                 // bits) — a display cap, not a PIN-length rule; see the
+                 // dot-drawing code below for the separate visual cap.
+                 | ((uint32_t)(g_kpBuf.length() > 15 ? 15 : g_kpBuf.length()) << 10)
+#endif
+                 ;
   {
     // Fold the variable-length text in too, so an IP or name change still
     // repaints. Cheap additive hash — collisions only cost a missed refresh
@@ -1952,6 +2003,22 @@ void drawStatusLine() {
   // single fact this bench most needs to read off the panel.
   gfx->print("BLE: ");
   gfx->print(bleClientConnected ? "CONNECTED" : "NOT CONNECTED");
+#ifdef OZ_KEYPAD_LIVE
+  // 2026-09-03, operator's ask — green dots next to this line so a person
+  // (or the bench operator watching remotely) can see keypad taps
+  // registering in real time, not just after '#' submits and the result
+  // overlay appears. Visually capped at 8 — g_kpBuf's real bound is
+  // OZ_CRED_VAL_MAX (24), this is a display limit, not a PIN-length rule.
+  {
+    const int dotCount = g_kpBuf.length() > 8 ? 8 : (int)g_kpBuf.length();
+    int dx = gfx->getCursorX() + 6;
+    const int dy = 10; // same vertical centre as the MCU link dot at (7,10)
+    for (int i = 0; i < dotCount; i++) {
+      gfx->fillCircle(dx, dy, 2, C_GREEN);
+      dx += 7;
+    }
+  }
+#endif
 #else
   if (!provisioned) {
     gfx->print("UNSET");
@@ -3498,8 +3565,29 @@ static void addIdentity(JsonDocument &doc, bool full) {
   // offer — an economy Wi-Fi lock sleeps and cannot promise "open now" — but it
   // no longer decides WHETHER we can unlock at all.
   const bool canUnlock = ozVerbUsable(ozResolveVerb("lock.unlock", nullptr, OZ_DIR_DOWN));
-  const bool canPin    = ozVerbUsable(ozResolveVerb("cred.put", "pin", OZ_DIR_DOWN));
-  const bool canRfid   = ozVerbUsable(ozResolveVerb("cred.put", "rfid", OZ_DIR_DOWN));
+#ifdef OZ_NO_MCU
+  // 🔴 2026-08-31 — `ozVerbUsable(ozResolveVerb(...))` answers "does a real
+  // Tuya chip's DP layout exist for this", which canUnlock's own OZ_NO_MCU
+  // override already established is the wrong question on this board (see
+  // ozVerbUsable()'s header). It is DOUBLY wrong here: `tuya-wifi-lock-pro`
+  // (this board's loaded profile) has no cred.put mapping for "pin"/"rfid" AT
+  // ALL — ozResolveVerb() returns null, so ozVerbUsable(null) is false
+  // regardless of OZ_NO_MCU, unlike unlock's RESERVED-status case where a
+  // mapping existed but was marked unusable. Left as the production
+  // expression, this branch would have kept advertising `pin_sync`/
+  // `rfid_sync` as UNSUPPORTED — the same class of bug ozkey-42 §2.4 already
+  // named ("a capability is a PROMISE... it must be derived from whether the
+  // verb actually resolves") — even though `ozSemanticDispatch()`'s own
+  // OZ_NO_MCU credential branches (see their header, same date) now genuinely
+  // store PIN/RFID locally regardless of what profile is loaded. The
+  // capability report and the dispatcher must agree, or this is XF-127's
+  // "two builders diverge" pattern again, one level up.
+  const bool canPin  = true;
+  const bool canRfid = true;
+#else
+  const bool canPin  = ozVerbUsable(ozResolveVerb("cred.put", "pin", OZ_DIR_DOWN));
+  const bool canRfid = ozVerbUsable(ozResolveVerb("cred.put", "rfid", OZ_DIR_DOWN));
+#endif
 
   // ── 🔴 2.19 — `assisted_unlock` ALSO REQUIRES A PRESENCE SOURCE ──────────
   //
@@ -3611,6 +3699,33 @@ void publishEnroll() {
   // unsupported action goes here, once.
   addIdentity(doc, true);
   if (cfgName.length()) doc["name"] = cfgName;
+#ifdef OZ_NO_MCU
+  // 🔴 2026-08-31, XF-139 P0 — the ONLY function that ever built the full
+  // caps+verbs report, and its ONLY delivery mechanism was `mqtt.publish()`
+  // below — a no-op on this board, silently, forever. No CH584M lock could
+  // ever report `caps_source=device` as a result; confirmed live with App
+  // and Server. `ozRefreshInfoChar()` (what the app reads on BLE connect)
+  // never carried `caps`/`verbs` at all, and the bridge's own `info` read
+  // only ever extracted `device_id`/`fw` for its own routing — no relay
+  // existed at any layer.
+  //
+  // Same fix shape as the audit/time/reset relay two sessions ago: reuse
+  // `member`'s already-proven generic BLE->MQTT relay (the bridge forwards
+  // EVERYTHING arriving there to `.../uplink` unconditionally, no branching
+  // needed on that side) rather than inventing a new characteristic. `type`
+  // is explicit ("caps") rather than left for the server to infer from field
+  // presence — same discipline `ozPublishResetOutcome()`'s `type:"reset"`
+  // already established, and Server's own handler is written expecting it.
+  doc["type"] = "caps";
+  {
+    String relayOut; serializeJson(doc, relayOut);
+    ozNotifyChunked(relayOut);
+    Serial.printf("[CAPS] relayed via member (%u B) — the lock's own report "
+                  "of what it can do, not MQTT enrollment\n",
+                  (unsigned)relayOut.length());
+  }
+  return; // no MQTT on this board — see above; nothing below applies
+#endif
   String out; serializeJson(doc, out);
   mqtt.publish(topicEnroll.c_str(), out.c_str());
   lastEnrollSent = millis();
@@ -5667,8 +5782,21 @@ void handleMemberEnroll(JsonDocument &doc) {
   }
 
   // static, not stack: this runs on the BLE task, whose stack is modest, and a
-  // long member label pushes the decoded invite past 300 bytes. Safe because
-  // exactly one connection can exist at a time (the SCAN_IND busy rule).
+  // long member label pushes the decoded invite past 300 bytes.
+  //
+  // 🔴 ITS ORIGINAL SAFETY ARGUMENT IS DEAD. This used to read "safe because
+  // exactly one connection can exist at a time (the SCAN_IND busy rule)" — that
+  // stopped being true when OZ_BLE_MAX_LINKS became 2 so the bridge's relay hold
+  // could not lock the app out. TWO clients can now be attached at once, which
+  // is exactly the shape of a member-enrolment test: bridge on one link, the
+  // member's phone on the other.
+  //
+  // It is still safe, but for a DIFFERENT and narrower reason, so state the real
+  // one: GATT callbacks are dispatched on the single BLE host task, and this
+  // function runs to completion without yielding, so two enrolments cannot
+  // interleave through this buffer. That holds only while the bridge never
+  // WRITES `member` (it only subscribes) — if a second writer is ever added,
+  // this buffer and `memberBuf` both need real per-link state, not a comment.
   static uint8_t body[512];
   const int bodyLen = ozB64UrlDecode(inviteQr + plen, strlen(inviteQr) - plen,
                                      body, sizeof(body) - 1);
@@ -6136,6 +6264,240 @@ static void ozBondExpirySweep() {
   }
 }
 
+#ifdef OZ_NO_MCU
+// ─────────────────────────────────────────────────────────────────────────────
+// BENCH CONSOLE — READ-ONLY, OZ_NO_MCU ONLY (member/"digital passport" testing)
+//
+// Why this exists: the member ceremony is fully implemented but its result was
+// only ever observable three ways — the `[BOND] table loaded` dump that prints
+// ONCE at boot, the `[MEMBER]` lines emitted at the instant of enrolment, and
+// `list_bonds` (DPID 103) which needs a bonded phone to ask. So "is the member
+// bond actually there, with the right label, expiry and floor?" could only be
+// answered by rebooting the lock (destroying the state you wanted to inspect)
+// or by trusting the app you are trying to test. That is the same class of hole
+// as every other silent-failure we have paid for: a diagnostic you cannot read
+// on demand is not a diagnostic.
+//
+// 🔴 DELIBERATELY READ-ONLY. No `revoke`, no `enrol`, no bond mutation of any
+// kind. Serial is unauthenticated and physically exposed on the bench boards;
+// a console that could mint or delete a bond would be a second authority path
+// sitting beside the entire M2/M3/M4 gate stack, and the invite MAC, the
+// challenge and the counter floor would all be bypassable by anyone holding a
+// USB cable. Revocation stays where it belongs: DPID 101, admin-only, sealed.
+//
+// Guarded by OZ_NO_MCU so production doorlock/doorlock19 keep building
+// byte-identical — on those boards Serial is also the operator's only window
+// onto a shipping device, and this is a bench affordance, not a product one.
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// BENCH-ONLY LOCAL CREDENTIAL STORE — PIN/RFID, OZ_NO_MCU ONLY
+//
+// The real DL-MCU (CH584M in production, a real Tuya MCU on doorlock/
+// doorlock19) is what actually stores and enforces PIN/RFID credentials — see
+// tuyaWireSend()'s own header for why this board has neither. Before this,
+// grant_pin/grant_rfid/delete_pin/delete_rfid dispatched cleanly (server-path
+// gated per XF-59 §4, role-gated, ASCII/hex validated) and then landed
+// nowhere: forwardFrameToMcu()'s OZ_NO_MCU branch only ever special-cases the
+// unlock DP. Fine while nothing tested credential issuance; not fine once it
+// needed validating without a LockSim rig.
+//
+// Deliberately narrower than what a real DL-MCU (or LockSim's own
+// credentials.ts, which this mirrors) provides: nothing on this board
+// generates a simulated keypad/RFID-reader ENTRY event — CH584M owns that
+// hardware, and no OZ_NO_MCU code path invents one. So this store proves
+// grant / delete / persist-across-reboot / expire-by-clock, honestly, but
+// NOT "does entering this PIN actually open the door" — that assertion still
+// needs a real DL-MCU or LockSim. Said here once rather than left implicit,
+// because an unstated scope boundary is how a bench affordance quietly gets
+// mistaken for a finished feature.
+//
+// Fail-closed on time, same principle as ozBondExpirySweep()'s membership
+// check and LockSim's own checkWindowMcu(): a lock that cannot tell whether a
+// window has closed must not report it valid. TIME_UNKNOWN is a distinct
+// outcome from VALID, never conflated with it.
+// ─────────────────────────────────────────────────────────────────────────────
+#define OZ_CRED_MAX     16  // bench capacity; not a claim about production slot counts
+#define OZ_CRED_VAL_MAX 24  // PIN ASCII digits or RFID hex UID, NUL-terminated
+
+struct OzCred {
+  bool     present;
+  bool     isPin;              // true = PIN, false = RFID
+  uint16_t slot;
+  char     value[OZ_CRED_VAL_MAX];
+  uint32_t start, end;         // unix seconds — the OZKIE `from`/`to` fields, verbatim
+};
+static OzCred g_creds[OZ_CRED_MAX];
+
+static int ozCredFind(bool isPin, uint16_t slotNo) {
+  for (int i = 0; i < OZ_CRED_MAX; i++)
+    if (g_creds[i].present && g_creds[i].isPin == isPin && g_creds[i].slot == slotNo)
+      return i;
+  return -1;
+}
+
+static void ozCredsSave() {
+  prefs.begin("blelock", false);
+  prefs.putBytes("credtab", g_creds, sizeof(g_creds));
+  prefs.end();
+}
+
+static void ozCredsLoad() {
+  prefs.begin("blelock", true);
+  const size_t n = prefs.getBytesLength("credtab");
+  if (n == sizeof(g_creds)) prefs.getBytes("credtab", g_creds, sizeof(g_creds));
+  else memset(g_creds, 0, sizeof(g_creds)); // first boot, or a size mismatch — start clean
+  prefs.end();
+  int count = 0;
+  for (int i = 0; i < OZ_CRED_MAX; i++) if (g_creds[i].present) count++;
+  Serial.printf("[CRED] table loaded — %d credential(s)\n", count);
+}
+
+// Insert or replace the credential at (isPin, slot) — matches the OZKIE
+// grant_pin/grant_rfid semantics: a grant to an occupied slot REPLACES it,
+// same as LockSim's upsertCredential and the real MCU's own slot model.
+static bool ozCredUpsert(bool isPin, uint16_t slotNo, const char *value,
+                         uint32_t start, uint32_t end) {
+  if (!value || !*value || strlen(value) >= OZ_CRED_VAL_MAX) return false;
+  int i = ozCredFind(isPin, slotNo);
+  if (i < 0) {
+    for (int j = 0; j < OZ_CRED_MAX; j++) if (!g_creds[j].present) { i = j; break; }
+    if (i < 0) return false; // table full
+  }
+  g_creds[i].present = true;
+  g_creds[i].isPin = isPin;
+  g_creds[i].slot = slotNo;
+  strncpy(g_creds[i].value, value, OZ_CRED_VAL_MAX - 1);
+  g_creds[i].value[OZ_CRED_VAL_MAX - 1] = 0;
+  g_creds[i].start = start;
+  g_creds[i].end = end;
+  ozCredsSave();
+  return true;
+}
+
+static bool ozCredDelete(bool isPin, uint16_t slotNo) {
+  const int i = ozCredFind(isPin, slotNo);
+  if (i < 0) return false;
+  memset(&g_creds[i], 0, sizeof(OzCred));
+  ozCredsSave();
+  return true;
+}
+
+enum OzCredWindow { OZ_CRED_VALID, OZ_CRED_NOT_YET, OZ_CRED_EXPIRED, OZ_CRED_TIME_UNKNOWN };
+
+static OzCredWindow ozCredCheckWindow(const OzCred &c) {
+  if (!ozClockKnown(ozclock)) return OZ_CRED_TIME_UNKNOWN;
+  const uint32_t now = ozClockNow(ozclock, millis());
+  if (!now) return OZ_CRED_TIME_UNKNOWN;
+  if (now < c.start) return OZ_CRED_NOT_YET;
+  if (c.end && now > c.end) return OZ_CRED_EXPIRED;
+  return OZ_CRED_VALID;
+}
+
+static void ozBenchDumpBonds() {
+  const uint32_t now = ozClockKnown(ozclock) ? ozClockNow(ozclock, millis()) : 0;
+  Serial.printf("[BENCH] bonds %d/%d  roster_epoch=%lu  clock=%s\n", ozBondCount(),
+                OZ_BOND_MAX, (unsigned long)g_rosterEpoch,
+                now ? String(now).c_str() : "UNKNOWN");
+  for (int i = 0; i < OZ_BOND_MAX; i++) {
+    if (!g_bonds[i].present) continue;
+    // Expiry is printed as both the raw stamp and a live verdict: the stamp
+    // alone cannot be read against a clock you are not holding, and "expires in
+    // 40 s" is the number a tester actually needs mid-ceremony.
+    char exp[48];
+    if (g_bonds[i].expiresAt == 0) {
+      snprintf(exp, sizeof(exp), "permanent");
+    } else if (!now) {
+      snprintf(exp, sizeof(exp), "%u (clock UNKNOWN — unenforceable)",
+               (unsigned)g_bonds[i].expiresAt);
+    } else if (now >= g_bonds[i].expiresAt) {
+      snprintf(exp, sizeof(exp), "%u (EXPIRED %us ago — sweep pending)",
+               (unsigned)g_bonds[i].expiresAt, (unsigned)(now - g_bonds[i].expiresAt));
+    } else {
+      snprintf(exp, sizeof(exp), "%u (in %us)", (unsigned)g_bonds[i].expiresAt,
+               (unsigned)(g_bonds[i].expiresAt - now));
+    }
+    Serial.printf("[BENCH]  #%-2d %-6s label='%s' floor=%llu tx=%llu exp=%s\n", i,
+                  g_bonds[i].role == OZ_ROLE_ADMIN ? "admin" : "member",
+                  g_bonds[i].label, (unsigned long long)g_bonds[i].floor,
+                  (unsigned long long)g_bonds[i].txCounter, exp);
+    // The pubkey IS the app_id the invite is minted against, so a mismatch here
+    // is the commonest real cause of "invite MAC does not verify". Full 64 hex,
+    // not a prefix — a prefix cannot be diffed against what the app claims.
+    char hex[65];
+    ozHex(g_bonds[i].pub, 32, hex);
+    Serial.printf("[BENCH]      pub=%s\n", hex);
+  }
+}
+
+static void ozBenchConsolePoll() {
+  static String line;
+  while (Serial.available()) {
+    const char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') {
+      if (line.length() < 64) line += c;   // bounded: never grow on noise
+      continue;
+    }
+    line.trim();
+    const String cmd = line;
+    line = "";
+    if (!cmd.length()) continue;
+
+    if (cmd == "bonds") {
+      ozBenchDumpBonds();
+    } else if (cmd == "creds") {
+      int count = 0;
+      for (int i = 0; i < OZ_CRED_MAX; i++) if (g_creds[i].present) count++;
+      Serial.printf("[BENCH] credentials %d/%d\n", count, OZ_CRED_MAX);
+      for (int i = 0; i < OZ_CRED_MAX; i++) {
+        if (!g_creds[i].present) continue;
+        const OzCredWindow w = ozCredCheckWindow(g_creds[i]);
+        const char *verdict = w == OZ_CRED_VALID       ? "VALID"
+                            : w == OZ_CRED_NOT_YET      ? "NOT_YET_ACTIVE"
+                            : w == OZ_CRED_EXPIRED      ? "EXPIRED"
+                                                        : "TIME_UNKNOWN — unenforceable";
+        Serial.printf("[BENCH]  %-4s slot=%-3u value=%-10s start=%lu end=%lu -> %s\n",
+                      g_creds[i].isPin ? "PIN" : "RFID", g_creds[i].slot,
+                      g_creds[i].value, (unsigned long)g_creds[i].start,
+                      (unsigned long)g_creds[i].end, verdict);
+      }
+    } else if (cmd == "id") {
+      Serial.printf("[BENCH] device_id=%s fw=%s profile=%s bond0=%s\n",
+                    deviceId.c_str(), FW_VERSION, ozProfileId(),
+                    ozBond0Present() ? ozBond0PubHex().c_str() : "(none)");
+    } else if (cmd == "links") {
+      Serial.printf("[BENCH] links=%d/%d connected=%s advertising_allowed=%s\n",
+                    bleLinkCount, OZ_BLE_MAX_LINKS,
+                    bleClientConnected ? "y" : "n",
+                    bleAdvertisingAllowed() ? "y" : "n");
+    } else if (cmd == "pushcaps") {
+      // 🔴 THE ONE DELIBERATE EXCEPTION to this console's read-only rule
+      // (2026-08-31, XF-139 P0). Everything else here mutates nothing because
+      // a mutating console would be a second authority path beside the M2/M3/
+      // M4 crypto stack — see this section's own header. This command carries
+      // no such risk: it doesn't touch a bond, a credential, or access control
+      // at all — it just re-sends the lock's own public-ish capability report
+      // (caps/verbs) over the relay any connected client already learns this
+      // from anyway. Exists because the normal once-per-boot trigger is timed
+      // against `bleClientConnected`, and confirming it actually fires and
+      // reaches the bridge live is otherwise stuck waiting on real boot/
+      // reconnect timing — this makes it a deterministic, on-demand check.
+      if (!bleClientConnected) {
+        Serial.println("[BENCH] pushcaps: no BLE client connected, nothing to relay to");
+      } else {
+        publishEnroll();
+      }
+    } else if (cmd == "help") {
+      Serial.println("[BENCH] bonds | creds | id | links | pushcaps | help   "
+                     "(read-only except pushcaps, see its own note; revoke is "
+                     "DPID 101, delete_pin/delete_rfid deletes a credential)");
+    } else {
+      Serial.printf("[BENCH] unknown '%s' — try: help\n", cmd.c_str());
+    }
+  }
+}
+#endif // OZ_NO_MCU — bench console
+
 // DPID 102 — invite_cancel. Value = the 16-byte invite nonce. Kills a QR that
 // was photographed but never redeemed; this is the real expiry control, since
 // `expires` is parse-and-ignore on a lock with no clock (XF-47).
@@ -6351,14 +6713,27 @@ static void ozControlDispatch(int slot, const uint8_t *frame, size_t flen) {
 // CONTRACT (normative — ozkey-17 §6c. The lock is the reference implementation;
 // server and app align to THIS, not the reverse):
 //
-//   {"kind":"unlock"}                                            any bond
-//   {"kind":"grant_pin",  "slot":N,"cred":hex,"from":ts,"to":ts}  bond #0 only
-//   {"kind":"delete_pin", "slot":N}                               bond #0 only
-//   {"kind":"grant_rfid", "slot":N,"cred":hex,"from":ts,"to":ts}  bond #0 only
-//   {"kind":"delete_rfid","slot":N}                               bond #0 only
-//   {"kind":"bond_revoke","pub":hex(64 chars)}                    bond #0 only
-//   {"kind":"invite_cancel","nonce":hex(32 chars)}                bond #0 only
-//   {"kind":"list_bonds"}                                         bond #0 only
+//   {"kind":"unlock"}                                              any bond
+//   {"kind":"grant_pin",  "slot":N,"cred":ascii,"from":ts,"to":ts} bond #0 only, server path only
+//   {"kind":"delete_pin", "slot":N}                                bond #0 only, server path only
+//   {"kind":"grant_rfid", "slot":N,"cred":hex,"from":ts,"to":ts}   bond #0 only, server path only
+//   {"kind":"delete_rfid","slot":N}                                bond #0 only, server path only
+//   {"kind":"bond_revoke","pub":hex(64 chars)}                     bond #0 only
+//   {"kind":"invite_cancel","nonce":hex(32 chars)}                 bond #0 only
+//   {"kind":"list_bonds"}                                          bond #0 only
+//
+// 🔴 `grant_pin`'s `cred` is ASCII, NOT hex — this line was wrong until
+// XF-140 (2026-08-31) caught the app sending hex-of-ASCII-bytes, tested and
+// passing on both sides in isolation, invisible until run against real
+// firmware. `grant_rfid`'s `cred` genuinely is hex (a UID, not text). See
+// CONTRACT.md's "Credential-issuance verbs" section for the full incident —
+// this exact comment block is the doc that let it drift stale in the first
+// place; CONTRACT.md is now the canonical copy, keep this one in sync with
+// it rather than the reverse.
+//
+// grant_pin/grant_rfid/delete_pin/delete_rfid are ALSO refused over BLE
+// `control` (XF-59 §4, CANONICAL) — see ozSemanticDispatch()'s own `viaBle`
+// checks in each of those four branches, not shown in this list.
 //
 // An unrecognised `kind` is REJECTED — never guessed at, never forwarded. Same
 // allow-list discipline ozDpForwardable() enforces on the legacy path, and for
@@ -7006,6 +7381,109 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
       val[0] = 0x01; vlen = 1;
     }
   } else if (strcmp(kind, "grant_pin") == 0 || strcmp(kind, "grant_rfid") == 0) {
+    // ── XF-59 §4 (AV), agreed both teams 2026-08-04 — SERVER PATH ONLY ────────
+    //
+    // 🔴 This gate was AGREED and never BUILT. XF-59 §4 confirmed BLE `control`
+    // (…0006) carries DP 1/101/102 only — "a frame with DP 21-24 on …0006 is
+    // answered UNLOCK_DENIED today" — and was meant to become canonical in
+    // CONTRACT.md. It never did, and when grant_pin/grant_rfid moved off the
+    // raw DP numbers onto this semantic verb resolver (ozkey-42/XF-128, to fix
+    // the navigation_volume mis-DP bug), no one re-implemented the transport
+    // check for the new dispatch shape — this whole branch has never once
+    // asked `viaBle`.
+    //
+    // The reasoning still holds: credential issuance has a server-side record
+    // (grants, expiry, revocation, the audit trail). A PIN/RFID granted or
+    // deleted at the door over BLE has none of that — the server never learns
+    // it happened, so it cannot be listed, expired or revoked, and the lock
+    // and server end up disagreeing about what is live on that door. That is
+    // two authorities for one operation, and the quieter one wins by accident.
+    // An unlock has nothing to reconcile, which is why DP 1 is fine here and
+    // credential verbs are not.
+    //
+    // On production hardware this was invisible: DP 16/13's payload layout is
+    // still unsupplied, so `ozVerbUsable()` refuses it anyway, for an unrelated
+    // reason — the moment a supplier layout lands, THAT gate opens and this one
+    // was never there to catch it. On a CH584M board under OZ_NO_MCU the mask
+    // is already off (`ozVerbUsable()` returns true for any resolved verb by
+    // design — see its own header), so this was live and exploitable on the
+    // bench today: a bonded phone standing at LockA could grant or delete a
+    // PIN with zero server record, the exact hole XF-59 exists to close.
+    if (viaBle) {
+      Serial.printf("[OZKIE] %s REFUSED over BLE control — server path only "
+                    "(XF-59 §4)\n", kind);
+      ozReportOutcome(slot, "CRED_SERVER_ONLY",
+                      String(kind) + " requires the server path, not BLE control");
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    const bool isPin = (strcmp(kind, "grant_pin") == 0);
+#ifdef OZ_NO_MCU
+    // ── OZ_NO_MCU: skip Tuya DP resolution — it is the wrong question here ──
+    //
+    // 🔴 2026-08-31, operator's call. `ozResolveVerb("cred.put",…)` and
+    // `ozVerbUsable()` exist to answer "do we know a REAL supplier chip's
+    // byte layout for this DP" — this board never puts a byte on a Tuya wire
+    // (`tuyaWireSend()`'s own header), so that question has no meaning here.
+    // The first cut of this branch ran credential grants through that gate
+    // anyway, purely because it was already there for production, and hit
+    // exactly the trap this codebase keeps re-learning: `tuya-wifi-lock-pro`
+    // (LockA's loaded profile) has NO pin/rfid DP at all — its own credential
+    // model is method/response/remote_key (DP 35/37/49, a different product
+    // category) — so the honest local answer ("no supplier chip exists on
+    // this board") came back as `CRED_UNSUPPORTED`, the SAME code production
+    // uses for "a real chip's byte layout is unconfirmed." Two different
+    // facts, one string. Reflashing with a DIFFERENT profile chosen only
+    // because it happens to define cred.put would not have fixed anything —
+    // it tests compatibility with a real chip these bytes were never going
+    // to reach either way. The OZKIE ceremony this grant is meant to prove
+    // has nothing to do with which Tuya product's DP table happens to be
+    // loaded.
+    //
+    // Same reasoning `ozVerbUsable()`'s own header already established for
+    // unlock ("we ARE the thing that would have moved the bolt"), applied to
+    // credentials instead: we ARE the thing that would have stored this one,
+    // so the local store IS the authority — nothing left to resolve, pack
+    // into a Tuya frame, or forward.
+    if (g_bonds[slot].role != OZ_ROLE_ADMIN) {
+      Serial.printf("[OZKIE] %s is role-gated to bond #0 — bond %d ('%s', member) "
+                    "denied\n", kind, slot, g_bonds[slot].label);
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    const uint32_t credSlot = doc["slot"] | 0xFFFFFFFFu;
+    const char *credCred = doc["cred"] | "";
+    const uint32_t credFrom = doc["from"] | 0u;
+    const uint32_t credTo = doc["to"] | 0u;
+    // Same ASCII-vs-hex split ozSemGrantValue() enforces on production —
+    // reimplemented rather than shared, because that function also PACKS a
+    // Tuya-frame value this path has no use for. See XF-140: PIN is ASCII
+    // digits verbatim, RFID is hex — not the other way round, and not
+    // interchangeable.
+    bool credOk = (credSlot <= 0xFFFF) && *credCred;
+    if (credOk && isPin) {
+      for (const char *p = credCred; *p; p++)
+        if (*p < '0' || *p > '9') { credOk = false; break; }
+    } else if (credOk) {
+      uint8_t scratch[16];
+      credOk = ozHexDecode(String(credCred), scratch, sizeof(scratch)) > 0;
+    }
+    if (!credOk || !ozCredUpsert(isPin, (uint16_t)credSlot, credCred, credFrom, credTo)) {
+      Serial.printf("[OZKIE] %s: bad/missing slot/cred/from/to, or table full\n", kind);
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+    Serial.printf("[CRED] %s slot=%u stored locally (bench store, no external MCU)\n",
+                  isPin ? "PIN" : "RFID", (unsigned)credSlot);
+    {
+      char gdetail[72];
+      snprintf(gdetail, sizeof(gdetail), "OZKIE credential (%s, via %s)",
+               slot == 0 ? "owner" : "member", viaBle ? "ble" : "net");
+      publishLog("granted", gdetail, slot);
+    }
+    notifyStatus("UNLOCK_OK");
+    return;
+#else
     // 🔴 RESOLVED, NOT HARDCODED — and this one is a safety fix, not tidiness.
     //
     // This used to be `dp = grant_pin ? 21 : 23`, unconditionally. On the real
@@ -7019,7 +7497,6 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
     // both RESERVED because the supplier has never supplied their payload
     // layout — so the grant is now REFUSED with a reason instead of silently
     // misfiring. Refusing is the correct behaviour until ozkey-42 P0 lands.
-    const bool isPin = (strcmp(kind, "grant_pin") == 0);
     const OzVerbMap *g = ozResolveVerb("cred.put", isPin ? "pin" : "rfid",
                                        OZ_DIR_DOWN);
     if (!g) {
@@ -7047,7 +7524,50 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
       notifyStatus("UNLOCK_DENIED");
       return;
     }
+#endif
   } else if (strcmp(kind, "delete_pin") == 0 || strcmp(kind, "delete_rfid") == 0) {
+    // XF-59 §4 — same server-path-only restriction as grant_pin/grant_rfid
+    // above; see that branch's header comment for the full reasoning. A
+    // delete carries the same dual-authority problem as a grant: the server
+    // must learn a credential is gone, or it goes on believing a revoked PIN
+    // is still live.
+    if (viaBle) {
+      Serial.printf("[OZKIE] %s REFUSED over BLE control — server path only "
+                    "(XF-59 §4)\n", kind);
+      ozReportOutcome(slot, "CRED_SERVER_ONLY",
+                      String(kind) + " requires the server path, not BLE control");
+      notifyStatus("UNLOCK_DENIED");
+      return;
+    }
+#ifdef OZ_NO_MCU
+    // Same reasoning as grant_pin/grant_rfid's OZ_NO_MCU branch above: no
+    // Tuya DP to resolve, no wire to forward to — the local store IS the
+    // authority, delete it here and answer directly.
+    {
+      const bool credIsPin = (strcmp(kind, "delete_pin") == 0);
+      if (g_bonds[slot].role != OZ_ROLE_ADMIN) {
+        Serial.printf("[OZKIE] %s is role-gated to bond #0 — bond %d ('%s', member) "
+                      "denied\n", kind, slot, g_bonds[slot].label);
+        notifyStatus("UNLOCK_DENIED");
+        return;
+      }
+      const uint32_t credSlot = doc["slot"] | 0xFFFFFFFFu;
+      if (credSlot > 0xFFFF) {
+        Serial.printf("[OZKIE] %s: bad or missing `slot`\n", kind);
+        notifyStatus("UNLOCK_DENIED");
+        return;
+      }
+      const bool deleted = ozCredDelete(credIsPin, (uint16_t)credSlot);
+      Serial.printf("[CRED] %s slot=%u %s (bench store)\n", credIsPin ? "PIN" : "RFID",
+                    (unsigned)credSlot, deleted ? "deleted locally" : "was not present");
+      char gdetail[72];
+      snprintf(gdetail, sizeof(gdetail), "OZKIE credential delete (%s, via %s)",
+               slot == 0 ? "owner" : "member", viaBle ? "ble" : "net");
+      publishLog("granted", gdetail, slot);
+      notifyStatus("UNLOCK_OK");
+      return;
+    }
+#else
     dp = (strcmp(kind, "delete_pin") == 0) ? 22 : 24;
     type = 0x00 /* RAW */;
     const uint32_t slotNo = doc["slot"] | 0xFFFFFFFFu;
@@ -7057,6 +7577,7 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
       return;
     }
     val[0] = (uint8_t)(slotNo >> 8); val[1] = (uint8_t)(slotNo & 0xFF); vlen = 2;
+#endif
   } else {
     Serial.printf("[OZKIE] unknown kind '%s' — rejected, NOT forwarded\n", kind);
     notifyStatus("UNLOCK_DENIED");
@@ -7071,6 +7592,13 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
     notifyStatus("UNLOCK_DENIED");
     return;
   }
+
+  // NOTE: grant_pin/grant_rfid/delete_pin/delete_rfid never reach this point
+  // under OZ_NO_MCU — each returns early from its own branch above once the
+  // local store is updated, since there is no DP to resolve or MCU to
+  // forward to on this board. Only `unlock` (and, on production hardware,
+  // the credential verbs too) still falls through to the Tuya-frame tail
+  // below.
 
   uint8_t frame[OZ_SEM_VAL_MAX + 16];
   const size_t flen = ozBuildDpFrame(dp, type, val, vlen, frame);
@@ -7997,6 +8525,22 @@ const char KP_KEYS[2][4] = {
 // set it once the panel stopped being an input, so it was dead by
 // construction. The keypad is still DRAWN: it is the product's face and the
 // lock/unlock state block sits in the same layout.
+//
+// 🟢 2026-09-01, OZ_KEYPAD_LIVE only (dlch584m_19, operator's ask) — touch
+// input is back, deliberately scoped to this one board rather than restored
+// globally. See touchRead()'s own header (dlch584m_19.ino) for why global
+// restoration was NOT done: the last time a gesture on this exact panel
+// drove real behavior (XF-58's presence gate), it was wired to hardware
+// PRODUCTION DOES NOT HAVE, and the fix was removing the dependency, not the
+// panel. This is bench-only, purely to close a real, named gap: the
+// credential store built earlier this session could prove grant/delete/
+// persist/expire, but never "does entering this PIN actually open the
+// door" — there was no keypad-entry event anywhere in this codebase to
+// prove it with. This is that event, nowhere else.
+#ifdef OZ_KEYPAD_LIVE
+int  g_kpLitR = -1, g_kpLitC = -1;   // which key is currently highlighted
+unsigned long g_kpLitUntil = 0;      // millis deadline for the highlight
+#endif
 
 void drawKeypad() {
   // Filled blue keys (operator, 2026-08-07: "employ blue amber etc. ...to
@@ -8006,7 +8550,11 @@ void drawKeypad() {
   for (int r = 0; r < 2; r++) {
     for (int c = 0; c < 4; c++) {
       int x = c * KEY_W, y = KP_TOP + r * KEY_H;
+#ifdef OZ_KEYPAD_LIVE
+      const bool lit = (r == g_kpLitR && c == g_kpLitC && millis() < g_kpLitUntil);
+#else
       const bool lit = false; // (2.19) no touch input — nothing can highlight
+#endif
       // 1.70: the amber '#' is GONE, and that is not cosmetic. It existed to
       // say "this key, and only this key, opens the pairing window" — true from
       // 2026-08-11 until this version, false the moment any key started opening
@@ -8024,6 +8572,95 @@ void drawKeypad() {
     }
   }
 }
+
+#ifdef OZ_KEYPAD_LIVE
+// ── Bench keypad PIN entry — reads real touches, checks real credentials ───
+//
+// '#' submits, '*' clears — the only two non-digit keys KP_KEYS has (see its
+// own comment on why the set is 4x2 not 4x3: no real backend ever existed
+// behind these taps before, so a full 0-9 set was never needed either — six
+// digits, 1/2/3/4/5/6, is what's actually on the panel today).
+//
+// Edge-detected: acts once per press, not once per loop iteration while a
+// finger sits still. Bounded: the digit buffer cannot grow past what the
+// credential store can hold (OZ_CRED_VAL_MAX), so a stuck/noisy touch cannot
+// overrun anything.
+static bool g_kpWasDown = false;
+// g_kpBuf itself is declared earlier now (see drawStatusLine()'s own
+// comment) — this section still owns its meaning and lifecycle, only the
+// declaration moved so the status line can read its length.
+static unsigned long g_kpFlashUntil = 0; // 0 = not showing a result overlay
+
+static void ozKeypadPoll() {
+  // A result overlay (OPEN/DENIED) is showing — let it sit, then hand the
+  // screen back to the normal dashboard. Nothing else runs while it's up:
+  // reading touches under it would let a tap on the overlay register as a
+  // keypad press on the dashboard underneath once it clears.
+  if (g_kpFlashUntil) {
+    if (millis() >= g_kpFlashUntil) { g_kpFlashUntil = 0; screenDirty = true; }
+    return;
+  }
+
+  int rawX, rawY;
+  const bool down = touchRead(rawX, rawY);
+  if (!down) { g_kpWasDown = false; return; }
+  if (g_kpWasDown) return; // still holding the same press — wait for release
+  g_kpWasDown = true;
+
+  int x, y;
+  mapTouchRaw(rawX, rawY, x, y);
+  if (y < KP_TOP) return; // touch landed above the keypad — not ours
+
+  const int c = x / KEY_W;
+  const int r = (y - KP_TOP) / KEY_H;
+  if (r < 0 || r > 1 || c < 0 || c > 3) return;
+  const char key = KP_KEYS[r][c];
+
+  g_kpLitR = r; g_kpLitC = c; g_kpLitUntil = millis() + 200;
+  screenDirty = true;
+  Serial.printf("[KEYPAD] tap r=%d c=%d key='%c' raw=(%d,%d) mapped=(%d,%d)\n",
+                r, c, key, rawX, rawY, x, y);
+
+  if (key == '*') {
+    g_kpBuf = "";
+    Serial.println("[KEYPAD] cleared");
+    return;
+  }
+  if (key != '#') {
+    if (g_kpBuf.length() < OZ_CRED_VAL_MAX - 1) g_kpBuf += key;
+    Serial.printf("[KEYPAD] buffer now %u digit(s)\n", g_kpBuf.length());
+    return;
+  }
+
+  // '#' — submit. Look for ANY stored PIN whose value matches what was
+  // typed; a person at the door does not know or care which slot it lives
+  // in, the same way a real MCU's keypad match would not surface one.
+  Serial.printf("[KEYPAD] submit '%s'\n", g_kpBuf.c_str());
+  int slot = -1;
+  for (int i = 0; i < OZ_CRED_MAX; i++) {
+    if (g_creds[i].present && g_creds[i].isPin && g_kpBuf == g_creds[i].value) {
+      slot = i; break;
+    }
+  }
+  const bool valid = (slot >= 0) && (ozCredCheckWindow(g_creds[slot]) == OZ_CRED_VALID);
+  if (valid) {
+    Serial.printf("[KEYPAD] PIN matched slot %d — OPEN\n", slot);
+    markDoorUnlocked();
+    // actorSlot -1: ozEvtPush()'s own mapping reads this as "keypad" — MCU-
+    // sourced, identity unknown — exactly true here: nothing upstream of
+    // this match knows or asks WHO typed the PIN, same as real hardware.
+    publishLog("granted", "keypad PIN", -1);
+    drawFlash("OPEN", C_GREEN, C_BLACK);
+  } else {
+    const char *why = (slot < 0) ? "no match" : "expired/not yet active";
+    Serial.printf("[KEYPAD] PIN denied (%s)\n", why);
+    publishLog("denied", "keypad PIN", -1);
+    drawFlash("DENIED", C_RED, C_WHITE);
+  }
+  g_kpBuf = "";
+  g_kpFlashUntil = millis() + 1500;
+}
+#endif // OZ_KEYPAD_LIVE
 
 // lastMcuHex is set by tuyaWireSend() (defined earlier — set by the operator
 // directive, "no need to use locksim... display hex cmd instead").
@@ -8377,6 +9014,9 @@ void setup() {
   ozBondsLoad();
   Serial.printf("[BOND] bond #0: %s\n",
                 ozBond0Present() ? ozBond0PubHex().c_str() : "none (unowned)");
+#ifdef OZ_NO_MCU
+  ozCredsLoad(); // bench-only PIN/RFID store — see its own header
+#endif
   // M3: name every member at boot. A bond the operator cannot enumerate is a
   // bond they cannot audit, and this is the only surface that lists them until
   // the M4 uplink exists.
@@ -8993,6 +9633,27 @@ void loop() {
       millis() - lastTimePushAt > MCU_TIME_PUSH_MS)
     serveMcuTimePush();
 
+#ifdef OZ_NO_MCU
+  // XF-139 P0 — none of publishEnroll()'s existing callers ever fire on this
+  // board (both gated on mqtt.connected(), which is permanently false here),
+  // so the capability report needs its own trigger. Fires once per boot, the
+  // first time the bridge is actually connected to relay it — sending it
+  // before that would just be a wasted queue that never gets read. `caps`
+  // does not depend on the clock (unlike CHR_TIME's push), so it does not
+  // need to wait on anything else being ready.
+  {
+    static bool capsReportSent = false;
+    if (!capsReportSent && bleClientConnected) {
+      capsReportSent = true;
+      publishEnroll();
+    }
+  }
+  ozBenchConsolePoll();   // read-only bench console (see ozBenchDumpBonds)
+#ifdef OZ_KEYPAD_LIVE
+  ozKeypadPoll();          // real touch -> real PIN entry (see its own header)
+#endif
+#endif
+
   // ozkey-21 T5: expire memberships on a timer as well as on the command path.
   // The timer is what makes an expiry OBSERVABLE — the roster_changed notify
   // and the heartbeat's bond count move on their own, so an admin's app learns
@@ -9026,7 +9687,20 @@ void loop() {
                   "udp=%s mcu=%s tx=%u rx=%u wake=%s mrdy=%s srdy=%s hb=%us "
                   "radio=%s naps=%u heap=%u clock=%s treq=%u tserved=%u\n",
                   st, cfgName.c_str(),
+                  // 🔴 A THIRD BUILDER OF `transport`. publishHeartbeat() and
+                  // ozRefreshInfoChar() both got the OZ_NO_MCU->"ble" override
+                  // (the second only on 2026-08-30, after reporting "wifi" cost
+                  // App an entire night — XF-127's pattern, twice). This line is
+                  // the same field built a third time, straight off the NVS
+                  // default, and it is the one a firmware dev actually READS
+                  // while debugging. Leaving it saying "wifi" on a radio-less
+                  // lock is how that bug stays invisible to the person best
+                  // placed to catch it. See [[two-heartbeat-builders-diverge]].
+#ifdef OZ_NO_MCU
+                  provisioned ? "ble" : "unset", modeInfo.c_str(),
+#else
                   provisioned ? cfgTransport.c_str() : "unset", modeInfo.c_str(),
+#endif
                   WiFi.status() == WL_CONNECTED ? "up" : "down",
                   WiFi.localIP().toString().c_str(),
                   mqtt.connected() ? "up" : "down",

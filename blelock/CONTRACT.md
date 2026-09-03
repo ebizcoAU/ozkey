@@ -325,6 +325,50 @@ the two frames specified below.
 **Cost:** +5,640 B flash (62% of 3.34 MB), +520 B RAM — the 512 B reassembly
 buffer and its bookkeeping.
 
+### Credential-issuance verbs — `grant_pin` / `grant_rfid` / `delete_pin` / `delete_rfid`
+
+**Server path only, never BLE `control`** — see the DP 1/101/102 restriction
+above (XF-59 §4). These four never had a wire shape written down anywhere
+outside firmware source before now, which is exactly how XF-140's encoding
+mismatch (below) went undetected by either side's own tests.
+
+Sealed envelope, same structure as `bond_revoke`/`invite_cancel` — plaintext
+JSON, one of:
+```
+{"kind":"grant_pin",   "slot":N, "cred":"<ASCII digits>",  "from":ts, "to":ts}
+{"kind":"grant_rfid",  "slot":N, "cred":"<hex UID>",       "from":ts, "to":ts}
+{"kind":"delete_pin",  "slot":N}
+{"kind":"delete_rfid", "slot":N}
+```
+Admin-only (bond #0). `slot` 0–65535. `from`/`to` unix seconds, the
+credential's validity window.
+
+**`cred` encoding is PER-KIND, not uniform — this is the whole point of
+documenting it here.** `grant_pin`'s `cred` is the PIN's ASCII digit string,
+verbatim — `"482915"`, not hex, not any transform of it. `grant_rfid`'s
+`cred` is the UID's hex encoding, matching every other binary field on this
+wire (`pub`, `nonce`, `app_id`). Firmware validates and rejects a
+malformed `cred` per-kind: every character must be `0`–`9` for a PIN, valid
+hex for RFID.
+
+**Two independent incidents already happened from getting this wrong, in
+opposite directions — recorded here so a third does not.** Firmware's 1.60
+fix corrected an over-eager hex-*decode* that silently mangled every PIN
+grant (`UNLOCK_OK`, MCU discarded the frame — ozkey-42 §2.4.1). XF-140
+(2026-08-31) found the mirror bug on the app side — an over-eager hex-*encode*
+in `Keyring.sealAddTempPin`, tested and passing on both sides in isolation,
+invisible until run against real firmware because ASCII-digit bytes happen
+to hex-encode into strings that still pass a "must be digits" check. Fixed
+in `ozkey_commissioner` 1.0.43.
+
+`grant_pin`/`grant_rfid` answer `UNLOCK_OK` on success (same string a
+successful unlock uses — these are OUTSIDE the commissioning ladder, see
+`OzkeyStatus.parse`'s own note above), `UNLOCK_DENIED` on refusal
+(role, malformed `cred`, DP layout unsupplied on real Tuya hardware, or
+attempted over BLE), with the reason on the sealed outcome channel
+(`CRED_UNSUPPORTED`, `CRED_SERVER_ONLY`, `MCU_TIMEOUT`). `delete_pin`/
+`delete_rfid` answer the same way.
+
 ### [XF-47] Bond #0 establishment, and the ownership-theft rule
 
 Bond #0 is created from the **`app_id`** field already present in
