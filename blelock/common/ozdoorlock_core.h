@@ -9636,16 +9636,50 @@ void loop() {
 #ifdef OZ_NO_MCU
   // XF-139 P0 — none of publishEnroll()'s existing callers ever fire on this
   // board (both gated on mqtt.connected(), which is permanently false here),
-  // so the capability report needs its own trigger. Fires once per boot, the
-  // first time the bridge is actually connected to relay it — sending it
-  // before that would just be a wasted queue that never gets read. `caps`
-  // does not depend on the clock (unlike CHR_TIME's push), so it does not
-  // need to wait on anything else being ready.
+  // so the capability report needs its own trigger. `caps` does not depend
+  // on the clock (unlike CHR_TIME's push), so it does not need to wait on
+  // anything else being ready.
+  //
+  // 🔴 XF-154, 2026-09-04 — a single one-shot send here (the original P0
+  // fix) is exactly the shape of bug this whole session kept re-finding
+  // elsewhere: `ozNotifyChunked()` is a bare BLE notify with no ack, and
+  // firing it the instant `bleClientConnected` flips true says nothing
+  // about whether the BRIDGE has finished its own post-connect service
+  // discovery + CCCD-subscribe on `member` yet. A tight factory-reset ->
+  // re-pair cycle (App reported ~90s, live) lands the notify in that
+  // window often enough to matter, and a one-shot send that races has no
+  // way to ever recover — App/Server confirmed a real lock stuck
+  // `caps_source:"inferred"` indefinitely from exactly this. Same fix
+  // shape already applied twice tonight for the identical failure class
+  // (XF-152's presence resync, the revoke bounded-retry on XF-155):
+  // replace the single shot with a bounded retry instead of a smarter
+  // single shot. Re-armed on every fresh connection (not just once per
+  // boot) since a bridge relay session is what actually needs the report,
+  // and a lock can out-live many connect/disconnect cycles in one boot.
   {
-    static bool capsReportSent = false;
-    if (!capsReportSent && bleClientConnected) {
-      capsReportSent = true;
+    static bool wasConnected = false;
+    static unsigned long connectedAtMs = 0;
+    static uint8_t capsAttempt = 0;
+    // Retry offsets from the moment this connection went live, covering
+    // the plausible BLE-subscribe-race window without spamming forever.
+    static const unsigned long kCapsRetryMs[] = {0, 5000, 15000, 30000};
+    const uint8_t kCapsRetryCount = sizeof(kCapsRetryMs) / sizeof(kCapsRetryMs[0]);
+
+    if (bleClientConnected && !wasConnected) {
+      // Fresh connection: re-arm the whole retry sequence.
+      wasConnected = true;
+      connectedAtMs = millis();
+      capsAttempt = 0;
+    } else if (!bleClientConnected) {
+      wasConnected = false;
+    }
+
+    if (bleClientConnected && capsAttempt < kCapsRetryCount &&
+        millis() - connectedAtMs >= kCapsRetryMs[capsAttempt]) {
+      Serial.printf("[CAPS] retry %u/%u this connection\n",
+                    (unsigned)(capsAttempt + 1), (unsigned)kCapsRetryCount);
       publishEnroll();
+      capsAttempt++;
     }
   }
   ozBenchConsolePoll();   // read-only bench console (see ozBenchDumpBonds)
