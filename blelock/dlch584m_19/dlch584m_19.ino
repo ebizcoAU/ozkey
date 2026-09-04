@@ -155,7 +155,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(
     35 /* col offset 1 */, 0 /* row offset 1 */, 35 /* col offset 2 */, 0 /* row offset 2 */);
 
 // ── Firmware version — own namespace, see file header for why ─────────────
-#define FW_VERSION "dlch584m-0.28"
+#define FW_VERSION "dlch584m-0.29"
 // XF-124 F1 — device kind for Nexus's registry. Nexus's N1-N5 (XFtposDecisions-138)
 // already registered device_type="doorlock", firmware_id="fw-doorlock-ch584m-r1"
 // for the real CH584M model; this simulator identifies as the same device_type

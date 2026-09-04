@@ -103,7 +103,7 @@ Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_DIN);
 Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, 0, false /*BGR*/, 172, 320, 34, 0, 34, 0);
 
 // ── Firmware version — SHARED with dlch584m_19.ino, see the header ────────
-#define FW_VERSION "dlch584m-0.28"
+#define FW_VERSION "dlch584m-0.29"
 #define OZ_DEVICE_TYPE "doorlock"
 
 static const char *fwDisplayVersion() {

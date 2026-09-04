@@ -6319,52 +6319,178 @@ static void ozBondExpirySweep() {
 #define OZ_CRED_MAX     16  // bench capacity; not a claim about production slot counts
 #define OZ_CRED_VAL_MAX 24  // PIN ASCII digits or RFID hex UID, NUL-terminated
 
+// ── ozkey-47 — credential TYPE, not just "PIN or not" ────────────────────────
+//
+// Was `bool isPin`. Widened to a real type tag so this one table is the
+// lock's own DB for every credential kind the product wants (operator,
+// 2026-09-04: "doorlock must maintain its own DB of KeyPIN, digital
+// passport, fingerprint with validity date range") — NOT because fingerprint
+// is being built here. It still isn't: no sensor peripheral exists on any
+// bench or product board, and ozkey-47 itself scopes fingerprint OUT as a
+// separate design pass (template storage, probabilistic match, not an
+// equality check against `value`). Reserving the tag now costs nothing and
+// means that future work slots into this table instead of needing a second
+// one. RFID is the same story one notch further along: the GRANT/DELETE/
+// storage path below is real and tested, but nothing on any current board
+// reads a physical card — there is no `ozRfidPoll()` counterpart to
+// `ozKeypadPoll()` below. Confirmed with the operator 2026-09-04: PIN is
+// the only type with a working end-to-end local verify today; RFID and
+// fingerprint "would be similar" once their reader/sensor hardware exists,
+// not implemented now.
+//
+// "Digital passport" is NOT a third value here — it is `g_bonds` (ozcrypto.h),
+// a categorically different trust model (BLE bond + challenge + counter
+// floor, not a stored value compared for equality) that already has its own
+// validity window (`OzBond.expiresAt`) and its own durable, versioned
+// storage (`ozBondsSave()`/`ozBondsLoad()`, the exact pattern this table
+// adopts below). Folding it into this struct would blur a real security
+// boundary for no benefit — it already meets the "own DB with a validity
+// date range" bar on its own.
+enum OzCredType : uint8_t {
+  OZ_CRED_PIN         = 0,
+  OZ_CRED_RFID        = 1,
+  OZ_CRED_FINGERPRINT = 2,  // reserved — no capture/match code, see above
+};
+
 struct OzCred {
   bool     present;
-  bool     isPin;              // true = PIN, false = RFID
+  uint8_t  type;                // OzCredType
   uint16_t slot;
   char     value[OZ_CRED_VAL_MAX];
   uint32_t start, end;         // unix seconds — the OZKIE `from`/`to` fields, verbatim
 };
 static OzCred g_creds[OZ_CRED_MAX];
 
-static int ozCredFind(bool isPin, uint16_t slotNo) {
+static int ozCredFind(uint8_t type, uint16_t slotNo) {
   for (int i = 0; i < OZ_CRED_MAX; i++)
-    if (g_creds[i].present && g_creds[i].isPin == isPin && g_creds[i].slot == slotNo)
+    if (g_creds[i].present && g_creds[i].type == type && g_creds[i].slot == slotNo)
       return i;
   return -1;
 }
 
+// ── RECORD STRIDE — packed, versioned, OTA-safe (was a raw struct blob) ─────
+//
+// ozCredsSave()/ozCredsLoad() used to persist g_creds via
+// prefs.putBytes(g_creds, sizeof(g_creds)) — the live C struct, raw. That is
+// exactly the trap ozBondsLoad()'s own header (ozcrypto.h) already documents
+// for bonds: compiler padding/alignment and field widths are NOT a stable
+// on-flash format, and ozCredsLoad()'s only defense against a layout change
+// was "size mismatch -> start clean" — i.e. ANY firmware update that so
+// much as reordered a field silently deleted every stored PIN/RFID on the
+// next boot. Fine for a dev-kit bench table nobody depended on; not
+// survivable once this needs a real OTA story (ozkey-47: "needs to survive
+// the product's actual OTA/versioning story, which the bench store never
+// had to" — and the operator's own 2026-09-04 framing: this table IS the
+// lock's own DB, expected to persist). Packed instead, same convention
+// `ozBondsSave()`/`ozBondsLoad()` already use for bonds: fixed-width
+// big-endian fields, spare bytes reserved for future growth, exact-length
+// versioning, known strides read on load rather than only the newest one.
+//
+// Layout v1 (40): 0 present | 1 type | 2..3 slot (BE16) | 4..27 value[24]
+//                 28..31 start (BE32) | 32..35 end (BE32) | 36..39 spare(v2)
+#define OZ_CRED_REC    40
+#define OZ_CRED_TAB_SZ (OZ_CRED_REC * OZ_CRED_MAX)
+
+// The raw-struct blob every OZ_NO_MCU board up to and including this
+// firmware's immediate predecessor wrote directly. `bool isPin`'s on-flash
+// values (0/1) line up with OZ_CRED_PIN/OZ_CRED_RFID exactly by
+// construction, so reading that old blob straight into today's struct and
+// re-saving in the packed format is lossless for this ONE upgrade hop —
+// real boards on the bench hold real granted credentials right now (XF-157)
+// and this is what keeps this very change from wiping them. Do not extend
+// this raw-struct branch to any LATER layout change — pack those like every
+// other field addition, the same discipline bonds already follow.
+#define OZ_CRED_TAB_SZ_RAW (sizeof(OzCred) * OZ_CRED_MAX)
+
 static void ozCredsSave() {
+  uint8_t *buf = (uint8_t *)calloc(1, OZ_CRED_TAB_SZ);
+  if (!buf) {
+    Serial.println("[CRED] FATAL: no heap for credential table save");
+    return;
+  }
+  for (int i = 0; i < OZ_CRED_MAX; i++) {
+    uint8_t *r = buf + i * OZ_CRED_REC;
+    r[0] = g_creds[i].present ? 1 : 0;
+    r[1] = g_creds[i].type;
+    r[2] = (uint8_t)(g_creds[i].slot >> 8);
+    r[3] = (uint8_t)(g_creds[i].slot);
+    memcpy(r + 4, g_creds[i].value, OZ_CRED_VAL_MAX);
+    r[28] = (uint8_t)(g_creds[i].start >> 24);
+    r[29] = (uint8_t)(g_creds[i].start >> 16);
+    r[30] = (uint8_t)(g_creds[i].start >> 8);
+    r[31] = (uint8_t)(g_creds[i].start);
+    r[32] = (uint8_t)(g_creds[i].end >> 24);
+    r[33] = (uint8_t)(g_creds[i].end >> 16);
+    r[34] = (uint8_t)(g_creds[i].end >> 8);
+    r[35] = (uint8_t)(g_creds[i].end);
+    // 36..39 spare, zeroed by calloc — reserved for v2.
+  }
   prefs.begin("blelock", false);
-  prefs.putBytes("credtab", g_creds, sizeof(g_creds));
+  prefs.putBytes("credtab", buf, OZ_CRED_TAB_SZ);
   prefs.end();
+  free(buf);
 }
 
 static void ozCredsLoad() {
+  memset(g_creds, 0, sizeof(g_creds));
   prefs.begin("blelock", true);
-  const size_t n = prefs.getBytesLength("credtab");
-  if (n == sizeof(g_creds)) prefs.getBytes("credtab", g_creds, sizeof(g_creds));
-  else memset(g_creds, 0, sizeof(g_creds)); // first boot, or a size mismatch — start clean
+  const size_t tabLen = prefs.getBytesLength("credtab");
+  bool migrated = false;
+
+  if (tabLen == OZ_CRED_TAB_SZ) {
+    uint8_t *buf = (uint8_t *)malloc(tabLen);
+    if (buf) {
+      prefs.getBytes("credtab", buf, tabLen);
+      for (int i = 0; i < OZ_CRED_MAX; i++) {
+        const uint8_t *r = buf + i * OZ_CRED_REC;
+        g_creds[i].present = r[0] != 0;
+        g_creds[i].type    = r[1];
+        g_creds[i].slot    = (uint16_t)((r[2] << 8) | r[3]);
+        memcpy(g_creds[i].value, r + 4, OZ_CRED_VAL_MAX);
+        g_creds[i].value[OZ_CRED_VAL_MAX - 1] = 0; // never trust NVS to terminate
+        g_creds[i].start = ((uint32_t)r[28] << 24) | ((uint32_t)r[29] << 16) |
+                            ((uint32_t)r[30] << 8) | r[31];
+        g_creds[i].end   = ((uint32_t)r[32] << 24) | ((uint32_t)r[33] << 16) |
+                            ((uint32_t)r[34] << 8) | r[35];
+      }
+      free(buf);
+    }
+  } else if (tabLen > 0 && tabLen == OZ_CRED_TAB_SZ_RAW) {
+    // 🔴 ONE-HOP MIGRATION — see OZ_CRED_TAB_SZ_RAW's own comment above.
+    prefs.getBytes("credtab", g_creds, sizeof(g_creds));
+    migrated = true;
+  } else if (tabLen > 0) {
+    Serial.printf("[CRED] credtab is %u B — neither the current packed format "
+                  "(%u) nor the pre-packed raw struct (%u) — treating as "
+                  "corrupt/foreign, starting clean\n",
+                  (unsigned)tabLen, (unsigned)OZ_CRED_TAB_SZ,
+                  (unsigned)OZ_CRED_TAB_SZ_RAW);
+  }
   prefs.end();
+
+  if (migrated) {
+    Serial.println("[CRED] pre-packed table migrated to the versioned format");
+    ozCredsSave();
+  }
+
   int count = 0;
   for (int i = 0; i < OZ_CRED_MAX; i++) if (g_creds[i].present) count++;
   Serial.printf("[CRED] table loaded — %d credential(s)\n", count);
 }
 
-// Insert or replace the credential at (isPin, slot) — matches the OZKIE
+// Insert or replace the credential at (type, slot) — matches the OZKIE
 // grant_pin/grant_rfid semantics: a grant to an occupied slot REPLACES it,
 // same as LockSim's upsertCredential and the real MCU's own slot model.
-static bool ozCredUpsert(bool isPin, uint16_t slotNo, const char *value,
+static bool ozCredUpsert(uint8_t type, uint16_t slotNo, const char *value,
                          uint32_t start, uint32_t end) {
   if (!value || !*value || strlen(value) >= OZ_CRED_VAL_MAX) return false;
-  int i = ozCredFind(isPin, slotNo);
+  int i = ozCredFind(type, slotNo);
   if (i < 0) {
     for (int j = 0; j < OZ_CRED_MAX; j++) if (!g_creds[j].present) { i = j; break; }
     if (i < 0) return false; // table full
   }
   g_creds[i].present = true;
-  g_creds[i].isPin = isPin;
+  g_creds[i].type = type;
   g_creds[i].slot = slotNo;
   strncpy(g_creds[i].value, value, OZ_CRED_VAL_MAX - 1);
   g_creds[i].value[OZ_CRED_VAL_MAX - 1] = 0;
@@ -6374,8 +6500,8 @@ static bool ozCredUpsert(bool isPin, uint16_t slotNo, const char *value,
   return true;
 }
 
-static bool ozCredDelete(bool isPin, uint16_t slotNo) {
-  const int i = ozCredFind(isPin, slotNo);
+static bool ozCredDelete(uint8_t type, uint16_t slotNo) {
+  const int i = ozCredFind(type, slotNo);
   if (i < 0) return false;
   memset(&g_creds[i], 0, sizeof(OzCred));
   ozCredsSave();
@@ -6456,8 +6582,12 @@ static void ozBenchConsolePoll() {
                             : w == OZ_CRED_NOT_YET      ? "NOT_YET_ACTIVE"
                             : w == OZ_CRED_EXPIRED      ? "EXPIRED"
                                                         : "TIME_UNKNOWN — unenforceable";
+        const char *typeName = g_creds[i].type == OZ_CRED_PIN         ? "PIN"
+                              : g_creds[i].type == OZ_CRED_RFID        ? "RFID"
+                              : g_creds[i].type == OZ_CRED_FINGERPRINT ? "FGRP"
+                                                                        : "?";
         Serial.printf("[BENCH]  %-4s slot=%-3u value=%-10s start=%lu end=%lu -> %s\n",
-                      g_creds[i].isPin ? "PIN" : "RFID", g_creds[i].slot,
+                      typeName, g_creds[i].slot,
                       g_creds[i].value, (unsigned long)g_creds[i].start,
                       (unsigned long)g_creds[i].end, verdict);
       }
@@ -7468,7 +7598,8 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
       uint8_t scratch[16];
       credOk = ozHexDecode(String(credCred), scratch, sizeof(scratch)) > 0;
     }
-    if (!credOk || !ozCredUpsert(isPin, (uint16_t)credSlot, credCred, credFrom, credTo)) {
+    if (!credOk || !ozCredUpsert(isPin ? OZ_CRED_PIN : OZ_CRED_RFID,
+                                 (uint16_t)credSlot, credCred, credFrom, credTo)) {
       Serial.printf("[OZKIE] %s: bad/missing slot/cred/from/to, or table full\n", kind);
       notifyStatus("UNLOCK_DENIED");
       return;
@@ -7557,7 +7688,8 @@ static void ozSemanticDispatch(int slot, const char *json, size_t len, bool viaB
         notifyStatus("UNLOCK_DENIED");
         return;
       }
-      const bool deleted = ozCredDelete(credIsPin, (uint16_t)credSlot);
+      const bool deleted = ozCredDelete(credIsPin ? OZ_CRED_PIN : OZ_CRED_RFID,
+                                        (uint16_t)credSlot);
       Serial.printf("[CRED] %s slot=%u %s (bench store)\n", credIsPin ? "PIN" : "RFID",
                     (unsigned)credSlot, deleted ? "deleted locally" : "was not present");
       char gdetail[72];
@@ -8657,13 +8789,19 @@ static void ozKeypadPoll() {
   Serial.printf("[KEYPAD] submit '%s'\n", g_kpBuf.c_str());
   int slot = -1;
   for (int i = 0; i < OZ_CRED_MAX; i++) {
-    if (g_creds[i].present && g_creds[i].isPin && g_kpBuf == g_creds[i].value) {
+    if (g_creds[i].present && g_creds[i].type == OZ_CRED_PIN && g_kpBuf == g_creds[i].value) {
       slot = i; break;
     }
   }
   const bool valid = (slot >= 0) && (ozCredCheckWindow(g_creds[slot]) == OZ_CRED_VALID);
   if (valid) {
-    Serial.printf("[KEYPAD] PIN matched slot %d — OPEN\n", slot);
+    // 2026-09-04 follow-up (flagged, not fixed, last session): this used to
+    // print the loop index `slot` — g_creds[]'s own compacted array
+    // position, not the app-assigned logical slot in g_creds[slot].slot. A
+    // fresh grant landing at array position 0 right after a reset legitimately
+    // logged as "slot 0", which once looked like a leftover credential
+    // surviving the reset and alarmed the operator. Print the real slot.
+    Serial.printf("[KEYPAD] PIN matched slot %u — OPEN\n", g_creds[slot].slot);
     markDoorUnlocked();
     // actorSlot -1: ozEvtPush()'s own mapping reads this as "keypad" — MCU-
     // sourced, identity unknown — exactly true here: nothing upstream of
