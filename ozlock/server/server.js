@@ -1094,7 +1094,33 @@ const eventsAtRiskLogged = new Set(); // deviceId
  * lets a caller that just queued a specific job (e.g. `DELETE /locks/:id`)
  * learn the `msg_id` that went out for it, without every other caller
  * needing to care (ozkey-41 §5.3 correlation). */
-async function flushQueueForDevice(siteId, deviceId, onSent) {
+// XF-155 (2026-09-03): found live while investigating App's report of a
+// physical-lock regression after a burst of near-simultaneous revoke
+// requests. Multiple callers can invoke this for the SAME deviceId
+// concurrently (every write endpoint fires it fire-and-forget right after
+// its own commit — grant, revoke, unlock, bond verbs — and App's expiry
+// sweep did exactly that, 6-8 times within ~3s for one lock). With no
+// per-device serialization, each concurrent call independently SELECTs the
+// same still-'queued' rows before any of them has a chance to mark one
+// 'sent', so the SAME command gets published multiple times. Confirmed
+// live: 6 concurrent revoke requests produced 3-4x duplicate publishes of
+// EVERY one of them on the real command topic — exactly the kind of
+// self-inflicted BLE-link hammering XF-142/143/149/152 already documented
+// from other causes, just never traced to this one before. Same fix shape
+// as `handleBridgePresence()`'s XF-152 fix: chain concurrent calls for one
+// deviceId onto that device's own promise-queue tail so they process
+// strictly in arrival order — the second call's SELECT then correctly sees
+// the first call's jobs already 'sent'.
+const flushQueueQueues = new Map(); // deviceId -> Promise (tail of chain)
+
+function flushQueueForDevice(siteId, deviceId, onSent) {
+  const prev = flushQueueQueues.get(deviceId) || Promise.resolve();
+  const next = prev.catch(() => {}).then(() => flushQueueForDeviceImpl(siteId, deviceId, onSent));
+  flushQueueQueues.set(deviceId, next);
+  return next;
+}
+
+async function flushQueueForDeviceImpl(siteId, deviceId, onSent) {
   const [queued] = await pool.query(
     "SELECT * FROM pending_queue WHERE device_id = ? AND status = 'queued' ORDER BY id ASC",
     [deviceId]
@@ -1113,6 +1139,22 @@ async function flushQueueForDevice(siteId, deviceId, onSent) {
     if (job.expires_at && new Date(job.expires_at).getTime() < Date.now()) {
       await pool.query("UPDATE pending_queue SET status = 'expired' WHERE id = ?", [job.id]);
       logEvent('warn', `Queue #${job.id} (${job.action_type}) expired before ${deviceId} woke`);
+      // XF-155 (2026-09-03): a revoke-key job that expires unsent — the
+      // device never woke to receive it in time — used to leave the grants
+      // row silently stuck at 'revoking' forever, with nothing anywhere
+      // pointing at it. Surface it the same way an explicit lock-reported
+      // failure does.
+      if (job.action_type === 'revoke-key' && job.grant_id) {
+        await pool.query("UPDATE grants SET sync_status = 'revoke_failed' WHERE id = ?", [
+          job.grant_id,
+        ]);
+        await recordAudit(
+          null,
+          deviceId,
+          'revoke_failed',
+          `revoke-key grant #${job.grant_id}: queue #${job.id} expired unsent`
+        );
+      }
       continue;
     }
 
@@ -1155,20 +1197,24 @@ async function flushQueueForDevice(siteId, deviceId, onSent) {
 
     await pool.query("UPDATE pending_queue SET status = 'sent' WHERE id = ?", [job.id]);
     if (job.grant_id) {
-      if (job.action_type === 'revoke-key') {
-        await pool.query("UPDATE grants SET sync_status = 'revoked' WHERE id = ?", [
-          job.grant_id,
-        ]);
-      } else {
-        // ozkey-31 §2: a publish is evidence the SERVER sent something, not
-        // that the lock stored it — the exact gap that let four failed
-        // remote grants sit recorded as 'synced' this week while
-        // ozControlOpen rejected every one of them. Stay 'pending' and
-        // remember which grant this device's next uplink outcome code
-        // (handleUplinkOutcome, below) should be attributed to; 'failed' is
-        // the only state a publish can ever earn on its own now.
-        lastGrantSentByDevice.set(deviceId, { grantId: job.grant_id, queueId: job.id });
-      }
+      // ozkey-31 §2 / XF-155 (2026-09-03): a publish is evidence the SERVER
+      // sent something, not that the lock stored it — the exact gap that let
+      // four failed remote grants sit recorded as 'synced' this week while
+      // ozControlOpen rejected every one of them. Applies equally to
+      // revoke-key, which used to optimistically flip straight to 'revoked'
+      // here on publish alone (App found this live: a revoke against a
+      // genuinely-dead lock reported "Đã thu hồi" exactly as fast as a real
+      // one, no confirmation the credential was ever cleared). Stay in the
+      // current in-flight state ('pending' for grant-key, 'revoking' for
+      // revoke-key — set by the caller before this runs) and remember which
+      // grant + which action this device's next uplink outcome code
+      // (handleUplinkOutcome, below) should be attributed to; a reported
+      // failure is the only state a publish can ever earn on its own now.
+      lastGrantSentByDevice.set(deviceId, {
+        grantId: job.grant_id,
+        queueId: job.id,
+        actionType: job.action_type,
+      });
     }
     sent++;
     if (onSent) onSent(job, envelope.msg_id);
@@ -1417,12 +1463,24 @@ async function handleUplinkOutcome(fromDeviceId, payloadStr) {
   }
   lastGrantSentByDevice.delete(fromDeviceId);
 
-  await pool.query("UPDATE grants SET sync_status = 'failed' WHERE id = ?", [pending.grantId]);
+  // XF-155 (2026-09-03): distinguish which verb failed — 'revoke-key' gets
+  // its own visible state ('revoke_failed') rather than reusing 'failed',
+  // which read ambiguous ("failed to issue" vs "failed to revoke") once
+  // revoke started tracking through this same path instead of optimistically
+  // marking itself 'revoked' on publish alone.
+  const isRevoke = pending.actionType === 'revoke-key';
+  const failedStatus = isRevoke ? 'revoke_failed' : 'failed';
+  await pool.query('UPDATE grants SET sync_status = ? WHERE id = ?', [failedStatus, pending.grantId]);
   logEvent(
     'warn',
-    `Grant #${pending.grantId} (queue #${pending.queueId}) on ${fromDeviceId} FAILED — lock reported ${obj.code}`
+    `Grant #${pending.grantId} (queue #${pending.queueId}, ${pending.actionType}) on ${fromDeviceId} FAILED — lock reported ${obj.code}`
   );
-  await recordAudit(null, fromDeviceId, 'grant_failed', `grant #${pending.grantId}: ${obj.code}`);
+  await recordAudit(
+    null,
+    fromDeviceId,
+    isRevoke ? 'revoke_failed' : 'grant_failed',
+    `${pending.actionType} grant #${pending.grantId}: ${obj.code}`
+  );
 }
 
 /* ---------------------------------------------------------------------------
@@ -1518,6 +1576,18 @@ async function recomputeAndStorePresence(deviceId) {
   const reason = computeFaultAttribution(lock, bridgePresence);
   const unreachable = reason === 'bridge_offline' || reason === 'lock_unreachable' || reason === 'lock_offline_wifi';
   const presence = unreachable ? 'offline' : lock.direct_presence;
+
+  // XF-144/XF-152 (2026-09-03): XF-152's periodic MQTT unsubscribe/resubscribe
+  // forces a redundant retained redelivery every 30s, re-triggering this
+  // function for every lock behind a bridge even when nothing changed.
+  // Unconditionally bumping presence_at on every no-op re-verdict silently
+  // restarted XF-144's failover sweep's own 2-minute grace clock (keyed off
+  // this exact column) every 30s, so it could mathematically never reach its
+  // threshold — a lock whose only recovery path was the sweep got starved
+  // indefinitely. Only advance presence_at on an actual state transition.
+  if (lock.presence === presence && lock.presence_reason === reason) {
+    return { presence, reason };
+  }
 
   await pool.query('UPDATE locks SET presence = ?, presence_reason = ?, presence_at = NOW() WHERE id = ?', [
     presence,
@@ -4173,18 +4243,35 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
       grantId,
       deviceId,
     ]);
-    if (!grant)
-      return res.status(404).json({
-        ok: false,
-        code: 'grant_not_found',
-        error: `Grant #${grantId} not found on ${deviceId}`,
-      });
-    if (grant.sync_status === 'revoked')
-      return res.status(409).json({
-        ok: false,
-        code: 'grant_already_revoked',
-        error: `Grant #${grantId} is already revoked`,
-      });
+    // XF-155 (2026-09-03): a `grants` row can legitimately be gone (purged
+    // on a lock delete/re-pair cycle, or never confirmed server-side to
+    // begin with — the app's own local-history fallback assigns those a
+    // synthetic id) while the LOCK still holds a live credential in that
+    // slot. The server's bookkeeping row isn't what protects anything here
+    // — the sealed envelope is, same trust relationship the S4 cutover
+    // already established for grant creation (server relays opaque, never
+    // gates on its own copy). Relay through regardless of whether `grants`
+    // still has a matching row; only refuse when the LOCK itself doesn't
+    // exist — there's genuinely nowhere to route the frame.
+    let siteId;
+    if (grant) {
+      if (grant.sync_status === 'revoked')
+        return res.status(409).json({
+          ok: false,
+          code: 'grant_already_revoked',
+          error: `Grant #${grantId} is already revoked`,
+        });
+      siteId = grant.site_id;
+    } else {
+      const [[lock]] = await conn.query('SELECT site_id FROM locks WHERE id = ?', [deviceId]);
+      if (!lock)
+        return res.status(404).json({
+          ok: false,
+          code: 'device_not_found',
+          error: `Lock ${deviceId} not found`,
+        });
+      siteId = lock.site_id;
+    }
     const [[dupe]] = await conn.query(
       `SELECT id FROM pending_queue
         WHERE grant_id = ? AND action_type = 'revoke-key' AND status = 'queued'`,
@@ -4198,23 +4285,41 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
         queue_id: dupe.id,
       });
 
+    // XF-155 (2026-09-03): revoke-key jobs previously had no expires_at at
+    // all — a job that could never be delivered (server's MQTT connection
+    // down at request time, or the lock permanently gone) sat 'queued'
+    // forever with nothing surfacing it as a failure. Give it the same
+    // expiry shape the bond verbs already use.
+    const expiresAt = new Date(Date.now() + BOND_VERB_EXPIRY_MS);
     await conn.beginTransaction();
     const [queueResult] = await conn.query(
-      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, envelope_hex, msg_type, status)
-       VALUES (?, ?, ?, 'revoke-key', ?, 'sealed_envelope', 'queued')`,
-      [deviceId, grant.site_id, grantId, envelope_hex]
+      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, envelope_hex, msg_type, status, expires_at)
+       VALUES (?, ?, ?, 'revoke-key', ?, 'sealed_envelope', 'queued', ?)`,
+      [deviceId, siteId, grantId, envelope_hex, expiresAt]
     );
-    await conn.query("UPDATE grants SET sync_status = 'revoking' WHERE id = ?", [grantId]);
+    if (grant) {
+      await conn.query("UPDATE grants SET sync_status = 'revoking' WHERE id = ?", [grantId]);
+    }
     await conn.commit();
 
     logEvent(
       'key',
-      `Revoking ${grant.type.toUpperCase()} on ${deviceId} slot ${grant.slot_number} ` +
-        `(grant #${grantId}, queue #${queueResult.insertId}, sealed) — awaiting wake`
+      grant
+        ? `Revoking ${grant.type.toUpperCase()} on ${deviceId} slot ${grant.slot_number} ` +
+            `(grant #${grantId}, queue #${queueResult.insertId}, sealed) — awaiting wake`
+        : `Revoking grant #${grantId} on ${deviceId} (no matching grants row — envelope ` +
+            `authoritative, queue #${queueResult.insertId}, sealed) — awaiting wake`
     );
-    await recordAudit(null, deviceId, 'revoke', `revoke ${grant.type.toUpperCase()} slot ${grant.slot_number}`);
+    await recordAudit(
+      null,
+      deviceId,
+      'revoke',
+      grant
+        ? `revoke ${grant.type.toUpperCase()} slot ${grant.slot_number}`
+        : `revoke grant #${grantId} (no server record)`
+    );
 
-    flushQueueForDevice(grant.site_id, deviceId).catch(() => {});
+    flushQueueForDevice(siteId, deviceId).catch(() => {});
 
     res.json({
       ok: true,
@@ -4223,6 +4328,7 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
       device_id: deviceId,
       envelope_hex,
       sync_status: 'revoking',
+      expires_at: expiresAt.toISOString(),
     });
   } catch (err) {
     try {
