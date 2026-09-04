@@ -7898,7 +7898,26 @@ static bool ozControlTry(bool final) {
   n = ctlLen;
   portEXIT_CRITICAL(&ctlMux);
 
-  if (n < 64 + OZ_ENV_MIN) {
+  // XF-157 — a bare envelope (bridge `command` relay, no 64-byte app_id
+  // prefix) is unambiguously identifiable by its leading byte the instant
+  // at least one has arrived: OZ_ENV_VER (0x02) is non-printable and can
+  // never be the first byte of a 64-char ASCII hex app_id, per
+  // ozControlOpen()'s own header comment above. Gating everything at
+  // 64 + OZ_ENV_MIN unconditionally meant delete_pin/delete_rfid — whose
+  // sealed bare envelope is naturally under 101 bytes, with no from/to
+  // fields to pad it out — could never clear this check and reach
+  // ozControlOpen()'s already-correct bare-envelope branch at all.
+  // Deliberately NOT just lowering this to OZ_ENV_MIN unconditionally:
+  // ozControlOpen()'s own prefixed-form branch returns OZCTL_FAILED_DEFINITE
+  // (not "maybe incomplete") for anything under 101 bytes, so a genuinely
+  // still-arriving `control`-characteristic message in the 37-100 byte
+  // range would be prematurely rejected instead of awaited if the minimum
+  // were lowered for it too — only the bare-envelope case is safe to admit
+  // early, since its complete size is knowable up front from the plaintext
+  // length, not learned by waiting for more chunks.
+  const size_t minNeeded =
+      (n >= 1 && ctlBuf[0] == OZ_ENV_VER) ? OZ_ENV_MIN : (64 + OZ_ENV_MIN);
+  if (n < minNeeded) {
     if (!final) return false;
     Serial.printf("[CTL] %u B is too short to be a control message\n",
                   (unsigned)n);
