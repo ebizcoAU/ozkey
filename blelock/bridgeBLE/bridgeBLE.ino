@@ -244,7 +244,7 @@ static char g_advName[16] = BLE_NAME;
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
 // Own namespace, forked from bridge32-1.44 (2026-08-29) — see file header.
-#define FW_VERSION "bridgeBLE-0.43"
+#define FW_VERSION "bridgeBLE-0.44"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen

@@ -427,6 +427,27 @@ static unsigned long g_bleLastScanAt = 0;
 static bool g_bleCentralReady = false;
 static uint32_t g_bleUpRelayed = 0, g_bleUpDropped = 0, g_bleCmdSent = 0;
 
+// XF-149 — mqttMessageReceived() -> ozBleCentralTick() handoff for relay
+// writes. forwardOverBle() used to call sink->writeValue(..., true) directly
+// from inside the MQTT callback: a synchronous write-with-response that, under
+// BLE link contention, can block for seconds. While blocked, the WHOLE
+// Arduino loop() is stuck — no second mqttClient.loop() to pick up a buffered
+// message, no ozBleCentralTick() reaping/uplink service, and MQTT's own
+// keepalive (also serviced inside loop()) at risk of lapsing. Same call path
+// every relayed command (unlock, grant_pin, grant_rfid, delete_pin,
+// delete_rfid, factory_reset, unpair_lock) goes through, so this affects all
+// of them, not just one. Traced live twice (XF-147, XF-149) and deliberately
+// left unfixed both times pending a real structural change — this is it.
+//
+// No mutex needed: unlike g_blePending (fed from the BLE scan callback, a
+// different task), the producer (mqttMessageReceived(), via mqttClient.loop())
+// and the consumer (ozBleCentralTick()) both run from the same main loop()
+// on the same task, never concurrently.
+struct OzBleCmdWrite { String deviceId; String fieldName; uint8_t buf[600]; size_t len = 0; };
+#define OZ_BLE_CMDQ 4
+static OzBleCmdWrite g_bleCmdQ[OZ_BLE_CMDQ];
+static uint8_t g_bleCmdQHead = 0, g_bleCmdQCount = 0;
+
 /** Variable-length hex -> bytes. The file's own hexToBytes() takes a FIXED
  *  expected length (dataset fields); an envelope is any length. */
 static size_t ozHexToBytesVar(const String &hex, uint8_t *out, size_t cap) {
@@ -950,7 +971,12 @@ static bool ozBleConnectOne(const String &addr) {
 }
 
 /** Downlink. Returns false if this target is not a BLE lock we hold, so the
- *  caller can fall through to Thread — a bridge may carry both kinds. */
+ *  caller can fall through to Thread — a bridge may carry both kinds.
+ *
+ *  XF-149 — does NOT write to the BLE characteristic itself anymore. Decodes
+ *  and validates here (cheap, non-blocking), then hands the bytes to
+ *  ozBleCentralTick() to actually write, one per tick, off the MQTT-callback
+ *  call stack. See the g_bleCmdQ comment above for why. */
 static bool forwardOverBle(const String &target, const String &fieldName,
                            const String &valueHex) {
   OzBleLock *l = ozBleFindByDeviceId(target);
@@ -960,8 +986,7 @@ static bool forwardOverBle(const String &target, const String &fieldName,
   // bridge cannot produce; that is exactly the UNLOCK_DENIED seen on the
   // 2026-08-30 end-to-end test. No fallback to `control` on purpose: it would
   // "work" only by silently failing, which is worse than a named error.
-  BLERemoteCharacteristic *sink = l->chrCommand;
-  if (!sink) {
+  if (!l->chrCommand) {
     Serial.printf("[BLE-CMD] %s: no `command` characteristic (pre-P5.5 lock "
                   "firmware) — dropped, NOT retried on control\n", target.c_str());
     return true;                          // it IS ours; do not also try Thread
@@ -973,17 +998,31 @@ static bool forwardOverBle(const String &target, const String &fieldName,
   // getData()/getLength() precisely because a c_str() copy would truncate at
   // the first zero byte). So the bridge decodes here. It still never
   // interprets the envelope — decoding hex is not decoding the seal.
-  static uint8_t buf[600];
+  uint8_t buf[600];
   const size_t n = ozHexToBytesVar(valueHex, buf, sizeof(buf));
   if (!n) {
     Serial.printf("[BLE-CMD] %s: bad/oversized %s (%u chars) — dropped\n",
                   target.c_str(), fieldName.c_str(), (unsigned)valueHex.length());
     return true;
   }
-  const bool ok = sink->writeValue(buf, n, true /*response*/);
-  g_bleCmdSent++;
-  Serial.printf("[BLE-CMD] %s <- %s (%u B)%s\n", target.c_str(), fieldName.c_str(),
-                (unsigned)n, ok ? "" : " WRITE FAILED");
+
+  if (g_bleCmdQCount >= OZ_BLE_CMDQ) {
+    // Real backpressure, not a hang — the write-per-tick drain is only ever
+    // this shallow behind if a link is badly contended right now. Dropping
+    // (rather than growing unbounded) matches every other queue in this file;
+    // the caller side (server) already retries relays it never sees confirmed.
+    Serial.printf("[BLE-CMD] %s: write queue full (%u pending) — %s DROPPED\n",
+                  target.c_str(), (unsigned)g_bleCmdQCount, fieldName.c_str());
+    return true;
+  }
+  OzBleCmdWrite &slot = g_bleCmdQ[(g_bleCmdQHead + g_bleCmdQCount) % OZ_BLE_CMDQ];
+  slot.deviceId = target;
+  slot.fieldName = fieldName;
+  memcpy(slot.buf, buf, n);
+  slot.len = n;
+  g_bleCmdQCount++;
+  Serial.printf("[BLE-CMD] %s: %s (%u B) queued (%u pending)\n", target.c_str(),
+                fieldName.c_str(), (unsigned)n, (unsigned)g_bleCmdQCount);
   return true;
 }
 
@@ -1120,6 +1159,32 @@ static void ozBleCentralTick() {
     if (ok) g_bleUpRelayed++;
     Serial.printf("[BLE-UP] %s -> %s (%u B)%s\n", deviceId.c_str(), topic.c_str(),
                   (unsigned)payload.length(), ok ? "" : " PUBLISH FAILED");
+  }
+
+  // XF-149 — service ONE queued relay write per tick, same "one blocking op
+  // per tick" discipline as the connect-drain below. sink->writeValue(...,
+  // true) is a write-WITH-RESPONSE: under a contended link it can take far
+  // longer than a healthy one, so bounding it to one per tick (and returning
+  // immediately after, like the connect case) keeps a slow write from also
+  // delaying the reap/uplink-drain/rescan work above and below it — and
+  // critically keeps mqttClient.loop() (called later in the same main
+  // loop()) from being starved, which was the actual mechanism XF-149 traced.
+  if (g_bleCmdQCount) {
+    OzBleCmdWrite &cmd = g_bleCmdQ[g_bleCmdQHead];
+    g_bleCmdQHead = (g_bleCmdQHead + 1) % OZ_BLE_CMDQ;
+    g_bleCmdQCount--;
+
+    OzBleLock *l = ozBleFindByDeviceId(cmd.deviceId);
+    if (!l || !ozBleConnected(*l) || !l->chrCommand) {
+      Serial.printf("[BLE-CMD] %s: %s dropped from queue — no longer connected\n",
+                    cmd.deviceId.c_str(), cmd.fieldName.c_str());
+    } else {
+      const bool ok = l->chrCommand->writeValue(cmd.buf, cmd.len, true /*response*/);
+      g_bleCmdSent++;
+      Serial.printf("[BLE-CMD] %s <- %s (%u B)%s\n", cmd.deviceId.c_str(),
+                    cmd.fieldName.c_str(), (unsigned)cmd.len, ok ? "" : " WRITE FAILED");
+    }
+    return;
   }
 
   // Connect anything the scanner queued. One per tick: connect() blocks for
