@@ -4,7 +4,7 @@
  *  ---------------------------------------------------------------------------
  *  Role     : Market-A personal cloud, per ozkey-05: MQTT rendezvous + mini
  *             directory that holds doorlock <-> owner-account pairing.
- *  Port     : 4200  (REST base /ozlockserv/api)
+ *  Port     : 4400  (REST base /ozlockserv/api)
  *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.42:1883 (lab stand-in for EMQX;
  *             2026-09-01: moved from 10.1.1.20, old host went unreachable)
  *  Database : MySQL (localhost / ozlock)
@@ -114,8 +114,8 @@ function detectLanIp() {
  * Configuration
  * ------------------------------------------------------------------------- */
 const CONFIG = {
-  // Override to spin a verification instance beside the watcher-run :4200 one.
-  HTTP_PORT: Number(process.env.OZLOCK_HTTP_PORT) || 4200,
+  // Override to spin a verification instance beside the watcher-run :4400 one.
+  HTTP_PORT: Number(process.env.OZLOCK_HTTP_PORT) || 4400,
   SERVER_IP: process.env.OZLOCK_SERVER_IP || detectLanIp(),
   SITE_ID: 'lab', // single-tenant lab deployment (ozkey-05 §1.3)
   // ozkey-24: HMAC secret ozlockserv signs app broker-auth JWTs with; EMQX's

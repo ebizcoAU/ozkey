@@ -1,12 +1,12 @@
 /*
  * ============================================================================
- *  OZLODGE COCKPIT — Sovereign Smart Lock Hospitality Dashboard (Port 3300)
+ *  OZLODGE COCKPIT — Sovereign Smart Lock Hospitality Dashboard (Port 4411)
  *  (formerly OZKEY Core Cockpit, renamed ozkey-18 §2 S12, 2026-08-10 — API
  *  base below points at the new /ozlodgeserv/api path; the server still
  *  mounts the legacy /ozkeyserv/api alias too, so nothing broke by renaming
  *  the sender, only by dropping the receiver's alias, which wasn't done)
  *  ---------------------------------------------------------------------------
- *  - 30-room pairing matrix (Block A) driven live from OZLODGESERV (Port 3200)
+ *  - 30-room pairing matrix (Block A) driven live from OZLODGESERV (Port 4410)
  *  - Discovered Unpaired Hardware panel (MQTT discovery + Web Serial capture)
  *  - Credential injector (PIN / RFID / Fingerprint) via the API gateway
  *  - Web Serial desk-module reader + scrolling green lab terminal
@@ -15,7 +15,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-const API = 'http://localhost:3200/ozlodgeserv/api';
+const API = 'http://localhost:4410/ozlodgeserv/api';
 const MAC_REGEX = /(?:[0-9A-F]{2}[:\-]){5}[0-9A-F]{2}|[0-9A-F]{12}/gi;
 
 /* ---------------------------------------------------------------------------
@@ -875,7 +875,7 @@ export default function Cockpit() {
             })}
             {rooms.length === 0 && (
               <div style={{ gridColumn: '1 / -1', color: C.dim, fontSize: 12, padding: 20 }}>
-                Waiting for OZLODGESERV room matrix… (is the gateway on :3200 running?)
+                Waiting for OZLODGESERV room matrix… (is the gateway on :4410 running?)
               </div>
             )}
           </div>

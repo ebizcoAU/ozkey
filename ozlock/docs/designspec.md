@@ -8,8 +8,8 @@ deferred follow-up, not scoped here.
 
 ## 1. Purpose & audience
 
-`ozlock` (port 4300) is the operator-facing console over `ozlockserv`'s
-registry (:4200). Today it answers two questions well — *"what does this app
+`ozlock` (port 4401) is the operator-facing console over `ozlockserv`'s
+registry (:4400). Today it answers two questions well — *"what does this app
 have paired?"* and *"what does this doorlock belong to?"* — via a
 click-through browser + inspector. It answers a third question poorly: **"is
 the fleet OK right now, and if not, where's the problem?"** That question

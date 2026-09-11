@@ -21,7 +21,7 @@
  *
  *             So the XF-47 §8(b) work (seq / recorded_at / sync_batch /
  *             window_from / window_to, drop lock_ts) targets THIS server.
- *  Port     : 4400  (REST base /ozpmsserv/api)   [OZPMS_HTTP_PORT]
+ *  Port     : 4420  (REST base /ozpmsserv/api)   [OZPMS_HTTP_PORT]
  *  Site     : 'pms' — must differ from ozlockserv's 'lab' (see CONFIG.SITE_ID)
  *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.20:1883 (lab stand-in for EMQX)
  *  Database : MySQL (localhost / ozpms)
@@ -67,8 +67,8 @@ function detectLanIp() {
  * Configuration
  * ------------------------------------------------------------------------- */
 const CONFIG = {
-  // Override to spin a verification instance beside the watcher-run :4400 one.
-  HTTP_PORT: Number(process.env.OZPMS_HTTP_PORT) || 4400,
+  // Override to spin a verification instance beside the watcher-run :4420 one.
+  HTTP_PORT: Number(process.env.OZPMS_HTTP_PORT) || 4420,
   SERVER_IP: process.env.OZPMS_SERVER_IP || detectLanIp(),
   // MUST NOT be 'lab'. Topics are site-pinned so several servers can share one
   // broker, but two servers on the SAME site both consume every heartbeat and

@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "description": "OZLODGE Cockpit - 100-Room Matrix, Pairing & Credential Injection (formerly OZKEY Core Cockpit, renamed ozkey-18 S12)",
   "scripts": {
-    "dev": "next dev -p 3300",
+    "dev": "next dev -p 4411",
     "build": "next build",
-    "start": "next start -p 3300"
+    "start": "next start -p 4411"
   },
   "dependencies": {
     "next": "^14.2.15",

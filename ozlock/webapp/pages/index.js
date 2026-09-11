@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- *  OZLOCK REGISTRY CONSOLE — the rendezvous server's operator view (Port 4300)
+ *  OZLOCK REGISTRY CONSOLE — the rendezvous server's operator view (Port 4401)
  *  ---------------------------------------------------------------------------
  *  OZLOCK is the STUN/rendezvous server: it matches apps to doorlocks and
  *  relays. It does NOT grant keys or add doorlocks — those are the BANOI app's
@@ -16,9 +16,9 @@
  *                      410 Gone. The Door Transactions tab now explains the
  *                      absence instead of rendering an empty list, which would
  *                      read as "this door has never been opened".
- *                      Door history lives on OZPMSSERV (:4400, console :4401)
+ *                      Door history lives on OZPMSSERV (:4420, console :4421)
  *                      and OZKEYSERV — the operator's OWN servers.
- *  Against OZLOCKSERV (:4200). Registry admin (prune stale records) is kept;
+ *  Against OZLOCKSERV (:4400). Registry admin (prune stale records) is kept;
  *  originating pairings/keys is not.
  * ============================================================================
  */
@@ -39,7 +39,7 @@ import {
 import PanelTitle from '../components/PanelTitle';
 import OverviewTab from '../components/OverviewTab';
 
-const API = 'http://localhost:4200/ozlockserv/api';
+const API = 'http://localhost:4400/ozlockserv/api';
 
 // resultColor (granted/denied/expired) removed 2026-07-31 with the door log —
 // it coloured door outcomes, which this console no longer receives.
@@ -703,7 +703,7 @@ export default function OzlockConsole() {
                     <div style={{ color: C.dim }}>
                       • <span style={{ color: C.teal }}>OZPMSSERV</span> — the
                       property operator&apos;s own server, over their own doors
-                      (console on :4401)
+                      (console on :4421)
                       <br />• <span style={{ color: C.teal }}>OZKEYSERV</span> —
                       the hotel gateway, likewise operator-run
                       <br />• <span style={{ color: C.teal }}>On the phone</span> —

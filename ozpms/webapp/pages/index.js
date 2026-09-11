@@ -1,9 +1,9 @@
 /*
  * ============================================================================
- *  OZPMS CONSOLE — the property operator's own view (Port 4401)
+ *  OZPMS CONSOLE — the property operator's own view (Port 4421)
  *  ---------------------------------------------------------------------------
  *  Forked from ozlock/ 2026-07-31 (operator decision, XF-48 §9.4) as the
- *  front-end for OZPMSSERV (:4400).
+ *  front-end for OZPMSSERV (:4420).
  *
  *  WHY THIS IS A SEPARATE APP, not a mode of the ozlock console:
  *    OZLOCKSERV is the hosted relay we run for other people, and it now holds
@@ -29,7 +29,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-const API = 'http://localhost:4400/ozpmsserv/api';
+const API = 'http://localhost:4420/ozpmsserv/api';
 
 /* ---------------------------------------------------------------------------
  * Palette

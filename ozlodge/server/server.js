@@ -5,8 +5,8 @@
  *  and did not change)
  *  ---------------------------------------------------------------------------
  *  Role     : API Gateway + Rule Engine + MySQL Manager
- *  Port     : 3200 (header previously said 4000 — stale, HTTP_PORT below has
- *             always defaulted to 3200; fixed while touching this header)
+ *  Port     : 4410 (moved from 3200 2026-09-06, XF-160 — HTTP_PORT below
+ *             defaults to 4410 now; header previously said 4000, then 3200)
  *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.20:1883
  *  Database : MySQL (localhost / ozlodge — see the S12 note near CONFIG.DB)
  *
@@ -61,7 +61,7 @@ function detectLanIp() {
 const CONFIG = {
   // S12 rename: OZLODGE_* is primary; OZKEY_* still read as a fallback so an
   // existing deploy's env/systemd config keeps working unchanged.
-  HTTP_PORT: Number(process.env.OZLODGE_HTTP_PORT || process.env.OZKEY_HTTP_PORT) || 3200,
+  HTTP_PORT: Number(process.env.OZLODGE_HTTP_PORT || process.env.OZKEY_HTTP_PORT) || 4410,
   SERVER_IP: process.env.OZLODGE_SERVER_IP || process.env.OZKEY_SERVER_IP || detectLanIp(),
   DB: {
     host: 'localhost',
