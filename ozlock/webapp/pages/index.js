@@ -704,7 +704,7 @@ export default function OzlockConsole() {
                       • <span style={{ color: C.teal }}>OZPMSSERV</span> — the
                       property operator&apos;s own server, over their own doors
                       (console on :4421)
-                      <br />• <span style={{ color: C.teal }}>OZKEYSERV</span> —
+                      <br />• <span style={{ color: C.teal }}>OZLODGESERV</span> —
                       the hotel gateway, likewise operator-run
                       <br />• <span style={{ color: C.teal }}>On the phone</span> —
                       BANOI&apos;s own local event notes

@@ -1076,7 +1076,7 @@ export default function Cockpit() {
           {termTab === 'terminal' && (
             <>
               {logs.length === 0 && (
-                <div style={{ color: C.dim }}>ozkey@lab:~$ waiting for gateway event stream…</div>
+                <div style={{ color: C.dim }}>ozlodge@lab:~$ waiting for gateway event stream…</div>
               )}
               {logs.map(renderLogLine)}
             </>
@@ -1086,7 +1086,7 @@ export default function Cockpit() {
           {termTab === 'keys' &&
             (!inspectedRoom ? (
               <div style={{ color: C.dim }}>
-                ozkey@lab:~$ click a room tile in the matrix to list its issued keys…
+                ozlodge@lab:~$ click a room tile in the matrix to list its issued keys…
               </div>
             ) : (
               <>
@@ -1180,7 +1180,7 @@ export default function Cockpit() {
           {termTab === 'lock' &&
             (!inspectedRoom ? (
               <div style={{ color: C.dim }}>
-                ozkey@lab:~$ click a room tile in the matrix to tail its doorlock log…
+                ozlodge@lab:~$ click a room tile in the matrix to tail its doorlock log…
               </div>
             ) : (
               <>

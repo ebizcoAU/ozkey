@@ -803,6 +803,20 @@ async function initDatabase() {
   );
   if (!hasBondsCol) await pool.query('ALTER TABLE locks ADD COLUMN bonds TINYINT UNSIGNED NULL');
 
+  // ozkey-48 §7 (OZKIE v2, operator-approved 2026-10-18): which protocol the
+  // lock speaks. 1 = every lock that exists today (ESP32 / CH584M era, sealed
+  // JSON envelopes); 2 = AK1037 and later (EDHOC + OSCORE). The app learns it
+  // from the GATT service UUID at pairing and tells us at POST /pairings —
+  // the server has no way to tell on its own, since it never opens either
+  // kind of payload. Gates every relay route below via `isOzkieV2()`.
+  const [[{ hasOzkieVersionCol }]] = await pool.query(
+    `SELECT COUNT(*) AS hasOzkieVersionCol FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'ozkie_version'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasOzkieVersionCol)
+    await pool.query('ALTER TABLE locks ADD COLUMN ozkie_version TINYINT UNSIGNED NOT NULL DEFAULT 1');
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bridges_presence (
       bridge_id   VARCHAR(64) PRIMARY KEY,
@@ -1113,6 +1127,32 @@ const eventsAtRiskLogged = new Set(); // deviceId
 // the first call's jobs already 'sent'.
 const flushQueueQueues = new Map(); // deviceId -> Promise (tail of chain)
 
+/* -- OZKIE v2 gate (ozkey-48, operator-approved 2026-10-18) -------------------
+ * Every relay route below carries v1 sealed envelopes. A v2 (AK1037) lock
+ * speaks EDHOC + OSCORE instead, and its relay path (pass OSCORE bytes
+ * through, route `4.01 + Echo` back to the sender, ozkey-48 §7) is not built
+ * yet — no v2 lock or simulator exists to build it against. Until it is,
+ * refuse cleanly instead of queueing bytes the lock cannot read.
+ */
+const OZKIE_V2 = 2;
+
+/** Sends the refusal and returns true when `lock` is OZKIE v2; false otherwise. */
+function refuseIfOzkieV2(res, lock, deviceId, verb) {
+  if (!lock || lock.ozkie_version !== OZKIE_V2) return false;
+  logEvent('warn', `${verb} refused for ${deviceId} — OZKIE v2 relay not built yet (ozkey-48 §7)`);
+  res.status(501).json({
+    ok: false,
+    code: 'ozkie_v2_relay_not_built',
+    error: 'ozkie_v2_relay_not_built',
+    detail:
+      'This lock speaks OZKIE v2 (EDHOC + OSCORE). The server cannot relay v2 messages yet, ' +
+      'and a v1 envelope would mean nothing to it. Use a direct BLE session at the door.',
+    device_id: deviceId,
+    ref: 'ozkey-48 §7',
+  });
+  return true;
+}
+
 function flushQueueForDevice(siteId, deviceId, onSent) {
   const prev = flushQueueQueues.get(deviceId) || Promise.resolve();
   const next = prev.catch(() => {}).then(() => flushQueueForDeviceImpl(siteId, deviceId, onSent));
@@ -1130,8 +1170,21 @@ async function flushQueueForDeviceImpl(siteId, deviceId, onSent) {
   // Transport routing (ozkey-11 §3). A bridged (Thread) lock never subscribes
   // to MQTT itself, so publishing to its device-scoped topic reaches nobody —
   // the command must go to its BRIDGE's topic, naming the lock in `target`.
-  const [[lockRow]] = await pool.query('SELECT bridge_id FROM locks WHERE id = ?', [deviceId]);
+  const [[lockRow]] = await pool.query('SELECT bridge_id, ozkie_version FROM locks WHERE id = ?', [deviceId]);
   const bridgeId = lockRow && lockRow.bridge_id ? lockRow.bridge_id : null;
+
+  // ozkey-48 backstop: every relay route already refuses a v2 lock before
+  // queueing (`refuseIfOzkieV2`), so a row here means one slipped past — or
+  // was queued before the lock's row was marked v2. A v1 envelope means
+  // nothing to a v2 lock and an actuation must never sit in this queue
+  // (§4.2), so drop it rather than publish it.
+  if (lockRow && lockRow.ozkie_version === OZKIE_V2) {
+    for (const job of queued) {
+      await pool.query("UPDATE pending_queue SET status = 'expired' WHERE id = ?", [job.id]);
+      logEvent('warn', `Queue #${job.id} (${job.action_type}) dropped — ${deviceId} is OZKIE v2 (ozkey-48)`);
+    }
+    return 0;
+  }
 
   let sent = 0;
   for (const job of queued) {
@@ -1628,8 +1681,23 @@ async function handleLockPresence(deviceId, payload) {
   // the new ownership gate a few lines down needs `bridge_id` for OFFLINE
   // `via` reports too (a non-owning bridge's own disconnect/lwt as it
   // complies with `release_lock`), not just online claims.
-  const [[lock]] = await pool.query('SELECT bridge_id, presence FROM locks WHERE id = ?', [deviceId]);
+  const [[lock]] = await pool.query('SELECT bridge_id, presence, ozkie_version FROM locks WHERE id = ?', [
+    deviceId,
+  ]);
   let effectiveBridgeId = lock ? lock.bridge_id : null;
+
+  // ozkey-48 §7: the bridge saw which GATT service the lock advertises
+  // (…4b31 = v1, …4b32 = v2) — that beats the app's word at POST /pairings,
+  // which an older app build never sends. Absent = the bridge has no opinion
+  // (hasn't seen it advertise), NOT v1, so only a present 1|2 is applied.
+  if (lock && (obj.ozkie_version === 1 || obj.ozkie_version === 2) && obj.ozkie_version !== lock.ozkie_version) {
+    await pool.query('UPDATE locks SET ozkie_version = ? WHERE id = ?', [obj.ozkie_version, deviceId]);
+    logEvent(
+      'warn',
+      `Lock ${deviceId} ozkie_version ${lock.ozkie_version} → ${obj.ozkie_version} per bridge ` +
+        `${obj.via || '(unknown)'} scan — disagrees with the stored (app-reported) value (ozkey-48 §7)`
+    );
+  }
 
   if (obj.via && state === 'online') {
     if (lock && lock.bridge_id !== obj.via) {
@@ -2698,7 +2766,7 @@ function buildProvisionPayload(appId, deviceId) {
  * unguessability + the (future) e2e envelope are the security, not a server
  * credential. Returns {status:number}|null via `err` for the caller to map.
  */
-async function registerPairing(appId, deviceId, label, bridgeId) {
+async function registerPairing(appId, deviceId, label, bridgeId, ozkieVersion) {
   const [[existing]] = await pool.query('SELECT app_id, status FROM locks WHERE id = ?', [
     deviceId,
   ]);
@@ -2721,6 +2789,9 @@ async function registerPairing(appId, deviceId, label, bridgeId) {
        label = COALESCE(VALUES(label), label)`,
     [deviceId, CONFIG.SITE_ID, appId, bridgeId || null, label || 'New Doorlock', CONFIG.DEFAULT_HEARTBEAT_S]
   );
+  // Only written when the app says so — an older app build that never sends
+  // it must not flip an existing row back to the default.
+  if (ozkieVersion) await pool.query('UPDATE locks SET ozkie_version = ? WHERE id = ?', [ozkieVersion, deviceId]);
   logEvent(
     'pair',
     `Pairing registered: app ${appId || '(anon)'} ⇄ device ${deviceId}` +
@@ -2735,8 +2806,16 @@ async function registerPairing(appId, deviceId, label, bridgeId) {
 api.post('/pairings', async (req, res) => {
   if (!guardDb(res)) return;
   try {
-    const { app_id, device_id, label, bridge_id } = req.body || {};
+    const { app_id, device_id, label, bridge_id, ozkie_version } = req.body || {};
     const appId = app_id ? String(app_id).slice(0, 80) : null;
+    // ozkey-48 §7: optional, absent = leave as is (default 1 for a new row).
+    if (ozkie_version !== undefined && ozkie_version !== 1 && ozkie_version !== 2) {
+      return res.status(400).json({
+        ok: false,
+        code: 'invalid_ozkie_version',
+        error: 'ozkie_version must be 1 or 2 (ozkey-48 §7)',
+      });
+    }
     const deviceId = device_id ? String(device_id).slice(0, 64) : null;
     // Optional: present only for a Thread lock reached through a bridge32
     // gateway (ozkey-11 §3). Absent = direct Wi-Fi lock, routed as before.
@@ -2750,7 +2829,7 @@ api.post('/pairings', async (req, res) => {
           error: 'app_id and device_id are required (the app grants both)',
         });
     }
-    await registerPairing(appId, deviceId, label, bridgeId);
+    await registerPairing(appId, deviceId, label, bridgeId, ozkie_version);
     // ozkey-23 §10.2a, XF-96 §4/§6: app broker auth is NOT minted here —
     // it's a separate identity/auth flow (ozkey-24: POST /apps/register +
     // /auth/challenge + /auth/token, below), independent of pairing a
@@ -2760,6 +2839,7 @@ api.post('/pairings', async (req, res) => {
       device_id: deviceId,
       app_id: appId,
       bridge_id: bridgeId,
+      ozkie_version: ozkie_version || null,
       provision_payload: buildProvisionPayload(appId, deviceId),
     });
   } catch (err) {
@@ -2968,7 +3048,7 @@ api.get('/locks', async (req, res) => {
     // reachable via Thread/bridge before falling back to asking the user for BLE.
     const [rows] = await pool.query(
       `SELECT id, site_id, app_id, mac, label, fw, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
+              last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile, ozkie_version,
               presence, direct_presence, presence_reason, presence_at, battery_pct, mcu_link_up, mcu_last_frame_s,
               seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch, bonds
          FROM locks ORDER BY enrolled_at DESC`
@@ -3082,7 +3162,7 @@ api.get('/locks/:id', async (req, res) => {
     // This is XF-48 ask 1 (the capability field) landing on the read path.
     const [[lock]] = await pool.query(
       `SELECT id, app_id, site_id, mac, label, fw, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
+              last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile, ozkie_version,
               presence, direct_presence, presence_reason, presence_at, battery_pct, mcu_link_up, mcu_last_frame_s,
               seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch, bonds
          FROM locks WHERE id = ?`,
@@ -3302,7 +3382,7 @@ api.patch('/locks/:id', async (req, res) => {
     // that remote_unlock flips the instant bridge_id does (effectiveCaps()).
     const [[updatedLock]] = await pool.query(
       `SELECT id, app_id, site_id, mac, label, fw, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile,
+              last_seen_at, enrolled_at, bridge_id, caps, transport, tuya_pid, profile, ozkie_version,
               presence, direct_presence, presence_reason, presence_at, battery_pct, mcu_link_up, mcu_last_frame_s,
               seq_highwater, dropped_before_seq, last_pulled_seq, has_doorbell, profile_mismatch, bonds
          FROM locks WHERE id = ?`,
@@ -3470,7 +3550,7 @@ api.delete('/locks/:id', async (req, res) => {
     // not just the record): tell it to wipe NVS and return to ADVERTISING.
     // Best-effort — an offline lock misses it and needs the on-device reset.
     const [[lock]] = await conn.query(
-      'SELECT site_id, bridge_id, last_seen_at, heartbeat_s, presence, presence_reason, mac, last_reset_reason FROM locks WHERE id = ?',
+      'SELECT site_id, bridge_id, last_seen_at, heartbeat_s, presence, presence_reason, mac, last_reset_reason, ozkie_version FROM locks WHERE id = ?',
       [id]
     );
     let attempted = false;
@@ -3491,6 +3571,12 @@ api.delete('/locks/:id', async (req, res) => {
           'key',
           `Factory reset SKIPPED for lock ${id} — already reset per retained presence (XF-119)`
         );
+      } else if (lock.ozkie_version === OZKIE_V2) {
+        // ozkey-48: neither branch below can reach a v2 lock — both send v1
+        // bytes — and `dev/reset` over a relay is owner-only actuation with an
+        // Echo round trip (§4.2), not built yet. Remove the record only and
+        // report the reset as not attempted; the owner resets at the door.
+        logEvent('warn', `Factory reset NOT sent for lock ${id} — OZKIE v2 relay not built yet (ozkey-48 §7)`);
       } else if (envelope_hex) {
         // XF-91 §5 — sealed unpair, required for a Thread lock: bridge32 has
         // no `locks/+/command` subscription at all, so the plain path below
@@ -3669,6 +3755,7 @@ api.post('/locks/:id/grants', async (req, res) => {
       return res
         .status(404)
         .json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
+    if (refuseIfOzkieV2(res, lock, deviceId, 'Grant')) return;
 
     await conn.beginTransaction();
     // S3 cutover: grants has no raw_value column anymore — the server
@@ -3910,6 +3997,34 @@ api.post('/locks/:id/unlock', async (req, res) => {
       return res
         .status(404)
         .json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
+
+    // ozkey-48 §6 (operator, 2026-10-18): on a v2 lock, remote unlock is OWNER
+    // ONLY — members are on-premises only and never get a relay context, so
+    // their relayed unlock could never execute anyway. The lock is what
+    // enforces this; the server has no way to see whose context sealed an
+    // OSCORE request, and this API takes the caller's word for `app_id`. This
+    // check is fail-fast UX, so a member's app gets a clear answer instead of
+    // a timeout, not a security boundary.
+    if (lock.ozkie_version === OZKIE_V2) {
+      const callerAppId = req.body && req.body.app_id ? String(req.body.app_id).trim().toLowerCase() : null;
+      if (!callerAppId || callerAppId !== String(lock.app_id || '').toLowerCase()) {
+        logEvent('warn', `Remote UNLOCK refused for "${lock.label}" — not the owner (OZKIE v2, ozkey-48 §6)`);
+        return res.status(403).json({
+          ok: false,
+          code: 'remote_unlock_owner_only',
+          error: 'remote_unlock_owner_only',
+          detail:
+            'Only the lock owner can unlock this lock remotely. Members unlock with ' +
+            'Bluetooth at the door.',
+          device_id: deviceId,
+          ref: 'ozkey-48 §6',
+        });
+      }
+      // §4.2: actuation is never store-and-forward — so nothing below (which
+      // queues) may run for a v2 lock, even once the relay exists.
+      if (refuseIfOzkieV2(res, lock, deviceId, 'Remote UNLOCK')) return;
+    }
+
     // A bridged (Thread) lock has no MQTT uplink of its own, so handleEnroll can
     // never run for it and its status cannot advance past 'registered' — that is
     // the ozkey-10 uplink gap, not a half-finished pairing. Commands still reach
@@ -3976,7 +4091,7 @@ api.post('/locks/:id/unlock', async (req, res) => {
         detail:
           'This lock cannot be unlocked remotely. Unlock is Bluetooth-at-the-door; ' +
           'its network link carries key management, PIN sync and audit on a periodic ' +
-          'wake, not live commands. Add an OZKEY bridge to enable remote unlock.',
+          'wake, not live commands. Add a bridge to enable remote unlock.',
         caps,
         caps_source: source, // 'device' = the lock said so; 'inferred' = no bridge bound
         device_id: deviceId,
@@ -4099,6 +4214,7 @@ async function handleBondVerb(req, res, actionType, label) {
       return res
         .status(404)
         .json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
+    if (refuseIfOzkieV2(res, lock, deviceId, label)) return;
 
     const reachable = lock.status === 'enrolled' || (lock.bridge_id && lock.status === 'registered');
     if (!reachable) {
@@ -4272,6 +4388,8 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
         });
       siteId = lock.site_id;
     }
+    const [[verRow]] = await conn.query('SELECT ozkie_version FROM locks WHERE id = ?', [deviceId]);
+    if (refuseIfOzkieV2(res, verRow, deviceId, 'Grant revoke')) return;
     const [[dupe]] = await conn.query(
       `SELECT id FROM pending_queue
         WHERE grant_id = ? AND action_type = 'revoke-key' AND status = 'queued'`,
@@ -4358,7 +4476,7 @@ api.get('/locks/:id/log', (_req, res) => {
       'Door event history is not held by the hosted relay. This server stores ' +
       'no record of which lock opened, when, or by whom (Sovereign Edge v3 ' +
       '§4.1). Door events are available only from an operator-run OZPMSSERV / ' +
-      'OZKEYSERV instance, or on-device.',
+      'OZLODGESERV instance, or on-device.',
     since: '2026-07-31',
     ref: 'XF-48 §9.4',
   });
