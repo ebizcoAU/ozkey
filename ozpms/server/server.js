@@ -2,45 +2,41 @@
  * ============================================================================
  *  OZPMSSERV — OZPMS Property-Management Server (lab deployment)
  *  ---------------------------------------------------------------------------
- *  Role     : The OPERATOR'S OWN server. Forked from ozlockserv 2026-07-31 by
- *             operator decision ("OZLOCKSERV IS OZPMS SERVER") to resolve the
- *             XF-48 §9.4 conflict between the v3 whitepaper §4.1 data inventory
- *             and the XF-47 §8(b) log work.
+ *  Role     : The OPERATOR'S OWN server, run by the property operator on their
+ *             own infrastructure over their own doors. Forked from ozlockserv
+ *             2026-07-31 (operator: "OZLOCKSERV IS OZPMS SERVER", XF-48 §9.4);
+ *             rebuilt on ozserver-core in S1 (ozkey-50 §7), so it now shares
+ *             ozlock's lock side: presence, XF-144 bridge failover, the opaque
+ *             sealed relay, the write queue and the August fixes.
  *
- *             THE SPLIT, and why it is a fork rather than a flag:
- *               - OZLOCKSERV is the HOSTED RELAY we run for other people. It is
- *                 blind: it holds no door events at all (§4.1 — "not which lock
- *                 opened, when, or by whom"). `lock_logs` was REMOVED there.
- *               - OZPMSSERV is run BY the property operator, ON their own
- *                 infrastructure, over THEIR OWN doors. Holding that data is not
- *                 a sovereignty breach — it is the point of a PMS, and it is the
- *                 same rule XF-47 Ask 7 already set for `grants.raw_value`.
- *             A runtime flag would have put both behaviours in one binary we
- *             also host; the guarantee is only credible if the hosted build
- *             cannot log door events at all.
- *
- *             So the XF-47 §8(b) work (seq / recorded_at / sync_batch /
- *             window_from / window_to, drop lock_ts) targets THIS server.
+ *             What still makes it a separate product, not a flag on ozlock:
+ *               - OZLOCKSERV is the HOSTED RELAY we run for other people and
+ *                 holds no door events at all (Sovereign Edge v3 §4.1).
+ *               - OZPMSSERV may keep door events (`lock_logs`), because the
+ *                 operator holds them over their own doors. It also keeps any
+ *                 grants columns its DB already has: the core's irreversible
+ *                 plaintext-column drop is ozlock's opt-in, not ours.
  *  Port     : 4420  (REST base /ozpmsserv/api)   [OZPMS_HTTP_PORT]
  *  Site     : 'pms' — must differ from ozlockserv's 'lab' (see CONFIG.SITE_ID)
- *  Broker   : TalkPOS Mosquitto @ mqtt://10.1.1.20:1883 (lab stand-in for EMQX)
- *  Database : MySQL (localhost / ozpms)
+ *  Broker   : lab Mosquitto @ mqtt://10.1.1.42:1883 [OZPMS_MQTT_URL]
+ *             (S1: moved from 10.1.1.20, as ozlock did 2026-09-01)
+ *  Database : MySQL (localhost / ozpms)          [OZPMS_DB_NAME]
  *
- *  Responsibilities (ozkey-04 §6, ozkey-05 §6)
- *    1. Mint single-use enrollment tokens (BANOI "Add Doorlock" begins here)
- *    2. Enroll locks: verify token, bind device -> site/owner, issue broker
- *       credentials, ack on the command topic
- *    3. Issue/revoke user keys as Tuya 55 AA DPID frames, queue them, flush
- *       on the lock's wake (ozkey/<site>/locks/<id>/heartbeat)
- *    4. Ingest door access transactions (ozkey/<site>/locks/<id>/log)
+ *  S1 changes against the July fork, deliberately:
+ *    - NO server-side Tuya frames and NO unsealed unlock (ozkey-50 §8.3). Grants,
+ *      revokes and unlock take an app-sealed `envelope_hex` only, like ozlock.
+ *    - Topics move to `ozkie/pms/…`; `ozkey/pms/…` stays subscribed as the
+ *      legacy twin until bridges are reconfigured (ozlock's S16 path).
+ *    - Lock broker secrets stay scrypt-hashed (S−1), now via the core.
  *
- *  Lab simplifications (flagged, ozkey-05 §10 migration steps 3-5 pending):
- *    - single seeded owner + site ('pms'); REST is unauthenticated. NOTE: real
- *      OZPMS is multi-tenant (2000 locks / 10 PMs / GM / admin) — that is the
- *      first thing this fork must grow, and it is why it is a separate server.
- *    - broker credentials are minted + stored + acked for contract shape, but
- *      the lab Mosquitto does not enforce them
- *    - device_id is derived from the MAC (real hardware: keypair, ozkey-04 §3)
+ *  Lab simplifications — NOT production-ready:
+ *    - single seeded owner + site ('pms'). REST has NO auth yet: the lock API
+ *      is mounted open only when OZPMS_LAB_OPEN_API=1 is set; otherwise (and
+ *      always in production) the server refuses to start. Real tenancy and auth are ozkey-51 (S5). ozpms must not go
+ *      on a customer VPS before then.
+ *    - door events come only from the v1 plaintext `log` topic, which only
+ *      Wi-Fi-direct v1 locks publish (bench locks are BLE/Thread via a bridge,
+ *      so expect zero rows). Sealed door history is ozkey-51/S5.
  * ============================================================================
  */
 
@@ -50,134 +46,98 @@ const express = require('express');
 const cors = require('cors');
 const mysql = require('mysql2/promise');
 const mqtt = require('mqtt');
-const os = require('os');
-const crypto = require('crypto');
-const fs = require('fs');
 const path = require('path');
-
-/** First non-internal IPv4 of this host. Override with OZPMS_SERVER_IP. */
-function detectLanIp() {
-  for (const ifaces of Object.values(os.networkInterfaces())) {
-    for (const iface of ifaces || []) {
-      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
-    }
-  }
-  return '127.0.0.1';
-}
+const { createCore, util: coreUtil } = require('../../ozserver-core');
+const { IS_PRODUCTION, detectLanIp, loadDotEnv, resolveSecret, enforceSecrets, normalizeMac, deviceIdFromMac } =
+  coreUtil;
 
 /* ---------------------------------------------------------------------------
- * S−1 (ozkey-50 §8.2): fail-closed secrets. Values come from the process env,
- * then from an optional `.env` beside this file (gitignored, must be 0600),
- * never from the source. resolveSecret() runs at load so CONFIG can read the
- * values; enforceSecrets() is the first thing boot() does, before any DB,
- * MQTT or HTTP, and exits on any required secret that is missing. Problems
- * name the variable, never the value. Same block in all three servers until
- * S0 lifts it into the shared core.
+ * S−1 (ozkey-50 §8.2): fail-closed secrets — env first, then a 0600 `.env`
+ * beside this file, never the source. enforceSecrets() is the first thing
+ * boot() does and exits on any required secret that is missing.
  * ------------------------------------------------------------------------- */
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-// The one placeholder list: empty, these literals, and anything 'lab-…'.
-const SECRET_PLACEHOLDERS = ['changeme', 'change-me', 'change_me', '<set-me>'];
-const SECRET_MIN_PROD_LEN = 32;
-const secretProblems = [];
-
-function isPlaceholderSecret(value) {
-  const s = String(value || '').trim().toLowerCase();
-  return !s || s.startsWith('lab-') || SECRET_PLACEHOLDERS.includes(s);
-}
-
-/** KEY=VALUE lines; never overrides a var already set in the env. */
-function loadDotEnv(file) {
-  if (!fs.existsSync(file)) return;
-  if (fs.statSync(file).mode & 0o077) {
-    secretProblems.push(`${file} is readable by group/others (chmod 600 it)`);
-    return;
-  }
-  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
-    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (!m || process.env[m[1]] !== undefined) continue;
-    process.env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
-  }
-}
-
-/** First set var in `vars` (primary first, then legacy names). `required`:
- *  'always' | 'production' | false. Returns null when unset/placeholder. */
-function resolveSecret(vars, { required = false, minProdLen = 0 } = {}) {
-  const found = vars.find((v) => process.env[v] !== undefined);
-  const value = found ? process.env[found] : undefined;
-  const needed = required === 'always' || (required === 'production' && IS_PRODUCTION);
-  if (isPlaceholderSecret(value)) {
-    if (needed) secretProblems.push(`${vars[0]} is missing or a placeholder`);
-    return null;
-  }
-  if (IS_PRODUCTION && value.length < minProdLen) {
-    secretProblems.push(`${vars[0]} is shorter than ${minProdLen} characters`);
-    return null;
-  }
-  return value;
-}
-
-function enforceSecrets(warnings = []) {
-  const mode = IS_PRODUCTION ? 'production' : 'lab';
-  if (secretProblems.length) {
-    for (const p of secretProblems) logEvent('error', `FATAL S−1: ${p}`);
-    logEvent('error', `FATAL S−1: refusing to start (${mode}); set these in the env or a 0600 .env beside server.js`);
-    process.exit(1);
-  }
-  for (const w of warnings) logEvent('warn', `S−1: ${w}`);
-  logEvent('info', `S−1: secrets OK (${mode})`);
-}
-
 loadDotEnv(path.join(__dirname, '.env'));
 
 const SECRETS = {
   DB_PASSWORD: resolveSecret(['OZPMS_DB_PASSWORD'], { required: 'always' }),
+  // S1c: the Wi-Fi the provision payload hands a lock. No literal in source.
+  PROVISION_WIFI_SSID: resolveSecret(['PROVISION_WIFI_SSID'], { required: 'always' }),
+  PROVISION_WIFI_PASSWORD: resolveSecret(['PROVISION_WIFI_PASSWORD'], { required: 'always' }),
 };
 
 /* ---------------------------------------------------------------------------
  * Configuration
  * ------------------------------------------------------------------------- */
+const MQTT_URL = process.env.OZPMS_MQTT_URL || 'mqtt://10.1.1.42:1883';
+
 const CONFIG = {
   // Override to spin a verification instance beside the watcher-run :4420 one.
   HTTP_PORT: Number(process.env.OZPMS_HTTP_PORT) || 4420,
   SERVER_IP: process.env.OZPMS_SERVER_IP || detectLanIp(),
   // MUST NOT be 'lab'. Topics are site-pinned so several servers can share one
   // broker, but two servers on the SAME site both consume every heartbeat and
-  // both flush the queue — the lock would receive each command twice. OZLOCKSERV
-  // owns 'lab'; OZKEYSERV owns 'hotel'; this server owns 'pms'.
+  // both flush the queue — the lock would receive each command twice.
+  // OZLOCKSERV owns 'lab'; OZLODGE owns 'hotel'; this server owns 'pms'.
   SITE_ID: 'pms',
   DB: {
     host: 'localhost',
     user: 'root',
     password: SECRETS.DB_PASSWORD, // S−1: OZPMS_DB_PASSWORD, required in every mode
-    // Separate schema from ozlockserv's 'ozlock'. Nothing is migrated by this
-    // server: it bootstraps its own tables on first boot (CREATE TABLE IF NOT
-    // EXISTS), so the existing lab data is left exactly where it is.
-    database: 'ozpms',
+    database: process.env.OZPMS_DB_NAME || 'ozpms',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
   },
-  MQTT_URL: 'mqtt://10.1.1.20:1883',
+  MQTT_URL,
   BROKER: {
-    host: '10.1.1.20',
-    tcp_port: 1883,
+    host: new URL(MQTT_URL).hostname,
+    tcp_port: Number(new URL(MQTT_URL).port) || 1883,
     ws_port: 9001,
     ws_path: '/mqtt',
   },
-  // ozkey-04 §9 topic scheme (site-prefixed, device-scoped, room-free).
-  // Site-pinned (NOT wildcard) so multiple servers can share one broker —
-  // OZKEYSERV (site 'hotel', ozkey-07) publishes device-scoped on the same
-  // ozkey/<site>/... root; each server must only consume its own site.
-  SUB_ENROLL: 'ozkey/pms/locks/+/enroll',
-  SUB_HEARTBEAT: 'ozkey/pms/locks/+/heartbeat',
-  SUB_LOG: 'ozkey/pms/locks/+/log',
-  topicCommand: (site, deviceId) => `ozkey/${site}/locks/${deviceId}/command`,
-  // A Thread lock has no MQTT client of its own — bridge32 is its gateway and
-  // subscribes to its OWN topic (blelock/bridge32/bridge32.ino:489), then
-  // demuxes onto the mesh by `target`. ozkey-11 §3.
-  topicBridgeCommand: (site, bridgeId) => `ozkey/${site}/bridges/${bridgeId}/command`,
+  // ozkie/ is primary; ozkey/ (the July scheme) is the legacy twin during the
+  // topic move (ozkey-50 §7 S1, ozlock's S16).
+  SUB_ENROLL: 'ozkie/pms/locks/+/enroll',
+  SUB_ENROLL_LEGACY: 'ozkey/pms/locks/+/enroll',
+  SUB_HEARTBEAT: 'ozkie/pms/locks/+/heartbeat',
+  SUB_HEARTBEAT_LEGACY: 'ozkey/pms/locks/+/heartbeat',
+  SUB_MEMBER_REQUEST_REMOVE: 'ozkie/pms/members/+/request_remove',
+  SUB_MEMBER_REQUEST_REMOVE_LEGACY: 'ozkey/pms/members/+/request_remove',
+  SUB_MEMBER_ACK_REMOVE: 'ozkie/pms/members/+/ack_remove',
+  SUB_MEMBER_ACK_REMOVE_LEGACY: 'ozkey/pms/members/+/ack_remove',
+  SUB_UPLINK: 'ozkie/pms/locks/+/uplink',
+  SUB_UPLINK_LEGACY: 'ozkey/pms/locks/+/uplink',
+  SUB_PRESENCE_LOCKS: 'ozkie/pms/locks/+/presence',
+  SUB_PRESENCE_LOCKS_LEGACY: 'ozkey/pms/locks/+/presence',
+  SUB_PRESENCE_BRIDGES: 'ozkie/pms/bridges/+/presence',
+  SUB_PRESENCE_BRIDGES_LEGACY: 'ozkey/pms/bridges/+/presence',
+  SUB_BRIDGE_SCAN_RESULT: 'ozkie/pms/bridges/+/scan_result',
+  SUB_PEER_STATUS: 'ozkie/pms/bridges/+/peer_status',
+  // LEGACY door events: v1 Wi-Fi-direct locks only (ozdoorlock_core.h
+  // publishLog()). See the header; don't build features on this path.
+  SUB_DOOR_LOG: 'ozkie/pms/locks/+/log',
+  SUB_DOOR_LOG_LEGACY: 'ozkey/pms/locks/+/log',
+  onDoorLog: (siteId, deviceId, obj) => ingestLegacyDoorLog(siteId, deviceId, obj),
+  topicCommand: (site, deviceId) => `ozkie/${site}/locks/${deviceId}/command`,
+  topicBridgeCommand: (site, bridgeId) => `ozkie/${site}/bridges/${bridgeId}/command`,
+  topicTime: (site) => `ozkie/${site}/time`,
+  BRIDGE_RESET_TIMEOUT_MS: 5000,
+  LOCK_RESET_TIMEOUT_MS: 5000,
+  UTC_PUSH_REFRESH_MS: 10 * 60 * 1000,
+  AUDIT_LOG_RETENTION_MS: 90 * 24 * 3600 * 1000,
+  AUDIT_LOG_PURGE_INTERVAL_MS: 24 * 3600 * 1000,
   ENROLL_TOKEN_TTL_MS: 10 * 60 * 1000, // ozkey-05 §7.5
   DEFAULT_HEARTBEAT_S: 60,
+  SERVICE_NAME: 'ozpmsserv',
+  ENROLL_ISSUED_BY: 'OZPMS/',
+  FAILOVER_GRACE_MS: Number(process.env.OZPMS_FAILOVER_GRACE_MS) || 2 * 60 * 1000,
+  FAILOVER_SWEEP_MS: Number(process.env.OZPMS_FAILOVER_SWEEP_MS) || 30_000,
+  // The operator's own data: never let a deploy drop grants columns.
+  DROP_PLAINTEXT_GRANT_COLUMNS: false,
+  ENFORCE_CAPS: process.env.OZPMS_ENFORCE_CAPS !== '0',
+  HASH_LOCK_BROKER_SECRETS: true, // S−1, kept from the July fork
+  PROVISION_WIFI_SSID: SECRETS.PROVISION_WIFI_SSID,
+  PROVISION_WIFI_PASSWORD: SECRETS.PROVISION_WIFI_PASSWORD,
 };
 
 /* ---------------------------------------------------------------------------
@@ -197,281 +157,16 @@ function logEvent(level, message) {
 }
 
 /* ---------------------------------------------------------------------------
- * Tuya 55 AA frame codec — identical to ozkeyserv (byte-verified vs LockSim)
+ * ozserver-core: one core per process; everything it needs is here.
  * ------------------------------------------------------------------------- */
-const TUYA_CMD = {
-  HEARTBEAT: 0x00,
-  DP_REPORT: 0x06,
-};
+const core = createCore({ CONFIG, logEvent, mysql, mqtt });
+const { purgeOldAuditLog, isMqttConnected, initMqtt, initDatabase, pageParams, rangeWhere } = core;
 
-const DPID = {
-  UNLOCK_CHANNEL: 1, // remote unlock request (BOOL 1) — the away-path "Mở cửa"
-  ADD_TEMP_PIN: 21,
-  DELETE_PIN: 22,
-  ADD_TEMP_RFID: 23,
-  DELETE_RFID: 24,
-};
-
-const DP_TYPE = { RAW: 0x00, BOOL: 0x01, VALUE: 0x02, STRING: 0x03, ENUM: 0x04 };
-
-const SUPPORTED_CRED_TYPES = ['pin', 'rfid'];
-
-function buildTuyaFrame(command, payloadBuf) {
-  const head = Buffer.alloc(6);
-  head[0] = 0x55;
-  head[1] = 0xaa;
-  head[2] = 0x00;
-  head[3] = command & 0xff;
-  head.writeUInt16BE(payloadBuf.length, 4);
-  const body = Buffer.concat([head, payloadBuf]);
-  let sum = 0;
-  for (const b of body) sum = (sum + b) & 0xff;
-  return Buffer.concat([body, Buffer.from([sum])]);
-}
-
-function buildDpPayload(dpId, dpType, valueBuf) {
-  const head = Buffer.alloc(4);
-  head[0] = dpId & 0xff;
-  head[1] = dpType & 0xff;
-  head.writeUInt16BE(valueBuf.length, 2);
-  return Buffer.concat([head, valueBuf]);
-}
-
-function toSpacedHex(buf) {
-  return buf
-    .toString('hex')
-    .toUpperCase()
-    .match(/.{2}/g)
-    .join(' ');
-}
-
-function credentialValueBytes(type, rawValue) {
-  const value = String(rawValue).trim();
-  if (type === 'pin') {
-    if (!/^\d+$/.test(value)) {
-      throw new Error(`PIN must be digits only (got "${value}")`);
-    }
-    return Buffer.from(value, 'ascii');
-  }
-  const hex = value.replace(/[^0-9a-fA-F]/g, '');
-  if (hex.length === 0 || hex.length % 2 !== 0) {
-    throw new Error(`RFID UID must be an even-length hex string (got "${value}")`);
-  }
-  return Buffer.from(hex, 'hex');
-}
-
-function buildCredentialFrame({ type, slotNumber, rawValue, dateFrom, dateTo }) {
-  if (!SUPPORTED_CRED_TYPES.includes(type)) {
-    throw new Error(`unsupported credential type "${type}" for the DP codec`);
-  }
-  const credBytes = credentialValueBytes(type, rawValue);
-  const fromTs = Math.floor(new Date(dateFrom).getTime() / 1000) || 0;
-  const toTs = Math.floor(new Date(dateTo).getTime() / 1000) || 0;
-
-  const value = Buffer.alloc(2 + credBytes.length + 8);
-  value.writeUInt16BE(slotNumber & 0xffff, 0);
-  credBytes.copy(value, 2);
-  value.writeUInt32BE(fromTs >>> 0, 2 + credBytes.length);
-  value.writeUInt32BE(toTs >>> 0, 2 + credBytes.length + 4);
-
-  const dpId = type === 'pin' ? DPID.ADD_TEMP_PIN : DPID.ADD_TEMP_RFID;
-  return buildTuyaFrame(TUYA_CMD.DP_REPORT, buildDpPayload(dpId, DP_TYPE.RAW, value));
-}
-
-function buildDeleteFrame({ type, slotNumber }) {
-  if (!SUPPORTED_CRED_TYPES.includes(type)) {
-    throw new Error(`unsupported credential type "${type}" for the DP codec`);
-  }
-  const value = Buffer.alloc(2);
-  value.writeUInt16BE(slotNumber & 0xffff, 0);
-  const dpId = type === 'pin' ? DPID.DELETE_PIN : DPID.DELETE_RFID;
-  return buildTuyaFrame(TUYA_CMD.DP_REPORT, buildDpPayload(dpId, DP_TYPE.RAW, value));
-}
-
-/** Remote unlock request: DP_REPORT / DPID 1 (UNLOCK_CHANNEL) BOOL value 1.
- *  Byte-matches LockSim's SAMPLE_REMOTE_UNLOCK_FRAME; the lock's handleFrame
- *  runs unlockCycle() on receipt. */
-function buildUnlockFrame() {
-  return buildTuyaFrame(
-    TUYA_CMD.DP_REPORT,
-    buildDpPayload(DPID.UNLOCK_CHANNEL, DP_TYPE.BOOL, Buffer.from([0x01]))
-  );
-}
-
-/* ---------------------------------------------------------------------------
- * Identity helpers
- * ------------------------------------------------------------------------- */
-function normalizeMac(raw) {
-  const hex = String(raw || '')
-    .replace(/[^0-9a-fA-F]/g, '')
-    .toUpperCase();
-  if (hex.length !== 12) return null;
-  return hex.match(/.{2}/g).join(':');
-}
-
-/** Lab interim device id (ozkey-04 §3: real hardware derives from a keypair). */
-function deviceIdFromMac(mac) {
-  return `ozk-${mac.replace(/:/g, '').toLowerCase()}`;
-}
-
-function makeSecret(bytes = 16, prefix = '') {
-  return prefix + crypto.randomBytes(bytes).toString('hex');
-}
-
-/** S−1 (ozkey-50 §8.2): broker_secret is stored as a salted scrypt hash, never
- *  plaintext. The plaintext only travels in the enrollment_ack; nothing here
- *  reads it back, so a hash is enough. Format: scrypt$<salt hex>$<hash hex>. */
-function hashBrokerSecret(secret) {
-  const salt = crypto.randomBytes(16);
-  return `scrypt$${salt.toString('hex')}$${crypto.scryptSync(secret, salt, 32).toString('hex')}`;
-}
-
-/* ---------------------------------------------------------------------------
- * MySQL bootstrap — owner/site/lock schema (rooms-free, ozkey-05 §3)
- * ------------------------------------------------------------------------- */
-let pool = null;
-
-async function initDatabase() {
-  const admin = await mysql.createConnection({
-    host: CONFIG.DB.host,
-    user: CONFIG.DB.user,
-    password: CONFIG.DB.password,
-    multipleStatements: false,
-  });
-  await admin.query(
-    `CREATE DATABASE IF NOT EXISTS \`${CONFIG.DB.database}\`
-     CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
-  );
-  await admin.end();
-
-  pool = mysql.createPool(CONFIG.DB);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS owners (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      display_name VARCHAR(255),
-      banoi_sub VARCHAR(255) NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS sites (
-      id VARCHAR(50) PRIMARY KEY,
-      owner_id INT,
-      label VARCHAR(255),
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (owner_id) REFERENCES owners(id)
-    ) ENGINE=InnoDB`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS locks (
-      id VARCHAR(64) PRIMARY KEY,
-      site_id VARCHAR(50),
-      app_id VARCHAR(80) NULL,
-      bridge_id VARCHAR(64) NULL,
-      mac VARCHAR(17),
-      label VARCHAR(255) DEFAULT 'New Doorlock',
-      fw VARCHAR(50) NULL,
-      status VARCHAR(20) DEFAULT 'enrolled',
-      power_profile VARCHAR(20) DEFAULT 'eco',
-      heartbeat_s INT DEFAULT 60,
-      broker_username VARCHAR(64),
-      broker_secret VARCHAR(128),
-      last_seen_at DATETIME NULL,
-      enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (site_id) REFERENCES sites(id)
-    ) ENGINE=InnoDB`);
-
-  // app_id = the paired app's self-generated identity (trust-model v2, ozkey-05
-  // amendment / XF-42 §13). Additive migration for pre-v2 lab rows.
-  const [[{ hasAppId }]] = await pool.query(
-    `SELECT COUNT(*) AS hasAppId FROM information_schema.columns
-      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'app_id'`,
-    [CONFIG.DB.database]
-  );
-  if (!hasAppId) await pool.query('ALTER TABLE locks ADD COLUMN app_id VARCHAR(80) NULL AFTER site_id');
-
-  // bridge_id = the bridge32 gateway a Thread lock is reached through (ozkey-11
-  // §3). NULL = the lock is its own MQTT client (direct Wi-Fi, modes 2b/3/4).
-  // Only the app learns this — it read the bridge's Thread dataset over BLE at
-  // commissioning — so it must tell us at /pairings or the lock is unreachable.
-  const [[{ hasBridgeId }]] = await pool.query(
-    `SELECT COUNT(*) AS hasBridgeId FROM information_schema.columns
-      WHERE table_schema = ? AND table_name = 'locks' AND column_name = 'bridge_id'`,
-    [CONFIG.DB.database]
-  );
-  if (!hasBridgeId)
-    await pool.query('ALTER TABLE locks ADD COLUMN bridge_id VARCHAR(64) NULL AFTER app_id');
-
-  // S−1: broker_secret holds a scrypt hash now (~105 chars). Widen the column
-  // and hash any plaintext rows left from before; both steps are idempotent.
-  await pool.query('ALTER TABLE locks MODIFY COLUMN broker_secret VARCHAR(128)');
-  const [plainSecrets] = await pool.query(
-    "SELECT id, broker_secret FROM locks WHERE broker_secret IS NOT NULL AND broker_secret NOT LIKE 'scrypt$%'"
-  );
-  for (const row of plainSecrets) {
-    await pool.query('UPDATE locks SET broker_secret = ? WHERE id = ?', [hashBrokerSecret(row.broker_secret), row.id]);
-  }
-  if (plainSecrets.length) logEvent('info', `S−1: hashed ${plainSecrets.length} plaintext broker_secret row(s)`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS enroll_tokens (
-      token VARCHAR(64) PRIMARY KEY,
-      site_id VARCHAR(50),
-      owner_id INT,
-      app_id VARCHAR(80) NULL,
-      label VARCHAR(255) NULL,
-      expires_at DATETIME,
-      used_at DATETIME NULL,
-      device_id VARCHAR(64) NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB`);
-
-  // MUST run AFTER the CREATE above. Ordered the other way round originally,
-  // which worked only because every existing deployment already had the table:
-  // on a FRESH schema the information_schema probe returns 0 (no table, so no
-  // column), and the ALTER then fails with "Table 'x.enroll_tokens' doesn't
-  // exist" — an init loop that never converges. Found 2026-07-31 bootstrapping
-  // the ozpms database. The `locks` probe above is safe only because `locks` is
-  // created earlier; keep every migration below the CREATE it depends on.
-  const [[{ hasTokenAppId }]] = await pool.query(
-    `SELECT COUNT(*) AS hasTokenAppId FROM information_schema.columns
-      WHERE table_schema = ? AND table_name = 'enroll_tokens' AND column_name = 'app_id'`,
-    [CONFIG.DB.database]
-  );
-  if (!hasTokenAppId)
-    await pool.query('ALTER TABLE enroll_tokens ADD COLUMN app_id VARCHAR(80) NULL AFTER owner_id');
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS grants (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      device_id VARCHAR(64),
-      site_id VARCHAR(50),
-      user_name VARCHAR(255),
-      type ENUM('pin','rfid','fingerprint'),
-      slot_number INT,
-      raw_value VARCHAR(255),
-      date_from VARCHAR(50),
-      date_to VARCHAR(50),
-      sync_status VARCHAR(50) DEFAULT 'pending',
-      issued_by VARCHAR(50) DEFAULT 'owner',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB`);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS pending_queue (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      device_id VARCHAR(64),
-      site_id VARCHAR(50),
-      grant_id INT NULL,
-      action_type VARCHAR(50),
-      payload_hex TEXT,
-      status VARCHAR(50) DEFAULT 'queued',
-      expires_at DATETIME NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB`);
-
-  await pool.query(`
+/** OZPMS's own tables, after the core schema. */
+async function initPmsTables() {
+  // LEGACY door events (v1 Wi-Fi-direct locks only, see the header). Same
+  // columns as the July fork, so an existing ozpms DB keeps its rows.
+  await core.pool.query(`
     CREATE TABLE IF NOT EXISTS lock_logs (
       id INT AUTO_INCREMENT PRIMARY KEY,
       device_id VARCHAR(64),
@@ -482,260 +177,20 @@ async function initDatabase() {
       lock_ts VARCHAR(50),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB`);
-
-  // App-attributed control-plane audit trail: every action an app performs
-  // through OZLOCK (register pairing, grant/revoke a key, remote unlock,
-  // settings). Distinct from lock_logs (physical door events at the lock).
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS audit_log (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      app_id VARCHAR(80) NULL,
-      device_id VARCHAR(64) NULL,
-      site_id VARCHAR(50),
-      action VARCHAR(30),
-      detail VARCHAR(255),
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB`);
-
-  // Seed the single lab owner + site (ozkey-05 lab simplification).
-  const [[{ ownerCnt }]] = await pool.query('SELECT COUNT(*) AS ownerCnt FROM owners');
-  if (ownerCnt === 0) {
-    const [r] = await pool.query(
-      "INSERT INTO owners (display_name, banoi_sub) VALUES ('BANOI Lab Owner', 'banoi:usr_lab')"
-    );
-    await pool.query('INSERT INTO sites (id, owner_id, label) VALUES (?, ?, ?)', [
-      CONFIG.SITE_ID,
-      r.insertId,
-      'Lab Home',
-    ]);
-    logEvent('info', `Seeded owner "BANOI Lab Owner" + site '${CONFIG.SITE_ID}'`);
-  }
-
-  logEvent('info', `MySQL online — ${CONFIG.DB.host}/${CONFIG.DB.database}`);
 }
 
-/* ---------------------------------------------------------------------------
- * MQTT — rendezvous engine (device-scoped topics, ozkey-04 §9)
- * ------------------------------------------------------------------------- */
-let mqttClient = null;
-
-function mqttPublish(topic, payload) {
-  if (!mqttClient || !mqttClient.connected) {
-    logEvent('warn', `MQTT offline — dropped publish to ${topic}`);
-    return false;
-  }
-  mqttClient.publish(topic, typeof payload === 'string' ? payload : JSON.stringify(payload), {
-    qos: 1,
-  });
-  return true;
-}
-
-/** Drain queued actions for a device; expired unlock-style rows are skipped. */
-async function flushQueueForDevice(siteId, deviceId) {
-  const [queued] = await pool.query(
-    "SELECT * FROM pending_queue WHERE device_id = ? AND status = 'queued' ORDER BY id ASC",
-    [deviceId]
+/** CONFIG.onDoorLog: one plaintext door transaction from a v1 Wi-Fi-direct lock. */
+async function ingestLegacyDoorLog(siteId, deviceId, obj) {
+  const mac = normalizeMac(obj.mac) || null;
+  const result = String(obj.result || 'unknown').slice(0, 20);
+  const detail = String(obj.detail || '').slice(0, 255);
+  const lockTs = obj.ts ? new Date(obj.ts).toISOString() : new Date().toISOString();
+  await core.pool.query(
+    'INSERT INTO lock_logs (device_id, site_id, mac, result, detail, lock_ts) VALUES (?, ?, ?, ?, ?, ?)',
+    [deviceId, siteId, mac, result, detail, lockTs]
   );
-  if (queued.length === 0) return 0;
-
-  // Transport routing (ozkey-11 §3). A bridged (Thread) lock never subscribes
-  // to MQTT itself, so publishing to its device-scoped topic reaches nobody —
-  // the command must go to its BRIDGE's topic, naming the lock in `target`.
-  const [[lockRow]] = await pool.query('SELECT bridge_id FROM locks WHERE id = ?', [deviceId]);
-  const bridgeId = lockRow && lockRow.bridge_id ? lockRow.bridge_id : null;
-
-  let sent = 0;
-  for (const job of queued) {
-    // ozkey-05 §6.3: commands must never fire stale.
-    if (job.expires_at && new Date(job.expires_at).getTime() < Date.now()) {
-      await pool.query("UPDATE pending_queue SET status = 'expired' WHERE id = ?", [job.id]);
-      logEvent('warn', `Queue #${job.id} (${job.action_type}) expired before ${deviceId} woke`);
-      continue;
-    }
-
-    const commandTopic = bridgeId
-      ? CONFIG.topicBridgeCommand(siteId, bridgeId)
-      : CONFIG.topicCommand(siteId, deviceId);
-    const envelope = {
-      msg_id: `ozl-${job.id}-${Date.now()}`,
-      device_id: deviceId,
-      action: job.action_type,
-      grant_id: job.grant_id,
-      payload_hex: job.payload_hex,
-      issued_at: new Date().toISOString(),
-      source: 'ozpmsserv',
-    };
-    // bridge32 demuxes on {target, payload} (CONTRACT-BRIDGE / ozkey-11 §3).
-    // Send it a MINIMAL envelope: the bridge reads only these two fields and
-    // rebuilds its own datagram from them, so msg_id/action/grant_id/issued_at/
-    // source never cross the Thread hop and are pure overhead on a constrained
-    // link. Keeping them nearly broke the product: PubSubClient's default
-    // MQTT_MAX_PACKET_SIZE is 256 bytes and silently discards anything larger,
-    // so the ~280-byte full envelope was dropped by every bridge without a
-    // trace while short hand-made test publishes sailed through (found live
-    // 2026-07-29). bridge32 now also calls setBufferSize(1024), but keeping the
-    // wire small is the belt to that braces — a stock-configured bridge, or one
-    // on an older build, still works.
-    const publishBody = bridgeId
-      ? { msg_id: envelope.msg_id, target: deviceId, payload: job.payload_hex }
-      : envelope;
-
-    const ok = mqttPublish(commandTopic, publishBody);
-    if (!ok) break;
-
-    await pool.query("UPDATE pending_queue SET status = 'sent' WHERE id = ?", [job.id]);
-    if (job.grant_id) {
-      const newStatus = job.action_type === 'revoke-key' ? 'revoked' : 'synced';
-      await pool.query('UPDATE grants SET sync_status = ? WHERE id = ?', [
-        newStatus,
-        job.grant_id,
-      ]);
-    }
-    sent++;
-    logEvent(
-      'sync',
-      `${deviceId} wake -> burst ${job.action_type} #${job.id} down ${commandTopic}` +
-        (bridgeId ? ` (via bridge ${bridgeId})` : '')
-    );
-  }
-  return sent;
-}
-
-function initMqtt() {
-  mqttClient = mqtt.connect(CONFIG.MQTT_URL, {
-    clientId: `ozpmsserv-${Math.random().toString(16).slice(2, 8)}`,
-    reconnectPeriod: 5000,
-    connectTimeout: 10_000,
-  });
-
-  mqttClient.on('connect', () => {
-    logEvent('info', `MQTT online — broker ${CONFIG.MQTT_URL}`);
-    mqttClient.subscribe(
-      [CONFIG.SUB_ENROLL, CONFIG.SUB_HEARTBEAT, CONFIG.SUB_LOG],
-      { qos: 1 },
-      (err) => {
-        if (err) logEvent('error', `MQTT subscribe failed: ${err.message}`);
-        else
-          logEvent(
-            'info',
-            `Subscribed: ${CONFIG.SUB_ENROLL} + ${CONFIG.SUB_HEARTBEAT} + ${CONFIG.SUB_LOG}`
-          );
-      }
-    );
-  });
-
-  mqttClient.on('reconnect', () => logEvent('warn', 'MQTT reconnecting...'));
-  mqttClient.on('error', (err) => logEvent('error', `MQTT error: ${err.message}`));
-  mqttClient.on('offline', () => logEvent('warn', 'MQTT broker offline'));
-
-  mqttClient.on('message', async (topic, payloadBuf) => {
-    const payload = payloadBuf.toString('utf8').trim();
-    try {
-      const m = topic.match(/^ozkey\/([^/]+)\/locks\/([^/]+)\/(enroll|heartbeat|log)$/);
-      if (!m) return;
-      const [, siteId, topicDeviceId, kind] = m;
-
-      let obj = {};
-      try {
-        obj = JSON.parse(payload);
-      } catch (_) {
-        logEvent('warn', `Non-JSON payload on ${topic}: "${payload.slice(0, 60)}"`);
-        return;
-      }
-
-      /* -- Enrollment: verify token, bind device -> site/owner ------------- */
-      if (kind === 'enroll') {
-        await handleEnroll(siteId, topicDeviceId, obj);
-        return;
-      }
-
-      const deviceId = String(obj.device_id || topicDeviceId);
-
-      /* -- Wake heartbeat: update presence, flush the queue ----------------- */
-      if (kind === 'heartbeat') {
-        await pool.query('UPDATE locks SET last_seen_at = NOW() WHERE id = ?', [deviceId]);
-        const sent = await flushQueueForDevice(siteId, deviceId);
-        if (sent > 0) return; // flush already logged
-        return; // quiet heartbeat
-      }
-
-      /* -- Door access transaction ------------------------------------------ */
-      if (kind === 'log') {
-        const mac = normalizeMac(obj.mac) || null;
-        const result = String(obj.result || 'unknown').slice(0, 20);
-        const detail = String(obj.detail || '').slice(0, 255);
-        const lockTs = obj.ts ? new Date(obj.ts).toISOString() : new Date().toISOString();
-        await pool.query(
-          'INSERT INTO lock_logs (device_id, site_id, mac, result, detail, lock_ts) VALUES (?, ?, ?, ?, ?, ?)',
-          [deviceId, siteId, mac, result, detail, lockTs]
-        );
-        const [[lk]] = await pool.query('SELECT label FROM locks WHERE id = ?', [deviceId]);
-        logEvent(
-          'lock',
-          `Door ${result.toUpperCase()} — ${detail || 'no detail'} @ "${lk ? lk.label : deviceId}"`
-        );
-      }
-    } catch (err) {
-      logEvent('error', `MQTT message handler fault on ${topic}: ${err.message}`);
-    }
-  });
-}
-
-/**
- * Lock's first broker contact (XF-42 §13.2 step 3). Token-free: the device_id
- * announced here must match a pairing the app already registered (§13.2 step 2).
- * Knowing the random device_id IS the bearer proof — no server credential. The
- * server binds the lock's MAC + broker creds to the pre-registered pairing.
- */
-async function handleEnroll(siteId, topicDeviceId, obj) {
-  const mac = normalizeMac(obj.mac);
-  const deviceId = String(obj.device_id || topicDeviceId);
-
-  if (!mac) {
-    logEvent('warn', `Enroll from ${deviceId} missing mac — ignored`);
-    return;
-  }
-
-  const [[row]] = await pool.query('SELECT * FROM locks WHERE id = ?', [deviceId]);
-  const fail = async (reason) => {
-    logEvent('error', `ENROLL REJECTED for ${deviceId} (${mac}) — ${reason}`);
-    mqttPublish(CONFIG.topicCommand(siteId, deviceId), {
-      op: 'enrollment_nack',
-      device_id: deviceId,
-      error: reason,
-    });
-  };
-
-  // No pre-registered pairing → the app must POST /pairings first (§13.2).
-  if (!row) return fail('no pairing registered for this device_id — app must register it first');
-
-  const brokerUsername = deviceId;
-  const brokerSecret = makeSecret(16, 'ozl_');
-  const label = row.label && row.label !== 'New Doorlock' ? row.label : `Doorlock ${mac.slice(-5)}`;
-  const appId = row.app_id || (obj.app_id ? String(obj.app_id).slice(0, 80) : null);
-
-  await pool.query(
-    `UPDATE locks SET app_id = ?, mac = ?, label = ?, fw = ?, status = 'enrolled',
-       heartbeat_s = COALESCE(heartbeat_s, ?), broker_username = ?, broker_secret = ?, last_seen_at = NOW()
-     WHERE id = ?`,
-    [appId, mac, label, obj.fw || null, CONFIG.DEFAULT_HEARTBEAT_S, brokerUsername, hashBrokerSecret(brokerSecret), deviceId]
-  );
-
-  // v1 plaintext ack — bench only; production wraps this in the ozkey-04 §8
-  // ECDH session and the broker enforces the credential.
-  mqttPublish(CONFIG.topicCommand(siteId, deviceId), {
-    op: 'enrollment_ack',
-    device_id: deviceId,
-    site_id: siteId,
-    app_id: appId,
-    label,
-    broker_username: brokerUsername,
-    broker_secret: brokerSecret,
-    heartbeat_s: CONFIG.DEFAULT_HEARTBEAT_S,
-    issued_by: 'OZLOCK/',
-  });
-
-  logEvent('pair', `ENROLLED ${deviceId} (${mac}) -> site '${siteId}' as "${label}", paired to app ${appId || '(anon)'}`);
+  const [[lk]] = await core.pool.query('SELECT label FROM locks WHERE id = ?', [deviceId]);
+  logEvent('lock', `Door ${result.toUpperCase()} — ${detail || 'no detail'} @ "${lk ? lk.label : deviceId}" (legacy log)`);
 }
 
 /* ---------------------------------------------------------------------------
@@ -749,10 +204,10 @@ const api = express.Router();
 // Mount under both the process name and the service brand so either base path
 // works (LockSim's health probe / the keyring app may use either).
 app.use('/ozpmsserv/api', api);
-app.use('/ozlock/api', api);
+app.use('/ozpms/api', api);
 
 function guardDb(res) {
-  if (!pool) {
+  if (!core.pool) {
     res.status(503).json({ ok: false, error: 'Database not ready' });
     return false;
   }
@@ -765,633 +220,44 @@ api.get('/health', (req, res) => {
     ok: true,
     service: 'ozpmsserv',
     site: CONFIG.SITE_ID,
-    db: !!pool,
-    mqtt: !!(mqttClient && mqttClient.connected),
+    db: !!core.pool,
+    mqtt: isMqttConnected(),
     uptime_s: Math.floor(process.uptime()),
   });
 });
 
-/** ozkey-04 §5 provision payload — the app writes it over BLE; lab pastes it
- *  into LockSim (transport equivalence, ozkey-04 §2.2). No enrollment_token:
- *  under trust-model v2 the device_id IS the bearer rendezvous handle. */
-function buildProvisionPayload(appId, deviceId) {
-  return {
-    v: 1,
-    mode: 'ozkey-cloud',
-    ssid: 'OZKEY-LAB',
-    password: 'labwifi-secret',
-    broker_host: CONFIG.BROKER.host,
-    broker_tcp_port: CONFIG.BROKER.tcp_port,
-    broker_ws_port: CONFIG.BROKER.ws_port,
-    broker_ws_path: CONFIG.BROKER.ws_path,
-    server_ip: CONFIG.SERVER_IP,
-    server_port: CONFIG.HTTP_PORT,
-    site_id: CONFIG.SITE_ID,
-    app_id: appId,
-    device_id: deviceId,
-    heartbeat_s: CONFIG.DEFAULT_HEARTBEAT_S,
-  };
-}
-
-/**
- * Register an app⇄device pairing (XF-42 §13.2). OZLOCK authenticates neither
- * party: the app self-generated app_id and granted the lock its device_id at
- * the BLE ceremony, and now records the bond here. First-writer-wins on the
- * random device_id — re-registering by the SAME app is idempotent; a different
- * app claiming a live device_id is refused (squatting guard). The device_id's
- * unguessability + the (future) e2e envelope are the security, not a server
- * credential. Returns {status:number}|null via `err` for the caller to map.
+/* -- The lock API (ozserver-core/api.js) -------------------------------------
+ * OZPMS has no REST auth yet (ozkey-51). Until it does, the open lock API is
+ * mounted ONLY when the lab says so explicitly (OZPMS_LAB_OPEN_API=1, in the
+ * env or the 0600 .env). Anything else — unset, a customer VPS started without
+ * NODE_ENV, or production — refuses to start (fail closed, ozkey-50 §7 S1).
  */
-async function registerPairing(appId, deviceId, label, bridgeId) {
-  const [[existing]] = await pool.query('SELECT app_id, status FROM locks WHERE id = ?', [
-    deviceId,
-  ]);
-  if (existing && existing.app_id && appId && existing.app_id !== appId) {
-    const e = new Error(`device_id already paired to a different app`);
-    e.httpStatus = 409;
-    throw e;
+function ozpmsLabOnlyAccess() {
+  if (process.env.OZPMS_LAB_OPEN_API !== '1' || IS_PRODUCTION) {
+    throw new Error(
+      'OZPMS has no REST auth yet (ozkey-51); refusing to mount the lock API. ' +
+        'Lab only: set OZPMS_LAB_OPEN_API=1 (never in production)'
+    );
   }
-  // Fresh registration lands as 'registered' (awaiting the lock's first
-  // contact); an already-enrolled lock keeps its status on re-register.
-  await pool.query(
-    `INSERT INTO locks (id, site_id, app_id, bridge_id, label, status, heartbeat_s)
-       VALUES (?, ?, ?, ?, ?, 'registered', ?)
-     ON DUPLICATE KEY UPDATE app_id = VALUES(app_id),
-       bridge_id = COALESCE(VALUES(bridge_id), bridge_id),
-       label = COALESCE(VALUES(label), label)`,
-    [deviceId, CONFIG.SITE_ID, appId, bridgeId || null, label || 'New Doorlock', CONFIG.DEFAULT_HEARTBEAT_S]
-  );
-  logEvent(
-    'pair',
-    `Pairing registered: app ${appId || '(anon)'} ⇄ device ${deviceId}` +
-      (bridgeId
-        ? ` via bridge ${bridgeId} (Thread — no self-enroll, see ozkey-11 §3)`
-        : ' — awaiting doorlock contact')
-  );
-  await recordAudit(appId, deviceId, 'pair', `registered pairing (label "${label || 'New Doorlock'}")`);
+  logEvent('warn', 'OZPMS_LAB_OPEN_API=1: the lock API is OPEN (lab only, no REST auth until ozkey-51)');
+  return (_req, _res, next) => next();
 }
-
-/* -- Pairing registration (trust-model v2, XF-42 §13.2) ---------------------- */
-api.post('/pairings', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const { app_id, device_id, label, bridge_id } = req.body || {};
-    const appId = app_id ? String(app_id).slice(0, 80) : null;
-    const deviceId = device_id ? String(device_id).slice(0, 64) : null;
-    // Optional: present only for a Thread lock reached through a bridge32
-    // gateway (ozkey-11 §3). Absent = direct Wi-Fi lock, routed as before.
-    const bridgeId = bridge_id ? String(bridge_id).slice(0, 64) : null;
-    if (!appId || !deviceId) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'app_id and device_id are required (the app grants both)' });
-    }
-    await registerPairing(appId, deviceId, label, bridgeId);
-    res.json({
-      ok: true,
-      device_id: deviceId,
-      app_id: appId,
-      bridge_id: bridgeId,
-      provision_payload: buildProvisionPayload(appId, deviceId),
-    });
-  } catch (err) {
-    res.status(err.httpStatus || 500).json({ ok: false, error: err.message });
-  }
+const ozpmsAuth = ozpmsLabOnlyAccess();
+core.mountLockApi(api, {
+  auth: ozpmsAuth,
+  // No Nexus hook: Nexus is a registry only (§8a); whether ozpms locks are
+  // registered there at all is an open operator question (ozkey-50 §9 Q7).
+  purgeExtraRows: (conn, where, args) => conn.query(`DELETE FROM lock_logs WHERE ${where}`, args),
 });
 
-api.get('/pairings/status', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const deviceId = String(req.query.device_id || '');
-    const [[row]] = await pool.query(
-      'SELECT id, app_id, bridge_id, status, mac FROM locks WHERE id = ?',
-      [deviceId]
-    );
-    if (!row) return res.status(404).json({ ok: false, error: 'no such pairing' });
-    res.json({
-      ok: true,
-      device_id: row.id,
-      app_id: row.app_id,
-      bridge_id: row.bridge_id,
-      // 'registered' = awaiting lock; 'enrolled' = lock made first contact.
-      status: row.status,
-      mac: row.mac,
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-/* -- DEPRECATED: /enroll/begin — token-variant shim over registerPairing ----- */
-api.post('/enroll/begin', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const { label, app_id, device_id } = req.body || {};
-    const appId = app_id ? String(app_id).slice(0, 80) : null;
-    const deviceId = device_id ? String(device_id).slice(0, 64) : makeSecret(16, 'ozl-');
-    await registerPairing(appId, deviceId, label);
-    logEvent('warn', `/enroll/begin is deprecated — use POST /pairings (device ${deviceId})`);
-    res.json({
-      ok: true,
-      // `token` retained only as a correlation handle for legacy callers.
-      token: deviceId,
-      device_id: deviceId,
-      app_id: appId,
-      provision_payload: buildProvisionPayload(appId, deviceId),
-    });
-  } catch (err) {
-    res.status(err.httpStatus || 500).json({ ok: false, error: err.message });
-  }
-});
-
-/* -- Locks (the owner's fleet) ----------------------------------------------- */
-api.get('/locks', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const [rows] = await pool.query(
-      `SELECT id, site_id, app_id, mac, label, fw, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at
-         FROM locks ORDER BY enrolled_at DESC`
-    );
-    res.json({ ok: true, locks: rows });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-/* ===========================================================================
- * Registry / observability lookups (OZLOCK console — no actions, ozkey-05)
- * ========================================================================= */
-
-/** Enumerate the apps (users) OZLOCK knows, with how many locks each holds. */
-api.get('/apps', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const [rows] = await pool.query(
-      `SELECT app_id,
-              COUNT(*) AS lock_count,
-              SUM(status = 'enrolled') AS enrolled_count,
-              MAX(last_seen_at) AS last_seen_at
-         FROM locks
-        WHERE app_id IS NOT NULL
-        GROUP BY app_id
-        ORDER BY lock_count DESC`
-    );
-    res.json({ ok: true, apps: rows });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-/** Given an app (user id) → all its doorlocks. */
-api.get('/apps/:appId/locks', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const [rows] = await pool.query(
-      `SELECT id, app_id, mac, label, status, power_profile, heartbeat_s, last_seen_at, enrolled_at
-         FROM locks WHERE app_id = ? ORDER BY enrolled_at DESC`,
-      [req.params.appId]
-    );
-    res.json({ ok: true, app_id: req.params.appId, locks: rows });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-/** Given an app (user id) → its control-plane activity (grant/revoke/unlock…). */
-api.get('/apps/:appId/activity', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const { where, params } = rangeWhere('app_id = ?', [req.params.appId], req.query);
-    const { limit, offset } = pageParams(req.query);
-    const [[{ total }]] = await pool.query(
-      `SELECT COUNT(*) AS total FROM audit_log WHERE ${where}`,
-      params
-    );
-    const [rows] = await pool.query(
-      `SELECT * FROM audit_log WHERE ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    );
-    res.json({ ok: true, app_id: req.params.appId, activity: rows, total, limit, offset });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-/** Given a doorlock (device id) → the app it's bound to + its record. */
-api.get('/locks/:id', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const [[lock]] = await pool.query(
-      `SELECT id, app_id, site_id, mac, label, status, power_profile, heartbeat_s,
-              last_seen_at, enrolled_at
-         FROM locks WHERE id = ?`,
-      [req.params.id]
-    );
-    if (!lock) return res.status(404).json({ ok: false, error: `Lock ${req.params.id} not found` });
-    res.json({ ok: true, lock });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-api.patch('/locks/:id', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const { label, power_profile, heartbeat_s } = req.body || {};
-    const sets = [];
-    const params = [];
-    if (label !== undefined) {
-      sets.push('label = ?');
-      params.push(String(label).slice(0, 255));
-    }
-    if (power_profile !== undefined) {
-      if (!['eco', 'responsive', 'scheduled'].includes(power_profile))
-        return res.status(400).json({ ok: false, error: 'invalid power_profile' });
-      sets.push('power_profile = ?');
-      params.push(power_profile);
-    }
-    if (heartbeat_s !== undefined) {
-      sets.push('heartbeat_s = ?');
-      params.push(Math.max(5, Number(heartbeat_s) || CONFIG.DEFAULT_HEARTBEAT_S));
-    }
-    if (!sets.length) return res.status(400).json({ ok: false, error: 'nothing to update' });
-    params.push(req.params.id);
-    const [r] = await pool.query(`UPDATE locks SET ${sets.join(', ')} WHERE id = ?`, params);
-    if (r.affectedRows === 0)
-      return res.status(404).json({ ok: false, error: `Lock ${req.params.id} not found` });
-    logEvent('info', `Lock ${req.params.id} settings updated (${sets.join(', ')})`);
-    res.json({ ok: true, id: req.params.id });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-/* -- Clear the fleet (start fresh) ------------------------------------------- *
- * No FK cascade from locks → grants/pending_queue/lock_logs (they only carry a
- * device_id column), so wipe the dependents explicitly. DELETE /locks clears
- * every lock for the site; DELETE /locks/:id removes one. Lab/dev convenience.
- */
-async function purgeLockRows(conn, where, args) {
-  await conn.query(`DELETE FROM grants WHERE ${where}`, args);
-  await conn.query(`DELETE FROM pending_queue WHERE ${where}`, args);
-  await conn.query(`DELETE FROM lock_logs WHERE ${where}`, args);
-  await conn.query(`DELETE FROM audit_log WHERE ${where}`, args);
-}
-
-/** Parse pagination query (?limit=&offset=), clamped; default 12 rows/page. */
-function pageParams(query) {
-  const limit = Math.min(200, Math.max(1, Number(query.limit) || 12));
-  const offset = Math.max(0, Number(query.offset) || 0);
-  return { limit, offset };
-}
-
-/**
- * Append an optional inclusive date range (?from=YYYY-MM-DD&to=YYYY-MM-DD) on
- * created_at to a base WHERE. `to` is inclusive (matches through end-of-day).
- * Returns { where, params } for interpolation (base clause is caller-literal).
- */
-function rangeWhere(baseClause, baseParams, query) {
-  const clauses = [baseClause];
-  const params = [...baseParams];
-  // Compare whole calendar dates (both ends inclusive) so a from=to=today
-  // range matches regardless of time-of-day / UTC-vs-local boundary skew.
-  if (query.from) {
-    clauses.push('DATE(created_at) >= ?');
-    params.push(String(query.from));
-  }
-  if (query.to) {
-    clauses.push('DATE(created_at) <= ?');
-    params.push(String(query.to));
-  }
-  return { where: clauses.join(' AND '), params };
-}
-
-/**
- * Record a control-plane action in the app-attributed audit trail. If appId is
- * omitted it's resolved from the device's current pairing. Best-effort — never
- * throws into the caller (an audit failure must not fail the real action).
- */
-async function recordAudit(appId, deviceId, action, detail) {
-  try {
-    let aid = appId;
-    if (!aid && deviceId) {
-      const [[l]] = await pool.query('SELECT app_id FROM locks WHERE id = ?', [deviceId]);
-      aid = l ? l.app_id : null;
-    }
-    await pool.query(
-      'INSERT INTO audit_log (app_id, device_id, site_id, action, detail) VALUES (?, ?, ?, ?, ?)',
-      [aid || null, deviceId || null, CONFIG.SITE_ID, action, String(detail || '').slice(0, 255)]
-    );
-  } catch (err) {
-    logEvent('warn', `audit_log write failed (${action}): ${err.message}`);
-  }
-}
-
-api.delete('/locks', async (req, res) => {
-  if (!guardDb(res)) return;
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    await purgeLockRows(conn, 'site_id = ?', [CONFIG.SITE_ID]);
-    const [d] = await conn.query('DELETE FROM locks WHERE site_id = ?', [CONFIG.SITE_ID]);
-    await conn.commit();
-    logEvent('warn', `Fleet cleared — ${d.affectedRows} doorlock(s) removed (start fresh)`);
-    res.json({ ok: true, removed: d.affectedRows });
-  } catch (err) {
-    try {
-      await conn.rollback();
-    } catch (_) {
-      /* connection already dead */
-    }
-    res.status(500).json({ ok: false, error: err.message });
-  } finally {
-    conn.release();
-  }
-});
-
-api.delete('/locks/:id', async (req, res) => {
-  if (!guardDb(res)) return;
-  const conn = await pool.getConnection();
-  try {
-    const id = req.params.id;
-    // Unpair the physical lock too (BANOI "Gỡ khoá" must reset the device,
-    // not just the record): tell it to wipe NVS and return to ADVERTISING.
-    // Best-effort — an offline lock misses it and needs the on-device reset.
-    const [[lock]] = await conn.query('SELECT site_id FROM locks WHERE id = ?', [id]);
-    if (lock) {
-      mqttPublish(CONFIG.topicCommand(lock.site_id || CONFIG.SITE_ID, id), {
-        op: 'factory_reset',
-        ts: new Date().toISOString(),
-      });
-    }
-    await conn.beginTransaction();
-    await purgeLockRows(conn, 'device_id = ?', [id]);
-    const [d] = await conn.query('DELETE FROM locks WHERE id = ?', [id]);
-    await conn.commit();
-    if (d.affectedRows === 0)
-      return res.status(404).json({ ok: false, error: `Lock ${id} not found` });
-    logEvent('info', `Doorlock ${id} removed + factory_reset sent`);
-    res.json({ ok: true, id });
-  } catch (err) {
-    try {
-      await conn.rollback();
-    } catch (_) {
-      /* connection already dead */
-    }
-    res.status(500).json({ ok: false, error: err.message });
-  } finally {
-    conn.release();
-  }
-});
-
-/* -- Grants: issue / list / revoke user keys --------------------------------- */
-api.post('/locks/:id/grants', async (req, res) => {
-  if (!guardDb(res)) return;
-  const conn = await pool.getConnection();
-  try {
-    const deviceId = req.params.id;
-    const {
-      user_name,
-      type = 'pin',
-      raw_value,
-      slot_number = 1,
-      date_from,
-      date_to,
-    } = req.body || {};
-
-    if (!user_name || !raw_value) {
-      return res.status(400).json({ ok: false, error: 'user_name and raw_value are required' });
-    }
-    if (type === 'fingerprint') {
-      return res.status(422).json({
-        ok: false,
-        error: 'fingerprint credentials are on hold — DP codec supports pin/rfid only',
-      });
-    }
-    if (!SUPPORTED_CRED_TYPES.includes(type)) {
-      return res
-        .status(400)
-        .json({ ok: false, error: `type must be one of: ${SUPPORTED_CRED_TYPES.join(', ')}` });
-    }
-
-    const [[lock]] = await conn.query('SELECT * FROM locks WHERE id = ?', [deviceId]);
-    if (!lock) return res.status(404).json({ ok: false, error: `Lock ${deviceId} not found` });
-
-    const from = date_from || new Date().toISOString();
-    const to = date_to || new Date(Date.now() + 24 * 3600 * 1000).toISOString();
-
-    let frame;
-    try {
-      frame = buildCredentialFrame({
-        type,
-        slotNumber: slot_number,
-        rawValue: raw_value,
-        dateFrom: from,
-        dateTo: to,
-      });
-    } catch (err) {
-      return res.status(400).json({ ok: false, error: err.message });
-    }
-    const payloadHex = toSpacedHex(frame);
-
-    await conn.beginTransaction();
-    const [grantResult] = await conn.query(
-      `INSERT INTO grants (device_id, site_id, user_name, type, slot_number, raw_value, date_from, date_to, sync_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
-      [deviceId, lock.site_id, user_name, type, slot_number, raw_value, from, to]
-    );
-    const grantId = grantResult.insertId;
-    const [queueResult] = await conn.query(
-      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, payload_hex, status)
-       VALUES (?, ?, ?, 'grant-key', ?, 'queued')`,
-      [deviceId, lock.site_id, grantId, payloadHex]
-    );
-    await conn.commit();
-
-    logEvent(
-      'key',
-      `Granted ${type.toUpperCase()} to "${user_name}" -> "${lock.label}" slot ${slot_number} ` +
-        `(grant #${grantId}, queue #${queueResult.insertId}) — awaiting wake`
-    );
-    await recordAudit(
-      lock.app_id,
-      deviceId,
-      'grant',
-      `grant ${type.toUpperCase()} slot ${slot_number} to "${user_name}" (grant #${grantId})`
-    );
-
-    flushQueueForDevice(lock.site_id, deviceId).catch(() => {});
-
-    res.json({
-      ok: true,
-      grant_id: grantId,
-      queue_id: queueResult.insertId,
-      device_id: deviceId,
-      payload_hex: payloadHex,
-      sync_status: 'pending',
-    });
-  } catch (err) {
-    try {
-      await conn.rollback();
-    } catch (_) {
-      /* connection already dead */
-    }
-    res.status(500).json({ ok: false, error: err.message });
-  } finally {
-    conn.release();
-  }
-});
-
-api.get('/locks/:id/grants', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const [rows] = await pool.query(
-      'SELECT * FROM grants WHERE device_id = ? ORDER BY id DESC LIMIT 100',
-      [req.params.id]
-    );
-    res.json({ ok: true, grants: rows });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-/* -- Remote unlock (the away-path "Mở cửa", ozkey-05 §6.3) -------------------- */
-api.post('/locks/:id/unlock', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const deviceId = req.params.id;
-    const [[lock]] = await pool.query('SELECT * FROM locks WHERE id = ?', [deviceId]);
-    if (!lock) return res.status(404).json({ ok: false, error: `Lock ${deviceId} not found` });
-    // A bridged (Thread) lock has no MQTT uplink of its own, so handleEnroll can
-    // never run for it and its status cannot advance past 'registered' — that is
-    // the ozkey-10 uplink gap, not a half-finished pairing. Commands still reach
-    // it, because the BRIDGE is the MQTT client. Direct locks keep the stricter
-    // 'enrolled' bar, which for them still means "the lock has spoken to us".
-    const reachable = lock.status === 'enrolled' || (lock.bridge_id && lock.status === 'registered');
-    if (!reachable) {
-      return res
-        .status(409)
-        .json({ ok: false, error: `Lock ${deviceId} is not enrolled yet (status: ${lock.status})` });
-    }
-
-    // §6.3: a remote unlock MUST NOT fire stale. Queue with a 60 s expiry; the
-    // flush drops it if the lock doesn't wake in time.
-    const payloadHex = toSpacedHex(buildUnlockFrame());
-    const expiresAt = new Date(Date.now() + 60_000);
-    const [queueResult] = await pool.query(
-      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, payload_hex, status, expires_at)
-       VALUES (?, ?, NULL, 'unlock', ?, 'queued', ?)`,
-      [deviceId, lock.site_id, payloadHex, expiresAt]
-    );
-
-    logEvent('key', `Remote UNLOCK queued for "${lock.label}" (queue #${queueResult.insertId}, expires 60s)`);
-    await recordAudit(lock.app_id, deviceId, 'unlock', `remote unlock "${lock.label}"`);
-    const sent = await flushQueueForDevice(lock.site_id, deviceId);
-
-    res.json({
-      ok: true,
-      device_id: deviceId,
-      queue_id: queueResult.insertId,
-      payload_hex: payloadHex,
-      // In the lab LockSim keeps its MQTT link open, so delivery is immediate;
-      // a real eco lock would report 'queued' until its next wake.
-      delivery: sent > 0 ? 'delivered' : 'queued',
-      expires_at: expiresAt.toISOString(),
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-api.delete('/locks/:id/grants/:gid', async (req, res) => {
-  if (!guardDb(res)) return;
-  const conn = await pool.getConnection();
-  try {
-    const deviceId = req.params.id;
-    const grantId = Number(req.params.gid);
-
-    const [[grant]] = await conn.query('SELECT * FROM grants WHERE id = ? AND device_id = ?', [
-      grantId,
-      deviceId,
-    ]);
-    if (!grant)
-      return res.status(404).json({ ok: false, error: `Grant #${grantId} not found on ${deviceId}` });
-    if (grant.sync_status === 'revoked')
-      return res.status(409).json({ ok: false, error: `Grant #${grantId} is already revoked` });
-    const [[dupe]] = await conn.query(
-      `SELECT id FROM pending_queue
-        WHERE grant_id = ? AND action_type = 'revoke-key' AND status = 'queued'`,
-      [grantId]
-    );
-    if (dupe)
-      return res.status(409).json({
-        ok: false,
-        error: `Grant #${grantId} already has revoke queue #${dupe.id} pending`,
-      });
-
-    let frame;
-    try {
-      frame = buildDeleteFrame({ type: grant.type, slotNumber: grant.slot_number });
-    } catch (err) {
-      return res.status(422).json({ ok: false, error: err.message });
-    }
-    const payloadHex = toSpacedHex(frame);
-
-    await conn.beginTransaction();
-    const [queueResult] = await conn.query(
-      `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, payload_hex, status)
-       VALUES (?, ?, ?, 'revoke-key', ?, 'queued')`,
-      [deviceId, grant.site_id, grantId, payloadHex]
-    );
-    await conn.query("UPDATE grants SET sync_status = 'revoking' WHERE id = ?", [grantId]);
-    await conn.commit();
-
-    logEvent(
-      'key',
-      `Revoking ${grant.type.toUpperCase()} for "${grant.user_name}" on ${deviceId} slot ${grant.slot_number} ` +
-        `(grant #${grantId}, queue #${queueResult.insertId}) — awaiting wake`
-    );
-    await recordAudit(
-      null,
-      deviceId,
-      'revoke',
-      `revoke ${grant.type.toUpperCase()} slot ${grant.slot_number} for "${grant.user_name}" (grant #${grantId})`
-    );
-
-    flushQueueForDevice(grant.site_id, deviceId).catch(() => {});
-
-    res.json({
-      ok: true,
-      grant_id: grantId,
-      queue_id: queueResult.insertId,
-      device_id: deviceId,
-      payload_hex: payloadHex,
-      sync_status: 'revoking',
-    });
-  } catch (err) {
-    try {
-      await conn.rollback();
-    } catch (_) {
-      /* connection already dead */
-    }
-    res.status(500).json({ ok: false, error: err.message });
-  } finally {
-    conn.release();
-  }
-});
-
-/* -- Door transaction log (paginated + optional date range) ------------------- */
-api.get('/locks/:id/log', async (req, res) => {
+/* -- Door transaction log (LEGACY plaintext path; paginated + date range) ----- */
+api.get('/locks/:id/log', ozpmsAuth, async (req, res) => {
   if (!guardDb(res)) return;
   try {
     const { where, params } = rangeWhere('device_id = ?', [req.params.id], req.query);
     const { limit, offset } = pageParams(req.query);
-    const [[{ total }]] = await pool.query(
-      `SELECT COUNT(*) AS total FROM lock_logs WHERE ${where}`,
-      params
-    );
-    const [rows] = await pool.query(
+    const [[{ total }]] = await core.pool.query(`SELECT COUNT(*) AS total FROM lock_logs WHERE ${where}`, params);
+    const [rows] = await core.pool.query(
       `SELECT * FROM lock_logs WHERE ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
@@ -1401,36 +267,10 @@ api.get('/locks/:id/log', async (req, res) => {
   }
 });
 
-/* -- Introspection + terminal feed --------------------------------------------- */
-api.get('/queue', async (req, res) => {
-  if (!guardDb(res)) return;
-  try {
-    const [rows] = await pool.query('SELECT * FROM pending_queue ORDER BY id DESC LIMIT 100');
-    res.json({ ok: true, queue: rows });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
+/* -- Terminal feed: the event ring is the profile's (logEvent above) -------- */
 api.get('/events', (req, res) => {
   const after = Number(req.query.after) || 0;
   res.json({ ok: true, events: eventRing.filter((e) => e.id > after) });
-});
-
-/* -- Lab simulator hook: fake a wake without the broker ------------------------ */
-api.post('/sim/heartbeat', async (req, res) => {
-  if (!guardDb(res)) return;
-  const { device_id } = req.body || {};
-  if (!device_id) return res.status(400).json({ ok: false, error: 'device_id required' });
-  try {
-    const [[lock]] = await pool.query('SELECT site_id FROM locks WHERE id = ?', [device_id]);
-    if (!lock) return res.status(404).json({ ok: false, error: `Lock ${device_id} not found` });
-    await pool.query('UPDATE locks SET last_seen_at = NOW() WHERE id = ?', [device_id]);
-    const sent = await flushQueueForDevice(lock.site_id, String(device_id));
-    res.json({ ok: true, device_id, flushed: sent });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
 });
 
 /* ---------------------------------------------------------------------------
@@ -1444,6 +284,7 @@ async function boot() {
   for (;;) {
     try {
       await initDatabase();
+      await initPmsTables();
       break;
     } catch (err) {
       attempts++;
@@ -1454,6 +295,10 @@ async function boot() {
 
   initMqtt();
 
+  // XF-125 P1: audit_log retention, once at boot then daily (same as ozlock).
+  await purgeOldAuditLog();
+  setInterval(purgeOldAuditLog, CONFIG.AUDIT_LOG_PURGE_INTERVAL_MS);
+
   app.listen(CONFIG.HTTP_PORT, () => {
     logEvent('info', `HTTP directory listening on http://localhost:${CONFIG.HTTP_PORT}/ozpmsserv/api`);
   });
@@ -1463,20 +308,15 @@ process.on('unhandledRejection', (err) => {
   logEvent('error', `Unhandled rejection: ${err && err.message ? err.message : err}`);
 });
 
+// Same as ozlock (2026-09-03): log a synchronous crash before exiting, so a
+// silent `node --watch` stall leaves a reason behind.
+process.on('uncaughtException', (err) => {
+  logEvent('error', `Uncaught exception: ${err && err.stack ? err.stack : err}`);
+  process.exit(1);
+});
+
 if (require.main === module) {
   boot();
 } else {
-  module.exports = {
-    CONFIG,
-    TUYA_CMD,
-    DPID,
-    DP_TYPE,
-    buildTuyaFrame,
-    buildDpPayload,
-    buildCredentialFrame,
-    buildDeleteFrame,
-    toSpacedHex,
-    normalizeMac,
-    deviceIdFromMac,
-  };
+  module.exports = { CONFIG, normalizeMac, deviceIdFromMac };
 }

@@ -60,8 +60,8 @@ function buildProvisionPayload(appId, deviceId) {
   return {
     v: 1,
     mode: 'ozkey-cloud',
-    ssid: 'OZKEY-LAB',
-    password: 'labwifi-secret',
+    ssid: CONFIG.PROVISION_WIFI_SSID,
+    password: CONFIG.PROVISION_WIFI_PASSWORD,
     broker_host: CONFIG.BROKER.host,
     broker_tcp_port: CONFIG.BROKER.tcp_port,
     broker_ws_port: CONFIG.BROKER.ws_port,
@@ -605,6 +605,7 @@ async function purgeLockRows(conn, where, args) {
   await conn.query(`DELETE FROM grants WHERE ${where}`, args);
   await conn.query(`DELETE FROM pending_queue WHERE ${where}`, args);
   await conn.query(`DELETE FROM audit_log WHERE ${where}`, args);
+  if (hooks.purgeExtraRows) await hooks.purgeExtraRows(conn, where, args);
 }
 
 /** Parse pagination query (?limit=&offset=), clamped; default 12 rows/page. */
@@ -1489,13 +1490,16 @@ api.post('/sim/heartbeat', async (req, res) => {
  *                                   S−1).
  * @param {Function} [opts.onLockRemoved] (lock) after DELETE /locks/:id removed
  *                                   the row; fire-and-forget (ozlock: Nexus).
+ * @param {Function} [opts.purgeExtraRows] (conn, where, args) inside the removal
+ *                                   transaction, for the profile's own per-lock
+ *                                   tables (ozpms: lock_logs).
  */
 function mountLockApi(router, opts = {}) {
   if (typeof opts.auth !== 'function') {
     throw new Error('ozserver-core: mountLockApi() needs an auth middleware (opts.auth); refusing to mount');
   }
   if (!ctx.CONFIG) throw new Error('ozserver-core: mountLockApi() before createCore()');
-  hooks = { onLockRemoved: opts.onLockRemoved || null };
+  hooks = { onLockRemoved: opts.onLockRemoved || null, purgeExtraRows: opts.purgeExtraRows || null };
   for (const { method, path, handlers } of routes) router[method](path, opts.auth, ...handlers);
 }
 

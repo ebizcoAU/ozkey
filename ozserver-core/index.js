@@ -45,6 +45,9 @@ const REQUIRED_CONFIG = [
   'UTC_PUSH_REFRESH_MS',
   'AUDIT_LOG_RETENTION_MS',
   'ENFORCE_CAPS',
+  'HASH_LOCK_BROKER_SECRETS',
+  'PROVISION_WIFI_SSID',
+  'PROVISION_WIFI_PASSWORD',
 ];
 
 function createCore({ CONFIG, logEvent, mysql, mqtt }) {

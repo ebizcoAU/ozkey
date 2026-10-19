@@ -1,7 +1,7 @@
 {
   "name": "ozpmsserv",
   "version": "0.1.0",
-  "description": "OZLOCK Rendezvous Directory - personal-cloud lock/account pairing, grants, usage logs (lab deployment)",
+  "description": "OZPMS - the property operator's own lock server (lab deployment), a profile on ozserver-core",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"

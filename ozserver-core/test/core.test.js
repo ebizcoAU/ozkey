@@ -22,6 +22,9 @@ const CONFIG = {
   UTC_PUSH_REFRESH_MS: 1000,
   AUDIT_LOG_RETENTION_MS: 1000,
   ENFORCE_CAPS: true,
+  HASH_LOCK_BROKER_SECRETS: true,
+  PROVISION_WIFI_SSID: 'test-ssid',
+  PROVISION_WIFI_PASSWORD: 'test-pass',
 };
 const deps = { logEvent: () => {}, mysql: {}, mqtt: {} };
 

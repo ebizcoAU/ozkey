@@ -217,6 +217,11 @@ class Fixture {
         OZLOCK_NEXUS_URL: this.nexusUrl,
         OZLOCK_SERVER_API_KEY: 's0-test-nexus-key',
         OZLOCK_JWT_SECRET: S0_JWT_SECRET,
+        // S1c: the provision payload's Wi-Fi now comes only from env. These
+        // are the values the source used to carry, so the golden stays
+        // byte-identical and proves the env path is what feeds it.
+        PROVISION_WIFI_SSID: 'OZKEY-LAB',
+        PROVISION_WIFI_PASSWORD: 'labwifi-secret',
         ...this.extraEnv,
       },
     });

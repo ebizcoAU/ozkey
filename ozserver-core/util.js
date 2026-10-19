@@ -126,6 +126,15 @@ function makeSecret(bytes = 16, prefix = '') {
   return prefix + crypto.randomBytes(bytes).toString('hex');
 }
 
+/** S−1 (ozkey-50 §8.2, from ozpms): a lock's broker_secret stored as a salted
+ *  scrypt hash, never plaintext. The plaintext only travels in the
+ *  enrollment_ack; nothing reads it back, so a hash is enough.
+ *  Format: scrypt$<salt hex>$<hash hex> (~105 chars). */
+function hashBrokerSecret(secret) {
+  const salt = crypto.randomBytes(16);
+  return `scrypt$${salt.toString('hex')}$${crypto.scryptSync(secret, salt, 32).toString('hex')}`;
+}
+
 module.exports = {
   detectLanIp,
   IS_PRODUCTION,
@@ -139,4 +148,5 @@ module.exports = {
   normalizeMac,
   deviceIdFromMac,
   makeSecret,
+  hashBrokerSecret,
 };

@@ -149,6 +149,8 @@ function initMqtt() {
         CONFIG.SUB_PRESENCE_BRIDGES_LEGACY,
         CONFIG.SUB_BRIDGE_SCAN_RESULT,
         CONFIG.SUB_PEER_STATUS,
+        // S1c: only a profile that keeps door events sets these (ozpms).
+        ...(CONFIG.SUB_DOOR_LOG ? [CONFIG.SUB_DOOR_LOG, CONFIG.SUB_DOOR_LOG_LEGACY].filter(Boolean) : []),
       ],
       { qos: 1 },
       (err) => {
@@ -162,7 +164,9 @@ function initMqtt() {
               `${CONFIG.SUB_PRESENCE_BRIDGES} + ${CONFIG.SUB_BRIDGE_SCAN_RESULT} + ` +
               `${CONFIG.SUB_PEER_STATUS}` +
               ' (+ legacy ozkey/ roots during S16 migration)' +
-              ' (door-event topic deliberately NOT subscribed — see header)'
+              (CONFIG.SUB_DOOR_LOG
+                ? ` + ${CONFIG.SUB_DOOR_LOG} (door events, ${CONFIG.SERVICE_NAME} keeps them)`
+                : ' (door-event topic deliberately NOT subscribed — see header)')
           );
       }
     );
@@ -428,6 +432,15 @@ function initMqtt() {
         const sent = await flushQueueForDevice(siteId, deviceId);
         if (sent > 0) return; // flush already logged
         return; // quiet heartbeat
+      }
+
+      /* -- Door access transactions: the profile's call (S1c) ----------------- *
+       * Only a profile that sets CONFIG.SUB_DOOR_LOG gets `log` here, and it
+       * handles it in CONFIG.onDoorLog(siteId, deviceId, obj). ozlock sets
+       * neither: the hosted relay keeps no door events (note below). */
+      if (kind === 'log') {
+        if (CONFIG.SUB_DOOR_LOG && CONFIG.onDoorLog) await CONFIG.onDoorLog(siteId, deviceId, obj);
+        return;
       }
 
       /* -- Door access transactions: NOT HANDLED, deliberately ---------------- *

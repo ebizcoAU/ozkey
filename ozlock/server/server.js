@@ -121,6 +121,10 @@ const SECRETS = {
     required: 'production',
     minProdLen: SECRET_MIN_PROD_LEN,
   }),
+  // S1c: the Wi-Fi the provision payload hands a lock. Required in every mode,
+  // no literal in source (secret, and the old SSID carried a trademark).
+  PROVISION_WIFI_SSID: resolveSecret(['PROVISION_WIFI_SSID'], { required: 'always' }),
+  PROVISION_WIFI_PASSWORD: resolveSecret(['PROVISION_WIFI_PASSWORD'], { required: 'always' }),
 };
 
 /* ---------------------------------------------------------------------------
@@ -293,6 +297,11 @@ const CONFIG = {
   // XF-48: refuse a remote unlock the lock's caps don't allow. OZLOCK_ENFORCE_CAPS=0
   // turns it off (lab escape hatch); anything else, including unset, enforces.
   ENFORCE_CAPS: process.env.OZLOCK_ENFORCE_CAPS !== '0',
+  PROVISION_WIFI_SSID: SECRETS.PROVISION_WIFI_SSID,
+  PROVISION_WIFI_PASSWORD: SECRETS.PROVISION_WIFI_PASSWORD,
+  // Lock broker_secret stays plaintext here for now (ozpms hashes it). Flipping
+  // it is its own step: it changes what the ozlock DB holds (ozkey-50 §7 S1e).
+  HASH_LOCK_BROKER_SECRETS: false,
 };
 
 /* ---------------------------------------------------------------------------

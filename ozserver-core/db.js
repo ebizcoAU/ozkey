@@ -13,6 +13,7 @@ const CONFIG = lazy(() => ctx.CONFIG);
 const pool = lazy(() => ctx.pool);
 const mysql = lazy(() => ctx.mysql);
 const logEvent = (...args) => ctx.logEvent(...args);
+const hashBrokerSecret = (...args) => require('./util').hashBrokerSecret(...args);
 
 async function initDatabase() {
   const admin = await mysql.createConnection({
@@ -555,6 +556,20 @@ async function initDatabase() {
       detail VARCHAR(255),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB`);
+
+  // S−1 / S1c: a profile that hashes lock broker secrets (ozpms) needs the
+  // wider column, and any plaintext rows from before get hashed. Both steps
+  // are idempotent. A profile that doesn't (ozlock today) is left as it was.
+  if (CONFIG.HASH_LOCK_BROKER_SECRETS) {
+    await pool.query('ALTER TABLE locks MODIFY COLUMN broker_secret VARCHAR(128)');
+    const [plainSecrets] = await pool.query(
+      "SELECT id, broker_secret FROM locks WHERE broker_secret IS NOT NULL AND broker_secret NOT LIKE 'scrypt$%'"
+    );
+    for (const row of plainSecrets) {
+      await pool.query('UPDATE locks SET broker_secret = ? WHERE id = ?', [hashBrokerSecret(row.broker_secret), row.id]);
+    }
+    if (plainSecrets.length) logEvent('info', `S−1: hashed ${plainSecrets.length} plaintext broker_secret row(s)`);
+  }
 
   // Seed the single lab owner + site (ozkey-05 lab simplification).
   const [[{ ownerCnt }]] = await pool.query('SELECT COUNT(*) AS ownerCnt FROM owners');

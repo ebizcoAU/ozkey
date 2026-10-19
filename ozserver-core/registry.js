@@ -18,6 +18,7 @@ const logEvent = (...args) => ctx.logEvent(...args);
 // From other core modules.
 const normalizeMac = (...args) => require('./util').normalizeMac(...args);
 const makeSecret = (...args) => require('./util').makeSecret(...args);
+const hashBrokerSecret = (...args) => require('./util').hashBrokerSecret(...args);
 const recordAudit = (...args) => require('./audit').recordAudit(...args);
 const mqttPublish = (...args) => require('./transport').mqttPublish(...args);
 
@@ -906,7 +907,8 @@ async function handleEnroll(siteId, topicDeviceId, obj) {
        heartbeat_s = COALESCE(heartbeat_s, ?), broker_username = ?, broker_secret = ?, last_seen_at = NOW()
      WHERE id = ?`,
     [appId, mac, label, obj.fw || null, ident.transport, ident.caps, tuyaPid, profile,
-     CONFIG.DEFAULT_HEARTBEAT_S, brokerUsername, brokerSecret, deviceId]
+     CONFIG.DEFAULT_HEARTBEAT_S, brokerUsername,
+     CONFIG.HASH_LOCK_BROKER_SECRETS ? hashBrokerSecret(brokerSecret) : brokerSecret, deviceId]
   );
 
   // v1 plaintext ack — bench only; production wraps this in the ozkey-04 §8
