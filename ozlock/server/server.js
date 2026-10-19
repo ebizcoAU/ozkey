@@ -235,12 +235,14 @@ const CONFIG = {
     host: 'localhost',
     user: 'root',
     password: SECRETS.DB_PASSWORD, // S−1: OZLOCK_DB_PASSWORD, required in every mode
-    database: 'ozlock',
+    // S0a: the regression suite points these at a throwaway DB and a local
+    // broker; unset = the lab values, unchanged.
+    database: process.env.OZLOCK_DB_NAME || 'ozlock',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
   },
-  MQTT_URL: 'mqtt://10.1.1.42:1883',
+  MQTT_URL: process.env.OZLOCK_MQTT_URL || 'mqtt://10.1.1.42:1883',
   BROKER: {
     host: '10.1.1.42',
     tcp_port: 1883,
