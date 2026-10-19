@@ -113,7 +113,7 @@ async function flushQueueForDeviceImpl(siteId, deviceId, onSent) {
       grant_id: job.grant_id,
       ...(sealed ? { envelope_hex: job.envelope_hex } : { payload_hex: job.payload_hex }),
       issued_at: new Date().toISOString(),
-      source: 'ozlockserv',
+      source: CONFIG.SERVICE_NAME,
     };
     // bridge32 demuxes on {target, payload}/{target, envelope_hex}
     // (CONTRACT-BRIDGE / ozkey-11 §3, extended ozkey-13 §8 S7/BR1/F7). Send

@@ -15,7 +15,7 @@ const fs = require('fs');
 const { ctx, lazy } = require('./ctx');
 const logEvent = (...args) => ctx.logEvent(...args);
 
-/** First non-internal IPv4 of this host. Override with OZLOCK_SERVER_IP. */
+/** First non-internal IPv4 of this host. Profiles override it via env (OZLOCK_SERVER_IP, …). */
 function detectLanIp() {
   for (const ifaces of Object.values(os.networkInterfaces())) {
     for (const iface of ifaces || []) {

@@ -452,12 +452,9 @@ async function refreshOnlineBridgeTimePushes() {
 // 2 minutes is comfortably longer than every transient blip observed
 // tonight (the worst was ~17s of confusion end-to-end) while still being
 // fast enough to matter for an actually-dead bridge.
-// S0a.1: overridable so the regression suite can exercise a real failover
-// in seconds; unset = the values above/below, unchanged.
-const FAILOVER_GRACE_MS = Number(process.env.OZLOCK_FAILOVER_GRACE_MS) || 2 * 60 * 1000;
-// Tick of the sweep timer armed in initMqtt() (it also drives the XF-152
-// presence resubscribe).
-const FAILOVER_SWEEP_MS = Number(process.env.OZLOCK_FAILOVER_SWEEP_MS) || 30_000;
+// The grace is the profile's CONFIG.FAILOVER_GRACE_MS (ozlock: 2 min). The
+// sweep tick, CONFIG.FAILOVER_SWEEP_MS, is the timer armed in initMqtt() (it
+// also drives the XF-152 presence resubscribe).
 
 /** Periodic sweep, same cadence as the time-refresh timer. For any lock
  * whose CURRENT bridge has read `bridge_offline` for at least
@@ -475,7 +472,7 @@ async function runBridgeFailoverSweep() {
     `SELECT id, bridge_id FROM locks
       WHERE bridge_id IS NOT NULL AND presence_reason = 'bridge_offline'
         AND presence_at <= DATE_SUB(NOW(), INTERVAL ? SECOND)`,
-    [FAILOVER_GRACE_MS / 1000]
+    [CONFIG.FAILOVER_GRACE_MS / 1000]
   );
   for (const lock of stuck) {
     let [[next]] = await pool.query(
@@ -543,7 +540,7 @@ async function runBridgeFailoverSweep() {
     logEvent(
       'key',
       `XF-144 auto-failover: lock ${lock.id} moved from bridge ${oldBridgeId} ` +
-        `(bridge_offline ${FAILOVER_GRACE_MS / 1000}s+) to bridge ${next.bridge_id}, ` +
+        `(bridge_offline ${CONFIG.FAILOVER_GRACE_MS / 1000}s+) to bridge ${next.bridge_id}, ` +
         `pair_lock dispatched${viaScanConfirm ? ' (via scan-confirm, no lock_bridges history)' : ''}`
     );
     await recordAudit(
@@ -923,7 +920,7 @@ async function handleEnroll(siteId, topicDeviceId, obj) {
     broker_username: brokerUsername,
     broker_secret: brokerSecret,
     heartbeat_s: CONFIG.DEFAULT_HEARTBEAT_S,
-    issued_by: 'OZLOCK/',
+    issued_by: CONFIG.ENROLL_ISSUED_BY,
   });
 
   logEvent('pair', `ENROLLED ${deviceId} (${mac}) -> site '${siteId}' as "${label}", paired to app ${appId || '(anon)'}`);
@@ -1115,8 +1112,6 @@ module.exports = {
   lastUtcPushAt,
   pushUtcToBridge,
   refreshOnlineBridgeTimePushes,
-  FAILOVER_GRACE_MS,
-  FAILOVER_SWEEP_MS,
   runBridgeFailoverSweep,
   waitForBridgeResetVerdict,
   pendingLockScans,

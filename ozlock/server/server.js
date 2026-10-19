@@ -278,6 +278,19 @@ const CONFIG = {
   topicTime: (site) => `ozkie/${site}/time`,
   ENROLL_TOKEN_TTL_MS: 10 * 60 * 1000, // ozkey-05 §7.5
   DEFAULT_HEARTBEAT_S: 60,
+  // S1 (ozkey-50 §7): profile identity the core stamps on the wire — the
+  // MQTT clientId prefix, the queue envelope's `source`, the enrollment
+  // ack's `issued_by`.
+  SERVICE_NAME: 'ozlockserv',
+  ENROLL_ISSUED_BY: 'OZLOCK/',
+  // XF-144 failover timing. Overridable (S0a.1) so the regression suite can
+  // exercise a real failover in seconds; unset = 2 min grace / 30 s sweep.
+  FAILOVER_GRACE_MS: Number(process.env.OZLOCK_FAILOVER_GRACE_MS) || 2 * 60 * 1000,
+  FAILOVER_SWEEP_MS: Number(process.env.OZLOCK_FAILOVER_SWEEP_MS) || 30_000,
+  // S3 + ozkey-29 cutovers: drop grants.raw_value/user_name/date_from/date_to
+  // on boot. Irreversible, so it is the profile's explicit choice, never a
+  // core default — the hosted relay holds nothing beyond the pairing.
+  DROP_PLAINTEXT_GRANT_COLUMNS: true,
 };
 
 /* ---------------------------------------------------------------------------

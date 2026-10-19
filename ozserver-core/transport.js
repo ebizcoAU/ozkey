@@ -30,7 +30,7 @@ const handleBridgePresence = (...args) => require('./registry').handleBridgePres
 const handlePeerStatus = (...args) => require('./registry').handlePeerStatus(...args);
 const handleEnroll = (...args) => require('./registry').handleEnroll(...args);
 const deviceIdentity = (...args) => require('./registry').deviceIdentity(...args);
-const { eventsAtRiskLogged, FAILOVER_SWEEP_MS } = require('./registry');
+const { eventsAtRiskLogged } = require('./registry');
 
 /* ---------------------------------------------------------------------------
  * MQTT — rendezvous engine (device-scoped topics, ozkey-04 §9)
@@ -120,7 +120,7 @@ function logMemberRelay(targetDeviceId, kind, payload) {
 
 function initMqtt() {
   mqttClient = mqtt.connect(CONFIG.MQTT_URL, {
-    clientId: `ozlockserv-${Math.random().toString(16).slice(2, 8)}`,
+    clientId: `${CONFIG.SERVICE_NAME}-${Math.random().toString(16).slice(2, 8)}`,
     reconnectPeriod: 5000,
     connectTimeout: 10_000,
   });
@@ -219,7 +219,7 @@ function initMqtt() {
           if (err2) logEvent('error', `XF-152 presence re-subscribe (resync) failed: ${err2.message}`);
         });
       });
-    }, FAILOVER_SWEEP_MS);
+    }, CONFIG.FAILOVER_SWEEP_MS);
   });
 
   mqttClient.on('reconnect', () => logEvent('warn', 'MQTT reconnecting...'));

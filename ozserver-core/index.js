@@ -24,13 +24,30 @@ const db = require('./db');
 
 /**
  * @param {object} deps
- * @param {object} deps.CONFIG    the profile's CONFIG (DB, MQTT_URL, SITE_ID, topics, timeouts)
+ * @param {object} deps.CONFIG    the profile's CONFIG (REQUIRED_CONFIG plus topics; see README.md)
  * @param {Function} deps.logEvent (level, message) => event
  * @param {object} deps.mysql     require('mysql2/promise')
  * @param {object} deps.mqtt      require('mqtt')
  */
+// CONFIG keys the core reads that have no sensible shared default; a profile
+// missing one fails at createCore(), not on the first message that needs it.
+const REQUIRED_CONFIG = [
+  'SITE_ID',
+  'DB',
+  'MQTT_URL',
+  'SERVICE_NAME',
+  'ENROLL_ISSUED_BY',
+  'DEFAULT_HEARTBEAT_S',
+  'FAILOVER_GRACE_MS',
+  'FAILOVER_SWEEP_MS',
+  'UTC_PUSH_REFRESH_MS',
+  'AUDIT_LOG_RETENTION_MS',
+];
+
 function createCore({ CONFIG, logEvent, mysql, mqtt }) {
   if (ctx.CONFIG) throw new Error('ozserver-core: createCore() called twice; one core per process');
+  const missing = REQUIRED_CONFIG.filter((k) => CONFIG[k] === undefined);
+  if (missing.length) throw new Error(`ozserver-core: CONFIG is missing ${missing.join(', ')}`);
   Object.assign(ctx, { CONFIG, logEvent, mysql, mqtt, pool: null });
   return {
     ...audit,

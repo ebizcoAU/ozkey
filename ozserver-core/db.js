@@ -471,7 +471,9 @@ async function initDatabase() {
       WHERE table_schema = ? AND table_name = 'grants' AND column_name = 'raw_value'`,
     [CONFIG.DB.database]
   );
-  if (hasRawValue) await pool.query('ALTER TABLE grants DROP COLUMN raw_value');
+  // S1: only when the profile opts in (CONFIG.DROP_PLAINTEXT_GRANT_COLUMNS) —
+  // ozpms is the operator's own server and its grants rows are its data.
+  if (hasRawValue && CONFIG.DROP_PLAINTEXT_GRANT_COLUMNS) await pool.query('ALTER TABLE grants DROP COLUMN raw_value');
 
   // ozkey-29 cutover, executed 2026-08-13 (operator: "the residential server
   // retains nothing beyond the pairing relationship" — same irreversible-on-
@@ -491,7 +493,7 @@ async function initDatabase() {
         WHERE table_schema = ? AND table_name = 'grants' AND column_name = ?`,
       [CONFIG.DB.database, col]
     );
-    if (hasCol) await pool.query(`ALTER TABLE grants DROP COLUMN ${col}`);
+    if (hasCol && CONFIG.DROP_PLAINTEXT_GRANT_COLUMNS) await pool.query(`ALTER TABLE grants DROP COLUMN ${col}`);
   }
 
   await pool.query(`
