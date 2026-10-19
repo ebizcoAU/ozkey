@@ -2,10 +2,13 @@
   "name": "ozserver-core",
   "version": "0.1.0",
   "private": true,
-  "description": "Lock side of the OZKIE servers (transport, registry, relay, queue, audit, DB bootstrap), shared by the ozlock/ozpms/ozlodge profiles (ozkey-50 §2)",
+  "description": "Lock side of the OZKIE servers (transport, registry, relay, queue, audit, DB bootstrap), shared by the ozlock/ozpms/ozlodge profiles (ozkey-50 \u00a72)",
   "main": "index.js",
   "license": "UNLICENSED",
   "engines": {
     "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/core.test.js"
   }
 }

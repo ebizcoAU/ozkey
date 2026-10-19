@@ -1,9 +1,10 @@
 'use strict';
 /*
  * ozserver-core — the lock side of the OZKIE servers, written once
- * (ozkey-50 §2): transport, registry, relay, queue, audit, DB bootstrap.
- * Each product (ozlock now; ozpms and ozlodge in S1/S2) is a profile that
- * creates one core and adds its own routes and tables.
+ * (ozkey-50 §2): transport, registry, relay, queue, audit, DB bootstrap and
+ * the lock-side REST API (api.js, S1b). Each product (ozlock now; ozpms and
+ * ozlodge in S1/S2) is a profile that creates one core, mounts the lock API
+ * with its own auth, and adds its own routes and tables.
  *
  * Everything the core needs from outside is the argument to createCore().
  * The core has no node_modules of its own: the profile passes in its mysql2
@@ -21,6 +22,7 @@ const queue = require('./queue');
 const registry = require('./registry');
 const transport = require('./transport');
 const db = require('./db');
+const api = require('./api');
 
 /**
  * @param {object} deps
@@ -42,6 +44,7 @@ const REQUIRED_CONFIG = [
   'FAILOVER_SWEEP_MS',
   'UTC_PUSH_REFRESH_MS',
   'AUDIT_LOG_RETENTION_MS',
+  'ENFORCE_CAPS',
 ];
 
 function createCore({ CONFIG, logEvent, mysql, mqtt }) {
@@ -56,6 +59,7 @@ function createCore({ CONFIG, logEvent, mysql, mqtt }) {
     ...registry,
     ...transport,
     ...db,
+    ...api,
     /** The mysql2 pool, once initDatabase() has created it. */
     get pool() {
       return ctx.pool;

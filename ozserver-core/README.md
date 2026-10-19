@@ -2,9 +2,10 @@
 
 The lock side of the OZKIE servers, written once (ozkey-50 §2). It covers MQTT
 transport, the lock/bridge registry and presence, XF-144 bridge failover, the
-opaque relay, the write queue, the audit trail and the MySQL schema bootstrap.
-Each product is a **profile**: it builds a CONFIG, creates one core, and adds
-its own REST routes and tables.
+opaque relay, the write queue, the audit trail, the MySQL schema bootstrap and
+the lock-side REST API. Each product is a **profile**: it builds a CONFIG,
+creates one core, mounts the lock API behind its own auth, and adds its own
+routes and tables.
 
 | Profile | Directory | Status |
 |---|---|---|
@@ -40,6 +41,15 @@ const core = createCore({ CONFIG, logEvent, mysql: require('mysql2/promise'), mq
 - Every other export is on the returned `core` object. Call
   `core.initDatabase()` and then `core.initMqtt()`; after `initDatabase()`,
   `core.pool` is the mysql2 pool.
+- **`core.mountLockApi(router, { auth, onLockRemoved })`** puts the lock API
+  on the profile's express Router: pairing, registry reads, settings, sealed
+  grants/unlock/bond verbs, bridge reset, removal, queue, sim. `auth` is
+  middleware run first on every one of those routes. It is **required**:
+  without it the call throws at startup (fail closed, as S−1). ozlock passes
+  an explicit open pass because its REST is unauthenticated today.
+  `onLockRemoved(lock)` is an optional fire-and-forget hook after
+  `DELETE /locks/:id` (ozlock: Nexus decommission). The profile keeps
+  `/health`, `/events` and anything product-specific.
 - Core modules read their dependencies lazily through `ctx.js`. The stand-ins
   are read-only: setting, defining or deleting a property through one throws.
 
@@ -59,6 +69,7 @@ const core = createCore({ CONFIG, logEvent, mysql: require('mysql2/promise'), mq
 | `FAILOVER_SWEEP_MS` | failover sweep / presence-resubscribe tick (30 s) |
 | `UTC_PUSH_REFRESH_MS` | re-push utc to online bridges (10 min) |
 | `AUDIT_LOG_RETENTION_MS` | audit_log age limit (90 days) |
+| `ENFORCE_CAPS` | refuse a remote unlock the lock's caps don't allow (XF-48; ozlock: on unless `OZLOCK_ENFORCE_CAPS=0`) |
 
 The profile also supplies the topic builders (`topicCommand`,
 `topicBridgeCommand`, `topicTime`) and the `SUB_*` subscriptions. A `SUB_*_LEGACY`
@@ -73,5 +84,7 @@ operator's own data (ozpms) leaves it unset.
 
 ## Tests
 
-The behaviour is pinned by ozlock's suite: `cd ozlock/server && npm test`
-(golden transcripts in `test/golden/`). Rerun it after any change here.
+- `cd ozserver-core && npm test`: contract tests, no DB or broker (required
+  CONFIG, the auth hook, read-only lazy deps).
+- `cd ozlock/server && npm test`: the route behaviour, pinned by golden
+  transcripts in `test/golden/`. Rerun it after any change here.
