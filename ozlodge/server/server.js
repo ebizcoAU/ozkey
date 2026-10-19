@@ -42,6 +42,9 @@ const cors = require('cors');
 const mysql = require('mysql2/promise');
 const mqtt = require('mqtt');
 const os = require('os');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 /** First non-internal IPv4 of this host — the lock's consistency value for
  *  the gateway address (ozkey-02 §3.2). Override with OZLODGE_SERVER_IP
@@ -56,6 +59,78 @@ function detectLanIp() {
 }
 
 /* ---------------------------------------------------------------------------
+ * S−1 (ozkey-50 §8.2): fail-closed secrets. Values come from the process env,
+ * then from an optional `.env` beside this file (gitignored, must be 0600),
+ * never from the source. resolveSecret() runs at load so CONFIG can read the
+ * values; enforceSecrets() is the first thing boot() does, before any DB,
+ * MQTT or HTTP, and exits on any required secret that is missing. Problems
+ * name the variable, never the value. Same block in all three servers until
+ * S0 lifts it into the shared core.
+ * ------------------------------------------------------------------------- */
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// The one placeholder list: empty, these literals, and anything 'lab-…'.
+const SECRET_PLACEHOLDERS = ['changeme', 'change-me', 'change_me', '<set-me>'];
+const SECRET_MIN_PROD_LEN = 32;
+const secretProblems = [];
+
+function isPlaceholderSecret(value) {
+  const s = String(value || '').trim().toLowerCase();
+  return !s || s.startsWith('lab-') || SECRET_PLACEHOLDERS.includes(s);
+}
+
+/** KEY=VALUE lines; never overrides a var already set in the env. */
+function loadDotEnv(file) {
+  if (!fs.existsSync(file)) return;
+  if (fs.statSync(file).mode & 0o077) {
+    secretProblems.push(`${file} is readable by group/others (chmod 600 it)`);
+    return;
+  }
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (!m || process.env[m[1]] !== undefined) continue;
+    process.env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
+  }
+}
+
+/** First set var in `vars` (primary first, then legacy names). `required`:
+ *  'always' | 'production' | false. Returns null when unset/placeholder. */
+function resolveSecret(vars, { required = false, minProdLen = 0 } = {}) {
+  const found = vars.find((v) => process.env[v] !== undefined);
+  const value = found ? process.env[found] : undefined;
+  const needed = required === 'always' || (required === 'production' && IS_PRODUCTION);
+  if (isPlaceholderSecret(value)) {
+    if (needed) secretProblems.push(`${vars[0]} is missing or a placeholder`);
+    return null;
+  }
+  if (IS_PRODUCTION && value.length < minProdLen) {
+    secretProblems.push(`${vars[0]} is shorter than ${minProdLen} characters`);
+    return null;
+  }
+  return value;
+}
+
+function enforceSecrets(warnings = []) {
+  const mode = IS_PRODUCTION ? 'production' : 'lab';
+  if (secretProblems.length) {
+    for (const p of secretProblems) logEvent('error', `FATAL S−1: ${p}`);
+    logEvent('error', `FATAL S−1: refusing to start (${mode}); set these in the env or a 0600 .env beside server.js`);
+    process.exit(1);
+  }
+  for (const w of warnings) logEvent('warn', `S−1: ${w}`);
+  logEvent('info', `S−1: secrets OK (${mode})`);
+}
+
+loadDotEnv(path.join(__dirname, '.env'));
+
+const SECRETS = {
+  DB_PASSWORD: resolveSecret(['OZLODGE_DB_PASSWORD'], { required: 'always' }),
+  PMS_SECRET: resolveSecret(['OZLODGE_PMS_SECRET', 'OZKEY_PMS_SECRET'], {
+    required: 'production',
+    minProdLen: SECRET_MIN_PROD_LEN,
+  }),
+};
+
+/* ---------------------------------------------------------------------------
  * Configuration
  * ------------------------------------------------------------------------- */
 const CONFIG = {
@@ -66,7 +141,7 @@ const CONFIG = {
   DB: {
     host: 'localhost',
     user: 'root',
-    password: 'Cableman',
+    password: SECRETS.DB_PASSWORD, // S−1: OZLODGE_DB_PASSWORD, required in every mode
     // S12 rename: code default is now 'ozlodge', but the LIVE MySQL database
     // is still physically named 'ozkey' — MySQL has no atomic RENAME
     // DATABASE, only dump/restore or per-table RENAME TABLE tricks, both
@@ -94,10 +169,11 @@ const CONFIG = {
   subDeviceHeartbeat: (siteId) => `ozkey/${siteId}/locks/+/heartbeat`,
   subDeviceLog: (siteId) => `ozkey/${siteId}/locks/+/log`,
   UNPAIRED_TTL_MS: 120_000, // forget an unpaired MAC if silent for 2 minutes
-  // Shared secret for PMS write endpoints (ozkey-07 §4.4). Unset = open (lab);
-  // set OZLODGE_PMS_SECRET (OZKEY_PMS_SECRET also read) to enforce
+  // Shared secret for PMS write endpoints (ozkey-07 §4.4), enforced as
   // `X-OZLODGE-Secret` (or legacy `X-OZKEY-Secret`) on /pms/* writes.
-  PMS_SECRET: process.env.OZLODGE_PMS_SECRET || process.env.OZKEY_PMS_SECRET || '',
+  // OZLODGE_PMS_SECRET (OZKEY_PMS_SECRET also read). S−1: production refuses
+  // to start without it; unset in lab = open, warned at boot.
+  PMS_SECRET: SECRETS.PMS_SECRET || '',
 };
 
 /* ---------------------------------------------------------------------------
@@ -805,7 +881,9 @@ api.get('/rooms', async (req, res) => {
 function guardPmsSecret(req, res) {
   if (!CONFIG.PMS_SECRET) return true; // lab: open when no secret configured
   const got = req.get('X-OZLODGE-Secret') || req.get('X-OZKEY-Secret');
-  if (got === CONFIG.PMS_SECRET) return true;
+  // Constant-time compare; hashing first makes the lengths equal.
+  const digest = (v) => crypto.createHash('sha256').update(String(v)).digest();
+  if (got && crypto.timingSafeEqual(digest(got), digest(CONFIG.PMS_SECRET))) return true;
   res.status(401).json({ ok: false, error: 'missing or invalid X-OZLODGE-Secret' });
   return false;
 }
@@ -1845,6 +1923,9 @@ api.post('/sim/room-heartbeat', async (req, res) => {
  * ------------------------------------------------------------------------- */
 async function boot() {
   logEvent('info', 'OZLODGESERV booting — Sovereign Smart Lock hospitality gateway');
+  enforceSecrets(
+    SECRETS.PMS_SECRET ? [] : ['OZLODGE_PMS_SECRET unset, /pms/* writes are OPEN (lab only; refused in production)']
+  );
 
   // MySQL with retry so the gateway survives a cold lab bench.
   let attempts = 0;

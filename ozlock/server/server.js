@@ -111,6 +111,78 @@ function detectLanIp() {
 }
 
 /* ---------------------------------------------------------------------------
+ * S−1 (ozkey-50 §8.2): fail-closed secrets. Values come from the process env,
+ * then from an optional `.env` beside this file (gitignored, must be 0600),
+ * never from the source. resolveSecret() runs at load so CONFIG can read the
+ * values; enforceSecrets() is the first thing boot() does, before any DB,
+ * MQTT or HTTP, and exits on any required secret that is missing. Problems
+ * name the variable, never the value. Same block in all three servers until
+ * S0 lifts it into the shared core.
+ * ------------------------------------------------------------------------- */
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// The one placeholder list: empty, these literals, and anything 'lab-…'.
+const SECRET_PLACEHOLDERS = ['changeme', 'change-me', 'change_me', '<set-me>'];
+const SECRET_MIN_PROD_LEN = 32;
+const secretProblems = [];
+
+function isPlaceholderSecret(value) {
+  const s = String(value || '').trim().toLowerCase();
+  return !s || s.startsWith('lab-') || SECRET_PLACEHOLDERS.includes(s);
+}
+
+/** KEY=VALUE lines; never overrides a var already set in the env. */
+function loadDotEnv(file) {
+  if (!fs.existsSync(file)) return;
+  if (fs.statSync(file).mode & 0o077) {
+    secretProblems.push(`${file} is readable by group/others (chmod 600 it)`);
+    return;
+  }
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (!m || process.env[m[1]] !== undefined) continue;
+    process.env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
+  }
+}
+
+/** First set var in `vars` (primary first, then legacy names). `required`:
+ *  'always' | 'production' | false. Returns null when unset/placeholder. */
+function resolveSecret(vars, { required = false, minProdLen = 0 } = {}) {
+  const found = vars.find((v) => process.env[v] !== undefined);
+  const value = found ? process.env[found] : undefined;
+  const needed = required === 'always' || (required === 'production' && IS_PRODUCTION);
+  if (isPlaceholderSecret(value)) {
+    if (needed) secretProblems.push(`${vars[0]} is missing or a placeholder`);
+    return null;
+  }
+  if (IS_PRODUCTION && value.length < minProdLen) {
+    secretProblems.push(`${vars[0]} is shorter than ${minProdLen} characters`);
+    return null;
+  }
+  return value;
+}
+
+function enforceSecrets(warnings = []) {
+  const mode = IS_PRODUCTION ? 'production' : 'lab';
+  if (secretProblems.length) {
+    for (const p of secretProblems) logEvent('error', `FATAL S−1: ${p}`);
+    logEvent('error', `FATAL S−1: refusing to start (${mode}); set these in the env or a 0600 .env beside server.js`);
+    process.exit(1);
+  }
+  for (const w of warnings) logEvent('warn', `S−1: ${w}`);
+  logEvent('info', `S−1: secrets OK (${mode})`);
+}
+
+loadDotEnv(path.join(__dirname, '.env'));
+
+const SECRETS = {
+  DB_PASSWORD: resolveSecret(['OZLOCK_DB_PASSWORD'], { required: 'always' }),
+  JWT_SIGNING_SECRET: resolveSecret(['OZLOCK_JWT_SECRET'], {
+    required: 'production',
+    minProdLen: SECRET_MIN_PROD_LEN,
+  }),
+};
+
+/* ---------------------------------------------------------------------------
  * Configuration
  * ------------------------------------------------------------------------- */
 const CONFIG = {
@@ -119,11 +191,10 @@ const CONFIG = {
   SERVER_IP: process.env.OZLOCK_SERVER_IP || detectLanIp(),
   SITE_ID: 'lab', // single-tenant lab deployment (ozkey-05 §1.3)
   // ozkey-24: HMAC secret ozlockserv signs app broker-auth JWTs with; EMQX's
-  // JWT auth plugin must hold the SAME secret to verify them. LAB DEFAULT
-  // ONLY — production must set OZLOCK_JWT_SECRET (same posture as the
-  // 'labwifi-secret' Wi-Fi password in buildProvisionPayload below: a
-  // deliberately loud placeholder, not a value anyone should ship with).
-  JWT_SIGNING_SECRET: process.env.OZLOCK_JWT_SECRET || 'lab-only-INSECURE-jwt-secret-CHANGE-IN-PRODUCTION',
+  // JWT auth plugin must hold the SAME secret to verify them. S−1: production
+  // refuses to start without OZLOCK_JWT_SECRET (>= 32 chars); the 'lab-only'
+  // fallback below is lab-only and logged as a warning at boot.
+  JWT_SIGNING_SECRET: SECRETS.JWT_SIGNING_SECRET || 'lab-only-INSECURE-jwt-secret-CHANGE-IN-PRODUCTION',
   AUTH_NONCE_TTL_MS: 60_000, // ozkey-24 §3.2: challenge nonce lifetime
   AUTH_JWT_TTL_S: 3600, // ozkey-24 §3.2: issued JWT lifetime
   // ozkey-P2: how long POST /bridges/:id/reset waits for the bridge's own
@@ -163,7 +234,7 @@ const CONFIG = {
   DB: {
     host: 'localhost',
     user: 'root',
-    password: 'Cableman',
+    password: SECRETS.DB_PASSWORD, // S−1: OZLOCK_DB_PASSWORD, required in every mode
     database: 'ozlock',
     waitForConnections: true,
     connectionLimit: 10,
@@ -4545,6 +4616,9 @@ async function purgeOldAuditLog() {
  * ------------------------------------------------------------------------- */
 async function boot() {
   logEvent('info', 'OZLOCKSERV booting — personal-cloud rendezvous directory (lab)');
+  enforceSecrets(
+    SECRETS.JWT_SIGNING_SECRET ? [] : ['OZLOCK_JWT_SECRET unset, using the lab-only JWT secret (refused in production)']
+  );
 
   serverEcdhKeyPair = loadOrCreateServerEcdhKeyPair();
   logEvent('info', `ozkey-24: server ECDH identity ${serverEcdhKeyPair.publicKeyHex.slice(0, 12)}…`);
