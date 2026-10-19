@@ -26,19 +26,20 @@ const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const path = require('path');
 const jwt = require('jsonwebtoken');
-const { Fixture, Golden, publishSet, waitFor, S0_JWT_SECRET } = require('./harness');
+const {
+  Fixture,
+  Golden,
+  makeSteps,
+  x25519FromSeed,
+  assertGolden,
+  waitFor,
+  S0_JWT_SECRET,
+} = require('./harness');
 
 const fx = new Fixture();
 const golden = new Golden(path.join(__dirname, 'golden', 'ozlock.json'));
 
 /* -- Deterministic identities ------------------------------------------------ */
-function x25519FromSeed(seed) {
-  const raw = crypto.createHash('sha256').update(seed).digest();
-  const der = Buffer.concat([Buffer.from('302e020100300506032b656e04220420', 'hex'), raw]);
-  const privateKey = crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
-  const x = crypto.createPublicKey(privateKey).export({ format: 'jwk' }).x;
-  return { privateKey, hex: Buffer.from(x, 'base64url').toString('hex') };
-}
 const APP_A = x25519FromSeed('s0-app-A'); // owner of L1, L2
 const APP_B = x25519FromSeed('s0-app-B'); // owner of L3, squatter attempts
 const L1 = 's0-direct-01'; // Wi-Fi-direct lock
@@ -53,33 +54,7 @@ const MAC1 = 'AA:BB:CC:00:00:01';
 const T = (kind, id) => `ozkie/lab/locks/${id}/${kind}`;
 const TB = (kind, id) => `ozkie/lab/bridges/${id}/${kind}`;
 
-/* -- Step helper ---------------------------------------------------------------
- * `act` performs the step (HTTP and/or MQTT) and returns the HTTP result if
- * any; the helper captures publishes and records the golden entry. */
-async function step(name, act) {
-  const mark = fx.mark();
-  const exchange = await act();
-  const pubs = await fx.since(mark);
-  const entry = { step: name, mqtt: publishSet(pubs) };
-  if (exchange && exchange.request) entry.http = exchange;
-  golden.record(entry);
-  return { res: exchange && exchange.response, pubs };
-}
-
-// Lists the server orders by a timestamp (or a count) can tie within a
-// second; sort those by their key so the transcript only records content.
-const TIE_SORTED_LISTS = { locks: 'id', apps: 'app_id' };
-
-async function call(method, p, body) {
-  const r = await fx.http(method, p, body);
-  for (const [field, key] of Object.entries(TIE_SORTED_LISTS)) {
-    const list = r.body && r.body[field];
-    if (Array.isArray(list)) list.sort((x, y) => String(x[key]).localeCompare(String(y[key])));
-  }
-  return { request: { method, path: p, body: body === undefined ? null : body }, response: r };
-}
-
-const getLock = async (id) => (await fx.http('GET', `/locks/${id}`)).body.lock;
+const { step, call, getLock } = makeSteps(fx, golden);
 
 before(async () => {
   await fx.start();
@@ -739,12 +714,4 @@ test('DELETE unknown lock is 404; DELETE /locks clears the fleet', async () => {
 /* ===========================================================================
  * Golden transcript (must run last)
  * ========================================================================= */
-test('golden transcript matches', () => {
-  const { written, mismatches } = golden.settle();
-  if (written) return;
-  assert.deepEqual(
-    mismatches.map((m) => m.step),
-    [],
-    'golden drift — first mismatch:\n' + JSON.stringify(mismatches[0], null, 2)
-  );
-});
+test('golden transcript matches', () => assertGolden(assert, golden));

@@ -1974,7 +1974,12 @@ async function refreshOnlineBridgeTimePushes() {
 // 2 minutes is comfortably longer than every transient blip observed
 // tonight (the worst was ~17s of confusion end-to-end) while still being
 // fast enough to matter for an actually-dead bridge.
-const FAILOVER_GRACE_MS = 2 * 60 * 1000;
+// S0a.1: overridable so the regression suite can exercise a real failover
+// in seconds; unset = the values above/below, unchanged.
+const FAILOVER_GRACE_MS = Number(process.env.OZLOCK_FAILOVER_GRACE_MS) || 2 * 60 * 1000;
+// Tick of the sweep timer armed in initMqtt() (it also drives the XF-152
+// presence resubscribe).
+const FAILOVER_SWEEP_MS = Number(process.env.OZLOCK_FAILOVER_SWEEP_MS) || 30_000;
 
 /** Periodic sweep, same cadence as the time-refresh timer. For any lock
  * whose CURRENT bridge has read `bridge_offline` for at least
@@ -2467,7 +2472,7 @@ function initMqtt() {
           if (err2) logEvent('error', `XF-152 presence re-subscribe (resync) failed: ${err2.message}`);
         });
       });
-    }, 30_000);
+    }, FAILOVER_SWEEP_MS);
   });
 
   mqttClient.on('reconnect', () => logEvent('warn', 'MQTT reconnecting...'));

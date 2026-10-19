@@ -1,0 +1,436 @@
+[
+  {
+    "mqtt": [
+      {
+        "payload": {
+          "broker_secret": "<masked>",
+          "broker_username": "ozb-s0-fo1",
+          "op": "broker_credentials"
+        },
+        "retain": false,
+        "topic": "ozkie/lab/bridges/ozb-s0-fo1/command"
+      },
+      {
+        "payload": {
+          "broker_secret": "<masked>",
+          "broker_username": "ozb-s0-fo2",
+          "op": "broker_credentials"
+        },
+        "retain": false,
+        "topic": "ozkie/lab/bridges/ozb-s0-fo2/command"
+      },
+      {
+        "payload": {
+          "broker_secret": "<masked>",
+          "broker_username": "ozb-s0-fo3",
+          "op": "broker_credentials"
+        },
+        "retain": false,
+        "topic": "ozkie/lab/bridges/ozb-s0-fo3/command"
+      },
+      {
+        "payload": {
+          "utc": "<masked>"
+        },
+        "retain": false,
+        "topic": "ozkie/lab/bridges/ozb-s0-fo1/command"
+      },
+      {
+        "payload": {
+          "utc": "<masked>"
+        },
+        "retain": false,
+        "topic": "ozkie/lab/bridges/ozb-s0-fo2/command"
+      },
+      {
+        "payload": {
+          "utc": "<masked>"
+        },
+        "retain": false,
+        "topic": "ozkie/lab/bridges/ozb-s0-fo3/command"
+      }
+    ],
+    "step": "bridges-online"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+          "bridge_id": "ozb-s0-fo1",
+          "device_id": "s0-fo-history-01"
+        },
+        "method": "POST",
+        "path": "/pairings"
+      },
+      "response": {
+        "body": {
+          "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+          "bridge_id": "ozb-s0-fo1",
+          "device_id": "s0-fo-history-01",
+          "ok": true,
+          "ozkie_version": null,
+          "provision_payload": {
+            "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+            "broker_host": "10.1.1.42",
+            "broker_tcp_port": 1883,
+            "broker_ws_path": "/mqtt",
+            "broker_ws_port": 9001,
+            "device_id": "s0-fo-history-01",
+            "heartbeat_s": 60,
+            "mode": "ozkey-cloud",
+            "password": "labwifi-secret",
+            "server_ip": "<masked>",
+            "server_port": "<masked>",
+            "site_id": "lab",
+            "ssid": "OZKEY-LAB",
+            "v": 1
+          }
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "pair-LA"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "bridge_id": "ozb-s0-fo2"
+        },
+        "method": "PATCH",
+        "path": "/locks/s0-fo-history-01"
+      },
+      "response": {
+        "body": {
+          "id": "s0-fo-history-01",
+          "lock": {
+            "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+            "battery_pct": null,
+            "bonds": null,
+            "bridge_id": "ozb-s0-fo2",
+            "caps": [
+              "remote_unlock",
+              "audit"
+            ],
+            "caps_source": "inferred",
+            "direct_presence": "unknown",
+            "dropped_before_seq": null,
+            "enrolled_at": "<masked>",
+            "events_at_risk": false,
+            "events_pending": false,
+            "fw": null,
+            "has_doorbell": null,
+            "heartbeat_s": 60,
+            "id": "s0-fo-history-01",
+            "label": "New Doorlock",
+            "last_pulled_seq": null,
+            "last_seen_at": null,
+            "mac": null,
+            "mcu_last_frame_s": null,
+            "mcu_link_up": null,
+            "ozkie_version": 1,
+            "power_profile": "eco",
+            "presence": "unknown",
+            "presence_at": null,
+            "presence_reason": null,
+            "profile": null,
+            "profile_mismatch": null,
+            "seq_highwater": null,
+            "site_id": "lab",
+            "status": "registered",
+            "transport": null,
+            "tuya_pid": null
+          },
+          "ok": true
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "patch-LA-B2"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "bridge_id": "ozb-s0-fo1"
+        },
+        "method": "PATCH",
+        "path": "/locks/s0-fo-history-01"
+      },
+      "response": {
+        "body": {
+          "id": "s0-fo-history-01",
+          "lock": {
+            "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+            "battery_pct": null,
+            "bonds": null,
+            "bridge_id": "ozb-s0-fo1",
+            "caps": [
+              "remote_unlock",
+              "audit"
+            ],
+            "caps_source": "inferred",
+            "direct_presence": "unknown",
+            "dropped_before_seq": null,
+            "enrolled_at": "<masked>",
+            "events_at_risk": false,
+            "events_pending": false,
+            "fw": null,
+            "has_doorbell": null,
+            "heartbeat_s": 60,
+            "id": "s0-fo-history-01",
+            "label": "New Doorlock",
+            "last_pulled_seq": null,
+            "last_seen_at": null,
+            "mac": null,
+            "mcu_last_frame_s": null,
+            "mcu_link_up": null,
+            "ozkie_version": 1,
+            "power_profile": "eco",
+            "presence": "unknown",
+            "presence_at": null,
+            "presence_reason": null,
+            "profile": null,
+            "profile_mismatch": null,
+            "seq_highwater": null,
+            "site_id": "lab",
+            "status": "registered",
+            "transport": null,
+            "tuya_pid": null
+          },
+          "ok": true
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "patch-LA-B1"
+  },
+  {
+    "mqtt": [],
+    "step": "presence-LA-online"
+  },
+  {
+    "mqtt": [
+      {
+        "payload": {
+          "id": "s0-fo-history-01",
+          "op": "pair_lock"
+        },
+        "retain": false,
+        "topic": "ozkie/lab/bridges/ozb-s0-fo2/command"
+      }
+    ],
+    "step": "failover-LA"
+  },
+  {
+    "http": {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/apps/4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06/activity?limit=50"
+      },
+      "response": {
+        "body": {
+          "activity": [
+            {
+              "action": "bridge_failover",
+              "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+              "created_at": "<masked>",
+              "detail": "auto-failover from ozb-s0-fo1 to ozb-s0-fo2 after sustained bridge_offline (pair_lock dispatched)",
+              "device_id": "s0-fo-history-01",
+              "id": 4,
+              "site_id": "lab"
+            },
+            {
+              "action": "pair",
+              "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+              "created_at": "<masked>",
+              "detail": "bridge_id set to ozb-s0-fo1",
+              "device_id": "s0-fo-history-01",
+              "id": 3,
+              "site_id": "lab"
+            },
+            {
+              "action": "pair",
+              "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+              "created_at": "<masked>",
+              "detail": "bridge_id set to ozb-s0-fo2",
+              "device_id": "s0-fo-history-01",
+              "id": 2,
+              "site_id": "lab"
+            },
+            {
+              "action": "pair",
+              "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+              "created_at": "<masked>",
+              "detail": "registered pairing",
+              "device_id": "s0-fo-history-01",
+              "id": 1,
+              "site_id": "lab"
+            }
+          ],
+          "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+          "limit": 50,
+          "offset": 0,
+          "ok": true,
+          "total": 4
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "activity-after-LA"
+  },
+  {
+    "mqtt": [],
+    "step": "presence-LA-via-B2"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+          "bridge_id": "ozb-s0-fo3",
+          "device_id": "s0-fo-scan-02"
+        },
+        "method": "POST",
+        "path": "/pairings"
+      },
+      "response": {
+        "body": {
+          "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+          "bridge_id": "ozb-s0-fo3",
+          "device_id": "s0-fo-scan-02",
+          "ok": true,
+          "ozkie_version": null,
+          "provision_payload": {
+            "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+            "broker_host": "10.1.1.42",
+            "broker_tcp_port": 1883,
+            "broker_ws_path": "/mqtt",
+            "broker_ws_port": 9001,
+            "device_id": "s0-fo-scan-02",
+            "heartbeat_s": 60,
+            "mode": "ozkey-cloud",
+            "password": "labwifi-secret",
+            "server_ip": "<masked>",
+            "server_port": "<masked>",
+            "site_id": "lab",
+            "ssid": "OZKEY-LAB",
+            "v": 1
+          }
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "pair-LB"
+  },
+  {
+    "mqtt": [],
+    "step": "presence-LB-online"
+  },
+  {
+    "mqtt": [
+      {
+        "payload": {
+          "duration_s": 8,
+          "op": "scan",
+          "target": "s0-fo-scan-02"
+        },
+        "retain": false,
+        "topic": "ozkie/lab/bridges/ozb-s0-fo2/command"
+      },
+      {
+        "payload": {
+          "id": "s0-fo-scan-02",
+          "op": "pair_lock"
+        },
+        "retain": false,
+        "topic": "ozkie/lab/bridges/ozb-s0-fo2/command"
+      }
+    ],
+    "step": "failover-LB-scan-confirm"
+  },
+  {
+    "http": {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/apps/4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06/activity?limit=50"
+      },
+      "response": {
+        "body": {
+          "activity": [
+            {
+              "action": "bridge_failover",
+              "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+              "created_at": "<masked>",
+              "detail": "auto-failover from ozb-s0-fo3 to ozb-s0-fo2 after sustained bridge_offline (pair_lock dispatched, candidate found via scan-confirm — no prior lock_bridges history)",
+              "device_id": "s0-fo-scan-02",
+              "id": 6,
+              "site_id": "lab"
+            },
+            {
+              "action": "pair",
+              "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+              "created_at": "<masked>",
+              "detail": "registered pairing",
+              "device_id": "s0-fo-scan-02",
+              "id": 5,
+              "site_id": "lab"
+            },
+            {
+              "action": "bridge_failover",
+              "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+              "created_at": "<masked>",
+              "detail": "auto-failover from ozb-s0-fo1 to ozb-s0-fo2 after sustained bridge_offline (pair_lock dispatched)",
+              "device_id": "s0-fo-history-01",
+              "id": 4,
+              "site_id": "lab"
+            },
+            {
+              "action": "pair",
+              "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+              "created_at": "<masked>",
+              "detail": "bridge_id set to ozb-s0-fo1",
+              "device_id": "s0-fo-history-01",
+              "id": 3,
+              "site_id": "lab"
+            },
+            {
+              "action": "pair",
+              "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+              "created_at": "<masked>",
+              "detail": "bridge_id set to ozb-s0-fo2",
+              "device_id": "s0-fo-history-01",
+              "id": 2,
+              "site_id": "lab"
+            },
+            {
+              "action": "pair",
+              "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+              "created_at": "<masked>",
+              "detail": "registered pairing",
+              "device_id": "s0-fo-history-01",
+              "id": 1,
+              "site_id": "lab"
+            }
+          ],
+          "app_id": "4263c28db9e4001492dbbef193c0a4528ee2c2e913e9890a3b1831764aedff06",
+          "limit": 50,
+          "offset": 0,
+          "ok": true,
+          "total": 6
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "activity-after-LB"
+  }
+]

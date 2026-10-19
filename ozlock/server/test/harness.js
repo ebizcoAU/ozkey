@@ -15,6 +15,7 @@
  */
 
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const net = require('net');
 const os = require('os');
@@ -135,7 +136,9 @@ class Golden {
 
 /* -- Fixture ----------------------------------------------------------------- */
 class Fixture {
-  constructor() {
+  /** `env`: extra server env for this file's instance (e.g. short timers). */
+  constructor({ env = {} } = {}) {
+    this.extraEnv = env;
     this.tmp = fs.mkdtempSync(path.join(os.tmpdir(), 's0-ozlock-'));
     this.dbName = `s0_ozlock_${process.pid}`;
     this.published = []; // server publishes, in arrival order
@@ -214,6 +217,7 @@ class Fixture {
         OZLOCK_NEXUS_URL: this.nexusUrl,
         OZLOCK_SERVER_API_KEY: 's0-test-nexus-key',
         OZLOCK_JWT_SECRET: S0_JWT_SECRET,
+        ...this.extraEnv,
       },
     });
     this.procs.push(this.server);
@@ -323,4 +327,69 @@ function publishSet(msgs) {
     .map((s) => JSON.parse(s));
 }
 
-module.exports = { Fixture, Golden, publishSet, waitFor, sleep, assertLocal, S0_JWT_SECRET };
+/* -- Step helpers ---------------------------------------------------------------
+ * `step(name, act)`: `act` performs the step (HTTP and/or MQTT) and returns
+ * the HTTP exchange if any; the helper captures publishes and records the
+ * golden entry. `call()` builds that exchange. */
+
+// Lists the server orders by a timestamp (or a count) can tie within a
+// second; sort those by their key so the transcript only records content.
+const TIE_SORTED_LISTS = { locks: 'id', apps: 'app_id' };
+
+function makeSteps(fx, golden) {
+  async function step(name, act) {
+    const mark = fx.mark();
+    const exchange = await act();
+    const pubs = await fx.since(mark);
+    const entry = { step: name, mqtt: publishSet(pubs) };
+    if (exchange && exchange.request) entry.http = exchange;
+    golden.record(entry);
+    return { res: exchange && exchange.response, pubs };
+  }
+
+  async function call(method, p, body) {
+    const r = await fx.http(method, p, body);
+    for (const [field, key] of Object.entries(TIE_SORTED_LISTS)) {
+      const list = r.body && r.body[field];
+      if (Array.isArray(list)) list.sort((x, y) => String(x[key]).localeCompare(String(y[key])));
+    }
+    return { request: { method, path: p, body: body === undefined ? null : body }, response: r };
+  }
+
+  const getLock = async (id) => (await fx.http('GET', `/locks/${id}`)).body.lock;
+
+  return { step, call, getLock };
+}
+
+/** Deterministic X25519 identity; `hex` is the app_id (ozkey-24 §9.2). */
+function x25519FromSeed(seed) {
+  const raw = crypto.createHash('sha256').update(seed).digest();
+  const der = Buffer.concat([Buffer.from('302e020100300506032b656e04220420', 'hex'), raw]);
+  const privateKey = crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
+  const x = crypto.createPublicKey(privateKey).export({ format: 'jwk' }).x;
+  return { privateKey, hex: Buffer.from(x, 'base64url').toString('hex') };
+}
+
+/** Last test in a file: the transcript must match its golden file. */
+function assertGolden(assert, golden) {
+  const { written, mismatches } = golden.settle();
+  if (written) return;
+  assert.deepEqual(
+    mismatches.map((m) => m.step),
+    [],
+    'golden drift — first mismatch:\n' + JSON.stringify(mismatches[0], null, 2)
+  );
+}
+
+module.exports = {
+  Fixture,
+  Golden,
+  publishSet,
+  makeSteps,
+  x25519FromSeed,
+  assertGolden,
+  waitFor,
+  sleep,
+  assertLocal,
+  S0_JWT_SECRET,
+};
