@@ -147,12 +147,14 @@ const CONFIG = {
   // is called synchronously right after the presence publish in firmware —
   // no async delay on the bridge's side — so this is round-trip + broker
   // latency budget, not a real processing wait.
-  BRIDGE_RESET_TIMEOUT_MS: 5000,
+  // S1d: overridable (same pattern as S0a.1) so the regression suite can give
+  // the wait room on a loaded box; unset = 5 s, unchanged.
+  BRIDGE_RESET_TIMEOUT_MS: Number(process.env.OZLOCK_BRIDGE_RESET_TIMEOUT_MS) || 5000,
   // ozkey-41 §5/§6: doorlock-1.96/bridge32-1.40 publish the reset outcome to
   // `locks/<id>/presence` synchronously, right before the wipe (or on
   // refusal) — same latency shape as the bridge's own signal, so the same
   // bound applies.
-  LOCK_RESET_TIMEOUT_MS: 5000,
+  LOCK_RESET_TIMEOUT_MS: Number(process.env.OZLOCK_LOCK_RESET_TIMEOUT_MS) || 5000,
   // ozkey-27 §9 (firmware, 2026-08-13): the ozkey-20 §23.1 utc push below
   // fired only on the presence 'online' transition — a server restart while
   // a bridge was already online, a missed presence message, or a reconnect

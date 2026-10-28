@@ -1,0 +1,770 @@
+[
+  {
+    "http": {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/health"
+      },
+      "response": {
+        "body": {
+          "db": true,
+          "mqtt": true,
+          "ok": true,
+          "service": "ozpmsserv",
+          "site": "pms",
+          "uptime_s": "<masked>"
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "health"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+          "device_id": "s1-pms-direct-01",
+          "label": "Room 101"
+        },
+        "method": "POST",
+        "path": "/pairings"
+      },
+      "response": {
+        "body": {
+          "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+          "bridge_id": null,
+          "device_id": "s1-pms-direct-01",
+          "ok": true,
+          "ozkie_version": null,
+          "provision_payload": {
+            "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+            "broker_host": "127.0.0.1",
+            "broker_tcp_port": "<harness-broker-port>",
+            "broker_ws_path": "/mqtt",
+            "broker_ws_port": 9001,
+            "device_id": "s1-pms-direct-01",
+            "heartbeat_s": 60,
+            "mode": "ozkey-cloud",
+            "password": "labwifi-secret",
+            "server_ip": "<masked>",
+            "server_port": "<masked>",
+            "site_id": "pms",
+            "ssid": "OZKEY-LAB",
+            "v": 1
+          }
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "pairings-L1"
+  },
+  {
+    "mqtt": [
+      {
+        "payload": {
+          "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+          "broker_secret": "<masked>",
+          "broker_username": "s1-pms-direct-01",
+          "device_id": "s1-pms-direct-01",
+          "heartbeat_s": 60,
+          "issued_by": "OZPMS/",
+          "label": "Room 101",
+          "op": "enrollment_ack",
+          "site_id": "pms"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/locks/s1-pms-direct-01/command"
+      }
+    ],
+    "step": "enroll-L1"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+          "device_id": "s1-pms-legacy-03",
+          "label": "Room 103"
+        },
+        "method": "POST",
+        "path": "/pairings"
+      },
+      "response": {
+        "body": {
+          "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+          "bridge_id": null,
+          "device_id": "s1-pms-legacy-03",
+          "ok": true,
+          "ozkie_version": null,
+          "provision_payload": {
+            "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+            "broker_host": "127.0.0.1",
+            "broker_tcp_port": "<harness-broker-port>",
+            "broker_ws_path": "/mqtt",
+            "broker_ws_port": 9001,
+            "device_id": "s1-pms-legacy-03",
+            "heartbeat_s": 60,
+            "mode": "ozkey-cloud",
+            "password": "labwifi-secret",
+            "server_ip": "<masked>",
+            "server_port": "<masked>",
+            "site_id": "pms",
+            "ssid": "OZKEY-LAB",
+            "v": 1
+          }
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "pairings-L3"
+  },
+  {
+    "mqtt": [
+      {
+        "payload": {
+          "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+          "broker_secret": "<masked>",
+          "broker_username": "s1-pms-legacy-03",
+          "device_id": "s1-pms-legacy-03",
+          "heartbeat_s": 60,
+          "issued_by": "OZPMS/",
+          "label": "Room 103",
+          "op": "enrollment_ack",
+          "site_id": "pms"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/locks/s1-pms-legacy-03/command"
+      }
+    ],
+    "step": "enroll-L3-legacy-root"
+  },
+  {
+    "mqtt": [],
+    "step": "heartbeat-L3-legacy-root"
+  },
+  {
+    "mqtt": [
+      {
+        "payload": {
+          "broker_secret": "<masked>",
+          "broker_username": "ozb-s1-pms-b1",
+          "op": "broker_credentials"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-b1/command"
+      },
+      {
+        "payload": {
+          "utc": "<masked>"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-b1/command"
+      }
+    ],
+    "step": "bridge-B1-online"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+          "bridge_id": "ozb-s1-pms-b1",
+          "device_id": "s1-pms-bridged-02",
+          "label": "Room 102"
+        },
+        "method": "POST",
+        "path": "/pairings"
+      },
+      "response": {
+        "body": {
+          "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+          "bridge_id": "ozb-s1-pms-b1",
+          "device_id": "s1-pms-bridged-02",
+          "ok": true,
+          "ozkie_version": null,
+          "provision_payload": {
+            "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+            "broker_host": "127.0.0.1",
+            "broker_tcp_port": "<harness-broker-port>",
+            "broker_ws_path": "/mqtt",
+            "broker_ws_port": 9001,
+            "device_id": "s1-pms-bridged-02",
+            "heartbeat_s": 60,
+            "mode": "ozkey-cloud",
+            "password": "labwifi-secret",
+            "server_ip": "<masked>",
+            "server_port": "<masked>",
+            "site_id": "pms",
+            "ssid": "OZKEY-LAB",
+            "v": 1
+          }
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "pairings-L2"
+  },
+  {
+    "mqtt": [],
+    "step": "presence-L2-online"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {},
+        "method": "POST",
+        "path": "/locks/s1-pms-bridged-02/unlock"
+      },
+      "response": {
+        "body": {
+          "code": "envelope_hex_required",
+          "detail": "Unsealed unlock is no longer accepted — seal {\"kind\":\"unlock\"} client-side. This closes the unauthenticated raw-DP path XF-120 §1.2b described.",
+          "error": "envelope_hex is required",
+          "ok": false,
+          "ref": "XF-120 §2"
+        },
+        "status": 400
+      }
+    },
+    "mqtt": [],
+    "step": "unlock-L2-no-envelope"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "envelope_hex": "aa"
+        },
+        "method": "POST",
+        "path": "/locks/s1-pms-direct-01/unlock"
+      },
+      "response": {
+        "body": {
+          "caps": [
+            "audit"
+          ],
+          "caps_source": "device",
+          "code": "remote_unlock_unsupported",
+          "detail": "This lock cannot be unlocked remotely. Unlock is Bluetooth-at-the-door; its network link carries key management, PIN sync and audit on a periodic wake, not live commands. Add a bridge to enable remote unlock.",
+          "device_id": "s1-pms-direct-01",
+          "error": "remote_unlock_unsupported",
+          "ok": false,
+          "ref": "XF-48 §3"
+        },
+        "status": 409
+      }
+    },
+    "mqtt": [],
+    "step": "unlock-L1-no-cap"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "envelope_hex": "c0ffee11"
+        },
+        "method": "POST",
+        "path": "/locks/s1-pms-bridged-02/unlock"
+      },
+      "response": {
+        "body": {
+          "delivery": "delivered",
+          "device_id": "s1-pms-bridged-02",
+          "envelope_hex": "c0ffee11",
+          "expires_at": "<masked>",
+          "mode": "remote",
+          "ok": true,
+          "queue_id": 1,
+          "requires_touch": false,
+          "transport_ok": true,
+          "window_s": 60
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [
+      {
+        "payload": {
+          "envelope_hex": "c0ffee11",
+          "msg_id": "ozl-1-<ms>",
+          "target": "s1-pms-bridged-02"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-b1/command"
+      }
+    ],
+    "step": "unlock-L2"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "raw_value": "123456",
+          "type": "pin",
+          "user_name": "Guest"
+        },
+        "method": "POST",
+        "path": "/locks/s1-pms-bridged-02/grants"
+      },
+      "response": {
+        "body": {
+          "code": "missing_fields",
+          "error": "envelope_hex is required",
+          "ok": false
+        },
+        "status": 400
+      }
+    },
+    "mqtt": [],
+    "step": "grant-L2-raw-value"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "envelope_hex": "beef0011",
+          "slot_number": 2,
+          "type": "pin"
+        },
+        "method": "POST",
+        "path": "/locks/s1-pms-bridged-02/grants"
+      },
+      "response": {
+        "body": {
+          "device_id": "s1-pms-bridged-02",
+          "envelope_hex": "beef0011",
+          "grant_id": 1,
+          "ok": true,
+          "queue_id": 2,
+          "sync_status": "pending"
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [
+      {
+        "payload": {
+          "envelope_hex": "beef0011",
+          "msg_id": "ozl-2-<ms>",
+          "target": "s1-pms-bridged-02"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-b1/command"
+      }
+    ],
+    "step": "grant-L2-sealed"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "envelope_hex": "dead0011"
+        },
+        "method": "DELETE",
+        "path": "/locks/s1-pms-bridged-02/grants/1"
+      },
+      "response": {
+        "body": {
+          "device_id": "s1-pms-bridged-02",
+          "envelope_hex": "dead0011",
+          "expires_at": "<masked>",
+          "grant_id": 1,
+          "ok": true,
+          "queue_id": 3,
+          "sync_status": "revoking"
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [
+      {
+        "payload": {
+          "envelope_hex": "dead0011",
+          "msg_id": "ozl-3-<ms>",
+          "target": "s1-pms-bridged-02"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-b1/command"
+      }
+    ],
+    "step": "revoke-L2-sealed"
+  },
+  {
+    "mqtt": [],
+    "step": "door-log-L1"
+  },
+  {
+    "http": {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/locks/s1-pms-direct-01/log?limit=1&offset=1"
+      },
+      "response": {
+        "body": {
+          "limit": 1,
+          "log": [
+            {
+              "created_at": "<masked>",
+              "detail": "PIN slot 1",
+              "device_id": "s1-pms-direct-01",
+              "id": 1,
+              "lock_ts": "2026-10-19T01:00:00.000Z",
+              "mac": "AA:BB:CC:01:00:01",
+              "result": "granted",
+              "site_id": "pms"
+            }
+          ],
+          "offset": 1,
+          "ok": true,
+          "total": 2
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "door-log-L1-page"
+  },
+  {
+    "http": {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/locks/s1-pms-direct-01/log?from=2999-01-01"
+      },
+      "response": {
+        "body": {
+          "limit": 12,
+          "log": [],
+          "offset": 0,
+          "ok": true,
+          "total": 0
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "door-log-L1-future-range"
+  },
+  {
+    "http": {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/locks"
+      },
+      "response": {
+        "body": {
+          "locks": [
+            {
+              "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+              "backup_available": false,
+              "battery_pct": null,
+              "bonds": null,
+              "bridge_id": "ozb-s1-pms-b1",
+              "caps": [
+                "remote_unlock",
+                "audit"
+              ],
+              "caps_source": "inferred",
+              "direct_presence": "online",
+              "dropped_before_seq": null,
+              "enrolled_at": "<masked>",
+              "events_at_risk": false,
+              "events_pending": false,
+              "fw": null,
+              "has_doorbell": null,
+              "heartbeat_s": 60,
+              "id": "s1-pms-bridged-02",
+              "label": "Room 102",
+              "last_pulled_seq": null,
+              "last_seen_at": null,
+              "mac": null,
+              "mcu_last_frame_s": null,
+              "mcu_link_up": null,
+              "ozkie_version": 1,
+              "power_profile": "eco",
+              "presence": "online",
+              "presence_at": "<masked>",
+              "presence_reason": "ok",
+              "profile": null,
+              "profile_mismatch": null,
+              "seq_highwater": null,
+              "site_id": "pms",
+              "status": "registered",
+              "transport": null,
+              "tuya_pid": null
+            },
+            {
+              "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+              "backup_available": false,
+              "battery_pct": null,
+              "bonds": null,
+              "bridge_id": null,
+              "caps": [
+                "audit"
+              ],
+              "caps_source": "device",
+              "direct_presence": "unknown",
+              "dropped_before_seq": null,
+              "enrolled_at": "<masked>",
+              "events_at_risk": false,
+              "events_pending": false,
+              "fw": "s1-1.0",
+              "has_doorbell": null,
+              "heartbeat_s": 60,
+              "id": "s1-pms-direct-01",
+              "label": "Room 101",
+              "last_pulled_seq": null,
+              "last_seen_at": "<masked>",
+              "mac": "AA:BB:CC:01:00:01",
+              "mcu_last_frame_s": null,
+              "mcu_link_up": null,
+              "ozkie_version": 1,
+              "power_profile": "eco",
+              "presence": "unknown",
+              "presence_at": null,
+              "presence_reason": null,
+              "profile": null,
+              "profile_mismatch": null,
+              "seq_highwater": null,
+              "site_id": "pms",
+              "status": "enrolled",
+              "transport": "wifi",
+              "tuya_pid": null
+            },
+            {
+              "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+              "backup_available": false,
+              "battery_pct": 64,
+              "bonds": null,
+              "bridge_id": null,
+              "caps": [
+                "audit"
+              ],
+              "caps_source": "inferred",
+              "direct_presence": "online",
+              "dropped_before_seq": null,
+              "enrolled_at": "<masked>",
+              "events_at_risk": false,
+              "events_pending": false,
+              "fw": "s1-0.9",
+              "has_doorbell": null,
+              "heartbeat_s": 60,
+              "id": "s1-pms-legacy-03",
+              "label": "Room 103",
+              "last_pulled_seq": null,
+              "last_seen_at": "<masked>",
+              "mac": "AA:BB:CC:01:00:03",
+              "mcu_last_frame_s": null,
+              "mcu_link_up": null,
+              "ozkie_version": 1,
+              "power_profile": "eco",
+              "presence": "online",
+              "presence_at": "<masked>",
+              "presence_reason": "ok",
+              "profile": null,
+              "profile_mismatch": null,
+              "seq_highwater": null,
+              "site_id": "pms",
+              "status": "enrolled",
+              "transport": null,
+              "tuya_pid": null
+            }
+          ],
+          "ok": true
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "locks-list"
+  },
+  {
+    "http": {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/apps/a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c/activity?limit=50"
+      },
+      "response": {
+        "body": {
+          "activity": [
+            {
+              "action": "revoke",
+              "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+              "created_at": "<masked>",
+              "detail": "revoke PIN slot 2",
+              "device_id": "s1-pms-bridged-02",
+              "id": 6,
+              "site_id": "pms"
+            },
+            {
+              "action": "grant",
+              "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+              "created_at": "<masked>",
+              "detail": "grant PIN slot 2",
+              "device_id": "s1-pms-bridged-02",
+              "id": 5,
+              "site_id": "pms"
+            },
+            {
+              "action": "unlock",
+              "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+              "created_at": "<masked>",
+              "detail": "remote unlock",
+              "device_id": "s1-pms-bridged-02",
+              "id": 4,
+              "site_id": "pms"
+            },
+            {
+              "action": "pair",
+              "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+              "created_at": "<masked>",
+              "detail": "registered pairing",
+              "device_id": "s1-pms-bridged-02",
+              "id": 3,
+              "site_id": "pms"
+            },
+            {
+              "action": "pair",
+              "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+              "created_at": "<masked>",
+              "detail": "registered pairing",
+              "device_id": "s1-pms-legacy-03",
+              "id": 2,
+              "site_id": "pms"
+            },
+            {
+              "action": "pair",
+              "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+              "created_at": "<masked>",
+              "detail": "registered pairing",
+              "device_id": "s1-pms-direct-01",
+              "id": 1,
+              "site_id": "pms"
+            }
+          ],
+          "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
+          "limit": 50,
+          "offset": 0,
+          "ok": true,
+          "total": 6
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "apps-activity"
+  },
+  {
+    "http": {
+      "request": {
+        "body": null,
+        "method": "DELETE",
+        "path": "/locks/s1-pms-direct-01"
+      },
+      "response": {
+        "body": {
+          "id": "s1-pms-direct-01",
+          "ok": true,
+          "reset": {
+            "attempted": true,
+            "cause": null,
+            "likely_delivered": true,
+            "presence": "unknown",
+            "presence_reason": null,
+            "transport_ok": true,
+            "verdict": null
+          }
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [
+      {
+        "payload": {
+          "op": "factory_reset",
+          "ts": "<masked>"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/locks/s1-pms-direct-01/command"
+      }
+    ],
+    "step": "delete-L1"
+  },
+  {
+    "http": {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/locks/s1-pms-direct-01/log"
+      },
+      "response": {
+        "body": {
+          "limit": 12,
+          "log": [],
+          "offset": 0,
+          "ok": true,
+          "total": 0
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "door-log-L1-after-delete"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "envelope_hex": "reset11"
+        },
+        "method": "DELETE",
+        "path": "/locks/s1-pms-bridged-02"
+      },
+      "response": {
+        "body": {
+          "id": "s1-pms-bridged-02",
+          "ok": true,
+          "reset": {
+            "attempted": true,
+            "cause": "presence_confirmed",
+            "likely_delivered": true,
+            "presence": "online",
+            "presence_reason": "ok",
+            "transport_ok": true,
+            "verdict": "reset_confirmed"
+          }
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [
+      {
+        "payload": {
+          "envelope_hex": "reset11",
+          "msg_id": "ozl-4-<ms>",
+          "target": "s1-pms-bridged-02"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-b1/command"
+      },
+      {
+        "payload": {
+          "id": "s1-pms-bridged-02",
+          "op": "unpair_lock"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-b1/command"
+      }
+    ],
+    "step": "delete-L2-sealed"
+  }
+]

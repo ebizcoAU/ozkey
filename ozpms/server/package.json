@@ -4,7 +4,8 @@
   "description": "OZPMS - the property operator's own lock server (lab deployment), a profile on ozserver-core",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node --test --test-concurrency=1 test/refuse.test.js test/ozpms.test.js test/failover.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
