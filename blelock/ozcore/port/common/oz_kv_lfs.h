@@ -33,4 +33,12 @@ int oz_kv_lfs_get(const char *key, uint8_t *buf, size_t cap, size_t *len);
 int oz_kv_lfs_set(const char *key, const uint8_t *buf, size_t len);
 int oz_kv_lfs_erase(const char *key);
 
+/* Keys live in a namespace, two letters a-z, "oz" by default: the file is
+ * "<ns>.<key>". The on-target self-test switches to its own ("zt") so its
+ * resets can never touch the lock's real identity, and wipes it after.
+ * Not for production code paths. */
+int oz_kv_lfs_namespace(const char *name);
+/* Remove every key of the current namespace. */
+int oz_kv_lfs_wipe(void);
+
 #endif

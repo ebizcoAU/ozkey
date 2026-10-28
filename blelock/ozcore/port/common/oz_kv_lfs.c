@@ -6,6 +6,7 @@
 #include "oz_crypto.h"
 
 static lfs_t *fs;
+static char ns[2] = {'o', 'z'};         /* namespace, see oz_kv_lfs_namespace() */
 
 /* "oz." + key + ".t" + NUL */
 #define PATH_MAX_LEN (3 + OZ_KV_LFS_KEY_MAX + 2 + 1)
@@ -36,7 +37,9 @@ static int path_of(char *out, const char *key, int temp)
     }
     if (n == 0)
         return OZ_E_ARG;
-    memcpy(out, "oz.", 3);
+    out[0] = ns[0];
+    out[1] = ns[1];
+    out[2] = '.';
     memcpy(out + 3, key, n);
     if (temp) {
         memcpy(out + 3 + n, ".t", 3);
@@ -46,20 +49,22 @@ static int path_of(char *out, const char *key, int temp)
     return OZ_OK;
 }
 
+static int in_ns(const char *name)
+{
+    return name[0] == ns[0] && name[1] == ns[1] && name[2] == '.';
+}
+
+/* Any namespace's temp file is garbage after a power cut. */
 static int is_temp(const char *name)
 {
     size_t n = strlen(name);
-    return n > 5 && !memcmp(name, "oz.", 3) && !strcmp(name + n - 2, ".t");
+    return n > 5 && name[2] == '.' && !strcmp(name + n - 2, ".t");
 }
 
-int oz_kv_lfs_attach(lfs_t *lfs)
+/* Remove, one at a time and outside the walk, every file `doomed_by` picks:
+ * littlefs doesn't promise a stable iteration while the directory changes. */
+static int remove_all(int (*doomed_by)(const char *))
 {
-    if (!lfs || lfs->cfg->cache_size > OZ_KV_LFS_CACHE_MAX)
-        return OZ_E_ARG;
-    fs = lfs;
-
-    /* A set that lost power before its rename leaves "oz.<key>.t" behind:
-     * the old value is still intact, so the temp file is just garbage. */
     lfs_dir_t dir;
     struct lfs_info info;
     char doomed[PATH_MAX_LEN];
@@ -68,7 +73,7 @@ int oz_kv_lfs_attach(lfs_t *lfs)
         if (lfs_dir_open(fs, &dir, "/") < 0)
             return OZ_E_HW;
         while (lfs_dir_read(fs, &dir, &info) > 0) {
-            if (info.type == LFS_TYPE_REG && is_temp(info.name) &&
+            if (info.type == LFS_TYPE_REG && doomed_by(info.name) &&
                 strlen(info.name) < sizeof doomed) {
                 strcpy(doomed, info.name);
                 found = 1;
@@ -78,12 +83,37 @@ int oz_kv_lfs_attach(lfs_t *lfs)
         lfs_dir_close(fs, &dir);
         if (!found)
             return OZ_OK;
-        /* Removed outside the walk: littlefs doesn't promise a stable
-         * iteration while the directory changes. */
         int e = lfs_remove(fs, doomed);
         if (e < 0)
             return map_err(e);
     }
+}
+
+int oz_kv_lfs_namespace(const char *name)
+{
+    if (!name || strlen(name) != 2)
+        return OZ_E_ARG;
+    for (int i = 0; i < 2; i++)
+        if (name[i] < 'a' || name[i] > 'z')
+            return OZ_E_ARG;
+    ns[0] = name[0];
+    ns[1] = name[1];
+    return OZ_OK;
+}
+
+int oz_kv_lfs_wipe(void)
+{
+    return fs ? remove_all(in_ns) : OZ_E_HW;
+}
+
+int oz_kv_lfs_attach(lfs_t *lfs)
+{
+    if (!lfs || lfs->cfg->cache_size > OZ_KV_LFS_CACHE_MAX)
+        return OZ_E_ARG;
+    fs = lfs;
+    /* A set that lost power before its rename leaves "oz.<key>.t" behind:
+     * the old value is still intact, so the temp file is just garbage. */
+    return remove_all(is_temp);
 }
 
 static int open_file(lfs_file_t *f, uint8_t *cache, const char *path, int flags)

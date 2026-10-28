@@ -22,7 +22,7 @@ include port/ak1037/sdk_inc.mk
 
 CORE   = src/sha256_sw.c src/aes128_sw.c src/oz_crypto.c \
          src/oz_cbor.c src/oz_edhoc.c src/oz_coap.c src/oz_oscore.c src/oz_invite.c src/oz_lock.c \
-         src/oz_frame.c src/oz_ble.c
+         src/oz_frame.c src/oz_ble.c src/oz_adv.c
 OBJS   = $(CORE:src/%.c=$(OUT)/%.o) $(OUT)/monocypher.o $(OUT)/oz_kv_lfs.o $(OUT)/oz_port_ak1037.o $(OUT)/oz_gatt_ak1037.o
 
 $(OUT)/libozcore.a: $(OBJS)

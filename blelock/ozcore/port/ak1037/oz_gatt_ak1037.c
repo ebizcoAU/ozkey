@@ -9,8 +9,12 @@
  *     passes 0). Anyka question 5, ozkey-49.
  *   - A long info read (over MTU − 1) would need read-blob offsets; info is
  *     well under 23 bytes of overhead, so a single read is assumed.
- *   - Advertising per CONTRACT.md (service UUID, busy flag, touch window) is
- *     not done here yet; the stack's default advertising is on.
+ *   - Whether the stack restarts advertising by itself after a disconnect.
+ *     Harmless either way: the OZKIE thread re-applies its mode on every change.
+ *   - Advertising current at OZ_GATT_ADV_INTERVAL (P6).
+ *
+ * Advertising (oz_adv.h) is driven from the OZKIE thread only: the stack's
+ * default advertising is off, and the mode is re-applied whenever it changes.
  */
 #include <stddef.h>
 #include <string.h>
@@ -20,6 +24,7 @@
 #include "com_ble.h"
 
 #include "oz_port.h"
+#include "oz_adv.h"
 #include "oz_ble.h"
 #include "oz_gatt_ak1037.h"
 
@@ -38,7 +43,7 @@ static const T_BT_ATTREC gatt_table[] = {
 
 /* ── BLE context → OZKIE thread ──────────────────────────────────────────── */
 
-enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE };
+enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH };
 
 #define FRAME_MAX (BLE_MTU_MAX_SIZE - 3)
 typedef struct {
@@ -139,6 +144,39 @@ static struct rt_thread thread;
 static uint8_t thread_stack[OZ_GATT_THREAD_STACK] __attribute__((aligned(8)));
 static oz_link link;
 static oz_ble session;
+static oz_adv adv;
+
+static uint32_t now_ms(void) { return (uint32_t)rt_tick_get() * (1000u / RT_TICK_PER_SECOND); }
+
+/* Stop, set type and both payloads, start. The type can only change while
+ * stopped (HCI), and the controller has already stopped a connectable
+ * advertisement by itself when a link came up. Returns 0 when applied. */
+static int adv_apply(const oz_lock *L, oz_adv_mode mode)
+{
+    static uint8_t data[OZ_ADV_MAX], rsp[OZ_ADV_MAX];
+    static T_BLE_ADDR no_peer;
+    com_ble_set_adv_enable(eBLE_DISABLE);
+    if (mode == OZ_ADV_OFF)
+        return 0;
+    T_BT_ADV_DATA d, r;
+    memset(&d, 0, sizeof d);
+    memset(&r, 0, sizeof r);
+    d.custom_data.p_data = data;        /* raw AD structures, copied as they are */
+    d.custom_data.data_len = (uint32_t)oz_adv_data(data);
+    r.custom_data.p_data = rsp;
+    r.custom_data.data_len = (uint32_t)oz_adv_scan_rsp(rsp, mode == OZ_ADV_BUSY, L->device_id);
+    if (r.custom_data.data_len == 0) {
+        oz_port_log("adv: device_id %s has no short id", L->device_id);
+        return -1;
+    }
+    uint8_t type = mode == OZ_ADV_BUSY ? eBLE_ADV_SCAN_IND : eBLE_ADV_IND;
+    if (com_ble_set_adv_interval(type, OZ_GATT_ADV_INTERVAL, OZ_GATT_ADV_INTERVAL, 0, no_peer) != eBLE_RESULT_SUCCESS
+        || com_ble_set_adv_data(&d, &r) != eBLE_RESULT_SUCCESS
+        || com_ble_set_adv_enable(eBLE_ENABLE) != eBLE_RESULT_SUCCESS)
+        return -1;
+    oz_port_log("adv: %s", mode == OZ_ADV_BUSY ? "busy (scan_ind)" : "open (ind)");
+    return 0;
+}
 
 static int notify(void *ctx, const uint8_t *frame, size_t len)
 {
@@ -175,12 +213,15 @@ static void ozkie_thread(void *param)
     oz_lock *L = param;
     static msg_t m;
     int connected = 0;
+    int applied = -1, failed = 0;
     refresh_info(L);
     for (;;) {
         if (rt_mq_recv(&mq, &m, sizeof m, (rt_int32_t)rt_tick_from_millisecond(100)) == RT_EOK) {
             switch (m.h.ev) {
             case EV_CONNECT:
                 oz_ble_connect(&session);
+                if (!connected)
+                    oz_adv_link(&adv, 1);
                 connected = 1;
                 break;
             case EV_MTU:
@@ -197,9 +238,14 @@ static void ozkie_thread(void *param)
                 refresh_info(L);
                 break;
             case EV_DISCONNECT:
-                if (connected)
+                if (connected) {
                     oz_ble_disconnect(&session);
+                    oz_adv_link(&adv, 0);
+                }
                 connected = 0;
+                break;
+            case EV_TOUCH:
+                oz_adv_touch(&adv, now_ms());
                 break;
             default:
                 break;
@@ -207,6 +253,20 @@ static void ozkie_thread(void *param)
         }
         if (connected)
             (void)oz_ble_tick(&session);
+
+        /* Claiming the lock or a window closing changes the mode too, so it is
+         * recomputed every pass, not only on events. A failed apply is retried
+         * each pass and logged once. */
+        oz_adv_mode mode = oz_adv_mode_at(&adv, oz_lock_claimed(L), now_ms());
+        if ((int)mode != applied) {
+            if (adv_apply(L, mode) == 0) {
+                applied = (int)mode;
+                failed = 0;
+            } else if (!failed) {
+                oz_port_log("adv: could not apply mode %d, retrying", (int)mode);
+                failed = 1;
+            }
+        }
     }
 }
 
@@ -216,11 +276,18 @@ int oz_gatt_ak1037_pair_code(uint32_t code)
     return OZ_OK;
 }
 
+int oz_gatt_ak1037_touch(void)
+{
+    post(EV_TOUCH, 0);
+    return OZ_OK;
+}
+
 int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
 {
     if (rt_mq_init(&mq, "ozkie", mq_pool, SLOT_SIZE, sizeof mq_pool, RT_IPC_FLAG_FIFO) != RT_EOK)
         return OZ_E_HW;
     oz_ble_init(&session, L, &link, notify, NULL);
+    oz_adv_init(&adv, OZ_GATT_ADV_ALWAYS, now_ms());
 
     T_BLE_INIT_PARAM init;
     memset(&init, 0, sizeof init);
@@ -228,7 +295,7 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
     init.recv_cb = on_write;
     init.read_cb = on_read;
     init.evt_handle_cb = on_event;
-    init.adv_def_on = 1;
+    init.adv_def_on = 0;                /* the OZKIE thread decides */
     if (com_ble_init(&init) != eBLE_RESULT_SUCCESS) {
         oz_port_log("gatt: BLE init failed");
         return OZ_E_HW;

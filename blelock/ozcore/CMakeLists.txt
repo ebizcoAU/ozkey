@@ -17,6 +17,7 @@ add_library(ozcore STATIC
     src/oz_lock.c
     src/oz_frame.c
     src/oz_ble.c
+    src/oz_adv.c
     src/oz_crypto.c
     src/sha256_sw.c
     src/aes128_sw.c)
@@ -102,3 +103,7 @@ endif()
 # Host test lock for interop (ozkey-49 P2): tools/hostlock.c, driven by tools/ozapp.py.
 add_executable(ozhostlock tools/hostlock.c)
 target_link_libraries(ozhostlock ozport_host)
+
+add_executable(test_adv tests/test_adv.c)
+target_link_libraries(test_adv ozport_host)
+add_test(NAME adv COMMAND test_adv)

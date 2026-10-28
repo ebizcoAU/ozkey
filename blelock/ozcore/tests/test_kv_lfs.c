@@ -171,6 +171,40 @@ static void basics(void)
     expect_int("lk after reboot", which("lk", v, 32, NULL, 0), 1);
 }
 
+/* The self-test's namespace: its keys and wipes never reach the real ones. */
+static void namespaces(void)
+{
+    format_and_boot();
+    uint8_t v[16], w[16], out[16];
+    size_t n = 0;
+    fill(v, sizeof v, 3);
+    fill(w, sizeof w, 9);
+    expect_int("ns: real key", oz_kv_lfs_set("lk", v, sizeof v), OZ_OK);
+    expect_int("ns: bad, 1 char", oz_kv_lfs_namespace("z"), OZ_E_ARG);
+    expect_int("ns: bad, 3 chars", oz_kv_lfs_namespace("ztt"), OZ_E_ARG);
+    expect_int("ns: bad, upper", oz_kv_lfs_namespace("ZT"), OZ_E_ARG);
+    expect_int("ns: bad, null", oz_kv_lfs_namespace(NULL), OZ_E_ARG);
+    expect_int("ns: switch", oz_kv_lfs_namespace("zt"), OZ_OK);
+    expect_int("ns: real key invisible", oz_kv_lfs_get("lk", out, sizeof out, &n), OZ_E_NOT_FOUND);
+    expect_int("ns: own key", oz_kv_lfs_set("lk", w, sizeof w), OZ_OK);
+    expect_int("ns: own value", which("lk", w, sizeof w, v, sizeof v), 1);
+    expect_int("ns: second key", oz_kv_lfs_set("b0", w, 4), OZ_OK);
+    expect_int("ns: wipe", oz_kv_lfs_wipe(), OZ_OK);
+    expect_int("ns: wiped", which("lk", w, sizeof w, v, sizeof v), 0);
+    expect_int("ns: wiped too", which("b0", w, 4, NULL, 0), 0);
+    expect_int("ns: back", oz_kv_lfs_namespace("oz"), OZ_OK);
+    expect_int("ns: real key survived", which("lk", v, sizeof v, w, sizeof w), 1);
+
+    /* A temp left by a cut inside the test namespace is swept at boot too. */
+    lfs_file_t f;
+    expect_int("ns: plant zt temp", lfs_file_open(&lfs, &f, "zt.b0.t", LFS_O_WRONLY | LFS_O_CREAT), 0);
+    lfs_file_close(&lfs, &f);
+    lfs_unmount(&lfs);
+    expect_int("ns: reboot", boot(), OZ_OK);
+    expect_int("ns: zt temp swept", temp_files(), 0);
+    expect_int("ns: real key after reboot", which("lk", v, sizeof v, NULL, 0), 1);
+}
+
 /* The core's real working set: 16 bonds, 16 relay contexts, creds, keys. */
 static void capacity(void)
 {
@@ -305,6 +339,7 @@ static void soak(void)
 int main(void)
 {
     basics();
+    namespaces();
     capacity();
     sweep(OP_REPLACE, "replace", 3);
     sweep(OP_CREATE, "create", 3);
