@@ -15,6 +15,8 @@ add_library(ozcore STATIC
     src/oz_oscore.c
     src/oz_invite.c
     src/oz_lock.c
+    src/oz_frame.c
+    src/oz_ble.c
     src/oz_crypto.c
     src/sha256_sw.c
     src/aes128_sw.c)
@@ -68,6 +70,10 @@ add_test(NAME invite COMMAND test_invite)
 add_executable(test_lock tests/test_lock.c)
 target_link_libraries(test_lock ozport_host)
 add_test(NAME lock COMMAND test_lock)
+
+add_executable(test_frame tests/test_frame.c)
+target_link_libraries(test_frame ozport_host)
+add_test(NAME frame COMMAND test_frame)
 
 add_executable(test_kv_lfs tests/test_kv_lfs.c)
 target_link_libraries(test_kv_lfs ozkv_lfs ozport_host)

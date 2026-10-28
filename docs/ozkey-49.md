@@ -251,6 +251,58 @@ invites and the lock engine.
   - read alignment
   - power-cut behaviour of the real NOR part (P25Q16SH in the config's flash list)
 
+### P4-prep item 3 (2026-10-29): BLE GATT transport
+
+- **Portable, host-tested:**
+  - `src/oz_frame.c`: the §2.1 framer. It reassembles fragments and fragments replies at the ATT MTU.
+    - Fragment 0 always starts a new message, so a central that gave up mid-message recovers.
+    - Out-of-order fragments, a type change mid-message, an empty non-final fragment, fragment 31
+      marked "more", and anything over 1,024 bytes are all refused, and the partial message is
+      dropped.
+  - `src/oz_ble.c`: one connection. Frame in → reassemble → `oz_lock_rx` → reply fragmented →
+    the port's tx, one notification per frame.
+    - Pairing-code and tick replies take the same path.
+    - Malformed frames get no reply, so a stranger learns nothing.
+  - GATT UUIDs as LE byte strings (`OZ_BLE_UUID_*` in `oz_ble.h`), following the v1 pattern
+    (second group = characteristic): info `…-0002-…`, ozkie `…-0003-…`.
+- **Tests (ctest 10/10):**
+  - `frame`:
+    - every message length 0–1,024 at MTU 23/64/185/247/517 (4,709 round trips)
+    - all the refusal cases above
+    - 200k fuzzed frames (bounded, clean state after an error)
+    - the UUID bytes checked against the spec strings
+  - `lock` now runs its **whole suite three times**: engine direct, then every BLE-link message
+    through `oz_ble` at **MTU 23** (235 frames in, 131 out) and at **MTU 247**. Results are
+    identical (208 checks). The relay link stays unframed, as on MQTT.
+  - Mutation check: drop one byte of a reassembled message and the framed runs fail (3 + 3),
+    while the direct run doesn't.
+  - At MTU 23 the most one message can be is 608 bytes (32 × 19). Everything in the current
+    suite fits. Credential-by-value at ~480 B fits too, but only just, so apps should still
+    negotiate 247 as §2.1 says. A reply that doesn't fit is logged and dropped.
+- **AK1037 glue `port/ak1037/oz_gatt_ak1037.c`** (compile + link only):
+  - The service table follows the SDK's Nordic DFU sample: primary service + `info` (read) +
+    `ozkie` (write + notify + CCCD), 128-bit UUIDs.
+  - BLE callbacks only copy into an RT-Thread message queue (8 deep). The **OZKIE thread**
+    (12 KB stack) owns the `oz_lock` and runs everything.
+  - `info` reads are served from a snapshot the thread refreshes, so the BLE context never
+    touches the lock.
+  - Connect requests MTU 247. `eBT_MSG_LE_MTU_EXCHANGED` (MTU in `param1`, seen in the SDK
+    source) sets the fragment size.
+  - Notify retries while the stack's send ring is full.
+  - The keypad posts the pairing code with `oz_gatt_ak1037_pair_code()`.
+  - Build: `-Werror` clean, +1.4 KB text, 23.5 KB bss (12 KB stack, ~4.3 KB queue, 2 KB
+    session buffers, link state).
+  - Link with `oz_gatt_ak1037_start` rooted: text 751,604 / bss 41,092, with **no unresolved SDK
+    symbols**.
+- **Open, needs the kit or Anyka:**
+  - the notify `att_rec_idx` meaning (Anyka question 5; the code uses 4, the ozkie value record)
+  - real-phone MTU/PHY behaviour
+  - notify back-pressure
+  - **advertising per CONTRACT.md** (service UUID so the bridge can tell v2, busy flag, touch
+    window): not written yet, and the stack's default advertising is used. It's a small follow-up
+    once `T_BT_ADV_STRUCT_DATA` is understood.
+  - Nothing calls `oz_gatt_ak1037_start()` yet. That's item 4's self-test app.
+
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
 - **iOS:** minimum 15.0; xcframework with an `ios-arm64` slice and an `ios-arm64_x86_64` simulator slice.
@@ -306,3 +358,14 @@ LE Secure Connections + central role / GATT client example · English PKE/SKE re
    `TRNG_CR |= 17` (probably meant `1 << 17`). Please confirm.
 3. **SKE key registers:** after `hal_ske_final()` the key stays in the SKE key registers. Is that
    register readable over the bus or a debug port?
+4. **`ak_lfs` (found 2026-10-29, P4-prep item 2):**
+   - `user_provided_block_device_read()` reads the littlefs partition through the XIP window
+     straight after `spi_flash_write()`/`spi_flash_sector_erase()`, with `hal_dcache_flush_all()`
+     commented out. Can that return stale cached data?
+   - The wrapper also has no remove/rename/format. Is it maintained, or should customers use
+     littlefs directly, as we do (reading via `spi_flash_read()`)?
+   - Is `spi_flash_write`/`sector_erase` safe while code is executing XIP from the same chip?
+5. **GATT (found 2026-10-29, item 3):**
+   - In `com_ble_server_notify_ext(…, att_rec_idx)`, what does the index count? The Nordic DFU
+     sample passes `0` with `//IDX_DFU_CTRL_VAL` commented out.
+   - (The MTU question is answered by the SDK itself: `eBT_MSG_LE_MTU_EXCHANGED`, MTU in `param1`.)

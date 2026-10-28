@@ -4,6 +4,7 @@
 #include "oz_cbor.h"
 #include "oz_port_host.h"
 #include "oz_test.h"
+#include "oz_ble.h"
 
 /* ── the lock and its hardware hooks ────────────────────────────────────── */
 
@@ -39,6 +40,70 @@ typedef struct {
 
 static app_t owner, member, stranger, issuer, guest, service;
 static oz_link ble, relay;
+
+/* ── the GATT path (oz_ble), ozkey-48 §2.1 ─────────────────────────────────
+ * framed_mtu 0 calls the engine directly. Otherwise every message on the BLE
+ * link is fragmented at that MTU, written frame by frame into oz_ble, and the
+ * reply comes back through its tx as notifications, reassembled here. The
+ * relay link is never framed (MQTT carries whole messages). */
+static size_t framed_mtu;
+static oz_ble gatt;
+static oz_reasm got;
+static int got_done, got_bad;
+static long frames_in, frames_out;
+
+static int capture(void *ctx, const uint8_t *f, size_t n)
+{
+    int d;
+    (void)ctx;
+    frames_out++;
+    if (n > framed_mtu - 3 || oz_reasm_feed(&got, f, n, &d)) {
+        got_bad++;
+        return OZ_E_ARG;
+    }
+    got_done |= d;
+    return OZ_OK;
+}
+
+static void take(uint8_t *lt, uint8_t *out, size_t cap, size_t *ol)
+{
+    *ol = 0;
+    if (got_done && got.len <= cap) {
+        memcpy(out, got.buf, got.len);
+        *ol = got.len;
+        *lt = got.type;
+    }
+    got_done = 0;
+    oz_reasm_reset(&got);
+}
+
+static int lock_rx(oz_link *k, uint8_t type, const uint8_t *in, size_t len,
+                   uint8_t *lt, uint8_t *out, size_t cap, size_t *ol)
+{
+    if (!framed_mtu || k != &ble)
+        return oz_lock_rx(&L, k, type, in, len, lt, out, cap, ol);
+    unsigned count;
+    int rc = oz_frag_count(len, framed_mtu, &count);
+    for (unsigned i = 0; !rc && i < count; i++) {
+        uint8_t f[600];
+        size_t n;
+        rc = oz_frag(type, in, len, framed_mtu, i, f, sizeof f, &n);
+        frames_in++;
+        if (!rc)
+            rc = oz_ble_rx(&gatt, f, n);
+    }
+    take(lt, out, cap, ol);
+    return rc;
+}
+
+static int lock_pair_code(oz_link *k, uint32_t code, uint8_t *lt, uint8_t *out, size_t cap, size_t *ol)
+{
+    if (!framed_mtu || k != &ble)
+        return oz_lock_pair_code(&L, k, code, lt, out, cap, ol);
+    int rc = oz_ble_pair_code(&gatt, code);
+    take(lt, out, cap, ol);
+    return rc;
+}
 static uint8_t lock_ccs_view[OZ_CCS_LEN];
 
 static void app_new(app_t *a)
@@ -96,13 +161,13 @@ static int handshake(app_t *a, oz_link *k, const uint8_t *ead3, size_t ead3_len,
     if (why) why[0] = 0;
 
     oz_edhoc_i_msg1(&a->e, NULL, 0, m1, sizeof m1, &m1l);
-    oz_lock_rx(&L, k, OZ_FRAME_EDHOC, m1, m1l, &lt, m2, sizeof m2, &m2l);
+    lock_rx(k, OZ_FRAME_EDHOC, m1, m1l, &lt, m2, sizeof m2, &m2l);
     if (oz_edhoc_i_msg2(&a->e, m2, m2l, lo, sizeof lo, &lol)) {
         if (why) snprintf(why, 32, "msg2 refused");
         return 1;
     }
     oz_edhoc_i_msg3(&a->e, ead3, ead3_len, m3, sizeof m3, &m3l);
-    oz_lock_rx(&L, k, OZ_FRAME_EDHOC, m3, m3l, &lt, lo, sizeof lo, &lol);
+    lock_rx(k, OZ_FRAME_EDHOC, m3, m3l, &lt, lo, sizeof lo, &lol);
     if (lol) {
         /* EDHOC error: (1, "TEXT") */
         oz_cbor_r r;
@@ -149,7 +214,7 @@ static int deliver(app_t *a, oz_link *k, const uint8_t *req, size_t rl, oz_oscor
     a->code = 0;
     a->result = -1;
     a->has_echo = 0;
-    oz_lock_rx(&L, k, OZ_FRAME_OSCORE, req, rl, &lt, out, sizeof out, &ol);
+    lock_rx(k, OZ_FRAME_OSCORE, req, rl, &lt, out, sizeof out, &ol);
     if (!ol)
         return -1;
     int64_t piv;
@@ -230,11 +295,11 @@ static void first_pairing(void)
     uint8_t req[200];
     oz_oscore_xchg x;
     size_t n = make_req(&owner, OZ_COAP_POST, "pair", NULL, 0, NULL, req, sizeof req, &x);
-    oz_lock_rx(&L, &ble, OZ_FRAME_OSCORE, req, n, &lt, out, sizeof out, &ol);
+    lock_rx(&ble, OZ_FRAME_OSCORE, req, n, &lt, out, sizeof out, &ol);
     expect_int("pair request is held", (long long)ol, 0);
     uint32_t code;
     oz_edhoc_pair_code(&owner.e, &code);
-    oz_lock_pair_code(&L, &ble, (code + 1) % 1000000u, &lt, out, sizeof out, &ol);
+    lock_pair_code(&ble, (code + 1) % 1000000u, &lt, out, sizeof out, &ol);
     int64_t piv;
     expect_int("wrong code answered", ol > 0 &&
                !oz_oscore_verify_resp(&owner.osc, &x, out, ol, owner.pt, sizeof owner.pt, &owner.resp, &piv), 1);
@@ -246,9 +311,9 @@ static void first_pairing(void)
     oz_link_open(&ble, 0);
     handshake(&owner, &ble, NULL, 0, NULL);
     n = make_req(&owner, OZ_COAP_POST, "pair", NULL, 0, NULL, req, sizeof req, &x);
-    oz_lock_rx(&L, &ble, OZ_FRAME_OSCORE, req, n, &lt, out, sizeof out, &ol);
+    lock_rx(&ble, OZ_FRAME_OSCORE, req, n, &lt, out, sizeof out, &ol);
     oz_edhoc_pair_code(&owner.e, &code);
-    oz_lock_pair_code(&L, &ble, code, &lt, out, sizeof out, &ol);
+    lock_pair_code(&ble, code, &lt, out, sizeof out, &ol);
     oz_oscore_verify_resp(&owner.osc, &x, out, ol, owner.pt, sizeof owner.pt, &owner.resp, &piv);
     expect_int("right code → 2.04", owner.resp.code, OZ_COAP_CHANGED);
     expect_int("claimed", oz_lock_claimed(&L), 1);
@@ -277,7 +342,7 @@ static void pair_lockout(void)
     for (int i = 0; i < 5; i++) {
         oz_link_open(&ble, 0);
         handshake(&a, &ble, NULL, 0, NULL);
-        oz_lock_pair_code(&L, &ble, 1000000u, &lt, out, sizeof out, &ol);   /* never valid */
+        lock_pair_code(&ble, 1000000u, &lt, out, sizeof out, &ol);   /* never valid */
     }
     oz_link_open(&ble, 0);
     char why[32];
@@ -294,10 +359,10 @@ static void claim(app_t *a)
     oz_link_open(&ble, 0);
     handshake(a, &ble, NULL, 0, NULL);
     size_t n = make_req(a, OZ_COAP_POST, "pair", NULL, 0, NULL, req, sizeof req, &x);
-    oz_lock_rx(&L, &ble, OZ_FRAME_OSCORE, req, n, &lt, out, sizeof out, &ol);
+    lock_rx(&ble, OZ_FRAME_OSCORE, req, n, &lt, out, sizeof out, &ol);
     uint32_t code;
     oz_edhoc_pair_code(&a->e, &code);
-    oz_lock_pair_code(&L, &ble, code, &lt, out, sizeof out, &ol);
+    lock_pair_code(&ble, code, &lt, out, sizeof out, &ol);
     a->slot = 0;
 }
 
@@ -544,18 +609,36 @@ static void roles(void)
     expect_int("revoked member can't reconnect", handshake(&member, &ble, NULL, 0, NULL), 1);
 }
 
-int main(void)
+static void run_suite(size_t mtu)
 {
+    framed_mtu = mtu;
+    oz_ble_init(&gatt, &L, &ble, capture, NULL);
+    oz_ble_set_mtu(&gatt, mtu ? mtu : OZ_FRAME_MIN_MTU);
+    oz_reasm_reset(&got);
+    unlocks = locks = prompt_on = 0;
     oz_host_kv_reset();
     boot_lock();
     app_new(&owner); app_new(&member); app_new(&stranger);
     app_new(&issuer); app_new(&guest); app_new(&service);
 
+    int before = failures;
     first_pairing();
     members();
     credentials();
     relay_and_reboot();
     roles();
     pair_lockout();
+    if (mtu)
+        printf("lock over GATT, MTU %zu: %ld frames in, %ld out, %d new failures\n",
+               mtu, frames_in, frames_out, failures - before);
+    frames_in = frames_out = 0;
+}
+
+int main(void)
+{
+    run_suite(0);       /* the engine, called directly */
+    run_suite(23);      /* the same flows through oz_ble at the BLE default MTU */
+    run_suite(247);     /* and at the MTU apps should negotiate */
+    expect_int("GATT reply frames well-formed", got_bad, 0);
     return report("lock");
 }
