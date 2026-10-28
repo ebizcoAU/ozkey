@@ -25,6 +25,18 @@ target_compile_options(ozcore PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconver
 add_library(monocypher STATIC third_party/monocypher/monocypher.c)
 target_include_directories(monocypher PUBLIC third_party/monocypher)
 
+# littlefs 2.4.1 (BSD-3), upstream: the version the AK1037 SDK ships (cosmetic edits only).
+# Host-only here; the AK1037 build uses the SDK's copy.
+add_library(littlefs STATIC third_party/littlefs/lfs.c third_party/littlefs/lfs_util.c)
+target_include_directories(littlefs SYSTEM PUBLIC third_party/littlefs)
+target_compile_definitions(littlefs PUBLIC LFS_NO_DEBUG LFS_NO_WARN)
+
+# kv on littlefs (ozkey-49 P4), shared by the AK1037 port and the host test.
+add_library(ozkv_lfs STATIC port/common/oz_kv_lfs.c)
+target_include_directories(ozkv_lfs PUBLIC port/common)
+target_link_libraries(ozkv_lfs PUBLIC ozcore littlefs)
+target_compile_options(ozkv_lfs PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror)
+
 add_library(ozport_host STATIC port/host/oz_port_host.c)
 target_include_directories(ozport_host PUBLIC port/host)
 target_compile_definitions(ozport_host PRIVATE _DEFAULT_SOURCE)
@@ -56,6 +68,10 @@ add_test(NAME invite COMMAND test_invite)
 add_executable(test_lock tests/test_lock.c)
 target_link_libraries(test_lock ozport_host)
 add_test(NAME lock COMMAND test_lock)
+
+add_executable(test_kv_lfs tests/test_kv_lfs.c)
+target_link_libraries(test_kv_lfs ozkv_lfs ozport_host)
+add_test(NAME kv_lfs COMMAND test_kv_lfs)
 
 add_executable(ccm_vec tests/ccm_vec.c)
 target_link_libraries(ccm_vec ozport_host)

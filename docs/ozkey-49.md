@@ -185,6 +185,72 @@ invites and the lock engine.
     frames. Moving their buffers into `oz_lock` would cut the worst case by about 3 KB.
 - **Not run:** there's still no board.
 
+### P4-prep item 2 (2026-10-29): kv on littlefs, power-cut tested on the host
+
+- **Code:**
+  - `port/common/oz_kv_lfs.c` holds the kv logic. Each key is one file, `oz.<key>`.
+  - A set writes `oz.<key>.t` and then `lfs_rename`s it over the old file. littlefs commits a
+    rename atomically, which satisfies the `oz_port.h` rule (old value or new, never a mix).
+    Leftover `.t` files are swept at attach.
+  - The same file is built by the host CMake (against upstream littlefs) and by the AK1037
+    Makefile (against the SDK's `lfs.h`).
+- **Why not the SDK's `ak_lfs` wrapper:**
+  - It has no remove or rename.
+  - It never formats; it expects a pre-built `lfs.bin` to be burned.
+  - 🔴 It reads through the XIP window straight after programming, with
+    `hal_dcache_flush_all()` commented out, so a read-back can return stale cached data.
+  - Our block device (`port/ak1037/oz_port_ak1037.c`) reads with `spi_flash_read()` instead.
+    It mounts its own **`OZKV`** partition and formats it on first boot. A mount that can't be
+    repaired also ends in a format, which leaves the lock unpaired, the same as a factory reset.
+- **The SDK's littlefs is upstream v2.4.1**, checked by diff:
+  - Changes are cosmetic only: CRLF, blank lines, `\r\n` in trace output.
+  - `lfs_util.h` adds `LFS_THREADSAFE` under RTOS, `LFS_NO_ASSERT`, and its own allocator.
+  - The host test vendors upstream v2.4.1 (`third_party/littlefs`, BSD-3), so it tests the same
+    filesystem code.
+- **Host test `kv_lfs`** (ctest 9/9 now):
+  - Geometry matches AK1037: RAM NOR, 256 B pages, 4 KiB sectors, 64 KiB.
+  - Program only clears bits. A power cut tears the operation in flight (half a page, or half a
+    sector erased), then everything fails until a "reboot" remounts the image.
+  - The sweep cuts every flash operation of a replace, a create and an erase. Results: always
+    old-or-new, an OK return always means committed, no temp files left, always mountable, other
+    keys untouched.
+  - A 3,000-operation soak with 192 random cuts stays consistent.
+  - The full working set (16 bonds, 16 relay contexts, creds, keys) fits in 64 KiB and survives
+    3,200 rewrites.
+  - littlefs never asked the flash for a 0→1 program.
+  - **Mutation check:** writing the final file directly, without temp+rename, fails the test.
+    A cut while creating a key leaves an empty file (8 cut points), and the soak goes
+    inconsistent. Replacing an existing key is atomic even without the rename, because littlefs
+    file writes are copy-on-write; the rename is what protects *new* keys.
+- **AK1037 build:** `-Werror` clean.
+  - Link: text 749,100 (**+3,968** over P3b, kv plus the SDK's `lfs.c`, which `app_mcu`
+    previously garbage-collected); bss +252.
+- **Stack with littlefs on the path** (SDK `lfs.c` built with `-fcallgraph-info`):
+  - Single-pass worst case is `oz_lock_rx` at **6,128 B** (dev/reset → init → kv_set → rename →
+    dir_commit). Each kv call costs about 1.5–1.6 KB.
+  - littlefs 2.4.1 also recurses (`dir_commit`↔`dir_compact`/`dir_drop`, `dir_traverse`).
+    Upstream removed recursion in 2.5, but the SDK ships 2.4.1.
+  - **Raise the OZKIE thread to 12 KB until it's measured on silicon.** SRAM is not the limit
+    (≈19 KB of 218 KiB in total).
+- **Needs the burn config (item 5):** an `OZKV` partition, sector-aligned, ≥ 16 KiB; 64 KiB
+  recommended.
+- **Default 2 MiB layout** (`tools/burntool/config_app_mcu.txt`, KB):
+
+  | OTA | PROG | LP | ROMFS | UDATA | FPDAT | total |
+  |---|---|---|---|---|---|---|
+  | 212 | 780 | 44 | 210 | 100 | 628 | 1,974 / 2,048 |
+
+  - Our realistic image (751,124 B `.bin` = text + data, 733.5 KiB) fits PROG (780 KiB) with
+    ~46 KiB spare. Stripping the SDK samples we never call will free more.
+  - There's no second app bank: OTA goes through the separate 212 KB `app_ota` updater.
+  - `UDATA` is the SDK's own littlefs, which we don't use, so 64 KiB of it can become `OZKV`.
+  - Layout options go to the PM if Anyka confirms 2 MiB.
+- **Not run on silicon:**
+  - the real flash
+  - erase/program while executing XIP from the same chip
+  - read alignment
+  - power-cut behaviour of the real NOR part (P25Q16SH in the config's flash list)
+
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
 - **iOS:** minimum 15.0; xcframework with an `ios-arm64` slice and an `ios-arm64_x86_64` simulator slice.

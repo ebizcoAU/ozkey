@@ -9,7 +9,8 @@
  *   X25519   software (Monocypher); no curve API in the SDK.
  *   Random   TRNG, read one word per DRDY and conditioned through SHA-256
  *            (the SDK's burst read takes several words per ready flag).
- *   kv       NOT IMPLEMENTED: needs the flash partition plan (P4).
+ *   kv       littlefs on the OZKV partition via port/common/oz_kv_lfs.c
+ *            (P4 code; power-cut tested on the host, not yet on silicon).
  *
  * Every SKE use runs with interrupts off: the driver keeps its state in
  * file-scope statics and is not re-entrant.
@@ -27,6 +28,10 @@
 #include "hal_ske.h"
 #include "hal_trng.h"
 #include "hal_sys.h"
+#include "hal_sfc_norflash.h"
+#include "hal_partition.h"
+#include "lfs.h"
+#include "oz_kv_lfs.h"
 
 /* ── SHA-256 ─────────────────────────────────────────────────────────────── */
 
@@ -156,24 +161,129 @@ done:
     return rc;
 }
 
-/* ── kv (P4) ─────────────────────────────────────────────────────────────── */
+/* ── kv (P4): littlefs on our own "OZKV" partition ───────────────────────────
+ *
+ * The SDK's ak_lfs wrapper isn't used. It has no remove/rename, it never
+ * formats, and it reads through the XIP window straight after programming
+ * with the cache flush commented out, so a read-back can see stale data. This
+ * block device reads with spi_flash_read() instead. The kv logic itself is
+ * port/common/oz_kv_lfs.c, the same code the host power-cut test runs.
+ *
+ * UNVERIFIED until the dev kit (P4): the partition has to exist in the burn
+ * config, spi_flash_write/erase must be safe while code runs XIP from the
+ * same chip (the SDK's own lfs relies on it), and the read buffers have no
+ * known alignment rule. */
+
+#define OZ_KV_PARTITION "OZKV"
+
+static lfs_t kv_fs;
+static struct lfs_config kv_cfg;
+static uint32_t kv_start_page;
+static int kv_state;                    /* 0 not tried, 1 mounted, <0 failed */
+#ifdef LFS_THREADSAFE
+static struct rt_mutex kv_mutex;
+#endif
+
+static int bd_read(const struct lfs_config *c, lfs_block_t b, lfs_off_t off, void *buf, lfs_size_t n)
+{
+    uint32_t page = kv_start_page + b * SPIFLASH_PAGE_PER_SECTOR + off / SPIFLASH_PAGE_SIZE;
+    (void)c;
+    return spi_flash_read(page, (T_U8 *)buf, n / SPIFLASH_PAGE_SIZE) == AK_TRUE ? 0 : LFS_ERR_IO;
+}
+
+static int bd_prog(const struct lfs_config *c, lfs_block_t b, lfs_off_t off, const void *buf, lfs_size_t n)
+{
+    uint32_t page = kv_start_page + b * SPIFLASH_PAGE_PER_SECTOR + off / SPIFLASH_PAGE_SIZE;
+    (void)c;
+    return spi_flash_write(page, (T_U8 *)buf, n / SPIFLASH_PAGE_SIZE) == AK_TRUE ? 0 : LFS_ERR_IO;
+}
+
+static int bd_erase(const struct lfs_config *c, lfs_block_t b)
+{
+    (void)c;
+    return spi_flash_sector_erase(kv_start_page / SPIFLASH_PAGE_PER_SECTOR + b) == AK_TRUE ? 0 : LFS_ERR_IO;
+}
+
+static int bd_sync(const struct lfs_config *c) { (void)c; return 0; }
+
+#ifdef LFS_THREADSAFE
+static int bd_lock(const struct lfs_config *c) { (void)c; return rt_mutex_take(&kv_mutex, RT_WAITING_FOREVER) == RT_EOK ? 0 : LFS_ERR_IO; }
+static int bd_unlock(const struct lfs_config *c) { (void)c; rt_mutex_release(&kv_mutex); return 0; }
+#endif
+
+static int kv_ready(void)
+{
+    if (kv_state)
+        return kv_state > 0 ? OZ_OK : OZ_E_HW;
+    kv_state = -1;
+
+    T_SPI_FILE_INFO info;
+    memset(&info, 0, sizeof info);
+    memcpy(info.file_name, OZ_KV_PARTITION, sizeof OZ_KV_PARTITION);
+    if (partition_get_bin_info(&info) != AK_TRUE) {
+        oz_port_log("kv: no %s partition", OZ_KV_PARTITION);
+        return OZ_E_HW;
+    }
+    if (info.file_start_page % SPIFLASH_PAGE_PER_SECTOR ||
+        info.file_partition_size < 4 * SPIFLASH_SECTOR_SIZE ||
+        info.file_partition_size % SPIFLASH_SECTOR_SIZE) {
+        oz_port_log("kv: %s partition not sector-aligned", OZ_KV_PARTITION);
+        return OZ_E_HW;
+    }
+    kv_start_page = info.file_start_page;
+
+    memset(&kv_cfg, 0, sizeof kv_cfg);
+    kv_cfg.read = bd_read;
+    kv_cfg.prog = bd_prog;
+    kv_cfg.erase = bd_erase;
+    kv_cfg.sync = bd_sync;
+#ifdef LFS_THREADSAFE
+    rt_mutex_init(&kv_mutex, "ozkv", RT_IPC_FLAG_FIFO);
+    kv_cfg.lock = bd_lock;
+    kv_cfg.unlock = bd_unlock;
+#endif
+    kv_cfg.read_size = SPIFLASH_PAGE_SIZE;
+    kv_cfg.prog_size = SPIFLASH_PAGE_SIZE;
+    kv_cfg.block_size = SPIFLASH_SECTOR_SIZE;
+    kv_cfg.block_count = info.file_partition_size / SPIFLASH_SECTOR_SIZE;
+    kv_cfg.cache_size = SPIFLASH_PAGE_SIZE;
+    kv_cfg.lookahead_size = 16;
+    kv_cfg.block_cycles = 500;
+
+    if (lfs_mount(&kv_fs, &kv_cfg) != 0) {
+        /* First boot (blank partition), or a superblock beyond repair. Either
+         * way the lock starts unpaired, the same as a factory reset. */
+        oz_port_log("kv: formatting %s (%u KiB)", OZ_KV_PARTITION,
+                    (unsigned)(info.file_partition_size / 1024));
+        if (lfs_format(&kv_fs, &kv_cfg) != 0 || lfs_mount(&kv_fs, &kv_cfg) != 0) {
+            oz_port_log("kv: format failed");
+            return OZ_E_HW;
+        }
+    }
+    if (oz_kv_lfs_attach(&kv_fs) != OZ_OK) {
+        oz_port_log("kv: attach failed");
+        return OZ_E_HW;
+    }
+    kv_state = 1;
+    return OZ_OK;
+}
 
 int oz_port_kv_get(const char *key, uint8_t *buf, size_t cap, size_t *len)
 {
-    (void)key; (void)buf; (void)cap; (void)len;
-    return OZ_E_HW;
+    int rc = kv_ready();
+    return rc ? rc : oz_kv_lfs_get(key, buf, cap, len);
 }
 
 int oz_port_kv_set(const char *key, const uint8_t *buf, size_t len)
 {
-    (void)key; (void)buf; (void)len;
-    return OZ_E_HW;
+    int rc = kv_ready();
+    return rc ? rc : oz_kv_lfs_set(key, buf, len);
 }
 
 int oz_port_kv_erase(const char *key)
 {
-    (void)key;
-    return OZ_E_HW;
+    int rc = kv_ready();
+    return rc ? rc : oz_kv_lfs_erase(key);
 }
 
 /* ── Time ────────────────────────────────────────────────────────────────── */

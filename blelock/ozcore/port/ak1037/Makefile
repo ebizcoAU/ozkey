@@ -16,13 +16,13 @@ BASE   = $(ARCH) -std=gnu11 -Os -g -fno-builtin -fdata-sections -ffunction-secti
 STRICT = -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror
 # EXTRA: e.g. EXTRA="-fstack-usage -fcallgraph-info=su" for the stack report.
 EXTRA  ?=
-INC    = -Iinclude -Ithird_party/monocypher
+INC    = -Iinclude -Ithird_party/monocypher -Iport/common
 
 include port/ak1037/sdk_inc.mk
 
 CORE   = src/sha256_sw.c src/aes128_sw.c src/oz_crypto.c \
          src/oz_cbor.c src/oz_edhoc.c src/oz_coap.c src/oz_oscore.c src/oz_invite.c src/oz_lock.c
-OBJS   = $(CORE:src/%.c=$(OUT)/%.o) $(OUT)/monocypher.o $(OUT)/oz_port_ak1037.o
+OBJS   = $(CORE:src/%.c=$(OUT)/%.o) $(OUT)/monocypher.o $(OUT)/oz_kv_lfs.o $(OUT)/oz_port_ak1037.o
 
 $(OUT)/libozcore.a: $(OBJS)
 	$(AR) rcs $@ $^
@@ -35,6 +35,11 @@ $(OUT)/%.o: src/%.c | $(OUT)
 # Third-party: as shipped.
 $(OUT)/monocypher.o: third_party/monocypher/monocypher.c | $(OUT)
 	$(CC) $(BASE) -Wall -Werror $(INC) -c $< -o $@
+
+# kv on littlefs: our code, but it includes the SDK's lfs.h, which doesn't survive
+# -Wconversion. lfs.c itself is linked from the SDK's app_mcu build, not built here.
+$(OUT)/oz_kv_lfs.o: port/common/oz_kv_lfs.c | $(OUT)
+	$(CC) $(BASE) -Wall -Wextra -Werror $(INC) $(SDKINC) -c $< -o $@
 
 # Port: vendor headers don't survive -Wpedantic/-Wconversion.
 $(OUT)/oz_port_ak1037.o: port/ak1037/oz_port_ak1037.c | $(OUT)

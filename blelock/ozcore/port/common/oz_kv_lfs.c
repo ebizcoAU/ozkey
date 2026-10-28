@@ -1,0 +1,174 @@
+/* oz_kv_lfs — see oz_kv_lfs.h. */
+#include <string.h>
+
+#include "oz_kv_lfs.h"
+#include "oz_port.h"
+#include "oz_crypto.h"
+
+static lfs_t *fs;
+
+/* "oz." + key + ".t" + NUL */
+#define PATH_MAX_LEN (3 + OZ_KV_LFS_KEY_MAX + 2 + 1)
+
+static int map_err(int e)
+{
+    switch (e) {
+    case LFS_ERR_NOENT: return OZ_E_NOT_FOUND;
+    case LFS_ERR_NOSPC: return OZ_E_NO_SPACE;
+    case LFS_ERR_INVAL:
+    case LFS_ERR_NAMETOOLONG: return OZ_E_ARG;
+    default: return OZ_E_HW;
+    }
+}
+
+static int path_of(char *out, const char *key, int temp)
+{
+    size_t n = 0;
+    if (!key)
+        return OZ_E_ARG;
+    while (key[n]) {
+        char c = key[n];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return OZ_E_ARG;
+        if (++n > OZ_KV_LFS_KEY_MAX)
+            return OZ_E_ARG;
+    }
+    if (n == 0)
+        return OZ_E_ARG;
+    memcpy(out, "oz.", 3);
+    memcpy(out + 3, key, n);
+    if (temp) {
+        memcpy(out + 3 + n, ".t", 3);
+    } else {
+        out[3 + n] = '\0';
+    }
+    return OZ_OK;
+}
+
+static int is_temp(const char *name)
+{
+    size_t n = strlen(name);
+    return n > 5 && !memcmp(name, "oz.", 3) && !strcmp(name + n - 2, ".t");
+}
+
+int oz_kv_lfs_attach(lfs_t *lfs)
+{
+    if (!lfs || lfs->cfg->cache_size > OZ_KV_LFS_CACHE_MAX)
+        return OZ_E_ARG;
+    fs = lfs;
+
+    /* A set that lost power before its rename leaves "oz.<key>.t" behind:
+     * the old value is still intact, so the temp file is just garbage. */
+    lfs_dir_t dir;
+    struct lfs_info info;
+    char doomed[PATH_MAX_LEN];
+    for (;;) {
+        int found = 0;
+        if (lfs_dir_open(fs, &dir, "/") < 0)
+            return OZ_E_HW;
+        while (lfs_dir_read(fs, &dir, &info) > 0) {
+            if (info.type == LFS_TYPE_REG && is_temp(info.name) &&
+                strlen(info.name) < sizeof doomed) {
+                strcpy(doomed, info.name);
+                found = 1;
+                break;
+            }
+        }
+        lfs_dir_close(fs, &dir);
+        if (!found)
+            return OZ_OK;
+        /* Removed outside the walk: littlefs doesn't promise a stable
+         * iteration while the directory changes. */
+        int e = lfs_remove(fs, doomed);
+        if (e < 0)
+            return map_err(e);
+    }
+}
+
+static int open_file(lfs_file_t *f, uint8_t *cache, const char *path, int flags)
+{
+    struct lfs_file_config fc;
+    memset(&fc, 0, sizeof fc);
+    fc.buffer = cache;
+    return lfs_file_opencfg(fs, f, path, flags, &fc);
+}
+
+int oz_kv_lfs_get(const char *key, uint8_t *buf, size_t cap, size_t *len)
+{
+    char path[PATH_MAX_LEN];
+    uint8_t cache[OZ_KV_LFS_CACHE_MAX];
+    lfs_file_t f;
+    int rc = path_of(path, key, 0);
+    if (rc)
+        return rc;
+    if (!fs)
+        return OZ_E_HW;
+    int e = open_file(&f, cache, path, LFS_O_RDONLY);
+    if (e < 0)
+        return map_err(e);
+    lfs_soff_t size = lfs_file_size(fs, &f);
+    if (size < 0) {
+        rc = map_err((int)size);
+    } else if ((size_t)size > cap) {
+        rc = OZ_E_NO_SPACE;
+    } else {
+        lfs_ssize_t got = lfs_file_read(fs, &f, buf, (lfs_size_t)size);
+        if (got < 0)
+            rc = map_err((int)got);
+        else if (got != size)
+            rc = OZ_E_HW;
+        else
+            *len = (size_t)size;
+    }
+    lfs_file_close(fs, &f);
+    oz_wipe(cache, sizeof cache);
+    return rc;
+}
+
+int oz_kv_lfs_set(const char *key, const uint8_t *buf, size_t len)
+{
+    char path[PATH_MAX_LEN], temp[PATH_MAX_LEN];
+    uint8_t cache[OZ_KV_LFS_CACHE_MAX];
+    lfs_file_t f;
+    int rc = path_of(path, key, 0);
+    if (!rc)
+        rc = path_of(temp, key, 1);
+    if (rc)
+        return rc;
+    if (!fs)
+        return OZ_E_HW;
+    if (len > 0x7fffffff)
+        return OZ_E_ARG;
+
+    int e = open_file(&f, cache, temp, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (e < 0) {
+        oz_wipe(cache, sizeof cache);
+        return map_err(e);
+    }
+    lfs_ssize_t put = len ? lfs_file_write(fs, &f, buf, (lfs_size_t)len) : 0;
+    e = lfs_file_close(fs, &f);           /* close commits the temp file */
+    oz_wipe(cache, sizeof cache);
+    if (put < 0 || e < 0 || (size_t)put != len) {
+        (void)lfs_remove(fs, temp);
+        return map_err(put < 0 ? (int)put : e < 0 ? e : LFS_ERR_IO);
+    }
+    e = lfs_rename(fs, temp, path);       /* the atomic switch-over */
+    if (e < 0) {
+        (void)lfs_remove(fs, temp);
+        return map_err(e);
+    }
+    return OZ_OK;
+}
+
+int oz_kv_lfs_erase(const char *key)
+{
+    char path[PATH_MAX_LEN];
+    int rc = path_of(path, key, 0);
+    if (rc)
+        return rc;
+    if (!fs)
+        return OZ_E_HW;
+    int e = lfs_remove(fs, path);
+    return e < 0 ? map_err(e) : OZ_OK;
+}
