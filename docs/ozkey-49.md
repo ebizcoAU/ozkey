@@ -82,8 +82,8 @@ roadmap), and the bridge's OZKIE end. A new chip only needs a new `port/` direct
 
 | Need | AK1037 hardware | Plan |
 |---|---|---|
-| SHA-256 / HKDF | ✅ `hal_hash` SHA-256/384/512 | HW hash; HKDF in core |
-| RNG | ✅ `hal_trng` | HW |
+| SHA-256 / HKDF | 🟡 `hal_hash` lists SHA-256/384/512, **but the shipped `hal_hash.h` enables only SM3** (`SUPPORT_HASH_SHA256` is not defined) | **Software for now** (correction 2026-10-18, P3). Bench-test the engine's SHA-256 at P4, then switch. HKDF in core |
+| RNG | ✅ `hal_trng` (true-random mode, health test) | HW, one word per ready flag, conditioned through SHA-256, with a stuck-output check. The SDK's own burst read takes several words per ready flag (see §7, next email) |
 | X25519 | 🟡 PKE microcode exists (`C25519_PMUL`), **no HAL API** | Asked Anyka 2026-10-18. Until then software (Monocypher 4.0.2, vendored) |
 | Ed25519 | 🟡 microcode, no API | **Not needed**: ozkey-48 uses EDHOC method 3 (static DH), with no signatures |
 | AEAD | 🟡 AES-128 + SM4, ECB/CBC/CFB/OFB/CTR; **no AES-256, no GCM/CCM** | v2 suite = **AES-128-CCM** (EDHOC suite 0): HW AES block + CCM mode in core. Asked Anyka whether HW GCM/CCM exists |
@@ -95,13 +95,47 @@ roadmap), and the bridge's OZKIE end. A new chip only needs a new `port/` direct
 |---|---|---|---|
 | P0 | `ozcore` skeleton + `port/host`, CMake, unit tests; Monocypher vendored | No | `ctest` green on macOS. 🟢 **DONE 2026-10-18**: `blelock/ozcore/`, 35 RFC/FIPS known-answer checks + 20k-case AES-CCM differential vs OpenSSL, all pass |
 | P1 | Move bond / member / expiry / cred-store (ozkey-47) logic into `ozcore`, behaviour-matched to `ozdoorlock_core.h` | No | The same test vectors pass that `ozdoorlock_core` passes today |
-| P2 | OZKIE v2 in `ozcore` (ozkey-48 approved 2026-10-18): EDHOC + OSCORE + CBOR, keypad pairing code. Deliverables for ftpos (XF-387 §5): host test lock over a socket, byte-exact vectors, and, if FFI is chosen, a reproducible iOS xcframework + Android per-ABI `.so` | No | Interop test: host lock ⇄ host "app" (Python); mobile libraries build bit-identical twice |
-| P3 | Toolchain: build `ozcore` with the Anyka RISC-V GCC. **The tools are Windows-only.** The operator has a Windows machine firmware can use (2026-10-18; access method TBD). Linux/macOS tools are also asked of Anyka | No (compile only) | `.bin` links; size report against 2/4 MiB flash, 218 KiB SRAM |
+| P2 | OZKIE v2 in `ozcore` (ozkey-48 approved 2026-10-18): EDHOC + OSCORE + CBOR, keypad pairing code. Deliverables for ftpos (XF-387 §5): host test lock over a socket, byte-exact vectors, and, if FFI is chosen, a reproducible iOS xcframework + Android per-ABI `.so` | No | Interop test: host lock ⇄ host "app" (Python); mobile libraries build bit-identical twice 🟡 **MOSTLY DONE 2026-10-19:** CBOR, EDHOC (method 3), CoAP, OSCORE, invites and the lock engine (`oz_lock`: pairing code, roles, invites v1/v2/v3, creds with epoch, Echo on relay, persisted relay contexts across reboot) are in `ozcore`.
+- **RFC vectors:** RFC 9529 §3 and RFC 8613 App. C 1–8 pass byte for byte, as do ftpos's frozen invite MACs.
+- **Host test lock** `ozhostlock` (TCP 7001 BLE / 7002 relay) and the **independent Python app** `tools/ozapp.py` (written from the RFCs) pass a 20-step interop scenario.
+- **8/8 ctest suites** pass, and the key rules were mutation-checked.
+- **Still to do:** `events` Observe, `lock/settings`, custodial mode (ozkey-51), mobile FFI libraries, AK1037 rebuild with the new sources |
+| P3 | Toolchain: build `ozcore` with the Anyka RISC-V GCC. **The tools are Windows-only.** The operator has a Windows machine firmware can use (2026-10-18; access method TBD). Linux/macOS tools are also asked of Anyka | No (compile only) | `.bin` links; size report against 2/4 MiB flash, 218 KiB SRAM. 🟢 **DONE 2026-10-18** (details below) |
 | P4 | `port/ak1037` on the dev board: GATT service, littlefs KV, HW crypto, TRNG, RTC | **Yes** (dev board) | ozkit suite: pair, unlock, member add/revoke over BLE |
 | P5 | Peripherals: touch keypad PIN, RFID 13.56 MHz, fingerprint enrol/match, motor H-bridge | **Yes** (+ peripherals) | ozkit suite on real parts |
 | P6 | Power: sleep / advertising / connection current against the datasheet (4 / 31 / 40 µA); secure boot; OTA via the bridge | **Yes** | Measured µA table; signed-OTA round trip |
 
 P0–P3 can start now. P4 onwards waits for the AK1037 kits.
+
+### P3 result (2026-10-18, Windows build host, SysGCC RISC-V GCC 10.1.0)
+
+- **`port/ak1037/oz_port_ak1037.c`** (new):
+  - AES-128 on the SKE engine, ECB, with a FIPS-197 self-test on first use that falls back to
+    software. Interrupts are off around each use, since the driver isn't re-entrant. The key
+    registers are overwritten afterwards, because `hal_ske_final()` leaves the key in them.
+  - TRNG as above; software SHA-256; Monocypher X25519.
+  - `get_ms_tick_func()` extended from 32 to 64 bits.
+  - kv returns `OZ_E_HW` until P4. Plan: the SDK's **littlefs** (power-loss safe, so the atomic-set
+    rule holds).
+- **Build:** `make -f port/ak1037/Makefile`. The core gets the same `-Wpedantic -Wconversion -Werror`
+  as the host build.
+  - GCC 10 found two real 32-bit issues the Mac's clang didn't: MixColumns integer promotion, and
+    a CCM AAD-length test that's always true when `size_t` is 32-bit. Both are fixed.
+  - Host tests still pass after the fixes.
+- **Link:** the SDK `app_mcu` objects plus `libozcore.a`, with the v2 primitives forced in as GC roots.
+  This is a separate `app_mcu_oz.elf`, so the SDK image is untouched.
+
+  | | text | data | bss |
+  |---|---|---|---|
+  | SDK `app_mcu` | 708,496 | 2,024 | 16,132 |
+  | + ozcore | 721,428 | 2,024 | 16,156 |
+  | **Δ** | **+12,932** | 0 | **+24** |
+
+  That is ~0.7 MB of 2 MiB flash. EDHOC/OSCORE/CBOR (P2) will add to it, estimated 15–25 KB more.
+- **No symbol collisions** with the SDK libraries.
+- **Stack:** the deepest frame is ~1 KB (HKDF → HMAC → SHA-256). Give the OZKIE thread **≥ 4 KB** once
+  EDHOC is in.
+- **Not run:** no board yet. The self-tests and KATs run on the device at P4.
 
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
@@ -148,3 +182,13 @@ LE Secure Connections + central role / GATT client example · English PKE/SKE re
   whether secure-boot signing and eFuse programming can run from the CLI (signing keys stay offline) ·
   Windows 11 support · license terms for the SDK, the BLE host source and the closed `libbt.a`, and
   whether we may modify the host stack · how SDK updates and errata are announced · dev-kit ETA.
+
+**For the next email (found in P3, 2026-10-18), alongside ozkey-52 §6:**
+1. **SHA-256 in the hash engine:** `hal_hash.h` defines only `SUPPORT_HASH_SM3`. Is SHA-256 supported
+   in hardware on AK1037, and is it safe to define `SUPPORT_HASH_SHA256`?
+2. **TRNG FIFO:** `hal_trng_get_randbuff_bytes()` reads several words from `TRNG_DR` after a single
+   `DRDY`. What is the FIFO depth? Is each read of `TRNG_DR` fresh entropy? Also,
+   `hal_trng_get_rand()` returns 0 on timeout with no error, and `hal_trng_init()` writes
+   `TRNG_CR |= 17` (probably meant `1 << 17`). Please confirm.
+3. **SKE key registers:** after `hal_ske_final()` the key stays in the SKE key registers. Is that
+   register readable over the bus or a debug port?
