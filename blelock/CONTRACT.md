@@ -103,6 +103,19 @@ advertises `OZLOCK` + the service UUID for **~60 s after any keypad/screen
 touch**, never while idle (power + no trackable beacon; ozkey-08 §0.4).
 Production adds BLE RPA rotation; bench keeps the plain name.
 
+> **Amended 2026-10-29 (PM nexus-a8 ruling, AK1037-ADV):** the default is now
+> **always-advertise**. A lock reached through a bridge must be reachable at any
+> moment for remote unlock; a touch-window-only lock is not (the CH584M
+> bridge-reachable ruling, `ozdoorlock_core.h` `bleAdvertisingAllowed()`). The
+> touch window above stays as the **compile-time alternative**
+> (`OZ_GATT_ADV_ALWAYS=0` in `ozcore/port/ak1037/oz_gatt_ak1037.h`: 60 s re-armed
+> by every touch, plus a 120 s post-boot grace while unclaimed; rules in
+> `ozcore/include/oz_adv.h`). The busy flag and the SCAN_IND switch below apply
+> in both modes. Open until the AK1037 dev kit (~2026-11-12): (1) whether
+> `ADV_SCAN_IND` works while a link is up in the single-link SDK build
+> (`SUPPORT_MULTI_BLE` off); (2) measured current draw of always-advertise, for
+> the battery estimate.
+
 **`info` gains `"pub"`:** the lock's X25519 ceremony public key (lowercase
 hex, 64 chars). Needed by the member ceremony (and the future v2 sealed
 commissioning) to derive the pairing secret. Lock keypair minted at first
@@ -502,7 +515,7 @@ Survives future RPA rotation, since service data is address-independent.
 |---|---|
 | advertising, `busy = 0` | available |
 | advertising, `busy = 1` | in use by another phone |
-| not advertising | out of range, or outside the touch window |
+| not advertising | out of range, or (touch-window builds only) outside the touch window |
 
 ### [XF-47] `expires` is parse-and-ignore in v1
 

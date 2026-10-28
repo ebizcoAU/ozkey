@@ -298,9 +298,12 @@ invites and the lock engine.
   - the notify `att_rec_idx` meaning (Anyka question 5; the code uses 4, the ozkie value record)
   - real-phone MTU/PHY behaviour
   - notify back-pressure
-  - **advertising per CONTRACT.md** (service UUID so the bridge can tell v2, busy flag, touch
-    window): not written yet, and the stack's default advertising is used. It's a small follow-up
-    once `T_BT_ADV_STRUCT_DATA` is understood.
+  - ~~advertising per CONTRACT.md: not written yet~~ Done in item 4a (ef2844d, `oz_adv`).
+    Default `OZ_GATT_ADV_ALWAYS=1` confirmed by PM nexus-a8 2026-10-29 (AK1037-ADV); CONTRACT.md
+    amended to match, touch window is the compile-time alternative. Still open for the kit:
+    - whether `ADV_SCAN_IND` works while a link is up in the single-link build
+      (`SUPPORT_MULTI_BLE` off; v1 had two links, bridge + app)
+    - measured current draw of always-advertise (feeds P6 and the battery estimate)
   - Nothing calls `oz_gatt_ak1037_start()` yet. That's item 4's self-test app.
 
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
