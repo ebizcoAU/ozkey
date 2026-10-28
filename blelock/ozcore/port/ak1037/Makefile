@@ -1,9 +1,9 @@
 # ozcore for AK1037 (ozkey-49 P3). Runs on the Windows build host:
-#   make -f port/ak1037/Makefile SDK=C:/ak1037/AnyMicro1037_SDK_V1.02
+#   make -f port/ak1037/Makefile
 # from the ozcore directory. Produces build-ak1037/libozcore.a.
 
-SDK    ?= C:/ak1037/AnyMicro1037_SDK_V1.02
-PREFIX ?= C:/SysGCC/risc-v/bin/riscv64-unknown-elf-
+SDK    ?= C:/Users/sshuser/ak1037/AnyMicro1037_SDK_V1.02
+PREFIX ?= C:/Users/sshuser/ak1037/SysGCC/risc-v/bin/riscv64-unknown-elf-
 CC      = $(PREFIX)gcc
 AR      = $(PREFIX)ar
 SIZE    = $(PREFIX)size
@@ -12,8 +12,10 @@ OUT     = build-ak1037
 # The SDK's own target flags (from app_mcu's eide config), C11 for _Alignas.
 ARCH   = -march=rv32imac -mabi=ilp32 -mcmodel=medlow
 BASE   = $(ARCH) -std=gnu11 -Os -g -fno-builtin -fdata-sections -ffunction-sections \
-         -DSUPP_MSH=1 -DSUPP_RTOS=1 -DSUPPORT_BLE_MCU_PRJ=1
+         -DSUPP_MSH=1 -DSUPP_RTOS=1 -DSUPPORT_BLE_MCU_PRJ=1 $(EXTRA)
 STRICT = -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror
+# EXTRA: e.g. EXTRA="-fstack-usage -fcallgraph-info=su" for the stack report.
+EXTRA  ?=
 INC    = -Iinclude -Ithird_party/monocypher
 
 include port/ak1037/sdk_inc.mk

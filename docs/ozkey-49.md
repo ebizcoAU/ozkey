@@ -137,6 +137,54 @@ P0–P3 can start now. P4 onwards waits for the AK1037 kits.
   EDHOC is in.
 - **Not run:** no board yet. The self-tests and KATs run on the device at P4.
 
+### P3b result (2026-10-29, VictorPC, SysGCC RISC-V GCC 10.1.0): the full P2 stack
+
+The 10-18 build was crypto only. This one is everything P2 added: CBOR, EDHOC, CoAP, OSCORE,
+invites and the lock engine.
+
+- **Build host:** VictorPC (Windows 11). It's the permanent station, so Mac2 Boot Camp is no
+  longer needed. All 11 objects build at the same `-Werror` level as before, with no new warnings.
+- **Reproducible:** the SDK stamps `__DATE__`/`__TIME__` into three files. With
+  `SOURCE_DATE_EPOCH` pinned, two clean `app_mcu` builds give a byte-identical `.bin`.
+- **Library** (`libozcore.a`): text 81,931, bss 1,252. Monocypher is 48.6 KB of that before
+  dead-code removal (`--gc-sections`).
+- **Link** (`port/ak1037/link_app_mcu.ps1`): builds `app_mcu_oz.elf`. The SDK's own image is
+  untouched.
+
+  | | text | data | bss |
+  |---|---|---|---|
+  | SDK `app_mcu` | 708,496 | 2,024 | 16,132 |
+  | + ozcore, realistic (`-RootPattern '^oz_lock_'`: the API the app calls) | 745,132 | 2,024 | 17,384 |
+  | + ozcore, upper bound (every global, all of Monocypher) | 787,036 | 2,024 | 17,384 |
+  | **Δ realistic** | **+36,636** | 0 | **+1,252** |
+
+  The P3 estimate was 13 + 15–25 KB, and this is in line with it.
+  - On a 2 MiB part: two ~750 KB OTA banks plus the bootloader and a littlefs partition leave
+    under 0.5 MiB of headroom. It fits, but it's tight, which is why the 2 vs 4 MiB question to
+    Anyka matters.
+  - On 4 MiB there's no concern.
+- **RAM:** `sizeof(oz_lock)` is **5,864 B** on rv32, allocated by the app. Plus 1,252 B bss and
+  the thread stack below, ozcore needs about 15 KB of the 218 KiB SRAM.
+- **Stack** (`-fcallgraph-info=su`, `tools/stack_report.py`): worst-case chain per entry point,
+  not counting indirect calls.
+
+  | entry | bytes | deepest chain |
+  |---|---|---|
+  | `oz_lock_rx` | **5,328** | rx_oscore (2,176) → admin `dev/reset` re-runs oz_lock_init (1,936) → X25519 |
+  | `oz_lock_init` | 2,768 | init (1,936) → X25519 |
+  | `oz_lock_pair_code` / `_tick` | ~1,560 | pair_finish → OSCORE protect → CCM → AES → log (224) |
+  | `oz_lock_keypad_pin` | 1,184 | save_creds (1,056) → CBOR |
+
+  - Not included: indirect calls (the app hooks, the EDHOC `dh`/`resolve_peer` callbacks,
+    OSCORE `next_ssn` persist → kv), plus libc and the SDK.
+  - CBOR `skip_item` is the only recursion. It's capped at `OZ_CBOR_MAX_DEPTH` 8 × 48 B, so
+    hostile CBOR can't overflow the stack.
+  - **Give the OZKIE thread an 8 KB stack**, up from the ≥ 4 KB said at P3. Check it on silicon
+    at P4 with RT-Thread's stack high-water mark.
+  - Follow-up worth doing: `rx_oscore` (2,176 B) and `oz_lock_init` (1,936 B) have large local
+    frames. Moving their buffers into `oz_lock` would cut the worst case by about 3 KB.
+- **Not run:** there's still no board.
+
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
 - **iOS:** minimum 15.0; xcframework with an `ios-arm64` slice and an `ios-arm64_x86_64` simulator slice.
