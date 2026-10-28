@@ -26,19 +26,23 @@ const mqttPublish = (...args) => require('./transport').mqttPublish(...args);
  *  (`brokerUsername = id`, `brokerSecret = makeSecret(16, 'ozl_')`). Returns
  *  {broker_username, broker_secret, minted: bool} — `minted` tells the
  *  caller whether this is the first time (worth pushing/returning) or a
- *  repeat lookup of an already-provisioned principal. */
+ *  repeat lookup of an already-provisioned principal.
+ *  S1e-1: the DB keeps only the hash (util.hashBrokerSecret). The plaintext
+ *  exists only in a minted result; a repeat lookup returns broker_secret null.
+ *  OZ-BRIDGE-REMINT (PM ticket, out of scope here): a bridge that loses its
+ *  NVS never gets credentials again, because its row already holds a secret. */
 async function getOrMintBridgeCredentials(bridgeId) {
   const [[row]] = await pool.query('SELECT broker_username, broker_secret FROM bridges WHERE id = ?', [
     bridgeId,
   ]);
-  if (row && row.broker_secret) return { ...row, minted: false };
+  if (row && row.broker_secret) return { broker_username: row.broker_username, broker_secret: null, minted: false };
   const broker_username = bridgeId;
   const broker_secret = makeSecret(16, 'ozl_');
   await pool.query(
     `INSERT INTO bridges (id, broker_username, broker_secret) VALUES (?, ?, ?)
        ON DUPLICATE KEY UPDATE broker_username = VALUES(broker_username),
          broker_secret = VALUES(broker_secret)`,
-    [bridgeId, broker_username, broker_secret]
+    [bridgeId, broker_username, hashBrokerSecret(broker_secret)]
   );
   return { broker_username, broker_secret, minted: true };
 }

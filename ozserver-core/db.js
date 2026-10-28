@@ -14,6 +14,21 @@ const pool = lazy(() => ctx.pool);
 const mysql = lazy(() => ctx.mysql);
 const logEvent = (...args) => ctx.logEvent(...args);
 const hashBrokerSecret = (...args) => require('./util').hashBrokerSecret(...args);
+const isHashedBrokerSecret = (...args) => require('./util').isHashedBrokerSecret(...args);
+const brokerSecretColumn = () => require('./util').BROKER_SECRET_COLUMN;
+
+/** Widen `table`.broker_secret for the hashed form and hash any plaintext
+ *  rows in place (ozkey-50 §8.2). Idempotent: hashed rows (PBKDF2$ or the
+ *  older scrypt$) are left alone, since they can't be re-hashed. */
+async function hashPlaintextBrokerSecrets(table) {
+  await pool.query(`ALTER TABLE ${table} MODIFY COLUMN broker_secret ${brokerSecretColumn()}`);
+  const [rows] = await pool.query(`SELECT id, broker_secret FROM ${table} WHERE broker_secret IS NOT NULL`);
+  const plain = rows.filter((r) => !isHashedBrokerSecret(r.broker_secret));
+  for (const row of plain) {
+    await pool.query(`UPDATE ${table} SET broker_secret = ? WHERE id = ?`, [hashBrokerSecret(row.broker_secret), row.id]);
+  }
+  if (plain.length) logEvent('info', `hashed ${plain.length} plaintext ${table}.broker_secret row(s)`);
+}
 
 async function initDatabase() {
   const admin = await mysql.createConnection({
@@ -560,16 +575,10 @@ async function initDatabase() {
   // S−1 / S1c: a profile that hashes lock broker secrets (ozpms) needs the
   // wider column, and any plaintext rows from before get hashed. Both steps
   // are idempotent. A profile that doesn't (ozlock today) is left as it was.
-  if (CONFIG.HASH_LOCK_BROKER_SECRETS) {
-    await pool.query('ALTER TABLE locks MODIFY COLUMN broker_secret VARCHAR(128)');
-    const [plainSecrets] = await pool.query(
-      "SELECT id, broker_secret FROM locks WHERE broker_secret IS NOT NULL AND broker_secret NOT LIKE 'scrypt$%'"
-    );
-    for (const row of plainSecrets) {
-      await pool.query('UPDATE locks SET broker_secret = ? WHERE id = ?', [hashBrokerSecret(row.broker_secret), row.id]);
-    }
-    if (plainSecrets.length) logEvent('info', `S−1: hashed ${plainSecrets.length} plaintext broker_secret row(s)`);
-  }
+  if (CONFIG.HASH_LOCK_BROKER_SECRETS) await hashPlaintextBrokerSecrets('locks');
+  // S1e-1: bridge broker secrets are hashed in every profile. Nothing reads
+  // them back after the one-time broker_credentials push.
+  await hashPlaintextBrokerSecrets('bridges');
 
   // Seed the single lab owner + site (ozkey-05 lab simplification).
   const [[{ ownerCnt }]] = await pool.query('SELECT COUNT(*) AS ownerCnt FROM owners');

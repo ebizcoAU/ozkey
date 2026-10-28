@@ -230,9 +230,16 @@ class Fixture {
     // Server
     this.httpPort = await freePort();
     this.base = `http://127.0.0.1:${this.httpPort}${P.basePath}`;
+    this.serverLog = path.join(this.tmp, 'server.log');
+    await this.startServer();
+    await waitFor(() => this.published.some((m) => m.topic === `ozkie/${P.site}/time`), { what: 'retained time' });
+  }
+
+  /** Spawn the profile's server.js against this fixture's broker and DB. */
+  async startServer() {
     const profileEnv = P.serverEnv(this);
     for (const [k, v] of Object.entries(profileEnv)) if (/_URL$/.test(k)) assertLocal(k, v);
-    this.serverLog = path.join(this.tmp, 'server.log');
+    const logFrom = this.log().length;
     const out = fs.openSync(this.serverLog, 'a');
     this.server = spawn(process.execPath, ['server.js'], {
       cwd: P.serverDir,
@@ -263,8 +270,39 @@ class Fixture {
       },
     });
     this.procs.push(this.server);
-    await waitFor(() => /HTTP directory listening/.test(this.log()), { timeoutMs: 30000, what: 'server listening' });
-    await waitFor(() => this.published.some((m) => m.topic === `ozkie/${P.site}/time`), { what: 'retained time' });
+    await waitFor(() => /HTTP directory listening/.test(this.log().slice(logFrom)), {
+      timeoutMs: 30000,
+      what: 'server listening',
+    });
+  }
+
+  /** S1e-1: stop and re-spawn only the server; broker and DB stay. This is
+   *  how a boot migration is tested against rows seeded by query(). */
+  async restartServer() {
+    const old = this.server;
+    if (old.exitCode === null) {
+      old.kill('SIGTERM');
+      await Promise.race([new Promise((r) => old.once('exit', r)), sleep(3000)]);
+      if (old.exitCode === null) old.kill('SIGKILL');
+    }
+    this.procs = this.procs.filter((p) => p !== old);
+    await this.startServer();
+  }
+
+  /** Run SQL against this fixture's throwaway DB. */
+  async query(sql, args = []) {
+    const conn = await mysql.createConnection({
+      host: 'localhost',
+      user: 'root',
+      password: this.dbPassword,
+      database: this.dbName,
+    });
+    try {
+      const [rows] = await conn.query(sql, args);
+      return rows;
+    } finally {
+      await conn.end();
+    }
   }
 
   canConnect(port) {

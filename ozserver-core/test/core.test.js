@@ -1,14 +1,17 @@
 'use strict';
 /*
  * Core contract tests that need no DB or broker: the fail-closed rules
- * (required CONFIG, mountLockApi's auth hook) and the read-only lazy deps.
+ * (required CONFIG, mountLockApi's auth hook), the read-only lazy deps, and
+ * the broker-secret hash format (S1e-1).
  * Behaviour of the routes themselves is pinned by ozlock/server/test.
  * One core per process, so the order of these tests matters.
  */
 const test = require('node:test');
 const assert = require('node:assert');
 const { createCore } = require('..');
+const crypto = require('crypto');
 const { lazy } = require('../ctx');
+const { hashBrokerSecret, isHashedBrokerSecret, verifyBrokerSecret } = require('../util');
 
 const CONFIG = {
   SITE_ID: 'test',
@@ -83,4 +86,41 @@ test('lazy deps are read-only', () => {
   assert.throws(() => {
     delete l.a;
   }, /cannot delete 'a'/);
+});
+
+/* S1e-1: PM-ruled format, mosquitto-go-auth's PBKDF2 string with a 64-byte key. */
+test('broker secrets hash to PBKDF2$sha512$100000$<16-byte salt>$<64-byte key>', () => {
+  const h = hashBrokerSecret('ozl_0123456789abcdef0123456789abcdef');
+  const f = h.split('$');
+  assert.deepStrictEqual(f.slice(0, 3), ['PBKDF2', 'sha512', '100000']);
+  assert.strictEqual(Buffer.from(f[3], 'base64').length, 16);
+  assert.strictEqual(Buffer.from(f[4], 'base64').length, 64);
+  assert.ok(h.length <= 160, 'fits BROKER_SECRET_COLUMN');
+  assert.notStrictEqual(hashBrokerSecret('same'), hashBrokerSecret('same'), 'salted');
+});
+
+test('verifyBrokerSecret: PBKDF2 and legacy scrypt verify; anything else never does', () => {
+  const secret = 'ozl_0123456789abcdef0123456789abcdef';
+  const pbkdf2 = hashBrokerSecret(secret);
+  assert.ok(verifyBrokerSecret(secret, pbkdf2));
+  assert.ok(!verifyBrokerSecret('ozl_wrong', pbkdf2));
+
+  // The S−1 format already on ozpms rows (the old hashBrokerSecret).
+  const salt = crypto.randomBytes(16);
+  const scrypt = `scrypt$${salt.toString('hex')}$${crypto.scryptSync(secret, salt, 32).toString('hex')}`;
+  assert.ok(verifyBrokerSecret(secret, scrypt));
+  assert.ok(!verifyBrokerSecret('ozl_wrong', scrypt));
+
+  // An independently built go-auth string (sha512, any key length) verifies.
+  const goSalt = crypto.randomBytes(16);
+  const goauth = `PBKDF2$sha512$1000$${goSalt.toString('base64')}$${crypto
+    .pbkdf2Sync(secret, goSalt, 1000, 32, 'sha512')
+    .toString('base64')}`;
+  assert.ok(verifyBrokerSecret(secret, goauth));
+
+  for (const bad of [secret, '', 'PBKDF2$sha512$0$AA==$AA==', 'PBKDF2$md5$1$AA==$AA==', 'scrypt$00', null]) {
+    assert.ok(!verifyBrokerSecret(secret, bad), `rejects ${bad}`);
+  }
+  assert.ok(isHashedBrokerSecret(pbkdf2) && isHashedBrokerSecret(scrypt));
+  assert.ok(!isHashedBrokerSecret(secret));
 });
