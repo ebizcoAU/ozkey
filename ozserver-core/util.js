@@ -10,6 +10,7 @@
  */
 
 const crypto = require('crypto');
+const { promisify } = require('util');
 const os = require('os');
 const fs = require('fs');
 const { ctx, lazy } = require('./ctx');
@@ -126,13 +127,58 @@ function makeSecret(bytes = 16, prefix = '') {
   return prefix + crypto.randomBytes(bytes).toString('hex');
 }
 
-/** S−1 (ozkey-50 §8.2, from ozpms): a lock's broker_secret stored as a salted
- *  scrypt hash, never plaintext. The plaintext only travels in the
- *  enrollment_ack; nothing reads it back, so a hash is enough.
- *  Format: scrypt$<salt hex>$<hash hex> (~105 chars). */
-function hashBrokerSecret(secret) {
-  const salt = crypto.randomBytes(16);
-  return `scrypt$${salt.toString('hex')}$${crypto.scryptSync(secret, salt, 32).toString('hex')}`;
+/** S−1 / S1e-1 (ozkey-50 §8.2): a lock's or bridge's broker_secret is stored
+ *  hashed, never plaintext. The plaintext only travels in the enrollment_ack /
+ *  broker_credentials push; nothing reads it back.
+ *
+ *  Format (PM ruling 2026-10-29): mosquitto-go-auth's PBKDF2 string,
+ *    PBKDF2$sha512$100000$<base64 16-byte salt>$<base64 64-byte key>
+ *  (go-auth hashing/pbkdf2.go hashWithSalt; defaults in hashing/hashing.go).
+ *  The key is 64 bytes, not go-auth's default 32: go-auth reads the length
+ *  from the stored hash, and mosquitto dynsec always compares 64 bytes, so
+ *  either plugin can verify these rows without a re-mint (Q6a).
+ *  Older ozpms rows are scrypt$<salt hex>$<hash hex>; they still verify. */
+const pbkdf2 = promisify(crypto.pbkdf2);
+const PBKDF2_ITERATIONS = 100000;
+const PBKDF2_SALT_BYTES = 16;
+const PBKDF2_KEY_BYTES = 64;
+const HASHED_BROKER_SECRET_PREFIXES = ['PBKDF2$', 'scrypt$'];
+// Longest stored form: 'PBKDF2$sha512$100000$' + 24 + '$' + 88 = 134 chars.
+const BROKER_SECRET_COLUMN = 'VARCHAR(160)';
+
+/** Async: 100k PBKDF2 rounds cost ~100 ms, so it runs on the libuv pool, not
+ *  the event loop (a sync hash stalled every MQTT handler behind it). */
+async function hashBrokerSecret(secret) {
+  const salt = crypto.randomBytes(PBKDF2_SALT_BYTES);
+  const key = await pbkdf2(secret, salt, PBKDF2_ITERATIONS, PBKDF2_KEY_BYTES, 'sha512');
+  return `PBKDF2$sha512$${PBKDF2_ITERATIONS}$${salt.toString('base64')}$${key.toString('base64')}`;
+}
+
+function isHashedBrokerSecret(stored) {
+  return typeof stored === 'string' && HASHED_BROKER_SECRET_PREFIXES.some((p) => stored.startsWith(p));
+}
+
+/** Constant-time check of a presented secret against either stored format.
+ *  Unknown formats (including plaintext) never verify. */
+function verifyBrokerSecret(secret, stored) {
+  if (typeof secret !== 'string' || typeof stored !== 'string') return false;
+  const f = stored.split('$');
+  let want;
+  let got;
+  if (f[0] === 'PBKDF2' && f.length === 5 && (f[1] === 'sha512' || f[1] === 'sha256')) {
+    const iterations = Number(f[2]);
+    if (!Number.isInteger(iterations) || iterations < 1) return false;
+    want = Buffer.from(f[4], 'base64');
+    if (!want.length) return false;
+    got = crypto.pbkdf2Sync(secret, Buffer.from(f[3], 'base64'), iterations, want.length, f[1]);
+  } else if (f[0] === 'scrypt' && f.length === 3) {
+    want = Buffer.from(f[2], 'hex');
+    if (!want.length) return false;
+    got = crypto.scryptSync(secret, Buffer.from(f[1], 'hex'), want.length);
+  } else {
+    return false;
+  }
+  return crypto.timingSafeEqual(want, got);
 }
 
 module.exports = {
@@ -149,4 +195,7 @@ module.exports = {
   deviceIdFromMac,
   makeSecret,
   hashBrokerSecret,
+  isHashedBrokerSecret,
+  verifyBrokerSecret,
+  BROKER_SECRET_COLUMN,
 };

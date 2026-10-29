@@ -35,6 +35,7 @@ const {
   waitFor,
   S0_JWT_SECRET,
 } = require('./harness');
+const { verifyBrokerSecret } = require('../../../ozserver-core/util');
 
 const fx = new Fixture();
 const golden = new Golden(path.join(__dirname, 'golden', 'ozlock.json'));
@@ -217,6 +218,11 @@ test('bridge online -> utc push + one-time broker credentials', async () => {
   });
   const ops = pubs.filter((m) => m.topic === TB('command', B1)).map((m) => m.payload.op || 'utc');
   assert.deepEqual(ops.sort(), ['broker_credentials', 'utc']);
+  // S1e-1: the bridge gets the plaintext once; the DB keeps only the hash.
+  const creds = pubs.find((m) => m.payload.op === 'broker_credentials').payload;
+  const [row] = await fx.query('SELECT broker_secret FROM bridges WHERE id = ?', [B1]);
+  assert.match(row.broker_secret, /^PBKDF2\$sha512\$100000\$/);
+  assert.ok(verifyBrokerSecret(creds.broker_secret, row.broker_secret));
 
   ({ pubs } = await step('bridge-B1-online-again', async () => {
     await fx.pub(TB('presence', B1), { state: 'online' });

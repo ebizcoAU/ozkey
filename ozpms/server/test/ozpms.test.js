@@ -22,6 +22,7 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const mysql = require('mysql2/promise');
 const { Fixture, Golden, makeSteps, x25519FromSeed, assertGolden, waitFor } = require('./harness');
+const { verifyBrokerSecret } = require('../../../ozserver-core/util');
 
 const fx = new Fixture();
 const golden = new Golden(path.join(__dirname, 'golden', 'ozpms.json'));
@@ -34,6 +35,9 @@ const L3 = 's1-pms-legacy-03'; // still on the July ozkey/ root
 const B1 = 'ozb-s1-pms-b1';
 const MAC1 = 'AA:BB:CC:01:00:01';
 const MAC3 = 'AA:BB:CC:01:00:03';
+
+// S1e-1: PBKDF2$sha512$100000$<b64 16-byte salt>$<b64 64-byte key>
+const PBKDF2_RE = /^PBKDF2\$sha512\$100000\$[A-Za-z0-9+/]{22}==\$[A-Za-z0-9+/]{86}==$/;
 
 const T = (kind, id) => `ozkie/pms/locks/${id}/${kind}`;
 const TL = (kind, id) => `ozkey/pms/locks/${id}/${kind}`; // the legacy twin
@@ -101,7 +105,7 @@ test('POST /pairings: provision payload is site pms, Wi-Fi from env, broker from
   assert.equal(pp.broker_tcp_port, fx.mqttPort);
 });
 
-test('enroll on ozkie/: ack on ozkie/, issued_by OZPMS/, broker secret stored as scrypt', async () => {
+test('enroll on ozkie/: ack on ozkie/, issued_by OZPMS/, broker secret stored hashed (PBKDF2)', async () => {
   const { pubs } = await step('enroll-L1', async () => {
     await fx.pub(T('enroll', L1), { device_id: L1, mac: MAC1, fw: 's1-1.0', transport: 'wifi', caps: ['audit'] });
   });
@@ -114,8 +118,8 @@ test('enroll on ozkie/: ack on ozkie/, issued_by OZPMS/, broker secret stored as
   assert.match(ack.payload.broker_secret, /^ozl_[0-9a-f]{32}$/, 'the lock gets the plaintext once');
   const row = await lockRow(L1);
   assert.equal(row.status, 'enrolled');
-  assert.match(row.broker_secret, /^scrypt\$[0-9a-f]{32}\$[0-9a-f]{64}$/, 'the DB holds only the hash');
-  assert.notEqual(row.broker_secret, ack.payload.broker_secret);
+  assert.match(row.broker_secret, PBKDF2_RE, 'the DB holds only the hash');
+  assert.ok(verifyBrokerSecret(ack.payload.broker_secret, row.broker_secret));
 });
 
 test('enroll + heartbeat on the legacy ozkey/ root still work; replies go out on ozkie/', async () => {
@@ -145,6 +149,11 @@ test('bridge online -> utc push + one-time broker credentials on ozkie/pms', asy
   });
   const ops = pubs.filter((m) => m.topic === TB('command', B1)).map((m) => m.payload.op || 'utc');
   assert.deepEqual(ops.sort(), ['broker_credentials', 'utc']);
+  // S1e-1: the bridge gets the plaintext once; the DB keeps only the hash.
+  const creds = pubs.find((m) => m.payload.op === 'broker_credentials').payload;
+  const [row] = await fx.query('SELECT broker_secret FROM bridges WHERE id = ?', [B1]);
+  assert.match(row.broker_secret, PBKDF2_RE);
+  assert.ok(verifyBrokerSecret(creds.broker_secret, row.broker_secret));
 });
 
 test('bridged lock pairs and comes online via its bridge', async () => {
