@@ -532,6 +532,30 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
   init that a sample did as a side effect would show here; none was found in the link check. The
   first kit-day boot should compare the boot log with the SDK demo's.
 
+### P5 summary for the merge review (2026-10-30)
+P5 runs everything on the host against mocks of the AK1037 SDK. Nothing has run on silicon. Each
+phase passed the gate (default, Release, ASan+UBSan) and was mutation-checked. Commits, oldest
+first: 13960dd P5-A, f8964c8 kv retry, 68837ee P5-B, b9ba6f6 6-digit PINs, 6563887 P5-D,
+e4dc087 P5-C1, ebf0a47 P5-E0, 23aac88 P5-E, 8063e33 P5-F. None are pushed.
+
+| Phase | Real, portable logic (tested) | Mocked on the host | Needs the board or a ruling |
+|---|---|---|---|
+| P5-A port | kv on littlefs at the OZKV partition, the SKE KAT and key wipe, TRNG checks, mount retry | the whole SDK: SKE, TRNG, NOR flash, BLE stack, RT-Thread queues and threads, time | the SDK's real behaviour; notify index, address byte order, adv restart |
+| P5-B keypad | entry state machine, wrong-PIN limit (5 free, 60 s doubling to 30 min), PINs ≥ 6 digits | keys arrive via `oz.key` | touch IC and scan driver, buzzer and panel feedback |
+| P5-C1 motor | drive/brake/rest state machine, jam and timeout detection, latest-wins commands | the motor and bolt sensor (driver only logs) | real driver, sensor and timings (OZ-7); jam policy **6a**; reply timing 6b; auto-relock |
+| P5-D stack | host tripwire in Release; RV32 static bound 6,384 B | host pthread stacks | confirm 12 KB / 16 KB with RT-Thread's high-water mark on silicon |
+| P5-E0 events | `events` Observe (admin), seq reserved in kv, gap events, keypad lockout event | BLE and relay transport | service-bond and member observers |
+| P5-E cards | card matching, own wrong-card limit, 1.5 s hold filter, lockout event | cards arrive via `oz.card` | reader polling thread on `hal_rfid_*` and its low-power detect; UID clone risk **OZ-5** |
+| P5-F battery | levels with hysteresis, sag under load, unlock never refused, lock refused at CRITICAL | the SAR ADC | channel, divider and thresholds (OZ-7 5a/5b); brown-out point; low-battery chime/icon |
+
+- **Operator decisions pending:** OZ-7 5a with `OZ_POWER_LOCK_AT_CRITICAL` (lock refused at
+  CRITICAL today), jam policy 6a, and OZ-5 (UID-only cards).
+- **What the mocks can't prove:** they encode our reading of the SDK headers, not the SDK itself.
+  The first board run should start with the self-test image (`oz.selftest`, every suite plus its
+  own stack peak), then claim and unlock over real BLE.
+- **Wire changes in P5** (ozkey-48 §5.1, Appendix A): `events` with types 0–3, `lock/state` keys 3
+  and 4, result code 34 `BATTERY_LOW`.
+
 ### P5-A (2026-10-29): port/ak1037 on the host, against SDK mocks
 - **What:** `oz_port_ak1037.c`, `oz_gatt_ak1037.c`, `oz_lockapp_ak1037.c` and `oz_selftest_ak1037.c`
   now build and run in ctest under the gate (all three legs, ASan+UBSan included). They link the
