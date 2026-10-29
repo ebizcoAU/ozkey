@@ -277,6 +277,49 @@ test('DELETE a bridged lock with a sealed reset waits for the lock verdict', asy
   assert.equal(res.body.reset.verdict, 'reset_confirmed');
 });
 
+const { sleep } = require('./harness');
+
+// Regression: DELETE used to open its verdict waiter only after the DB delete,
+// so a lock that answered before that dropped its verdict and the request sat
+// out LOCK_RESET_TIMEOUT_MS as 'unknown'. A table lock on `grants` (the first
+// row purge, after the reset is published) holds the delete until the reply
+// has been handled. Not a golden step: it's a forced interleaving, not a flow.
+test('DELETE: a reset reply that beats the DB delete still settles the verdict', async () => {
+  const L9 = 's1-pms-fast-09';
+  const [{ id: site }] = await fx.query('SELECT id FROM sites LIMIT 1');
+  await fx.query("INSERT INTO locks (id, site_id, bridge_id, status) VALUES (?, ?, ?, 'enrolled')", [L9, site, B1]);
+
+  const blocker = await mysql.createConnection({
+    host: 'localhost',
+    user: 'root',
+    password: fx.dbPassword,
+    database: fx.dbName,
+  });
+  const responder = (topic, obj) => {
+    if (topic === TB('command', B1) && obj.target === L9 && obj.envelope_hex === 'reset99') {
+      fx.pub(T('presence', L9), { state: 'offline', reason: 'factory_reset', msg_id: obj.msg_id });
+    }
+  };
+  fx.responders.push(responder);
+  let res;
+  try {
+    await blocker.query('LOCK TABLES grants WRITE');
+    const pending = fx.http('DELETE', `/locks/${L9}`, { envelope_hex: 'reset99' });
+    await waitFor(
+      async () => (await fx.query('SELECT last_reset_reason FROM locks WHERE id = ?', [L9]))[0]?.last_reset_reason === 'factory_reset',
+      { what: 'reset reply handled while the delete is held' }
+    );
+    await sleep(500); // let the presence handler finish (it notifies after its DB writes)
+    await blocker.query('UNLOCK TABLES');
+    res = await pending;
+  } finally {
+    fx.responders.pop();
+    await blocker.end();
+  }
+  assert.equal(res.status, 200);
+  assert.equal(res.body.reset.verdict, 'reset_confirmed');
+});
+
 /* ===========================================================================
  * Golden transcript (must run last)
  * ========================================================================= */
