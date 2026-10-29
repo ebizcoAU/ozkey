@@ -228,10 +228,10 @@ class Fixture {
       for (const r of this.responders) r(topic, obj);
     });
 
-    // mysql2 reads DATETIME as Node-local time, so the server must run in the
-    // DB's zone or every JS-side age check (likelyOnline) is off by the gap.
-    // Pinning the child to MySQL's offset keeps the transcript host-independent.
-    this.serverTz = await mysqlZone(this.dbPassword);
+    // S1e-4: the server pins its DB sessions to UTC, so its own TZ must not
+    // matter. Run it in a zone that is never MySQL's, so every suite proves
+    // that (before S1e-4 the harness had to match the two to pass).
+    this.serverTz = await zoneUnlikeMysql(this.dbPassword);
 
     // Server
     this.httpPort = await freePort();
@@ -315,8 +315,10 @@ class Fixture {
       user: 'root',
       password: this.dbPassword,
       database: this.dbName,
+      timezone: 'Z', // same session zone as the server's pool (S1e-4)
     });
     try {
+      await conn.query("SET time_zone = '+00:00'");
       const [rows] = await conn.query(sql, args);
       return rows;
     } finally {
@@ -431,15 +433,13 @@ class Fixture {
   }
 }
 
-/** MySQL's current UTC offset as an IANA zone Node understands. */
-async function mysqlZone(password) {
+/** An IANA zone whose current offset differs from MySQL's by many hours. */
+async function zoneUnlikeMysql(password) {
   const conn = await mysql.createConnection({ host: 'localhost', user: 'root', password });
   const [[{ m }]] = await conn.query('SELECT TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW()) AS m');
   await conn.end();
-  const minutes = Math.round(Number(m) / 15) * 15;
-  if (minutes % 60) throw new Error(`MySQL offset ${minutes} min is not whole hours; set its time_zone`);
-  const h = minutes / 60;
-  return h === 0 ? 'UTC' : `Etc/GMT${h > 0 ? '-' : '+'}${Math.abs(h)}`; // Etc/ signs are inverted
+  // UTC+14 is as far east as any zone; if MySQL sits east of UTC, go far west.
+  return Number(m) > 0 ? 'Etc/GMT+12' : 'Pacific/Kiritimati';
 }
 
 /** Sorted, masked view of a step's publishes for the golden file. */

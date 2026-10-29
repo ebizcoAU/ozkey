@@ -43,7 +43,15 @@ async function initDatabase() {
   );
   await admin.end();
 
-  ctx.pool = mysql.createPool(CONFIG.DB);
+  // S1e-4: one zone for both clocks. JS Dates bound as params and NOW() in SQL
+  // write the same naive DATETIME columns; they agree only if Node and MySQL
+  // share a zone. Pin both to UTC so the host TZ (and DST) no longer matters.
+  ctx.pool = mysql.createPool({ ...CONFIG.DB, timezone: 'Z' });
+  ctx.pool.on('connection', (conn) => {
+    conn.query("SET time_zone = '+00:00'", (err) => {
+      if (err) logEvent('error', `SET time_zone failed: ${err.message}`);
+    });
+  });
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS owners (
