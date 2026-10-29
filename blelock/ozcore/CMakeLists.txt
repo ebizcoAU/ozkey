@@ -126,3 +126,39 @@ target_link_libraries(test_selftest_all ozport_host)
 target_compile_definitions(test_selftest_all PRIVATE OZ_SELFTEST_MAIN)
 target_include_directories(test_selftest_all PRIVATE tests)
 add_test(NAME selftest_all COMMAND test_selftest_all)
+
+# port/ak1037 on the host, against the SDK mocks in port/ak1037/hostmock
+# (ozkey-49 P5-A): the real port, GATT service and bring-up commands, run under
+# this gate like everything else. These link the AK1037 port, not the host one.
+find_package(Threads REQUIRED)
+add_library(ak1037_mock STATIC port/ak1037/hostmock/mock_sdk.c)
+target_include_directories(ak1037_mock PUBLIC port/ak1037/hostmock port/ak1037)
+target_link_libraries(ak1037_mock PUBLIC ozcore Threads::Threads)
+target_compile_options(ak1037_mock PRIVATE -Wall -Wextra -Werror)
+
+# The same warnings as port/ak1037/Makefile gives these files.
+add_library(ozport_ak1037_host STATIC port/ak1037/oz_port_ak1037.c port/ak1037/oz_gatt_ak1037.c)
+target_link_libraries(ozport_ak1037_host PUBLIC ak1037_mock ozkv_lfs monocypher ozcore)
+target_compile_options(ozport_ak1037_host PRIVATE -Wall -Wextra -Werror)
+
+add_executable(test_ak1037_port tests/test_ak1037_port.c)
+target_link_libraries(test_ak1037_port ozport_ak1037_host)
+foreach(m good wrong error blank nopart badpart)
+    add_test(NAME ak1037_port_${m} COMMAND test_ak1037_port ${m})
+endforeach()
+
+add_executable(test_ak1037_gatt tests/test_ak1037_gatt.c port/ak1037/oz_lockapp_ak1037.c)
+target_link_libraries(test_ak1037_gatt ozport_ak1037_host)
+target_compile_options(test_ak1037_gatt PRIVATE -Wall -Wextra -Werror)
+add_test(NAME ak1037_gatt COMMAND test_ak1037_gatt)
+
+# The self-test image: the suites (as selftest_all builds them) on the AK1037
+# port, plus both images' commands so the kv-owner rule is exercised.
+add_executable(test_ak1037_selftest tests/test_ak1037_selftest.c
+    ${OZ_SELFTEST_SOURCES} port/ak1037/oz_selftest_ak1037.c port/ak1037/oz_lockapp_ak1037.c)
+target_link_libraries(test_ak1037_selftest ozport_ak1037_host)
+target_include_directories(test_ak1037_selftest PRIVATE tests port/host)
+target_compile_options(test_ak1037_selftest PRIVATE -Wall -Wno-unused-function -Werror)
+foreach(m good wrong)
+    add_test(NAME ak1037_selftest_${m} COMMAND test_ak1037_selftest ${m})
+endforeach()

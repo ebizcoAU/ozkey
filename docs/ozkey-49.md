@@ -414,8 +414,8 @@ invites and the lock engine.
     **differed** from FIPS-197 C.1 and fell back to software when it matched. A broken engine
     would have been used for all AES (fail-open); a working one was silently replaced by software.
   - The 4b `ske_vs_software()` check would have reported every block as a mismatch.
-  - Neither file builds on the host, so no test could see it. The P5 plan proposes host-building
-    the port logic against SDK mocks so this class is covered.
+  - Neither file built on the host, so no test could see it. P5-A below now host-builds both, and
+    its SKE good/wrong/error cases fail if either comparison is inverted again.
 
 ### P4-prep item 5 (2026-10-29): burning, and the OZKV partition
 
@@ -531,6 +531,57 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
 - **Unverified until the kit:** whether the board boots and behaves the same without the demo. Any
   init that a sample did as a side effect would show here; none was found in the link check. The
   first kit-day boot should compare the boot log with the SDK demo's.
+
+### P5-A (2026-10-29): port/ak1037 on the host, against SDK mocks
+- **What:** `oz_port_ak1037.c`, `oz_gatt_ak1037.c`, `oz_lockapp_ak1037.c` and `oz_selftest_ak1037.c`
+  now build and run in ctest under the gate (all three legs, ASan+UBSan included). They link the
+  AK1037 port, not the host one.
+  - `port/ak1037/hostmock/`: fake SDK headers with the SDK's names and the prototypes the port
+    uses, written from the SDK's headers, not copied (the SDK stays out of the repo), plus
+    `mock_sdk.c`. The SKE engine is software AES, or one that flips a bit, or one that errors.
+    The TRNG is good, stuck or timing out. The flash is a 2 MiB RAM NOR (programming only clears
+    bits) with an OZKV partition at 1 MiB; any access outside it is counted. "Interrupts off" is a
+    counter, and the SKE driver counts calls made with interrupts on. Message queues have
+    RT-Thread's capacity (a 4-byte header per message, as on RV32). Threads are pthreads; the
+    OZKIE thread runs in lockstep with the test (it parks in `rt_mq_recv`), so runs are
+    deterministic. Time is virtual. `AK_MSH_CMD_EXPORT` registers the command so tests run it by
+    name.
+- **Tests (9 ctests):**
+  - `ak1037_port_{good,wrong,error}`: the SKE KAT keeps a good engine and rejects a wrong or
+    failing one. AES equals software every time. The key registers hold zeros after each block.
+    SKE runs only with interrupts off.
+  - `ak1037_port_good` also covers the TRNG (stuck and timeout refused, then recovers) and the
+    32-bit ms wrap. For kv: a filesystem that plain littlefs wrote at the partition offset is
+    read, not reformatted. What the port writes, plain littlefs reads back. A failed program
+    fails that call only.
+  - `ak1037_port_{blank,nopart,badpart}`: a factory-blank partition is formatted. A missing or
+    unaligned partition fails kv, and nothing is written.
+  - `ak1037_gatt`: `oz.start`, then a simulated phone claims the lock and unlocks it using only
+    the mocked BLE stack: GATT writes and reads, link events, notifications.
+    - Covered: advertising checked byte for byte on every change (open, busy, open); a 247 MTU
+      request; EDHOC at MTU 23 over several notifications; the pair request held until `oz.code`;
+      `info` flipping to claimed.
+    - Back-pressure: BUFFER_FULL ×3 retried 5 ms apart. A ring that never drains is given up
+      after 50 tries. A notify refused outright loses that reply, and nothing hangs.
+    - Junk writes are dropped: wrong row, empty, over MTU−3. A 12-frame burst overflows the
+      8-deep queue safely.
+    - Frames after a disconnect are ignored. An advertising update the stack refuses is retried
+      every pass. A second `oz.start` is refused.
+  - `ak1037_selftest_{good,wrong}`: `oz.selftest` runs all 8 suites on the AK1037 port and mock
+    flash, then the SKE and TRNG checks. It reports PASS with a good engine; with a wrong one the
+    suites pass (software fallback) and the SKE check says FAIL. Afterwards `oz.start` is refused
+    (one kv owner per boot), and so is a second `oz.selftest`.
+- **Mutation-checked (each caught by at least one test):** KAT comparison inverted (5 fail);
+  `ske_vs_software()` comparison inverted; key-register wipe skipped; SKE with interrupts on;
+  BUFFER_FULL treated as fatal; kv blocks addressed without the partition offset.
+- **What it does not show:**
+  - The real SDK's behaviour: these mocks encode our reading of its headers, and the open items
+    above (notify index, address byte order, adv restart) stay open.
+  - Stack use: code runs on pthread stacks, so the self-test's "stack peak" reads 0 here.
+    P5-D measures stacks.
+- **Also found (not changed):** after one failed mount, `kv_ready()` never retries, so kv stays down
+  until reboot, and a lock with no kv has no identity. Whether it should retry (say, on the next
+  call) is open, for the PM.
 
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
