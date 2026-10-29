@@ -286,15 +286,14 @@ const { sleep } = require('./harness');
 // has been handled. Not a golden step: it's a forced interleaving, not a flow.
 test('DELETE: a reset reply that beats the DB delete still settles the verdict', async () => {
   const L9 = 's1-pms-fast-09';
-  const [{ id: site }] = await fx.query('SELECT id FROM sites LIMIT 1');
-  await fx.query("INSERT INTO locks (id, site_id, bridge_id, status) VALUES (?, ?, ?, 'enrolled')", [L9, site, B1]);
+  // Own connections, not fx.query (S1e-1's), so this commit cherry-picks onto S1d.
+  const connect = () =>
+    mysql.createConnection({ host: 'localhost', user: 'root', password: fx.dbPassword, database: fx.dbName });
+  const db = await connect();
+  const blocker = await connect();
+  const [[{ id: site }]] = await db.query('SELECT id FROM sites LIMIT 1');
+  await db.query("INSERT INTO locks (id, site_id, bridge_id, status) VALUES (?, ?, ?, 'enrolled')", [L9, site, B1]);
 
-  const blocker = await mysql.createConnection({
-    host: 'localhost',
-    user: 'root',
-    password: fx.dbPassword,
-    database: fx.dbName,
-  });
   const responder = (topic, obj) => {
     if (topic === TB('command', B1) && obj.target === L9 && obj.envelope_hex === 'reset99') {
       fx.pub(T('presence', L9), { state: 'offline', reason: 'factory_reset', msg_id: obj.msg_id });
@@ -306,7 +305,7 @@ test('DELETE: a reset reply that beats the DB delete still settles the verdict',
     await blocker.query('LOCK TABLES grants WRITE');
     const pending = fx.http('DELETE', `/locks/${L9}`, { envelope_hex: 'reset99' });
     await waitFor(
-      async () => (await fx.query('SELECT last_reset_reason FROM locks WHERE id = ?', [L9]))[0]?.last_reset_reason === 'factory_reset',
+      async () => (await db.query('SELECT last_reset_reason FROM locks WHERE id = ?', [L9]))[0][0]?.last_reset_reason === 'factory_reset',
       { what: 'reset reply handled while the delete is held' }
     );
     await sleep(500); // let the presence handler finish (it notifies after its DB writes)
@@ -315,6 +314,7 @@ test('DELETE: a reset reply that beats the DB delete still settles the verdict',
   } finally {
     fx.responders.pop();
     await blocker.end();
+    await db.end();
   }
   assert.equal(res.status, 200);
   assert.equal(res.body.reset.verdict, 'reset_confirmed');
