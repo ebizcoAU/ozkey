@@ -1,11 +1,13 @@
 /* oz_lockapp_ak1037 — the lock image's shell commands (ozkey-49 P4 item 4b):
  * the real OZKIE lock with log-only hardware, for bring-up before the keypad
- * and motor are wired (P5).
+ * and motor are wired (P5). The motor's state machine runs (P5-C) against a
+ * log-only driver, so every move reports "unconfirmed".
  *
  *   oz.start     oz_lock_init + the OZKIE GATT service.
  *   oz.touch     someone is at the door (opens the advertising window).
  *   oz.code N    the owner typed pairing code N on the keypad.
  *   oz.key K…    keys pressed on the keypad, e.g. "oz.key 4826#" ('*' clears).
+ *   oz.state     the lock state and how the last motor move ended.
  *
  * MSH runs commands on the shell thread's small stack, so these only start
  * or post to the OZKIE thread. Its priority is compile-time until the kit
@@ -32,10 +34,11 @@ static volatile int running;
 
 static oz_lock lock;
 
-static void log_actuate(void *app, int unlock)
+static void actuate(void *app, int unlock)
 {
     (void)app;
     oz_port_log("actuate: %s", unlock ? "UNLOCK" : "lock");
+    oz_gatt_ak1037_actuate(unlock);
 }
 
 static void log_prompt(void *app, int on)
@@ -47,7 +50,7 @@ static void log_prompt(void *app, int on)
 
 int oz_lockapp_ak1037_start(void)
 {
-    static const oz_lock_hooks hooks = { log_actuate, log_prompt, NULL };
+    static const oz_lock_hooks hooks = { actuate, log_prompt, NULL };
     char id[4 + 12 + 1];
 
     if (running) {
@@ -119,7 +122,24 @@ static void oz_key_cmd(char argc, char **argv)
         (void)oz_gatt_ak1037_key(*k);
 }
 
+/* Two bytes the OZKIE thread writes: a torn read can't happen, a stale one
+ * only shows the state a moment late. */
+static void oz_state_cmd(char argc, char **argv)
+{
+    static const char *const lock_name[] = { "not fully locked", "locked", "unlocked" };
+    static const char *const move_name[] = { "none", "ok", "unconfirmed", "JAMMED" };
+    (void)argc;
+    (void)argv;
+    if (!running) {
+        printf("oz.state: the lock isn't running (oz.start)\r\n");
+        return;
+    }
+    uint8_t s = lock.lock_state, m = lock.last_move;
+    printf("oz.state: %s, last move %s\r\n", s < 3 ? lock_name[s] : "?", m < 4 ? move_name[m] : "?");
+}
+
 AK_MSH_CMD_EXPORT(oz_start_cmd, oz.start, start the OZKIE lock with log-only hardware);
 AK_MSH_CMD_EXPORT(oz_touch_cmd, oz.touch, someone is at the door: open the advertising window);
 AK_MSH_CMD_EXPORT(oz_code_cmd, oz.code, the owner typed this pairing code on the keypad);
 AK_MSH_CMD_EXPORT(oz_key_cmd, oz.key, keys pressed on the keypad);
+AK_MSH_CMD_EXPORT(oz_state_cmd, oz.state, lock state and the last motor move);

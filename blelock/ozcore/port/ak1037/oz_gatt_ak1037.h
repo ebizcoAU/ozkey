@@ -13,8 +13,8 @@
 
 #include "oz_lock.h"
 
-/* 12 KB until measured on silicon: worst static chain 6,128 B with littlefs
- * (ozkey-49 P4-prep item 2), plus indirect calls and littlefs recursion. */
+/* 12 KB until measured on silicon: worst static chain 6,160 B with littlefs
+ * (ozkey-49 P5-D), plus indirect calls and littlefs recursion. */
 #define OZ_GATT_THREAD_STACK (12 * 1024)
 
 /* 1 = always advertising, for a lock its bridge must reach at any moment (the
@@ -47,5 +47,10 @@ int oz_gatt_ak1037_key(char key);
 /* The lock's pair_prompt hook, which runs on the OZKIE thread: while on, an
  * entry on the keypad is the pairing code. */
 void oz_gatt_ak1037_pair_prompt(int on);
+
+/* The lock's actuate hook, also on the OZKIE thread: start (or queue) a bolt
+ * move (oz_motor.h). The thread steps the motor and reports each finished
+ * move to oz_lock_actuated(). */
+void oz_gatt_ak1037_actuate(int unlock);
 
 #endif

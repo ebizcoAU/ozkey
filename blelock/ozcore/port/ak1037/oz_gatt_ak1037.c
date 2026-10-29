@@ -27,6 +27,7 @@
 #include "oz_adv.h"
 #include "oz_ble.h"
 #include "oz_keypad.h"
+#include "oz_motor.h"
 #include "oz_gatt_ak1037.h"
 
 static const T_BT_ATTREC gatt_table[] = {
@@ -147,6 +148,7 @@ static oz_link link;
 static oz_ble session;
 static oz_adv adv;
 static oz_keypad keypad;
+static oz_motor motor;
 
 static uint32_t now_ms(void) { return (uint32_t)rt_tick_get() * (1000u / RT_TICK_PER_SECOND); }
 
@@ -212,6 +214,32 @@ static void refresh_info(const oz_lock *L)
 
 void oz_gatt_ak1037_pair_prompt(int on) { oz_keypad_pairing(&keypad, on); }
 
+void oz_gatt_ak1037_actuate(int unlock) { oz_motor_command(&motor, unlock, now_ms()); }
+
+/* The motor driver: log-only until OZ-7 gives the driver IC, its pins and a
+ * bolt sensor. Nothing is sensed, so every move ends OZ_MOVE_UNCONFIRMED. */
+static void motor_drive(uint8_t out)
+{
+    static const char *const name[] = { "off", "to unlock", "to lock", "brake" };
+    oz_port_log("motor: %s", name[out & 3]);
+}
+
+static void motor_step(oz_lock *L)
+{
+    static uint8_t driven = OZ_MOTOR_OFF;
+    int unlock = 0;
+    int r = oz_motor_step(&motor, now_ms(), OZ_BOLT_NONE, 0, &unlock);
+    if (motor.out != driven) {
+        driven = motor.out;
+        motor_drive(driven);
+    }
+    if (r != OZ_MOVE_NONE) {
+        oz_lock_actuated(L, unlock, r);
+        oz_port_log("motor: %s %s", unlock ? "unlock" : "lock",
+                    r == OZ_MOVE_OK ? "ok" : r == OZ_MOVE_JAMMED ? "JAMMED" : "unconfirmed");
+    }
+}
+
 /* One key, on the OZKIE thread. Results are logged until the panel and buzzer
  * are wired (P5). */
 static void key_in(oz_lock *L, char key, int connected)
@@ -253,7 +281,9 @@ static void ozkie_thread(void *param)
     int applied = -1, failed = 0;
     refresh_info(L);
     for (;;) {
-        if (rt_mq_recv(&mq, &m, sizeof m, (rt_int32_t)rt_tick_from_millisecond(100)) == RT_EOK) {
+        /* 10 ms while the motor moves (oz_motor_step's cadence), else 100. */
+        rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE ? 100 : 10;
+        if (rt_mq_recv(&mq, &m, sizeof m, (rt_int32_t)rt_tick_from_millisecond(wait)) == RT_EOK) {
             switch (m.h.ev) {
             case EV_CONNECT:
                 oz_ble_connect(&session);
@@ -293,6 +323,7 @@ static void ozkie_thread(void *param)
         }
         if (connected)
             (void)oz_ble_tick(&session);
+        motor_step(L);
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
             oz_port_log("keypad: entry timed out");
 
@@ -337,6 +368,7 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
     oz_ble_init(&session, L, &link, notify, NULL);
     oz_adv_init(&adv, OZ_GATT_ADV_ALWAYS, now_ms());
     oz_keypad_init(&keypad);
+    oz_motor_init(&motor, NULL);
 
     T_BLE_INIT_PARAM init;
     memset(&init, 0, sizeof init);

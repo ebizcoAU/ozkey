@@ -25,6 +25,7 @@
 #include "oz_adv.h"
 #include "oz_ble.h"
 #include "oz_gatt_ak1037.h"
+#include "oz_motor.h"
 #include "mock_sdk.h"
 
 #define LINK ((void *)0x1234)
@@ -406,6 +407,74 @@ static void keypad_lockout(void)
     expect_int("# on nothing checks nothing", count("keypad: wrong"), 0);
 }
 
+/* ── the motor (P5-C), log-only driver: every move is unconfirmed ────── */
+
+static void passes(int n)
+{
+    for (int i = 0; i < n; i++)
+        mock_pass();
+}
+
+static void motor_moves(void)
+{
+    uint8_t out[600], req[300];
+    oz_oscore_xchg x;
+    int result;
+
+    passes(200);                        /* earlier moves finish */
+    capture_start();
+    size_t n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
+    size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    uint32_t t0 = mock_ms;
+    passes(30);                         /* 300 ms: still driving */
+    capture_end();
+    expect_int("unlock answered", response(out, ol, &x, &result) == OZ_COAP_CHANGED && result == OZ_R_UNLOCK_OK, 1);
+    expect_int("driving to unlock", count("motor: to unlock"), 1);
+    expect_int("not done at 300 ms", count("motor: unlock unconfirmed"), 0);
+
+    capture_start();
+    passes(20);
+    capture_end();
+    expect_int("done after the drive time", count("motor: unlock unconfirmed"), 1);
+    expect_int("then brake", count("motor: brake"), 1);
+    expect_int("drive ran ~400 ms", (long long)(mock_ms - t0) >= OZ_MOTOR_DRIVE_MS - 300, 1);
+
+    /* Lock during the rest, then unlock: the latest wins, the lock never runs. */
+    capture_start();
+    n = request(OZ_COAP_POST, "lock/lock", req, sizeof req, &x);
+    (void)exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
+    (void)exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    passes(200);
+    capture_end();
+    expect_int("queued lock replaced", count("motor: to lock"), 0);
+    expect_int("…by the unlock", count("motor: unlock unconfirmed"), 1);
+
+    /* Idle: the lock runs at once, and the unlock waits its turn. */
+    capture_start();
+    n = request(OZ_COAP_POST, "lock/lock", req, sizeof req, &x);
+    (void)exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
+    (void)exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    passes(200);
+    capture_end();
+    const char *a = strstr(out_buf, "motor: lock unconfirmed");
+    const char *b = strstr(out_buf, "motor: unlock unconfirmed");
+    expect_int("lock, then unlock", a && b && a < b, 1);
+    expect_int("ends off", count("motor: off") >= 2, 1);
+    const char *last_off = NULL;
+    for (const char *p = out_buf; (p = strstr(p, "motor: ")); p += 7)
+        last_off = p;
+    expect_int("…and stays off", last_off && !strncmp(last_off, "motor: off", 10), 1);
+
+    /* The move reached the lock (oz_lock_actuated), not only the log. */
+    capture_start();
+    mock_msh_run("oz.state");
+    capture_end();
+    expect_int("oz.state: unlocked, last move unconfirmed",
+               count("oz.state: unlocked, last move unconfirmed"), 1);
+}
+
 static void junk_and_limits(void)
 {
     uint8_t f[BLE_MTU_MAX_SIZE];
@@ -471,6 +540,7 @@ int main(void)
     boot();
     claim();
     keypad_lockout();
+    motor_moves();
     junk_and_limits();
     disconnect_and_adv();
     expect_int("flash stayed in OZKV", mock_flash_out_of_part, 0);

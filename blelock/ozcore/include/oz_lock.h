@@ -125,6 +125,7 @@ typedef struct oz_lock {
     oz_cred        creds[OZ_LOCK_MAX_CREDS];
     uint16_t       next_cred_id;
     uint8_t        lock_state;
+    uint8_t        last_move;      /* OZ_MOVE_* of the last finished move (oz_motor.h) */
     uint8_t        battery;
     int64_t        utc_at_set;     /* clock: utc = utc_at_set + (mono − mono_at_set)/1000 */
     uint64_t       mono_at_set;
@@ -169,6 +170,12 @@ enum { OZ_PIN_WRONG = 0, OZ_PIN_OPEN = 1, OZ_PIN_LOCKED_OUT = 2 };
 int  oz_lock_keypad_pin(oz_lock *L, const char *digits);
 /* Time left in a keypad lockout, 0 when there is none (for the panel). */
 uint64_t oz_lock_keypad_lockout_ms(const oz_lock *L);
+
+/* The port's motor finished a move (oz_motor.h OZ_MOVE_*): the lock state
+ * follows what the move did. A jam leaves the bolt somewhere in between:
+ * OZ_LOCKSTATE_NOT_FULLY_LOCKED. An unconfirmed move (no sensor) reports the
+ * direction it drove. The actuate hook alone sets the commanded state. */
+void oz_lock_actuated(oz_lock *L, int unlock, int result);
 
 int64_t oz_lock_utc(const oz_lock *L);   /* 0 when the clock was never set */
 

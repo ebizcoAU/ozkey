@@ -3,6 +3,7 @@
 #include <string.h>
 #include "oz_lock.h"
 #include "oz_cbor.h"
+#include "oz_motor.h"
 
 #define PAIR_WINDOW_MS     60000u
 #define PAIR_LOCKOUT_MS    300000u
@@ -1401,6 +1402,17 @@ static int pin_in_entry(const oz_cred *c, const char *e, size_t n)
     for (size_t at = 0; at + c->secret_len <= n; at++)
         hit |= oz_ct_equal(c->secret, (const uint8_t *)e + at, c->secret_len) == 0;
     return hit;
+}
+
+void oz_lock_actuated(oz_lock *L, int unlock, int result)
+{
+    L->last_move = (uint8_t)result;
+    if (result == OZ_MOVE_JAMMED) {
+        L->lock_state = OZ_LOCKSTATE_NOT_FULLY_LOCKED;
+        oz_port_log("lock: motor jammed while %s", unlock ? "unlocking" : "locking");
+    } else if (result == OZ_MOVE_OK || result == OZ_MOVE_UNCONFIRMED) {
+        L->lock_state = unlock ? OZ_LOCKSTATE_UNLOCKED : OZ_LOCKSTATE_LOCKED;
+    }
 }
 
 /* A live PIN: inside its time window and with uses left. */

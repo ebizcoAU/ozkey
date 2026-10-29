@@ -647,6 +647,58 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
   need the board. An "owner unlock" means the app's `lock/unlock` with the admin bond; a member
   unlock does not clear the lockout. The server/app is not told about lockouts (no event yet).
 
+### P5-C, part 1 (2026-10-29): the motor's state machine, against a simulated motor
+- **Built ahead of the hardware spec (OZ-7), per PM nexus-a8.** Nothing here is tuned. The
+  drive, timeout, brake and rest times are placeholders (`OZ_MOTOR_*_MS` in `include/oz_motor.h`).
+- **`oz_motor` (`include/oz_motor.h`, portable, pure):** idle → driving → braking → resting → idle.
+  - With a bolt sensor, a move is **OK** when the sensor reads the target position. It is
+    **JAMMED** on a stall, or after `timeout_ms`.
+  - Without one, the motor runs for `drive_ms` and the move is **UNCONFIRMED** (JAMMED if the
+    driver reports a stall). Nothing claims a position it didn't see.
+  - After every move it brakes, then rests with the motor off before the next move (thermal,
+    OZ-7 1d).
+  - A command while busy waits. If several arrive, the latest wins. A command for the direction
+    the motor is already driving is dropped. It never reverses mid-move.
+  - On a jam it only reports: no retry and no reverse, until OZ-7 6a rules.
+  - The output is off at init and whenever no move runs (OZ-7 1a).
+- **Engine:** `oz_lock_actuated(L, unlock, result)` takes each finished move.
+  - OK or UNCONFIRMED sets the lock state to the direction driven.
+  - JAMMED sets `OZ_LOCKSTATE_NOT_FULLY_LOCKED` (Matter's value for a jam) and logs it.
+  - The result is kept in `oz_lock.last_move`.
+  - The `actuate` hook still sets the commanded state at once, and `lock/unlock` still answers at
+    once. **No wire change:** whether the app should see "unconfirmed" or "jammed", and whether the
+    answer should wait for the move, is OZ-7 6b.
+- **AK1037:** the lock image's `actuate` hook calls `oz_gatt_ak1037_actuate()`. The OZKIE thread
+  steps the motor every 10 ms while it moves (100 ms otherwise) and hands each result to the
+  engine.
+  - The driver only logs (`motor: to unlock`, `brake`, `off`, `unlock unconfirmed`) until OZ-7
+    gives the driver IC, its pins and a sensor.
+  - New bring-up shell command: `oz.state` prints the lock state and the last move.
+- **Tests:**
+  - New `motor` suite, also in the self-test image. It runs a simulated bolt that moves, can stick
+    halfway, and may or may not report a stall.
+    - Sensorless timing to the ms, across the 32-bit ms wrap.
+    - A sensor ending the move at the end stop; already there means no drive.
+    - Timeout jam and stall jam, each stopping the motor and leaving the bolt where it stuck.
+    - A position reading is ignored without a sensor.
+    - Latest-wins queueing; brake and rest before the next move; the motor driven only while
+      driving.
+    - The lock state after OK, UNCONFIRMED, JAMMED and an unknown result.
+  - `ak1037_gatt`: an owner unlock drives for the drive time, then brakes and goes off. A lock
+    queued during the rest is replaced by a later unlock. From idle, a lock then an unlock run in
+    order. `oz.state` shows that the result reached the engine.
+- **Mutation-checked, all 17 caught:**
+  - Drive time off by one; the sensor's OK ignored; a sensorless move reading the bolt; a stall
+    ignored; no timeout; no rest; no brake; a queued command lost; a same-direction command
+    queued; a reverse mid-move; a jam not setting "not fully locked".
+  - In the port: the motor not stepped, not commanded, or the result not reported to the engine
+    (caught only after `oz.state` was added).
+- **Still open:**
+  - Waiting on OZ-7: the real driver, sensor and timings; auto-relock; manual and key sensing;
+    low-battery refusal; the jam policy; what the app sees.
+  - The RV32 static stack was not re-run for this change. The host OZKIE peak (debug) went from
+    3,743 to 4,303 B, well inside 12 KB.
+
 ### P5-D (2026-10-29): stack budgets, measured on the host and bounded on RV32
 - **Static bound on RV32** (VictorPC, SysGCC GCC 10.1.0, `-Os`, `-fcallgraph-info=su`,
   `tools/stack_report.py`; the SDK's `lfs.c` built with the same flags so littlefs is on the path):
