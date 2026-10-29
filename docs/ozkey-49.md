@@ -556,6 +556,13 @@ e4dc087 P5-C1, ebf0a47 P5-E0, 23aac88 P5-E, 8063e33 P5-F. None are pushed.
 - **Wire changes in P5** (ozkey-48 §5.1, Appendix A): `events` with types 0–3, `lock/state` keys 3
   and 4, result code 34 `BATTERY_LOW`.
 
+**Resume (stand-down 2026-10-30):** P5-A..F and this summary were accepted by the PM. Next is
+P5-C part 2 (the real motor), which waits for the operator's jam policy 6a. Resume from branch
+`ozkey58/ak1037-port` (tip = this commit); recreate the worktree with
+`git worktree add ../ozkey-wt/ak1037-port ozkey58/ak1037-port`. The v1 unsealed-unlock fix
+(`ozkey58/v1-unsealed-unlock`, 81d0063) still waits for a bench check that the PM will schedule.
+Nothing is pushed; only the PM merges.
+
 ### P5-A (2026-10-29): port/ak1037 on the host, against SDK mocks
 - **What:** `oz_port_ak1037.c`, `oz_gatt_ak1037.c`, `oz_lockapp_ak1037.c` and `oz_selftest_ak1037.c`
   now build and run in ctest under the gate (all three legs, ASan+UBSan included). They link the
