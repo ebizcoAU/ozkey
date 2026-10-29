@@ -10,6 +10,7 @@
 #include "com_msh.h"
 #include "hal_ske.h"
 #include "hal_trng.h"
+#include "hal_saradc.h"
 #include "hal_sys.h"
 #include "hal_sfc_norflash.h"
 #include "hal_partition.h"
@@ -85,6 +86,20 @@ uint32_t hal_ske_final(void)
 }
 
 /* ── TRNG ──────────────────────────────────────────────────────────────── */
+
+/* ── SAR ADC ─────────────────────────────────────────────────────────── */
+
+int mock_adc_raw = 0xffff;              /* the SDK's error value until a test sets one */
+int mock_adc_channel;
+long mock_adc_reads;
+
+int32_t hal_saradc_init(int mark) { mock_adc_channel = mark; return 1; }
+
+int hal_saradc_get_data(T_eSARADC_SEL sel)
+{
+    mock_adc_reads++;
+    return (int)sel == mock_adc_channel ? mock_adc_raw : 0xffff;
+}
 
 int mock_trng_mode;
 int mock_trng_inits;

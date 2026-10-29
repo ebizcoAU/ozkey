@@ -286,7 +286,7 @@ operation source, alarm code and similar are taken from Matter so we don't inven
 |---|---|---|---|---|
 | `lock/unlock` | POST | `lock.unlock` | member (BLE only), admin (BLE or relay) | — (Echo on relay) |
 | `lock/lock` | POST | (new) | member+ | — |
-| `lock/state` | GET | `lock.state` | member+ | → `{1: lock_state, 2: door_state, 3: battery %}` |
+| `lock/state` | GET | `lock.state` | member+ | → `{1: lock_state, 2: door_state, 3: battery %, 4: battery level (0 ok, 1 low, 2 critical)}`. `lock/lock` answers 5.03 `BATTERY_LOW` at critical; `lock/unlock` is never refused for the battery (ozkey-49 P5-F) |
 | `lock/settings` | GET / PUT | `lock.settings.*` | admin | `{1: volume, 2: autolock, 3: autolock_delay_s}` |
 | `cred` | POST | `cred.put` | admin, service | `{0: epoch, 1: type, 2: cred_id, 3: secret, 4: from, 5: to, 6: uses}` (§4.3) |
 | `cred/<id>` | DELETE | `cred.delete` | admin, service | — |
@@ -351,8 +351,9 @@ filtering add roles, not fields):**
   | 0 | gap | `{1: events missed}`. `seq` is the first missed |
   | 1 | keypad lockout | `{1: level (1 = the first, after 5 misses), 2: seconds}` |
   | 2 | card reader lockout | as type 1, for wrong RFID cards (own counter) |
+  | 3 | battery | `{1: level (0 ok, 1 low, 2 critical), 2: percent}`, on each level change (ozkey-49 P5-F) |
 
-  - Further types (access, alarm, duress, battery, doorbell, bolt) take the next numbers as each
+  - Further types (access, alarm, duress, doorbell, bolt) take the next numbers as each
     is built. A receiver ignores data keys it doesn't know.
 - **Ring and loss:** the lock holds the last **16** events in RAM. When the ring is full the oldest
   is dropped. A reader that fell behind gets one `gap` event first, then the oldest held.
@@ -489,6 +490,7 @@ value is 8 random bytes, good for one use within 10 s.
 | 18 | UNSUPPORTED | 31 | NOT_FOUND |
 | 19 | NO_SLOT | 32 | REVOKE_DENIED |
 | | | 33 | TIME_REJECTED |
+| | | 34 | BATTERY_LOW |
 
 EDHOC-stage refusals (`BOND_DENIED`, `MEMBER_REPLAY`, `INVITE_BOUND_ELSEWHERE`, `PAIR_LOCKED_OUT`, …)
 travel as EDHOC error code 1 with the name as the text.

@@ -30,6 +30,12 @@ extern uint8_t mock_ske_key_reg[16];    /* what the key registers hold now */
 
 /* ── TRNG ──────────────────────────────────────────────────────────────── */
 enum { MOCK_TRNG_GOOD, MOCK_TRNG_STUCK, MOCK_TRNG_TIMEOUT };
+/* SAR ADC: what hal_saradc_get_data returns on the initialised channel
+ * (12-bit, 0xffff = the SDK's error). */
+extern int mock_adc_raw;
+extern int mock_adc_channel;
+extern long mock_adc_reads;
+
 extern int mock_trng_mode;
 extern int mock_trng_inits;
 extern long mock_trng_words;

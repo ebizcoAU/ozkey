@@ -27,6 +27,7 @@
 #include "rthw.h"
 #include "hal_ske.h"
 #include "hal_trng.h"
+#include "hal_saradc.h"
 #include "hal_sys.h"
 #include "hal_sfc_norflash.h"
 #include "hal_partition.h"
@@ -363,6 +364,34 @@ uint64_t oz_port_monotonic_ms(void)
     uint64_t t = high | now;
     rt_hw_interrupt_enable(level);
     return t + advanced;
+}
+
+/* ── Battery (P5-F) ──────────────────────────────────────────────────────── */
+
+/* Placeholders until OZ-7 5a gives the board: which AIN sees the pack, the
+ * divider in front of it, and the reference the ADC runs on. */
+#ifndef OZ_BATT_AIN
+#define OZ_BATT_AIN     SARADC_SEL_AIN1
+#endif
+#ifndef OZ_BATT_DIV
+#define OZ_BATT_DIV     3u              /* 6 V pack → 2 V at the pin */
+#endif
+#ifndef OZ_BATT_VREF_MV
+#define OZ_BATT_VREF_MV 2400u           /* full scale; UNVERIFIED (BGR × 2?) */
+#endif
+
+uint16_t oz_ak1037_battery_mv(void)
+{
+    static int ready;
+    if (!ready) {
+        hal_saradc_init(OZ_BATT_AIN);
+        ready = 1;
+    }
+    int raw = hal_saradc_get_data(OZ_BATT_AIN);
+    if (raw < 0 || raw > 4095)
+        return 0;                       /* 0xffff: the SDK's error */
+    uint32_t mv = (uint32_t)raw * OZ_BATT_VREF_MV * OZ_BATT_DIV / 4095u;
+    return mv > UINT16_MAX ? UINT16_MAX : (uint16_t)mv;
 }
 
 /* ── Log ─────────────────────────────────────────────────────────────────── */

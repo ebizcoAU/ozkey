@@ -635,6 +635,46 @@ static void cards(void)
     expect_int("owner clears it", oz_lock_card(&L, UID, sizeof UID), OZ_CARD_OPEN);
 }
 
+/* The battery (P5-F): a weak one refuses to throw the bolt, never to
+ * retract it; level changes are events; lock/state reports both. */
+static void battery(void)
+{
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    expect_int("state", call(&owner, &ble, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+    expect_int("…100 % before any reading", resp_int(&owner, 3), 100);
+    expect_int("…level ok", resp_int(&owner, 4), OZ_BATT_OK);
+
+    uint32_t e0 = L.events.next_seq;
+    oz_lock_power_rest(&L, 4490);
+    expect_int("critical: one battery event", L.events.next_seq - e0, 1);
+    oz_event ev;
+    uint32_t cur = e0;
+    expect_int("…level 2, 5 %", oz_events_next(&L.events, &cur, &ev) && ev.type == OZ_EV_BATTERY &&
+               ev.a == OZ_BATT_CRITICAL && ev.b == 5, 1);
+    oz_lock_power_rest(&L, 4480);
+    expect_int("same level: no event", L.events.next_seq - e0, 1);
+
+    int l0 = locks, u0 = unlocks;
+    expect_int("lock refused", call(&owner, &ble, OZ_COAP_POST, "lock/lock", NULL, 0), OZ_R_BATTERY_LOW);
+    expect_int("…5.03", owner.code, OZ_COAP_SERVICE_UNAVAILABLE);
+    expect_int("…the bolt not driven", locks, l0);
+    expect_int("unlock still works", call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0), OZ_R_UNLOCK_OK);
+    expect_int("the keypad still opens", oz_lock_keypad_pin(&L, "482613"), OZ_PIN_OPEN);
+    expect_int("…both actuated", unlocks - u0, 2);
+    expect_int("state shows it", call(&owner, &ble, OZ_COAP_GET, "lock/state", NULL, 0) == OZ_R_OK &&
+               resp_int(&owner, 3) == 5 && resp_int(&owner, 4) == OZ_BATT_CRITICAL, 1);
+
+    oz_lock_power_rest(&L, 5950);
+    expect_int("new batteries: an ok event", L.events.next_seq - e0, 2);
+    expect_int("lock works again", call(&owner, &ble, OZ_COAP_POST, "lock/lock", NULL, 0), OZ_R_LOCK_OK);
+    oz_lock_power_load(&L, 3900);
+    expect_int("a sag under load: critical again", L.power.level, OZ_BATT_CRITICAL);
+    expect_int("…lock refused", call(&owner, &ble, OZ_COAP_POST, "lock/lock", NULL, 0), OZ_R_BATTERY_LOW);
+    oz_lock_power_rest(&L, 5950);
+    expect_int("…until fresh batteries", L.power.level, OZ_BATT_OK);
+}
+
 static void relay_and_reboot(void)
 {
     /* The owner sets up a relay context (persisted per bond). */
@@ -1011,6 +1051,7 @@ static void run_suite(size_t mtu)
     credentials();
     keypad_limit();
     cards();
+    battery();
     relay_and_reboot();
     roles();
     events();

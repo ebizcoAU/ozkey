@@ -24,6 +24,7 @@
 #include "oz_invite.h"
 #include "oz_limit.h"
 #include "oz_events.h"
+#include "oz_power.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,7 +53,7 @@ enum {
     OZ_R_BOND_DENIED = 24, OZ_R_MEMBER_REPLAY = 25, OZ_R_MEMBER_FULL = 26,
     OZ_R_MEMBER_EXPIRED = 27, OZ_R_INVITE_BOUND_ELSEWHERE = 28, OZ_R_PAIR_FAILED = 29,
     OZ_R_PAIR_LOCKED_OUT = 30, OZ_R_NOT_FOUND = 31, OZ_R_REVOKE_DENIED = 32,
-    OZ_R_TIME_REJECTED = 33,
+    OZ_R_TIME_REJECTED = 33, OZ_R_BATTERY_LOW = 34,
 };
 
 /* Matter DoorLock vocabulary (🟡 values to be checked against Matter 1.x, ozkey-48 §5). */
@@ -143,7 +144,7 @@ typedef struct oz_lock {
     uint16_t       next_cred_id;
     uint8_t        lock_state;
     uint8_t        last_move;      /* OZ_MOVE_* of the last finished move (oz_motor.h) */
-    uint8_t        battery;
+    oz_power       power;          /* battery level and percent (P5-F), from the port's readings */
     int64_t        utc_at_set;     /* clock: utc = utc_at_set + (mono − mono_at_set)/1000 */
     uint64_t       mono_at_set;
     uint8_t        clock_set;
@@ -208,6 +209,12 @@ uint64_t oz_lock_card_lockout_ms(const oz_lock *L);
  * OZ_LOCKSTATE_NOT_FULLY_LOCKED. An unconfirmed move (no sensor) reports the
  * direction it drove. The actuate hook alone sets the commanded state. */
 void oz_lock_actuated(oz_lock *L, int unlock, int result);
+
+/* Battery readings from the port (oz_power.h): at rest, and the lowest one
+ * while the motor drove. A level change raises a `battery` event. At
+ * CRITICAL `lock/lock` is refused with BATTERY_LOW; unlocking never is. */
+void oz_lock_power_rest(oz_lock *L, uint16_t mv);
+void oz_lock_power_load(oz_lock *L, uint16_t min_mv);
 
 /* Pending `events` notifications for whoever observes on link k: the BLE
  * session's own registration, or on the relay link each bond's. At most one

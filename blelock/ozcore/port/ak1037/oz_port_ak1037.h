@@ -21,6 +21,11 @@ int oz_ak1037_kv_mount(void);
 enum { OZ_AK1037_KV_SELFTEST = 1, OZ_AK1037_KV_LOCK = 2 };
 int oz_ak1037_kv_claim(int owner);
 
+/* The battery in mV from the SAR ADC (P5-F). Channel, divider and reference
+ * are placeholders until OZ-7 5a: OZ_BATT_AIN, OZ_BATT_DIV, OZ_BATT_VREF_MV.
+ * 0 when the ADC reports an error (oz_power ignores it). */
+uint16_t oz_ak1037_battery_mv(void);
+
 /* Self-test only: move oz_port_monotonic_ms() forward (the suites step past
  * keypad lockouts). The kv owner rule keeps the lock from starting in a boot
  * that ran the self-test, so the lock never runs on a moved clock. */

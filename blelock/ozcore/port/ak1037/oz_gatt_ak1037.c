@@ -30,6 +30,7 @@
 #include "oz_motor.h"
 #include "oz_card.h"
 #include "oz_gatt_ak1037.h"
+#include "oz_port_ak1037.h"
 
 static const T_BT_ATTREC gatt_table[] = {
     { arPrimaryService, arLongUUID, OZ_BLE_UUID_SERVICE },
@@ -247,16 +248,39 @@ static void motor_drive(uint8_t out)
     oz_port_log("motor: %s", name[out & 3]);
 }
 
+/* The battery (P5-F): a reading at rest every OZ_GATT_BATT_MS, and the lowest
+ * one each 10 ms step while the motor drives, reported when the move ends. */
+#define OZ_GATT_BATT_MS (10u * 60u * 1000u)
+
+static void battery_rest(oz_lock *L)
+{
+    static uint32_t last;
+    static int once;
+    if (motor.phase != OZ_MOTOR_IDLE || (once && now_ms() - last < OZ_GATT_BATT_MS))
+        return;
+    once = 1;
+    last = now_ms();
+    oz_lock_power_rest(L, oz_ak1037_battery_mv());
+}
+
 static void motor_step(oz_lock *L)
 {
     static uint8_t driven = OZ_MOTOR_OFF;
+    static uint16_t load_min;
     int unlock = 0;
+    if (motor.phase == OZ_MOTOR_DRIVING) {
+        uint16_t mv = oz_ak1037_battery_mv();
+        if (mv && (!load_min || mv < load_min))
+            load_min = mv;
+    }
     int r = oz_motor_step(&motor, now_ms(), OZ_BOLT_NONE, 0, &unlock);
     if (motor.out != driven) {
         driven = motor.out;
         motor_drive(driven);
     }
     if (r != OZ_MOVE_NONE) {
+        oz_lock_power_load(L, load_min);
+        load_min = 0;
         oz_lock_actuated(L, unlock, r);
         oz_port_log("motor: %s %s", unlock ? "unlock" : "lock",
                     r == OZ_MOVE_OK ? "ok" : r == OZ_MOVE_JAMMED ? "JAMMED" : "unconfirmed");
@@ -364,6 +388,7 @@ static void ozkie_thread(void *param)
         if (connected)
             (void)oz_ble_tick(&session);
         motor_step(L);
+        battery_rest(L);
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
             oz_port_log("keypad: entry timed out");
 

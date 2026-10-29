@@ -859,6 +859,63 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
 - **Stack (RV32 static, with littlefs):** `oz_lock_card` 2,928 B; the OZKIE worst case is unchanged
   at 6,384 B.
 
+### P5-F (2026-10-30): the battery policy, against a mocked ADC
+PM nexus-a8's GO: policy and state machine only. Every threshold is a placeholder until OZ-7 5a/5b
+(the real cells, the divider, the brown-out point). Low battery must never lock anyone out.
+- **`oz_power` (`include/oz_power.h`, portable, pure):** takes mV readings and keeps a level
+  (OK, LOW, CRITICAL) and a percentage. Placeholders for a 4×AA alkaline pack: 6000 mV = 100 %,
+  4400 = 0 %, LOW below 4800, CRITICAL below 4500, 150 mV hysteresis.
+  - A level gets worse at once and better only with 150 mV of margin, so a reading near a
+    threshold doesn't flap.
+  - **Sag:** the lowest reading during a motor move is fed in too. Below 4000 mV the battery is
+    CRITICAL however well it reads at rest, because a weak cell recovers at rest and sags again on
+    the next move. It clears when a later move stays above 4000 mV, or when a rest reading looks
+    like fresh cells (≥ 5600 mV). A rest reading of 5200 mV alone does not clear it; the first
+    draft let it, and the tests now pin that down.
+  - A reading of 0 (ADC error) is no reading. With no reading yet, everything is allowed.
+- 🔴 **Never lock anyone out:**
+  - **Unlock is never refused for the battery**, at any level, with or without readings. That
+    covers the app, the relay, the keypad and cards.
+  - **Lock is refused at CRITICAL** (`lock/lock` → 5.03 `BATTERY_LOW`, result 34;
+    `OZ_POWER_LOCK_AT_CRITICAL` 0). A bolt thrown on a battery that may not retract it again is
+    the lock-out. The cost is a door left unlocked until the battery is changed.
+  - 🟡 **That trade-off is the operator's (OZ-7 5a, together with the jam policy 6a).** One
+    `#define` flips it if the operator would rather keep locking.
+- **Engine:** `oz_lock_power_rest()` and `oz_lock_power_load()`.
+  - Each level change logs and raises event type 3, **battery** `{level, percent}`
+    (ozkey-48 §5.1). The same level again raises nothing.
+  - `lock/state` gains key 4, the battery level; key 3 is now the real percentage.
+- **AK1037:**
+  - `oz_ak1037_battery_mv()` reads the SAR ADC (12-bit; an error reads as 0). Placeholders:
+    channel AIN1, divider ×3, 2400 mV reference.
+  - The OZKIE thread takes a rest reading at start, then every 10 min while the motor is idle.
+    While the motor drives, it keeps the lowest reading of each 10 ms step and reports it when the
+    move ends.
+  - **Not written:** the real channel and divider, a low-battery chime or panel icon, and the
+    brown-out point. All need the board (OZ-7 5a/5b).
+- **Tests:**
+  - New `power` suite: the levels with hysteresis both ways; sag and what clears it (5200 and
+    5599 at rest don't, a good move or 5600 does); a good move after a sag settles to the rest
+    level; 0 ignored; percent clamped at both ends.
+  - `lock`: 100 % and OK before any reading; one event per level change; at CRITICAL, lock is
+    refused with 5.03 and the bolt isn't driven, while unlock and the keypad still open; new
+    batteries let it lock again; a sag under load refuses lock until fresh batteries.
+  - `ak1037_gatt`: the ADC is read on the placeholder channel; a critical rest reading refuses
+    lock without driving the motor; new batteries read OK; an unlock that sags to 3900 and reads
+    5200 at rest stays critical; an ADC error changes nothing.
+- **Mutation-checked, all 16 caught:**
+  - In `oz_power`: unlock refused at critical; lock allowed at critical; no hysteresis; sag
+    ignored; a sag cleared by any rest reading; fresh cells not clearing it; a good move not
+    clearing it; a 0 reading taken as a value; percent not clamped at 100.
+  - In the engine: no refusal; no event; `lock/state` key 4 always 0.
+  - In the port: the load reading not reported; no rest reading; the highest load reading kept
+    instead of the lowest; an ADC error taken as a value (caught once the test checked it).
+- **Gate** passed (default, Release, ASan+UBSan, 27/27 tests), log
+  `ozkey_notes/ctest/2026-10-30_p5f_power.log`.
+- **Stack (RV32 static, with littlefs):** `oz_lock_power_rest` and `oz_lock_power_load` 1,760 B
+  each (through the event-sequence kv write); `oz_motor_step` 0 B. The OZKIE worst case is
+  unchanged at 6,384 B.
+
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
 - **iOS:** minimum 15.0; xcframework with an `ios-arm64` slice and an `ios-arm64_x86_64` simulator slice.

@@ -308,7 +308,7 @@ int oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_loc
     L->ev_reserved = load_u32("es");
     oz_events_init(&L->events, L->ev_reserved);
     L->lock_state = OZ_LOCKSTATE_LOCKED;
-    L->battery = 100;
+    oz_power_init(&L->power);
     return OZ_OK;
 }
 
@@ -774,6 +774,12 @@ static void v_unlock(req_ctx *q, int unlock)
         save_pin_limit(q->L);
     if (unlock && q->role == OZ_ROLE_ADMIN && oz_limit_success(&q->L->card_limit))
         save_card_limit(q->L);
+    /* A weak battery may refuse to throw the bolt, never to retract it (P5-F). */
+    if (!oz_power_may_move(&q->L->power, unlock)) {
+        q->code = OZ_COAP_SERVICE_UNAVAILABLE;
+        result(q, OZ_R_BATTERY_LOW, 0);
+        return;
+    }
     if (q->L->hooks.actuate)
         q->L->hooks.actuate(q->L->hooks.app, unlock);
     q->L->lock_state = unlock ? OZ_LOCKSTATE_UNLOCKED : OZ_LOCKSTATE_LOCKED;
@@ -782,10 +788,11 @@ static void v_unlock(req_ctx *q, int unlock)
 
 static void v_state(req_ctx *q)
 {
-    result(q, OZ_R_OK, 3);
+    result(q, OZ_R_OK, 4);
     oz_cbor_put_uint(&q->w, 1); oz_cbor_put_uint(&q->w, q->L->lock_state);
     oz_cbor_put_uint(&q->w, 2); oz_cbor_put_uint(&q->w, 4);     /* door state: unknown, no sensor */
-    oz_cbor_put_uint(&q->w, 3); oz_cbor_put_uint(&q->w, q->L->battery);
+    oz_cbor_put_uint(&q->w, 3); oz_cbor_put_uint(&q->w, q->L->power.percent);
+    oz_cbor_put_uint(&q->w, 4); oz_cbor_put_uint(&q->w, q->L->power.level);
 }
 
 static void v_info(req_ctx *q)
@@ -1252,7 +1259,7 @@ static void put_event(oz_cbor_w *w, const oz_event *ev)
     if (has_utc) { oz_cbor_put_uint(w, 4); oz_cbor_put_int(w, ev->utc); }
     if (has_actor) { oz_cbor_put_uint(w, 5); oz_cbor_put_uint(w, ev->actor); }
     oz_cbor_put_uint(w, 6);
-    if (ev->type == OZ_EV_KEYPAD_LOCKOUT || ev->type == OZ_EV_CARD_LOCKOUT) {
+    if (ev->type != OZ_EV_GAP) {
         oz_cbor_put_map(w, 2);
         oz_cbor_put_uint(w, 1); oz_cbor_put_uint(w, ev->a);
         oz_cbor_put_uint(w, 2); oz_cbor_put_uint(w, ev->b);
@@ -1704,4 +1711,26 @@ int oz_lock_card(oz_lock *L, const uint8_t *id, size_t len)
         event_add(L, OZ_EV_CARD_LOCKOUT, OZ_EV_NO_ACTOR, L->card_limit.level, ms / 1000u);
     }
     return OZ_CARD_WRONG;
+}
+
+/* ── battery (P5-F) ─────────────────────────────────────────────────────── */
+
+static void power_changed(oz_lock *L)
+{
+    oz_port_log("lock: battery %s, %u%%",
+                L->power.level == OZ_BATT_CRITICAL ? "CRITICAL" : L->power.level == OZ_BATT_LOW ? "low" : "ok",
+                (unsigned)L->power.percent);
+    event_add(L, OZ_EV_BATTERY, OZ_EV_NO_ACTOR, L->power.level, L->power.percent);
+}
+
+void oz_lock_power_rest(oz_lock *L, uint16_t mv)
+{
+    if (oz_power_rest(&L->power, mv))
+        power_changed(L);
+}
+
+void oz_lock_power_load(oz_lock *L, uint16_t min_mv)
+{
+    if (oz_power_load(&L->power, min_mv))
+        power_changed(L);
 }

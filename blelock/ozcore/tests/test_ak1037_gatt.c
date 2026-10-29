@@ -551,6 +551,61 @@ static void motor_moves(void)
                count("oz.state: unlocked, last move unconfirmed"), 1);
 }
 
+/* ── the battery (P5-F), on the mocked SAR ADC ────────────────────────── */
+
+/* Placeholder scaling (oz_port_ak1037.c): mV = raw × 2400 × 3 / 4095. */
+#define RAW(mv) ((int)((mv) * 4095u / 7200u) + 1)
+
+static void battery_reads(void)
+{
+    uint8_t out[600], req[300];
+    oz_oscore_xchg x;
+    int result;
+
+    passes(200);                        /* motor idle */
+    capture_start();
+    mock_adc_raw = RAW(4490);
+    mock_ms += 10u * 60u * 1000u;       /* the next rest reading is due */
+    passes(2);
+    size_t n = request(OZ_COAP_POST, "lock/lock", req, sizeof req, &x);
+    size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    capture_end();
+    expect_int("ADC on the placeholder channel", mock_adc_channel, 1 << 1);
+    expect_int("rest reading: critical", count("lock: battery CRITICAL"), 1);
+    expect_int("lock refused", response(out, ol, &x, &result) == OZ_COAP_SERVICE_UNAVAILABLE &&
+               result == OZ_R_BATTERY_LOW, 1);
+    expect_int("…the motor not driven", count("motor: to lock"), 0);
+
+    /* Fresh batteries; then one that sags under the motor. */
+    capture_start();
+    mock_adc_raw = RAW(5950);
+    mock_ms += 10u * 60u * 1000u;
+    passes(2);
+    capture_end();
+    expect_int("new batteries: ok", count("lock: battery ok"), 1);
+    capture_start();
+    mock_adc_raw = RAW(3900);           /* what it reads while the motor pulls */
+    n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
+    (void)exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    passes(20);
+    mock_adc_raw = RAW(5200);           /* and recovers at rest */
+    passes(200);
+    mock_ms += 10u * 60u * 1000u;
+    passes(2);
+    capture_end();
+    expect_int("the unlock ran", count("motor: unlock unconfirmed"), 1);
+    expect_int("the sag made it critical", count("lock: battery CRITICAL"), 1);
+    expect_int("recovered at rest: still critical", count("lock: battery ok"), 0);
+
+    /* An ADC error is no reading: still critical, nothing reported. */
+    capture_start();
+    mock_adc_raw = 0xffff;
+    mock_ms += 10u * 60u * 1000u;
+    passes(2);
+    capture_end();
+    expect_int("ADC error: no level change", count("lock: battery"), 0);
+}
+
 static void junk_and_limits(void)
 {
     uint8_t f[BLE_MTU_MAX_SIZE];
@@ -618,6 +673,7 @@ int main(void)
     keypad_lockout();
     cards_at_reader();
     motor_moves();
+    battery_reads();
     junk_and_limits();
     disconnect_and_adv();
     expect_int("flash stayed in OZKV", mock_flash_out_of_part, 0);
