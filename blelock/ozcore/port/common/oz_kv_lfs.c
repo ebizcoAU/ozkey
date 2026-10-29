@@ -116,34 +116,41 @@ int oz_kv_lfs_attach(lfs_t *lfs)
     return remove_all(is_temp);
 }
 
-static int open_file(lfs_file_t *f, uint8_t *cache, const char *path, int flags)
-{
+/* An open file and everything littlefs points into while it's open: it keeps
+ * the config pointer (file->cfg) and reads its attrs on every sync/close, so
+ * the config can't be a local of the open call. */
+typedef struct {
+    lfs_file_t f;
     struct lfs_file_config fc;
-    memset(&fc, 0, sizeof fc);
-    fc.buffer = cache;
-    return lfs_file_opencfg(fs, f, path, flags, &fc);
+    uint8_t cache[OZ_KV_LFS_CACHE_MAX];
+} kv_file;
+
+static int open_file(kv_file *k, const char *path, int flags)
+{
+    memset(&k->fc, 0, sizeof k->fc);
+    k->fc.buffer = k->cache;
+    return lfs_file_opencfg(fs, &k->f, path, flags, &k->fc);
 }
 
 int oz_kv_lfs_get(const char *key, uint8_t *buf, size_t cap, size_t *len)
 {
     char path[PATH_MAX_LEN];
-    uint8_t cache[OZ_KV_LFS_CACHE_MAX];
-    lfs_file_t f;
+    kv_file k;
     int rc = path_of(path, key, 0);
     if (rc)
         return rc;
     if (!fs)
         return OZ_E_HW;
-    int e = open_file(&f, cache, path, LFS_O_RDONLY);
+    int e = open_file(&k, path, LFS_O_RDONLY);
     if (e < 0)
         return map_err(e);
-    lfs_soff_t size = lfs_file_size(fs, &f);
+    lfs_soff_t size = lfs_file_size(fs, &k.f);
     if (size < 0) {
         rc = map_err((int)size);
     } else if ((size_t)size > cap) {
         rc = OZ_E_NO_SPACE;
     } else {
-        lfs_ssize_t got = lfs_file_read(fs, &f, buf, (lfs_size_t)size);
+        lfs_ssize_t got = lfs_file_read(fs, &k.f, buf, (lfs_size_t)size);
         if (got < 0)
             rc = map_err((int)got);
         else if (got != size)
@@ -151,16 +158,15 @@ int oz_kv_lfs_get(const char *key, uint8_t *buf, size_t cap, size_t *len)
         else
             *len = (size_t)size;
     }
-    lfs_file_close(fs, &f);
-    oz_wipe(cache, sizeof cache);
+    lfs_file_close(fs, &k.f);
+    oz_wipe(k.cache, sizeof k.cache);
     return rc;
 }
 
 int oz_kv_lfs_set(const char *key, const uint8_t *buf, size_t len)
 {
     char path[PATH_MAX_LEN], temp[PATH_MAX_LEN];
-    uint8_t cache[OZ_KV_LFS_CACHE_MAX];
-    lfs_file_t f;
+    kv_file k;
     int rc = path_of(path, key, 0);
     if (!rc)
         rc = path_of(temp, key, 1);
@@ -171,14 +177,14 @@ int oz_kv_lfs_set(const char *key, const uint8_t *buf, size_t len)
     if (len > 0x7fffffff)
         return OZ_E_ARG;
 
-    int e = open_file(&f, cache, temp, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    int e = open_file(&k, temp, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
     if (e < 0) {
-        oz_wipe(cache, sizeof cache);
+        oz_wipe(k.cache, sizeof k.cache);
         return map_err(e);
     }
-    lfs_ssize_t put = len ? lfs_file_write(fs, &f, buf, (lfs_size_t)len) : 0;
-    e = lfs_file_close(fs, &f);           /* close commits the temp file */
-    oz_wipe(cache, sizeof cache);
+    lfs_ssize_t put = len ? lfs_file_write(fs, &k.f, buf, (lfs_size_t)len) : 0;
+    e = lfs_file_close(fs, &k.f);         /* close commits the temp file */
+    oz_wipe(k.cache, sizeof k.cache);
     if (put < 0 || e < 0 || (size_t)put != len) {
         (void)lfs_remove(fs, temp);
         return map_err(put < 0 ? (int)put : e < 0 ? e : LFS_ERR_IO);

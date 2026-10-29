@@ -3,13 +3,17 @@
  * The flash has the AK1037 geometry: 256-byte pages, 4 KiB sectors, 16
  * sectors (64 KiB). It behaves like NOR: erase sets 0xFF, program can only
  * clear bits. A "power cut" after N flash operations tears the operation in
- * flight (half a page programmed, half a sector erased) and then fails
- * everything until the test "reboots" by mounting the same image again.
+ * flight (half a page programmed, half a sector erased) and then the CPU
+ * stops: a longjmp straight back to the test, so no code after the cut ever
+ * runs, until the test "reboots" by mounting the same image again. (Letting
+ * littlefs carry on against a dead flash is not a state silicon can reach,
+ * and littlefs 2.4.1 rightly asserts on it.)
  *
  * The sweep cuts each kv call at every possible operation and checks the
  * oz_port.h rule: after a reboot the key holds the old value or the new one,
  * never a mix, never an empty half-created file, and other keys are intact.
  */
+#include <setjmp.h>
 #include <stdlib.h>
 
 #include "oz_test.h"
@@ -24,6 +28,13 @@ static uint8_t flash[SECTORS * SECTOR];
 static long ops_left = -1;              /* -1: no cut armed */
 static int dead;                        /* power is off until reboot */
 static long ops_done, nor_violations;
+static jmp_buf power_off;               /* where the CPU "stops" at a cut */
+
+/* Run one kv call with power that may die during it: rc is OZ_E_HW if it did. */
+#define POWERED(rc, call) do {                     \
+        if (setjmp(power_off) == 0) (rc) = (call); \
+        else (rc) = OZ_E_HW;                       \
+    } while (0)
 
 static int bd_read(const struct lfs_config *c, lfs_block_t b, lfs_off_t off, void *buf, lfs_size_t n)
 {
@@ -59,7 +70,9 @@ static int bd_prog(const struct lfs_config *c, lfs_block_t b, lfs_off_t off, con
             nor_violations++;           /* littlefs asked for a 0 -> 1 */
         dst[i] &= src[i];
     }
-    return torn ? LFS_ERR_IO : 0;
+    if (torn)
+        longjmp(power_off, 1);
+    return 0;
 }
 
 static int bd_erase(const struct lfs_config *c, lfs_block_t b)
@@ -69,7 +82,9 @@ static int bd_erase(const struct lfs_config *c, lfs_block_t b)
         return LFS_ERR_IO;
     int torn = cut_now();
     memset(flash + b * SECTOR, 0xff, torn ? SECTOR / 2 : SECTOR);
-    return torn ? LFS_ERR_IO : 0;
+    if (torn)
+        longjmp(power_off, 1);
+    return 0;
 }
 
 static int bd_sync(const struct lfs_config *c) { (void)c; return dead ? LFS_ERR_IO : 0; }
@@ -253,8 +268,9 @@ static void sweep(op_kind kind, const char *name, long min_cuts)
             oz_kv_lfs_set("b3", oldv, sizeof oldv);
 
         ops_left = at;
-        int rc = kind == OP_ERASE ? oz_kv_lfs_erase("b3")
-                                  : oz_kv_lfs_set("b3", newv, sizeof newv);
+        int rc;
+        POWERED(rc, kind == OP_ERASE ? oz_kv_lfs_erase("b3")
+                                     : oz_kv_lfs_set("b3", newv, sizeof newv));
         int was_cut = dead;
         if (boot() != OZ_OK) {
             unmountable++;
@@ -307,7 +323,8 @@ static void soak(void)
         if (rand() % 6 == 0)
             ops_left = 1 + rand() % 12;
         int erase = rand() % 5 == 0;
-        int rc = erase ? oz_kv_lfs_erase(k) : oz_kv_lfs_set(k, v, len);
+        int rc;
+        POWERED(rc, erase ? oz_kv_lfs_erase(k) : oz_kv_lfs_set(k, v, len));
         if (dead) {
             reboots++;
             if (boot() != OZ_OK) { bad++; format_and_boot(); memset(present, 0, sizeof present); continue; }

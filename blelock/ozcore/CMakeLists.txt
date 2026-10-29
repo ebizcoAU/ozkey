@@ -33,6 +33,8 @@ target_include_directories(monocypher PUBLIC third_party/monocypher)
 add_library(littlefs STATIC third_party/littlefs/lfs.c third_party/littlefs/lfs_util.c)
 target_include_directories(littlefs SYSTEM PUBLIC third_party/littlefs)
 target_compile_definitions(littlefs PUBLIC LFS_NO_DEBUG LFS_NO_WARN)
+# Its asserts stay on in every build type: a Release gate once hid one (ozkey-49).
+target_compile_options(littlefs PRIVATE -UNDEBUG)
 
 # kv on littlefs (ozkey-49 P4), shared by the AK1037 port and the host test.
 add_library(ozkv_lfs STATIC port/common/oz_kv_lfs.c)

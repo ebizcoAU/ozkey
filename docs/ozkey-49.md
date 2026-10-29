@@ -222,6 +222,19 @@ invites and the lock engine.
     A cut while creating a key leaves an empty file (8 cut points), and the soak goes
     inconsistent. Replacing an existing key is atomic even without the rename, because littlefs
     file writes are copy-on-write; the rename is what protects *new* keys.
+  - 🔴 **Bug fixed 2026-10-29 (item 4b work):** `oz_kv_lfs.c` passed littlefs a
+    `struct lfs_file_config` that lived only for the open call. littlefs keeps that pointer
+    (`file->cfg`) and commits `cfg->attr_count` user attributes from `cfg->attrs` on every
+    sync/close, so each close read a dead stack frame and could write garbage attributes into
+    the metadata. It would have happened on silicon too, unchecked (the SDK's `lfs_util.h` sets
+    `LFS_NO_ASSERT`). Found because the soak's cut count depended on the optimization level
+    (Debug 200 vs Release 192); ASan at -O2 then named it as stack-use-after-scope. The config
+    now lives in a `kv_file` alongside the file and its cache. The count is 192 under every
+    -O level and stack-init pattern, and the whole ctest is clean under ASan+UBSan.
+  - The same review found that the test kept running littlefs after a simulated cut, which
+    silicon can't do (the CPU stops), and littlefs's own assert fired on it. Release gates hid
+    this because NDEBUG compiled the assert out. A cut now longjmps back to the test, and the
+    host littlefs build keeps its asserts on in every build type.
 - **AK1037 build:** `-Werror` clean.
   - Link: text 749,100 (**+3,968** over P3b, kv plus the SDK's `lfs.c`, which `app_mcu`
     previously garbage-collected); bss +252.
