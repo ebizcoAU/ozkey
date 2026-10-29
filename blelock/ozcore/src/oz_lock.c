@@ -10,6 +10,7 @@
 #define PAIR_MAX_FAILURES  5
 #define ECHO_WINDOW_MS     10000u
 #define RELAY_SSN_BLOCK    32
+#define EV_SEQ_BLOCK       32      /* event seqs reserved per kv write */
 #define ISSUER_START_SLACK 3600     /* invite may start ≤ 1 h before now (§6) */
 #define LOCK_KID           0x00
 
@@ -301,6 +302,9 @@ int oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_loc
         if (oz_limit_load(&L->pin_limit, pl, n, oz_port_monotonic_ms()))
             oz_port_log("lock: keypad limit record unreadable, locked out");
     }
+    /* Events restart above every seq the last boot could have used. */
+    L->ev_reserved = load_u32("es");
+    oz_events_init(&L->events, L->ev_reserved);
     L->lock_state = OZ_LOCKSTATE_LOCKED;
     L->battery = 100;
     return OZ_OK;
@@ -376,6 +380,7 @@ static void revoke(oz_lock *L, int i)
 {
     memset(&L->bonds[i], 0, sizeof L->bonds[i]);
     save_bond(L, i);
+    memset(&L->relay_obs[i], 0, sizeof L->relay_obs[i]);
     if (L->relay_used[i])
         drop_relay(L, i);
 }
@@ -609,6 +614,8 @@ static int after_msg3(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, s
     if (rc)
         return rc;
     if (k->relay) {
+        /* A new context: a registration bound to the old one can't continue. */
+        memset(&L->relay_obs[slot], 0, sizeof L->relay_obs[slot]);
         relay_hook(L, slot);
         L->relay_used[slot] = 1;
         save_relay(L, slot, c->ssn + RELAY_SSN_BLOCK);
@@ -1097,6 +1104,7 @@ static void factory_reset(void)
     oz_port_kv_erase("nc");
     oz_port_kv_erase("cr");
     oz_port_kv_erase("pl");
+    oz_port_kv_erase("es");
     oz_port_kv_erase("lk");
 }
 
@@ -1133,6 +1141,177 @@ static int send_echo(req_ctx *q, uint8_t *out, size_t cap, size_t *out_len, int 
     return oz_oscore_protect_resp(q->ctx, q->x, &m, with_piv, out, cap, out_len);
 }
 
+/* ── events (§5.1) ─────────────────────────────────────────────────────── */
+
+/* Observe values: 24 bits, minimal bytes (RFC 7641 §2). */
+static size_t obs_bytes(uint32_t v, uint8_t b[3])
+{
+    v &= 0xffffffu;
+    size_t n = v > 0xffffu ? 3 : v > 0xffu ? 2 : v ? 1 : 0;
+    for (size_t i = 0; i < n; i++)
+        b[i] = (uint8_t)(v >> (8 * (n - 1 - i)));
+    return n;
+}
+
+static uint32_t opt_uint(const oz_coap_opt *o)
+{
+    uint32_t v = 0;
+    for (size_t i = 0; i < o->len && i < 4; i++)
+        v = v << 8 | o->val[i];
+    return v;
+}
+
+/* Uri-Query "after=N": the last sequence number the reader already has. */
+static int query_after(const oz_coap_msg *m, uint32_t *after)
+{
+    for (unsigned i = 0; i < m->n_opts; i++) {
+        const oz_coap_opt *o = &m->opts[i];
+        if (o->num != OZ_COAP_OPT_URI_QUERY || o->len < 7 || o->len > 16 || memcmp(o->val, "after=", 6))
+            continue;
+        uint32_t v = 0;
+        for (size_t j = 6; j < o->len; j++) {
+            if (o->val[j] < '0' || o->val[j] > '9' || v > (UINT32_MAX - 9) / 10)
+                return 0;
+            v = v * 10 + (uint32_t)(o->val[j] - '0');
+        }
+        *after = v;
+        return 1;
+    }
+    return 0;
+}
+
+static void event_add(oz_lock *L, uint8_t type, uint8_t actor, uint32_t a, uint32_t b)
+{
+    if (L->events.next_seq == L->ev_reserved) {
+        L->ev_reserved += EV_SEQ_BLOCK;
+        if (save_u32("es", L->ev_reserved))
+            oz_port_log("lock: event seq reservation not saved");
+    }
+    oz_events_add(&L->events, type, actor, oz_lock_utc(L), a, b);
+}
+
+/* GET events: {0: OK, 1: next seq, 2: oldest held}. With Observe 0 it also
+ * registers (one registration per BLE session, one per bond on the relay; a
+ * new one replaces the old); the held events from the cursor on then follow
+ * as notifications. Observe 1 deregisters. */
+static int v_events(req_ctx *q, uint8_t *out, size_t cap, size_t *out_len)
+{
+    oz_lock *L = q->L;
+    oz_observer *o = q->k->relay ? &L->relay_obs[q->slot] : &q->k->obs;
+    const oz_coap_opt *ob = oz_coap_find(q->req, OZ_COAP_OPT_OBSERVE);
+    int reg = ob && opt_uint(ob) == 0;
+    if (ob && !reg)
+        memset(o, 0, sizeof *o);
+    q->code = OZ_COAP_CONTENT;
+    result(q, OZ_R_OK, 2);
+    oz_cbor_put_uint(&q->w, 1); oz_cbor_put_uint(&q->w, L->events.next_seq);
+    oz_cbor_put_uint(&q->w, 2); oz_cbor_put_uint(&q->w, oz_events_oldest(&L->events));
+    if (q->w.err)
+        return q->w.err;
+    if (!reg)
+        return respond(q, 0, out, cap, out_len);
+
+    memset(o, 0, sizeof *o);
+    uint32_t after;
+    o->cursor = query_after(q->req, &after) ? after + 1 : oz_events_oldest(&L->events);
+    o->tkl = q->req->tkl;
+    memcpy(o->token, q->req->token, q->req->tkl);
+    o->x = *q->x;
+    o->obs = 1;
+
+    oz_coap_msg m;
+    uint8_t ov[3];
+    oz_coap_init(&m, q->req->type == OZ_COAP_CON ? OZ_COAP_ACK : OZ_COAP_NON, q->code, q->req->mid);
+    m.tkl = q->req->tkl;
+    memcpy(m.token, q->req->token, q->req->tkl);
+    oz_coap_add_opt(&m, OZ_COAP_OPT_OBSERVE, ov, obs_bytes(o->obs, ov));
+    m.payload = q->res;
+    m.payload_len = q->w.len;
+    /* Observe responses always carry a Partial IV (RFC 8613 §8.3). */
+    int rc = oz_oscore_protect_resp(q->ctx, q->x, &m, 1, out, cap, out_len);
+    o->active = rc == OZ_OK;
+    return rc;
+}
+
+/* One event as a notification payload:
+ *   {1: seq, 2: type, 3: time basis (0 none, 1 utc), ?4: utc_s, ?5: actor bond slot, 6: data}
+ * data: keypad lockout {1: level, 2: seconds}; gap {1: events missed}. */
+static void put_event(oz_cbor_w *w, const oz_event *ev)
+{
+    int has_utc = ev->utc != 0, has_actor = ev->actor != OZ_EV_NO_ACTOR;
+    oz_cbor_put_map(w, (size_t)(4 + has_utc + has_actor));
+    oz_cbor_put_uint(w, 1); oz_cbor_put_uint(w, ev->seq);
+    oz_cbor_put_uint(w, 2); oz_cbor_put_uint(w, ev->type);
+    oz_cbor_put_uint(w, 3); oz_cbor_put_uint(w, (uint64_t)has_utc);
+    if (has_utc) { oz_cbor_put_uint(w, 4); oz_cbor_put_int(w, ev->utc); }
+    if (has_actor) { oz_cbor_put_uint(w, 5); oz_cbor_put_uint(w, ev->actor); }
+    oz_cbor_put_uint(w, 6);
+    if (ev->type == OZ_EV_KEYPAD_LOCKOUT) {
+        oz_cbor_put_map(w, 2);
+        oz_cbor_put_uint(w, 1); oz_cbor_put_uint(w, ev->a);
+        oz_cbor_put_uint(w, 2); oz_cbor_put_uint(w, ev->b);
+    } else {
+        oz_cbor_put_map(w, 1);
+        oz_cbor_put_uint(w, 1); oz_cbor_put_uint(w, ev->a);
+    }
+}
+
+/* The next notification for observer o, under context c. Nothing to send:
+ * OZ_OK with *out_len 0. The cursor moves only once the message is built. */
+static int notify_one(oz_lock *L, oz_oscore_ctx *c, oz_observer *o, uint8_t *out, size_t cap, size_t *out_len)
+{
+    oz_event ev;
+    uint32_t cursor = o->cursor;
+    *out_len = 0;
+    if (!oz_events_next(&L->events, &cursor, &ev))
+        return OZ_OK;
+    uint8_t pl[64], ov[3];
+    oz_cbor_w w;
+    oz_cbor_w_init(&w, pl, sizeof pl);
+    put_event(&w, &ev);
+    if (w.err)
+        return w.err;
+    oz_coap_msg m;
+    oz_coap_init(&m, OZ_COAP_NON, OZ_COAP_CONTENT, ++L->mid);
+    m.tkl = o->tkl;
+    memcpy(m.token, o->token, o->tkl);
+    oz_coap_add_opt(&m, OZ_COAP_OPT_OBSERVE, ov, obs_bytes(o->obs + 1, ov));
+    m.payload = pl;
+    m.payload_len = w.len;
+    int rc = oz_oscore_protect_resp(c, &o->x, &m, 1, out, cap, out_len);
+    if (rc) {
+        *out_len = 0;
+        return rc;
+    }
+    o->cursor = cursor;
+    o->obs++;
+    return OZ_OK;
+}
+
+static int observer_ok(const oz_lock *L, int slot)
+{
+    /* Admin only for now; the service bond (audit) and members (own events,
+     * filtered by actor) are the next roles (§5.1). */
+    return slot >= 0 && bond_live(L, slot) && L->bonds[slot].role == OZ_ROLE_ADMIN;
+}
+
+int oz_lock_events_poll(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, size_t cap, size_t *out_len)
+{
+    *out_type = OZ_FRAME_OSCORE;
+    *out_len = 0;
+    if (!k->relay)
+        return k->obs.active && k->ctx_ready && observer_ok(L, k->slot)
+               ? notify_one(L, &k->osc, &k->obs, out, cap, out_len) : OZ_OK;
+    for (int i = 0; i < OZ_LOCK_MAX_BONDS; i++) {
+        if (!L->relay_obs[i].active || !L->relay_used[i] || !observer_ok(L, i))
+            continue;
+        int rc = notify_one(L, &L->relay[i], &L->relay_obs[i], out, cap, out_len);
+        if (rc || *out_len)
+            return rc;
+    }
+    return OZ_OK;
+}
+
 static int dispatch(req_ctx *q, uint8_t *out, size_t cap, size_t *out_len)
 {
     const char *p = q->path;
@@ -1152,6 +1331,9 @@ static int dispatch(req_ctx *q, uint8_t *out, size_t cap, size_t *out_len)
     } else if (!strcmp(p, "lock/state")) {
         if (!allowed(R_ADMIN | R_MEMBER, role)) { q->code = OZ_COAP_FORBIDDEN; result(q, OZ_R_FORBIDDEN, 0); }
         else { q->code = OZ_COAP_CONTENT; v_state(q); }
+    } else if (!strcmp(p, "events")) {
+        if (meth != OZ_COAP_GET || role != OZ_ROLE_ADMIN) { q->code = OZ_COAP_FORBIDDEN; result(q, OZ_R_FORBIDDEN, 0); }
+        else return v_events(q, out, cap, out_len);
     } else if (!strcmp(p, "dev/info")) {
         if (!allowed(R_ADMIN | R_MEMBER, role)) { q->code = OZ_COAP_FORBIDDEN; result(q, OZ_R_FORBIDDEN, 0); }
         else { q->code = OZ_COAP_CONTENT; v_info(q); }
@@ -1461,7 +1643,9 @@ int oz_lock_keypad_pin(oz_lock *L, const char *digits)
     }
     uint32_t ms = oz_limit_miss(&L->pin_limit, mono);
     save_pin_limit(L);
-    if (ms)
+    if (ms) {
         oz_port_log("lock: keypad locked out for %u s", (unsigned)(ms / 1000u));
+        event_add(L, OZ_EV_KEYPAD_LOCKOUT, OZ_EV_NO_ACTOR, L->pin_limit.level, ms / 1000u);
+    }
     return OZ_PIN_WRONG;
 }

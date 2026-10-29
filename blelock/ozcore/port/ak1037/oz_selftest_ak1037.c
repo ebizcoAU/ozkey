@@ -53,6 +53,9 @@ void oz_host_kv_reset(void)
         oz_port_log("selftest: kv wipe failed");
 }
 
+/* The host port's clock step, on silicon (oz_port_ak1037.h). */
+void oz_host_advance_ms(uint64_t ms) { oz_ak1037_clock_advance(ms); }
+
 /* ── checks only silicon can run ─────────────────────────────────────────── */
 
 static int ske_vs_software(void)

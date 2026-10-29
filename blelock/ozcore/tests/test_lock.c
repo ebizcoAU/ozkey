@@ -680,6 +680,229 @@ static void roles(void)
     expect_int("revoked member can't reconnect", handshake(&member, &ble, NULL, 0, NULL), 1);
 }
 
+/* ── events (§5.1): Observe over BLE and the relay ────────────────────── */
+
+typedef struct {
+    oz_oscore_xchg x;          /* the registering request's exchange */
+    uint8_t token;
+    uint32_t last_obs;
+} watch_t;
+
+/* GET events, Observe `observe` (−1 none), optional "after=N" (−1 none).
+ * Repeats once with Echo when asked. Returns the result code. */
+static int events_get(app_t *a, oz_link *k, int observe, long after, watch_t *wt)
+{
+    uint8_t req[200];
+    uint8_t echo[8];
+    int with_echo = 0;
+    for (int round = 0; round < 2; round++) {
+        oz_coap_msg m;
+        char q[24];
+        uint8_t ob = (uint8_t)observe;
+        oz_coap_init(&m, OZ_COAP_CON, OZ_COAP_GET, ++a->mid);
+        m.tkl = 1;
+        m.token[0] = (uint8_t)(0x80 | a->mid);
+        if (observe >= 0)
+            oz_coap_add_opt(&m, OZ_COAP_OPT_OBSERVE, &ob, observe ? 1 : 0);
+        oz_coap_set_path(&m, "events");
+        if (after >= 0) {
+            snprintf(q, sizeof q, "after=%ld", after);
+            oz_coap_add_opt(&m, OZ_COAP_OPT_URI_QUERY, (const uint8_t *)q, strlen(q));
+        }
+        if (with_echo)
+            oz_coap_add_opt(&m, OZ_COAP_OPT_ECHO, echo, 8);
+        oz_oscore_xchg x;
+        size_t n = 0;
+        oz_oscore_protect_req(&a->osc, &m, req, sizeof req, &n, &x);
+        if (deliver(a, k, req, n, &x))
+            return -1;
+        if (!a->has_echo) {
+            if (wt) {
+                wt->x = x;
+                wt->token = m.token[0];
+                const oz_coap_opt *o = oz_coap_find(&a->resp, OZ_COAP_OPT_OBSERVE);
+                wt->last_obs = o ? (o->len ? o->val[o->len - 1] : 0) : 0xffffffffu;
+            }
+            return a->result;
+        }
+        memcpy(echo, a->echo, 8);
+        with_echo = 1;
+    }
+    return -1;
+}
+
+typedef struct {
+    int64_t seq, type, basis, utc, actor, d1, d2;
+} ev_t;
+
+/* One notification from the lock on link k, verified as the app does.
+ * Returns 1 with *ev, 0 when nothing was sent, −1 when it doesn't verify,
+ * isn't bound to the registration, or its Observe value didn't increase. */
+static int notification(app_t *a, oz_link *k, watch_t *wt, ev_t *ev)
+{
+    uint8_t out[600], lt;
+    size_t ol = 0;
+    oz_lock_events_poll(&L, k, &lt, out, sizeof out, &ol);
+    if (ol && framed_mtu && k == &ble) {            /* as the GATT path sends it */
+        oz_ble_send(&gatt, lt, out, ol);
+        take(&lt, out, sizeof out, &ol);
+    }
+    if (!ol)
+        return 0;
+    int64_t piv;
+    oz_coap_msg r;
+    if (lt != OZ_FRAME_OSCORE || oz_oscore_verify_resp(&a->osc, &wt->x, out, ol, a->pt, sizeof a->pt, &r, &piv))
+        return -1;
+    const oz_coap_opt *o = oz_coap_find(&r, OZ_COAP_OPT_OBSERVE);
+    uint32_t obs = 0;
+    for (size_t i = 0; o && i < o->len; i++)
+        obs = obs << 8 | o->val[i];
+    if (!o || r.tkl != 1 || r.token[0] != wt->token || r.code != OZ_COAP_CONTENT || piv < 0 ||
+        r.type != OZ_COAP_NON || (wt->last_obs != 0xffffffffu && obs <= wt->last_obs))
+        return -1;
+    wt->last_obs = obs;
+    memset(ev, 0xff, sizeof *ev);
+    oz_cbor_r c;
+    oz_cbor_r_init(&c, r.payload, r.payload_len);
+    size_t pairs = oz_cbor_get_map(&c);
+    for (size_t i = 0; i < pairs && !c.err; i++) {
+        uint64_t key = oz_cbor_get_uint(&c);
+        if (key == 6) {
+            size_t dp = oz_cbor_get_map(&c);
+            for (size_t j = 0; j < dp && !c.err; j++) {
+                uint64_t dk = oz_cbor_get_uint(&c);
+                int64_t v = (int64_t)oz_cbor_get_uint(&c);
+                if (dk == 1) ev->d1 = v;
+                if (dk == 2) ev->d2 = v;
+            }
+            continue;
+        }
+        int64_t v = oz_cbor_get_int(&c);
+        if (key == 1) ev->seq = v;
+        if (key == 2) ev->type = v;
+        if (key == 3) ev->basis = v;
+        if (key == 4) ev->utc = v;
+        if (key == 5) ev->actor = v;
+    }
+    return c.err ? -1 : 1;
+}
+
+/* A keypad lockout: wait out any running one, then miss until it locks. */
+static void raise_lockout(void)
+{
+    oz_host_advance_ms(oz_lock_keypad_lockout_ms(&L) + 1);
+    while (!oz_lock_keypad_lockout_ms(&L))
+        (void)oz_lock_keypad_pin(&L, "000000");
+}
+
+static void events(void)
+{
+    watch_t wb, wr;
+    ev_t ev;
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    oz_host_advance_ms(oz_lock_keypad_lockout_ms(&L) + 1);
+    (void)oz_lock_keypad_pin(&L, "482613");      /* a success: the limit starts afresh */
+
+    /* keypad_limit raised one event (seq 0), which reserved 0..31 in kv; two
+     * reboots since then lost the RAM ring and start numbering at 32. */
+    expect_int("plain GET", events_get(&owner, &ble, -1, -1, NULL), OZ_R_OK);
+    expect_int("…next seq after the reboots", resp_int(&owner, 1), 32);
+    expect_int("…nothing held", resp_int(&owner, 2), 32);
+    expect_int("register (BLE)", events_get(&owner, &ble, 0, -1, &wb), OZ_R_OK);
+    expect_int("…answer carries Observe", wb.last_obs != 0xffffffffu, 1);
+    expect_int("…2.05", owner.code, OZ_COAP_CONTENT);
+    expect_int("nothing yet", notification(&owner, &ble, &wb, &ev), 0);
+
+    /* Five misses: the lockout reaches the owner's app (PM ruling). */
+    raise_lockout();
+    expect_int("lockout notified", notification(&owner, &ble, &wb, &ev), 1);
+    expect_int("…seq 32", (long long)ev.seq, 32);
+    expect_int("…keypad lockout", (long long)ev.type, OZ_EV_KEYPAD_LOCKOUT);
+    expect_int("…utc basis (clock set)", ev.basis == 1 && ev.utc >= 1790000000, 1);
+    expect_int("…no actor", (long long)ev.actor, -1);
+    expect_int("…level 1, 60 s", ev.d1 == 1 && ev.d2 == 60, 1);
+    expect_int("once only", notification(&owner, &ble, &wb, &ev), 0);
+    raise_lockout();
+    expect_int("next lockout", notification(&owner, &ble, &wb, &ev), 1);
+    expect_int("…seq 33, level 2, 120 s", ev.seq == 33 && ev.d1 == 2 && ev.d2 == 120, 1);
+
+    /* Admin only for now: the service bond gets FORBIDDEN, not a stream. */
+    oz_link_open(&relay, 1);
+    handshake(&service, &relay, NULL, 0, NULL);
+    expect_int("service: not yet", events_get(&service, &relay, 0, -1, NULL), OZ_R_FORBIDDEN);
+    expect_int("…nothing sent to it", notification(&service, &relay, &wr, &ev), 0);
+
+    /* The relay: the owner's own registration, from after=32. The app keeps
+     * one OSCORE context per link. */
+    oz_oscore_ctx on_ble = owner.osc, on_relay;
+    handshake(&owner, &relay, NULL, 0, NULL);
+    on_relay = owner.osc;
+    expect_int("register (relay), after=32", events_get(&owner, &relay, 0, 32, &wr), OZ_R_OK);
+    expect_int("relay gets 33 only", notification(&owner, &relay, &wr, &ev) == 1 && ev.seq == 33, 1);
+    expect_int("…and then nothing", notification(&owner, &relay, &wr, &ev), 0);
+
+    /* 20 lockouts unread: each reader gets one gap marker, then the 16 held. */
+    for (int i = 0; i < 20; i++)
+        raise_lockout();
+    int64_t first_held = 34 + 20 - OZ_EVENTS_RING;
+    expect_int("relay: gap first", notification(&owner, &relay, &wr, &ev), 1);
+    expect_int("…gap from 34, 4 missed",
+               ev.type == OZ_EV_GAP && ev.seq == 34 && ev.d1 == first_held - 34, 1);
+    int n = 0, ok = 1;
+    while (notification(&owner, &relay, &wr, &ev) == 1) {
+        ok &= ev.type == OZ_EV_KEYPAD_LOCKOUT && ev.seq == first_held + n;
+        n++;
+    }
+    expect_int("…then the 16 held, in order", n == OZ_EVENTS_RING && ok, 1);
+    on_relay = owner.osc;
+    owner.osc = on_ble;
+    expect_int("BLE reader: its own gap", notification(&owner, &ble, &wb, &ev) == 1 && ev.type == OZ_EV_GAP, 1);
+    n = 0;
+    while (notification(&owner, &ble, &wb, &ev) == 1)
+        n++;
+    expect_int("…and its own 16", n, OZ_EVENTS_RING);
+    expect_int("lockouts capped at 30 min", (long long)ev.d2, 1800);
+
+    /* A cursor ahead of the lock waits; deregistering stops the stream. */
+    expect_int("re-register after=999", events_get(&owner, &ble, 0, 999, &wb), OZ_R_OK);
+    expect_int("…nothing", notification(&owner, &ble, &wb, &ev), 0);
+    expect_int("re-register, up to date", events_get(&owner, &ble, 0, (long)L.events.next_seq - 1, &wb), OZ_R_OK);
+    expect_int("deregister (Observe 1)", events_get(&owner, &ble, 1, -1, NULL), OZ_R_OK);
+    raise_lockout();
+    expect_int("deregistered: nothing", notification(&owner, &ble, &wb, &ev), 0);
+    on_ble = owner.osc;
+    owner.osc = on_relay;
+    expect_int("the relay still gets it", notification(&owner, &relay, &wr, &ev), 1);
+    owner.osc = on_ble;
+
+    /* A BLE registration ends with the session. */
+    expect_int("register again", events_get(&owner, &ble, 0, -1, &wb), OZ_R_OK);
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    raise_lockout();
+    expect_int("new session: not registered", notification(&owner, &ble, &wb, &ev), 0);
+
+    /* A new relay context replaces the old registration. */
+    handshake(&owner, &relay, NULL, 0, NULL);
+    expect_int("new relay context: not registered", notification(&owner, &relay, &wr, &ev), 0);
+
+    /* A reboot loses the ring and the registrations; numbers jump, never repeat. */
+    uint32_t before = L.events.next_seq;
+    boot_lock();
+    expect_int("after a reboot: past every seq used", (long long)(L.events.next_seq - before) > 0, 1);
+    expect_int("…ring empty", L.events.count, 0);
+
+    /* A factory reset forgets the numbering. */
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    expect_int("factory reset", call(&owner, &ble, OZ_COAP_POST, "dev/reset", NULL, 0), OZ_R_OK);
+    uint8_t es[4];
+    size_t esl;
+    expect_int("…event numbering erased", oz_port_kv_get("es", es, sizeof es, &esl) != OZ_OK, 1);
+    expect_int("…and restarts at 0", L.events.next_seq, 0);
+}
+
 static void run_suite(size_t mtu)
 {
     framed_mtu = mtu;
@@ -699,6 +922,7 @@ static void run_suite(size_t mtu)
     keypad_limit();
     relay_and_reboot();
     roles();
+    events();
     pair_lockout();
     if (mtu)
         printf("lock over GATT, MTU %zu: %ld frames in, %ld out, %d new failures\n",

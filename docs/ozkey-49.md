@@ -739,6 +739,71 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
 - **Still open:** moving the large locals of `rx_oscore` and `oz_lock_init` into `oz_lock` would
   cut ~3 KB from the worst case; not needed while SRAM isn't short.
 
+### P5-E0 (2026-10-29): `events`, starting with the keypad lockout
+- **PM ruling (nexus-a8, 2026-10-29), option (a):** the keypad lockout reaches the owner's app as
+  the first type of ozkey-48 §5.1 `events`, not as a one-off path.
+  - Scope: the admin bond only; delivery on the open BLE session or the admin relay context.
+  - Built so the service bond (audit trail) and members (their own events) slot in later as new
+    roles, with no wire change.
+  - The wire format is in ozkey-48 §5.1.
+- **`oz_events` (`include/oz_events.h`, portable, pure):** a 16-event RAM ring (384 B).
+  - Every event gets a 32-bit sequence number. When the ring is full the oldest is dropped.
+  - Each reader has its own cursor. A reader behind the ring gets one **gap** event (first missed
+    seq plus a count), then the oldest held. A cursor ahead of the lock waits.
+- **Engine (`oz_lock.c`):**
+  - `GET events` (Observe 0 registers, 1 deregisters, `after=N`), answering
+    `{0: OK, 1: next_seq, 2: oldest}`.
+  - A registration lives in `oz_link.obs` (BLE, ends with the session) or `oz_lock.relay_obs[slot]`
+    (relay, RAM). A new relay context for that bond, or a revoke, drops it.
+  - `oz_lock_events_poll()` builds at most one notification per call: NON 2.05, the registration's
+    token, an increasing Observe value, and a Partial IV (RFC 8613 §8.3). The reader's cursor moves
+    only once the message is built.
+  - `oz_ble_tick()` sends up to 4 a tick.
+  - The keypad raises `keypad lockout {level, seconds}` when a lockout starts.
+  - Sequence numbers are reserved in kv `"es"` 32 at a time, written lazily on the first event
+    of a block, so booting writes nothing. A reboot jumps past the reserved block. A factory reset
+    erases `"es"`.
+- **AK1037:** nothing port-specific; the OZKIE thread's existing `oz_ble_tick` delivers. The self-test
+  image gains `oz_host_advance_ms()` (via `oz_ak1037_clock_advance`) so test_lock can step past
+  lockouts on silicon. The kv owner rule keeps the lock from starting in a boot that ran the
+  self-test, so the lock never runs on a moved clock.
+- **Tests:**
+  - New `events` suite (pure; also in the self-test image): order, overflow with a gap per reader,
+    an ahead cursor, the 2^32 wrap.
+  - `lock` (direct, and over GATT at MTU 23 and 247), the BLE and relay paths:
+    - a plain GET; registering; the lockout arriving with seq, utc basis and level/seconds;
+    - the service bond refused;
+    - `after=` on the relay; 20 unread events giving each reader its own gap and then the 16 held,
+      in order;
+    - deregistering; a session ending; a new relay context;
+    - a reboot jumping the numbers; a factory reset erasing them.
+    - Notifications are checked as an app would: OSCORE-verified against the registering request,
+      same token, Partial IV present, NON, Observe increasing.
+  - `ak1037_gatt`: register over the mocked GATT, type 5 wrong PINs on the keypad, and the
+    notification arrives from the thread's tick.
+- **Mutation-checked: 16 of 18 caught.**
+  - Caught:
+    - in the ring: no gap marker; ring not capped; an ahead cursor read as behind; a wrong gap
+      count;
+    - in the numbering: not reserved; not loaded at boot; not erased on reset;
+    - in the verb: any role allowed; Observe 1 ignored; `after=` ignored;
+    - in delivery: no Partial IV; a static Observe value; the token not kept; the relay
+      registration kept across a new context; no event raised on a lockout; `oz_ble_tick` not
+      polling.
+  - Missed, both by design for now: dropping the observer on a revoke, and the bond/role re-check
+    at send time. Only bond 0 can be admin and it can't be revoked, so neither can be reached
+    until the service bond observes. Test both then.
+- **Stack (RV32 static, VictorPC, with littlefs, PM ask):**
+  - From the OZKIE thread's entry the worst case is **6,384 B**: the thread's own 176 B plus the
+    same `oz_lock_rx` chain at 6,160 B.
+  - `oz_lock_events_poll` is 1,280 B on its own branch; `oz_ble_tick` is 2,304 B.
+  - The 12 KB budget stands.
+- **Not in P5-E0:**
+  - Other event types. The service bond and audit trail (re-register on restart, per ozkey-48).
+  - Members' own events.
+  - Persisting the ring across reboots (a reboot loses it, shown as a seq jump).
+  - The bridge relay transport on AK1037 (relay delivery is engine-level, tested on the host).
+
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
 - **iOS:** minimum 15.0; xcframework with an `ios-arm64` slice and an `ios-arm64_x86_64` simulator slice.

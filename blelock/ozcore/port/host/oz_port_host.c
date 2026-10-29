@@ -152,11 +152,15 @@ int oz_port_kv_erase(const char *key)
     return OZ_OK;
 }
 
+static uint64_t advanced_ms;
+
+void oz_host_advance_ms(uint64_t ms) { advanced_ms += ms; }
+
 uint64_t oz_port_monotonic_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u + advanced_ms;
 }
 
 void oz_port_log(const char *fmt, ...)

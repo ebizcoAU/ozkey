@@ -12,7 +12,8 @@
  * an unbonded app sends {14: CCS} (kccs) in the canonical form above.
  *
  * Persistence through oz_port_kv_*: "lk" identity, "b0".."b15" bonds, "ep"
- * epoch, "nc" nonce cache, "cr" credentials, "r0".."r15" relay contexts.
+ * epoch, "nc" nonce cache, "cr" credentials, "r0".."r15" relay contexts,
+ * "pl" keypad limit, "es" the event sequence numbers reserved so far.
  */
 #ifndef OZ_LOCK_H
 #define OZ_LOCK_H
@@ -21,6 +22,7 @@
 #include "oz_oscore.h"
 #include "oz_invite.h"
 #include "oz_limit.h"
+#include "oz_events.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -82,6 +84,18 @@ typedef struct {
 
 struct oz_lock;
 
+/* One `events` Observe registration (ozkey-48 §5.1, RFC 7641): the token and
+ * OSCORE exchange of the GET that registered, so each notification binds to
+ * it, and the reader's cursor into the event ring. */
+typedef struct {
+    uint8_t        active;
+    uint8_t        tkl;
+    uint8_t        token[8];
+    oz_oscore_xchg x;
+    uint32_t       cursor;         /* next event sequence number to send */
+    uint32_t       obs;            /* Observe value of the last message sent */
+} oz_observer;
+
 typedef struct {
     void (*actuate)(void *app, int unlock);
     /* Ask the owner for the 6-digit pairing code on the keypad (on = 1), or stop. */
@@ -112,6 +126,8 @@ typedef struct {
     uint8_t   echo_valid;
     /* relay EDHOC: the bond it will persist for */
     int       relay_ctx_slot;
+    /* `events` observed on this BLE session (ends with it) */
+    oz_observer obs;
 } oz_link;
 
 typedef struct oz_lock {
@@ -133,6 +149,10 @@ typedef struct oz_lock {
     uint8_t        pair_failures;
     uint64_t       pair_lockout_until_ms;
     oz_limit       pin_limit;      /* keypad wrong-PIN limit (P5-B), kv "pl" */
+    oz_events      events;         /* RAM ring; seq reserved in kv "es" */
+    uint32_t       ev_reserved;    /* seqs below this are reserved in kv */
+    oz_observer    relay_obs[OZ_LOCK_MAX_BONDS];   /* `events` over the relay, per bond (RAM) */
+    uint16_t       mid;            /* CoAP message id of lock-sent notifications */
     /* persisted relay contexts, one per bond (admin / service) */
     oz_oscore_ctx  relay[OZ_LOCK_MAX_BONDS];
     uint8_t        relay_used[OZ_LOCK_MAX_BONDS];
@@ -176,6 +196,12 @@ uint64_t oz_lock_keypad_lockout_ms(const oz_lock *L);
  * OZ_LOCKSTATE_NOT_FULLY_LOCKED. An unconfirmed move (no sensor) reports the
  * direction it drove. The actuate hook alone sets the commanded state. */
 void oz_lock_actuated(oz_lock *L, int unlock, int result);
+
+/* Pending `events` notifications for whoever observes on link k: the BLE
+ * session's own registration, or on the relay link each bond's. At most one
+ * message per call; call again until out_len is 0 (oz_ble_tick does). */
+int  oz_lock_events_poll(oz_lock *L, oz_link *k,
+                         uint8_t *out_type, uint8_t *out, size_t cap, size_t *out_len);
 
 int64_t oz_lock_utc(const oz_lock *L);   /* 0 when the clock was never set */
 

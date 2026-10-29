@@ -333,6 +333,34 @@ Who else observes events:
 - **apps:** their own bond's events over BLE.
 - **residential ozlock:** no service bond and no usage logs, unchanged.
 
+**Wire (built 2026-10-29 for the admin bond, ozkey-49 P5-E0; the service bond and member
+filtering add roles, not fields):**
+- `GET events`: answers 2.05 `{0: OK, 1: next_seq, 2: oldest_seq_held}`.
+  - With **Observe 0** it also registers. There is one registration per BLE session and one per
+    bond on the relay; a new one replaces the old. Optional **Uri-Query `after=N`** is the last
+    seq the reader already has. Without it, the lock sends every event it still holds.
+  - **Observe 1** deregisters. A BLE registration ends with the session. A relay registration ends
+    with a new relay context for that bond, a revoke, or a reboot; re-register after a restart.
+  - Roles today: **admin only**; anyone else gets `FORBIDDEN`.
+- **Notifications:** CoAP NON 2.05 with the registration's token, an increasing Observe value and
+  an OSCORE Partial IV. The payload is one event:
+  `{1: seq, 2: type, 3: time basis (0 none, 1 utc), ?4: utc_s, ?5: actor bond slot, 6: data}`.
+
+  | type | name | data |
+  |---|---|---|
+  | 0 | gap | `{1: events missed}`. `seq` is the first missed |
+  | 1 | keypad lockout | `{1: level (1 = the first, after 5 misses), 2: seconds}` |
+
+  - Further types (access, alarm, duress, battery, doorbell, bolt) take the next numbers as each
+    is built. A receiver ignores data keys it doesn't know.
+- **Ring and loss:** the lock holds the last **16** events in RAM. When the ring is full the oldest
+  is dropped. A reader that fell behind gets one `gap` event first, then the oldest held.
+  - Notifications are NON and not retransmitted. The receiver detects loss from `seq` and
+    re-registers with `after=` to refill from the ring.
+  - Sequence numbers are 32-bit (modulo 2^32) and never repeat across reboots: the lock reserves
+    them in blocks of 32 in kv. A reboot loses the ring and shows as a jump in `seq`.
+  - A factory reset restarts them at 0.
+
 ## 6. Roles (lock-enforced)
 
 | Role | Gets it how | May |
@@ -464,6 +492,6 @@ value is 8 random bytes, good for one use within 10 s.
 EDHOC-stage refusals (`BOND_DENIED`, `MEMBER_REPLAY`, `INVITE_BOUND_ELSEWHERE`, `PAIR_LOCKED_OUT`, …)
 travel as EDHOC error code 1 with the name as the text.
 
-**Not built yet:** `events` Observe, `lock/settings`, custodial mode (ozkey-51), `ozkie_version` on
+**Not built yet:** `events` for the service bond and members (admin is built, §5.1), `lock/settings`, custodial mode (ozkey-51), `ozkie_version` on
 the bridge. 🟡 The Matter enum values (lock state 0/1/2, credential types PIN 1, RFID 2,
 Fingerprint 3) are still unchecked against the Matter 1.x spec.

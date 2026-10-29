@@ -348,6 +348,10 @@ int oz_port_kv_erase(const char *key)
 /* get_ms_tick_func() is 32-bit and wraps every 49.7 days. Extending it is
  * correct as long as this is called at least once per wrap; the core calls
  * it on every message and timer tick. */
+static uint64_t advanced;
+
+void oz_ak1037_clock_advance(uint64_t ms) { advanced += ms; }
+
 uint64_t oz_port_monotonic_ms(void)
 {
     static uint32_t last;
@@ -358,7 +362,7 @@ uint64_t oz_port_monotonic_ms(void)
     last = now;
     uint64_t t = high | now;
     rt_hw_interrupt_enable(level);
-    return t;
+    return t + advanced;
 }
 
 /* ── Log ─────────────────────────────────────────────────────────────────── */

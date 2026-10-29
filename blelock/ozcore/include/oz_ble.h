@@ -52,7 +52,8 @@ void oz_ble_disconnect(oz_ble *s);
 /* One frame written to `ozkie`. A malformed frame is dropped, the partial
  * message with it; nothing is sent back, so a stranger learns nothing. */
 int  oz_ble_rx(oz_ble *s, const uint8_t *frame, size_t len);
-/* The keypad pairing code and the periodic tick may each produce a reply. */
+/* The keypad pairing code and the periodic tick may each produce a reply; the
+ * tick also sends up to 4 pending `events` notifications. */
 int  oz_ble_pair_code(oz_ble *s, uint32_t code);
 int  oz_ble_tick(oz_ble *s);
 

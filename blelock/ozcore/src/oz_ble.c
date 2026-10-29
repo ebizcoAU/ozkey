@@ -87,6 +87,14 @@ int oz_ble_tick(oz_ble *s)
 {
     uint8_t type;
     size_t n = 0;
-    int rc = oz_lock_tick(s->L, s->link, &type, s->out, sizeof s->out, &n);
-    return reply(s, rc, type, n);
+    int rc = reply(s, oz_lock_tick(s->L, s->link, &type, s->out, sizeof s->out, &n), type, n);
+    /* Pending `events` notifications, a few per tick so one burst can't
+     * starve the rest of the thread. */
+    for (int i = 0; i < 4 && !rc; i++) {
+        n = 0;
+        rc = reply(s, oz_lock_events_poll(s->L, s->link, &type, s->out, sizeof s->out, &n), type, n);
+        if (!n)
+            break;
+    }
+    return rc;
 }

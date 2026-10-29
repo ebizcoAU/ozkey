@@ -378,16 +378,51 @@ static void keypad_lockout(void)
     expect_int("4 wrong PINs", count("keypad: wrong"), 4);
     expect_int("no lockout yet", count("locked out"), 0);
 
+    /* The owner's app observes `events` (P5-E0) over this GATT session. */
+    oz_coap_msg m;
+    oz_oscore_xchg xo;
+    oz_coap_init(&m, OZ_COAP_CON, OZ_COAP_GET, ++mid);
+    m.tkl = 1;
+    m.token[0] = 0xe0;
+    oz_coap_add_opt(&m, OZ_COAP_OPT_OBSERVE, NULL, 0);
+    oz_coap_set_path(&m, "events");
+    size_t n = 0;
+    oz_oscore_protect_req(&osc, &m, req, sizeof req, &n, &xo);
+    size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    expect_int("events observed", response(out, ol, &xo, &result) == OZ_COAP_CONTENT && result == OZ_R_OK, 1);
+
+    got_done = 0;
+    oz_reasm_reset(&got);
     capture_start();
     keys("0000#");
     keys("4826#");
     capture_end();
+    /* The lockout went out as a notification from the thread's tick. */
+    static uint8_t pt[256];
+    oz_coap_msg note;
+    int64_t piv;
+    int ok = got_done && !oz_oscore_verify_resp(&osc, &xo, got.buf, got.len, pt, sizeof pt, &note, &piv);
+    expect_int("lockout notified over GATT", ok, 1);
+    oz_cbor_r c;
+    oz_cbor_r_init(&c, ok ? note.payload : NULL, ok ? note.payload_len : 0);
+    int type = -1;
+    size_t pairs = oz_cbor_get_map(&c);
+    for (size_t i = 0; i < pairs && !c.err; i++) {
+        uint64_t k = oz_cbor_get_uint(&c);
+        size_t sl;
+        if (k == 2)
+            type = (int)oz_cbor_get_uint(&c);
+        else
+            (void)oz_cbor_skip(&c, &sl);
+    }
+    expect_int("…a keypad lockout", type, OZ_EV_KEYPAD_LOCKOUT);
+    expect_int("…bound to the registration", ok && note.tkl == 1 && note.token[0] == 0xe0, 1);
     expect_int("5th: locked out for 60 s", count("lock: keypad locked out for 60 s"), 1);
     expect_int("next entry not checked", count("keypad: locked out, 60 s left, not checked"), 1);
 
     /* An owner unlock from the app clears it. */
-    size_t n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
-    size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
+    ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
     expect_int("owner unlock", response(out, ol, &x, &result) == OZ_COAP_CHANGED && result == OZ_R_UNLOCK_OK, 1);
     capture_start();
     keys("0000#");

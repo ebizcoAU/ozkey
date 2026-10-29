@@ -21,4 +21,9 @@ int oz_ak1037_kv_mount(void);
 enum { OZ_AK1037_KV_SELFTEST = 1, OZ_AK1037_KV_LOCK = 2 };
 int oz_ak1037_kv_claim(int owner);
 
+/* Self-test only: move oz_port_monotonic_ms() forward (the suites step past
+ * keypad lockouts). The kv owner rule keeps the lock from starting in a boot
+ * that ran the self-test, so the lock never runs on a moved clock. */
+void oz_ak1037_clock_advance(uint64_t ms);
+
 #endif
