@@ -99,13 +99,16 @@ async function registerPairing(appId, deviceId, label, bridgeId, ozkieVersion) {
   }
   // Fresh registration lands as 'registered' (awaiting the lock's first
   // contact); an already-enrolled lock keeps its status on re-register.
+  // S1e-3: the 'New Doorlock' default is for a fresh row only. It used to be
+  // the inserted VALUE, so the update's COALESCE always saw a label and a
+  // label-less re-register overwrote the owner's name with the default.
   await pool.query(
     `INSERT INTO locks (id, site_id, app_id, bridge_id, label, status, heartbeat_s)
        VALUES (?, ?, ?, ?, ?, 'registered', ?)
      ON DUPLICATE KEY UPDATE app_id = VALUES(app_id),
        bridge_id = COALESCE(VALUES(bridge_id), bridge_id),
-       label = COALESCE(VALUES(label), label)`,
-    [deviceId, CONFIG.SITE_ID, appId, bridgeId || null, label || 'New Doorlock', CONFIG.DEFAULT_HEARTBEAT_S]
+       label = COALESCE(?, label)`,
+    [deviceId, CONFIG.SITE_ID, appId, bridgeId || null, label || 'New Doorlock', CONFIG.DEFAULT_HEARTBEAT_S, label || null]
   );
   // Only written when the app says so — an older app build that never sends
   // it must not flip an existing row back to the default.

@@ -102,7 +102,7 @@ test('POST /pairings validates input', async () => {
   assert.equal(res.body.code, 'invalid_ozkie_version');
 });
 
-test('POST /pairings registers a direct lock and is idempotent for the same app', async () => {
+test('POST /pairings registers a direct lock and is idempotent for the same app (keeps the label)', async () => {
   let { res } = await step('pairings-L1', () =>
     call('POST', '/pairings', { app_id: APP_A.hex, device_id: L1, label: 'Front door' })
   );
@@ -115,6 +115,9 @@ test('POST /pairings registers a direct lock and is idempotent for the same app'
     call('POST', '/pairings', { app_id: APP_A.hex, device_id: L1 })
   ));
   assert.equal(res.status, 200);
+  // S1e-3 regression: a label-less re-register keeps the owner's label.
+  const [row] = await fx.query('SELECT label FROM locks WHERE id = ?', [L1]);
+  assert.equal(row.label, 'Front door');
 });
 
 test('POST /pairings refuses a second app on a live device_id', async () => {
@@ -148,11 +151,9 @@ test('MQTT enroll of a paired lock -> enrollment_ack; unknown -> nack', async ()
   assert.ok(ack, 'enrollment_ack published on the lock command topic');
   assert.equal(ack.payload.op, 'enrollment_ack');
   assert.equal(ack.payload.app_id, APP_A.hex);
-  // Recorded, not endorsed: the label-less re-register above wrote the
-  // 'New Doorlock' default over 'Front door' (registerPairing's
-  // `label || 'New Doorlock'` defeats its own COALESCE), so enroll then
-  // names the lock from its MAC. Today's behaviour; flagged for S1.
-  assert.equal(ack.payload.label, 'Doorlock 00:01');
+  // S1e-3: the label-less re-register above kept 'Front door', so enroll
+  // uses it (it fell back to 'Doorlock 00:01', from the MAC, before the fix).
+  assert.equal(ack.payload.label, 'Front door');
   assert.match(ack.payload.broker_secret, /^ozl_[0-9a-f]{32}$/);
   // S1e-2: the DB keeps only the hash of what the ack carried.
   const [lockRow] = await fx.query('SELECT broker_secret FROM locks WHERE id = ?', [L1]);
