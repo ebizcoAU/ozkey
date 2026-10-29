@@ -353,6 +353,60 @@ invites and the lock engine.
     - measured current draw of always-advertise (feeds P6 and the battery estimate)
   - Nothing calls `oz_gatt_ak1037_start()` yet. That's item 4's self-test app.
 
+### P4-prep item 4b (2026-10-29): on-target self-test and lock bring-up images
+
+- **Portable runner** `tests/selftest_all.c` (`oz_selftest.h`):
+  - `oz_selftest_suites()` runs the 8 suites: crypto, cbor, edhoc, oscore, invite, frame, adv, lock.
+  - Each `tests/test_<name>.c` is compiled with `main` renamed `oz_t_<name>`, so its statics stay
+    its own. `nm` showed no other exported symbol in any suite.
+  - The host builds the same thing as ctest `selftest_all`, so the runner is tested before
+    silicon. `kv_lfs` stays host-only: it simulates power cuts on a RAM flash.
+- **Two images**, picked by the link roots (`link_app_mcu.ps1 -Libs … -Name … -RootPattern …`):
+  - **Self-test** (`oz_selftest_ak1037.c`, `^oz_selftest_ak1037_`). MSH `oz.selftest` runs the
+    suites in a 16 KB thread under kv namespace `zt`, wiped before and after. Then the silicon-only
+    checks:
+    - SKE engine vs software AES over 256 random blocks
+    - FIPS 140-2 monobit on 20,000 raw TRNG bits and on 20,000 conditioned bits
+    - no repeat among 64 × 32 B from `oz_port_random`
+    - It ends with one line, `OZ SELFTEST PASS|FAIL: n failing, t ms, stack peak x of 16384 B`.
+      The stack peak comes from RT-Thread's `#` fill and is the number we need to size the OZKIE
+      thread.
+  - **Lock** (`oz_lockapp_ak1037.c`, `^oz_lockapp_ak1037_`). MSH `oz.start` runs `oz_lock_init`
+    with device_id `ozk-` + the BLE address, log-only actuate/prompt hooks, then
+    `oz_gatt_ak1037_start`. `oz.touch` and `oz.code N` stand in for the keypad until P5.
+  - kv has one owner per boot (`oz_ak1037_kv_claim`): the self-test wipes its namespace between
+    cases, so the lock can't start after it without a reboot, and the reverse. A first version used
+    weak cross-references, which made ld pull the whole self-test into the lock image through the
+    archive index. Replaced.
+- **Build (VictorPC, GCC 10.1.0):** `make -f port/ak1037/Makefile selftest` is `-Werror` clean.
+  - Suites: `-Wall -Wno-unused-function` (the shared `oz_test.h` helpers). One dead variable was
+    removed from `test_lock.c`.
+  - Commands: `-Wno-cast-function-type`, because the SDK's `AK_MSH_CMD_EXPORT` casts every command
+    to `long (*)(void)`.
+  - Both images link with no unresolved symbols. Each map keeps exactly its own FSymTab entries.
+
+  | Image | text | data | bss | text+data vs PROG (798,720 B) |
+  |---|---|---|---|---|
+  | SDK `app_mcu` (reference) | 708,496 | 2,024 | 16,132 | |
+  | self-test | 794,016 | 2,024 | 101,504 | 796,040 B, **2.6 KiB headroom** |
+  | lock | 753,828 | 2,024 | 47,076 | 755,852 B, 42.8 KiB headroom |
+  | both together (not built) | 797,488 | 2,024 | 130,924 | **744 B over** |
+
+  - The suites add 47 KB of text. `t_lock`'s simulated apps and locks are 42 KB of bss.
+  - The image budget goes mostly to the SDK's demo `app_mcu`: about 78 KB fingerprint matcher
+    (`btl_*`) and 21 KB MP3 decoder (`mad_*`). Our own app without those is the real headroom
+    lever. Item 5's partition table is the other lever (the default table has no 2nd app bank).
+- **Unverified until the kit:**
+  - whether the shell actually reaches the commands
+  - thread priorities: `rtconfig.h` says 8 levels but the shell asks for 20, so the priorities are
+    macros (self-test `RT_THREAD_PRIORITY_MAX−2`, lock `/2`)
+  - the byte order of `com_ble_get_dev_addr()` against what a phone scans
+  - whether the SDK `printf` handles `%zu`/`%lld` in the suites' messages (pass/fail counts don't
+    depend on it)
+- **Also done in this item:**
+  - the kv fixes above (4389aa5, 3639482)
+  - the commit gate (22d6df9)
+
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
 - **iOS:** minimum 15.0; xcframework with an `ios-arm64` slice and an `ios-arm64_x86_64` simulator slice.

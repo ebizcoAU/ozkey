@@ -1,6 +1,10 @@
 # ozcore for AK1037 (ozkey-49 P3). Runs on the Windows build host:
 #   make -f port/ak1037/Makefile
 # from the ozcore directory. Produces build-ak1037/libozcore.a.
+#   make -f port/ak1037/Makefile selftest
+# also builds build-ak1037/libozselftest.a: every host suite plus the commands
+# of the two bring-up images, self-test and lock app (ozkey-49 P4 item 4b).
+# The link roots pick which image you get (link_app_mcu.ps1).
 
 SDK    ?= C:/Users/sshuser/ak1037/AnyMicro1037_SDK_V1.02
 PREFIX ?= C:/Users/sshuser/ak1037/SysGCC/risc-v/bin/riscv64-unknown-elf-
@@ -28,6 +32,30 @@ OBJS   = $(CORE:src/%.c=$(OUT)/%.o) $(OUT)/monocypher.o $(OUT)/oz_kv_lfs.o $(OUT
 $(OUT)/libozcore.a: $(OBJS)
 	$(AR) rcs $@ $^
 	$(SIZE) -t $^
+
+# Bring-up images: the host suites, each main() renamed oz_t_<name> so their
+# statics stay apart (tests/oz_selftest.h), the runner, and each image's MSH
+# commands.
+SUITES = crypto cbor edhoc oscore invite frame adv lock
+TOBJS  = $(SUITES:%=$(OUT)/t_%.o) $(OUT)/selftest_all.o $(OUT)/oz_selftest_ak1037.o \
+         $(OUT)/oz_lockapp_ak1037.o
+
+selftest: $(OUT)/libozcore.a $(OUT)/libozselftest.a
+
+$(OUT)/libozselftest.a: $(TOBJS)
+	$(AR) rcs $@ $^
+	$(SIZE) -t $^
+
+# oz_test.h's helpers are static and not every suite uses all of them.
+$(OUT)/t_%.o: tests/test_%.c | $(OUT)
+	$(CC) $(BASE) -Wall -Wno-unused-function -Werror $(INC) -Iport/host -Itests -Dmain=oz_t_$* -c $< -o $@
+
+$(OUT)/selftest_all.o: tests/selftest_all.c | $(OUT)
+	$(CC) $(BASE) $(STRICT) $(INC) -Itests -c $< -o $@
+
+# The SDK's AK_MSH_CMD_EXPORT casts every command to long (*)(void).
+$(OUT)/oz_selftest_ak1037.o $(OUT)/oz_lockapp_ak1037.o: $(OUT)/%.o: port/ak1037/%.c | $(OUT)
+	$(CC) $(BASE) -Wall -Wextra -Wno-cast-function-type -Werror $(INC) -Iport/host -Itests $(SDKINC) -c $< -o $@
 
 # Portable core: the same warnings as the host build.
 $(OUT)/%.o: src/%.c | $(OUT)

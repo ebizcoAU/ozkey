@@ -185,8 +185,6 @@ static int handshake(app_t *a, oz_link *k, const uint8_t *ead3, size_t ead3_len,
     return 0;
 }
 
-static oz_oscore_xchg held_x;
-
 /* Build an OSCORE request; returns its length in out. */
 static size_t make_req(app_t *a, uint8_t method, const char *path, const uint8_t *body, size_t bl,
                        const uint8_t *echo, uint8_t *out, size_t cap, oz_oscore_xchg *x)

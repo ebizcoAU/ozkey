@@ -32,6 +32,7 @@
 #include "hal_partition.h"
 #include "lfs.h"
 #include "oz_kv_lfs.h"
+#include "oz_port_ak1037.h"
 
 /* ── SHA-256 ─────────────────────────────────────────────────────────────── */
 
@@ -95,6 +96,17 @@ int oz_port_aes128_encrypt_block(const uint8_t key[16], const uint8_t in[16], ui
     return OZ_OK;
 }
 
+int oz_ak1037_ske_state(void)
+{
+    if (ske_state == 0) ske_selftest();
+    return ske_state;
+}
+
+int oz_ak1037_ske_block(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
+{
+    return ske_block(key, in, out);
+}
+
 /* ── X25519 ──────────────────────────────────────────────────────────────── */
 
 int oz_port_x25519_public_key(uint8_t pub[32], const uint8_t priv[32])
@@ -127,6 +139,12 @@ static int trng_word(uint32_t *w, uint32_t *prev, int *have_prev)
     *prev = *w;
     *have_prev = 1;
     return OZ_OK;
+}
+
+int oz_ak1037_trng_word(uint32_t *w)
+{
+    if (!trng_ready) { hal_trng_init(); trng_ready = 1; }
+    return hal_trng_get_randbuff_bytes((uint8_t *)w, 4) != 0 ? OZ_E_HW : OZ_OK;
 }
 
 int oz_port_random(uint8_t *out, size_t len)
@@ -266,6 +284,18 @@ static int kv_ready(void)
     }
     kv_state = 1;
     return OZ_OK;
+}
+
+int oz_ak1037_kv_mount(void) { return kv_ready(); }
+
+int oz_ak1037_kv_claim(int owner)
+{
+    static int kv_owner;
+    rt_base_t level = rt_hw_interrupt_disable();
+    int ok = kv_owner == 0 || kv_owner == owner;
+    if (ok) kv_owner = owner;
+    rt_hw_interrupt_enable(level);
+    return ok ? OZ_OK : OZ_E_ARG;
 }
 
 int oz_port_kv_get(const char *key, uint8_t *buf, size_t cap, size_t *len)

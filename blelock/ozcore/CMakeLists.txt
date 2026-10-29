@@ -109,3 +109,20 @@ target_link_libraries(ozhostlock ozport_host)
 add_executable(test_adv tests/test_adv.c)
 target_link_libraries(test_adv ozport_host)
 add_test(NAME adv COMMAND test_adv)
+
+# The same suites as one program, each main() renamed: what the AK1037
+# self-test image runs (tests/oz_selftest.h, ozkey-49 P4 item 4b). Source
+# properties are directory-wide, so the rename goes in a generated wrapper
+# rather than on tests/test_<name>.c, which the standalone tests also build.
+set(OZ_SELFTEST_SOURCES tests/selftest_all.c)
+foreach(t crypto cbor edhoc oscore invite frame adv lock)
+    set(w ${CMAKE_CURRENT_BINARY_DIR}/selftest_${t}.c)
+    file(WRITE ${w}.in "#define main oz_t_${t}\n#include \"${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${t}.c\"\n")
+    configure_file(${w}.in ${w} COPYONLY)
+    list(APPEND OZ_SELFTEST_SOURCES ${w})
+endforeach()
+add_executable(test_selftest_all ${OZ_SELFTEST_SOURCES})
+target_link_libraries(test_selftest_all ozport_host)
+target_compile_definitions(test_selftest_all PRIVATE OZ_SELFTEST_MAIN)
+target_include_directories(test_selftest_all PRIVATE tests)
+add_test(NAME selftest_all COMMAND test_selftest_all)
