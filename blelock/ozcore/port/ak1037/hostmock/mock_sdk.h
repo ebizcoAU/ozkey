@@ -49,6 +49,11 @@ void mock_flash_blank(void);            /* the whole chip erased (0xFF) */
 void mock_wait_parked(void);            /* until the lockstep thread waits in rt_mq_recv */
 void mock_pass(void);                   /* let it take one message or one timeout */
 void mock_join(const char *name);       /* until a free-running thread returns */
+/* Deepest stack the thread has used so far, in bytes from its entry point,
+ * measured on the host stack it really runs on (painted at start). 0 when it
+ * can't be measured (ASan builds: instrumented frames and poisoned memory).
+ * Host frames are not RV32 frames: a tripwire, not the target's number. */
+size_t mock_stack_peak(const char *name);
 
 /* ── BLE ───────────────────────────────────────────────────────────────── */
 extern T_BLE_INIT_PARAM mock_ble;       /* what com_ble_init was given */

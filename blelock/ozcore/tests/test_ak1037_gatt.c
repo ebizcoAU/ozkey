@@ -24,6 +24,7 @@
 #include "oz_frame.h"
 #include "oz_adv.h"
 #include "oz_ble.h"
+#include "oz_gatt_ak1037.h"
 #include "mock_sdk.h"
 
 #define LINK ((void *)0x1234)
@@ -476,6 +477,16 @@ int main(void)
     expect_int("NOR rule kept", mock_nor_violations, 0);
     expect_int("SKE only with interrupts off", mock_irq_violations, 0);
     expect_int("the engine did the AES", mock_ske_blocks > 1, 1);
+    /* P5-D: the OZKIE thread's deepest stack over everything above (claim,
+     * EDHOC, kv writes, keypad lockout), on the host. Release builds hold it
+     * to the thread's budget as a tripwire. It covers only the paths run
+     * here; the RV32 worst case is the static report (ozkey-49 P5-D). */
+    size_t peak = mock_stack_peak("ozkie");
+    printf("ozkie thread stack peak (host): %zu of %u B\n", peak, (unsigned)OZ_GATT_THREAD_STACK);
+#ifdef OZ_STACK_TRIPWIRE
+    expect_int("OZKIE stack measured", peak > 0, 1);
+    expect_int("OZKIE stack within its budget", peak <= OZ_GATT_THREAD_STACK, 1);
+#endif
     /* The OZKIE thread stays parked in rt_mq_recv; exit ends it. */
     return report("ak1037_gatt");
 }

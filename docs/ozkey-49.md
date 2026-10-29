@@ -647,6 +647,46 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
   need the board. An "owner unlock" means the app's `lock/unlock` with the admin bond; a member
   unlock does not clear the lockout. The server/app is not told about lockouts (no event yet).
 
+### P5-D (2026-10-29): stack budgets, measured on the host and bounded on RV32
+- **Static bound on RV32** (VictorPC, SysGCC GCC 10.1.0, `-Os`, `-fcallgraph-info=su`,
+  `tools/stack_report.py`; the SDK's `lfs.c` built with the same flags so littlefs is on the path):
+
+  | entry | bytes | deepest chain |
+  |---|---|---|
+  | `oz_lock_rx` | **6,160** | rx_oscore (2,176) → admin `dev/reset` → oz_lock_init (1,936) → kv_set → `lfs_rename` → dir_commit → … |
+  | `oz_lockapp_ak1037_start` | 3,664 | oz_lock_init → kv_set → littlefs |
+  | `oz_lock_init` | 3,600 | as above |
+  | `oz_lock_keypad_pin` (P5-B) | 2,928 | save_creds (1,056) → kv_set → littlefs |
+  | `oz_lock_pair_code` / `_tick` | ~2,280 | pair_finish → OSCORE → CCM → kv |
+  | `oz_gatt_ak1037_*` posts | ≤ 288 | they only queue for the OZKIE thread |
+
+  - The worst case is unchanged in kind since P4-prep item 2 (6,128 B then; +32 B now). P5-B's
+    keypad path is under half of it.
+  - Still not counted: indirect calls (app hooks, EDHOC `dh`/`resolve_peer`, OSCORE `next_ssn`
+    persist, littlefs's block-device callbacks), libc and the SDK. littlefs 2.4.1 recursion
+    (`dir_commit`↔`dir_compact`/`dir_drop`, `dir_traverse`, `file_flush`↔`file_rawwrite`) is
+    reported, not followed.
+- **Measured on the host** (`mock_stack_peak`, new in the hostmock): the mock paints each
+  thread's real pthread stack at start and scans for the deepest touched byte, the same idea as
+  RT-Thread's `#` fill.
+
+  | thread | budget | debug | Release |
+  |---|---|---|---|
+  | `ozkie` (`test_ak1037_gatt`: claim, EDHOC, kv, keypad lockout) | 12,288 | 3,743 | 3,279 |
+  | `oztest` (`test_ak1037_selftest`: every suite) | 16,384 | 9,003 | 11,871 |
+
+  - Release builds of both tests assert peak ≤ budget (`OZ_STACK_TRIPWIRE`), so a change that
+    blows a thread's stack fails the gate. ASan builds don't measure (returns 0).
+  - The host number covers only the paths the test runs. It does not reach the static worst case
+    (dev/reset with a littlefs compaction), so the static bound stays the sizing number.
+  - Mutation-checked, all 4 caught: scan returns 0; no paint; OZKIE budget cut to 3,000 B;
+    self-test budget cut to 8 KB.
+- **Verdict:** keep **12 KB** for the OZKIE thread (2× the static bound) and **16 KB** for the
+  self-test thread. Confirm both on silicon with RT-Thread's high-water mark (the self-test image
+  already prints its own).
+- **Still open:** moving the large locals of `rx_oscore` and `oz_lock_init` into `oz_lock` would
+  cut ~3 KB from the worst case; not needed while SRAM isn't short.
+
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
 - **iOS:** minimum 15.0; xcframework with an `ios-arm64` slice and an `ios-arm64_x86_64` simulator slice.

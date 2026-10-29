@@ -157,6 +157,9 @@ add_executable(test_ak1037_gatt tests/test_ak1037_gatt.c port/ak1037/oz_lockapp_
 target_link_libraries(test_ak1037_gatt ozport_ak1037_host)
 target_compile_options(test_ak1037_gatt PRIVATE -Wall -Wextra -Werror)
 add_test(NAME ak1037_gatt COMMAND test_ak1037_gatt)
+# P5-D: optimised builds hold the measured host stack peaks to the threads'
+# budgets (unoptimised frames are far bigger than the target's -Os ones).
+target_compile_definitions(test_ak1037_gatt PRIVATE $<$<CONFIG:Release>:OZ_STACK_TRIPWIRE>)
 
 # The self-test image: the suites (as selftest_all builds them) on the AK1037
 # port, plus both images' commands so the kv-owner rule is exercised.
@@ -165,6 +168,7 @@ add_executable(test_ak1037_selftest tests/test_ak1037_selftest.c
 target_link_libraries(test_ak1037_selftest ozport_ak1037_host)
 target_include_directories(test_ak1037_selftest PRIVATE tests port/host)
 target_compile_options(test_ak1037_selftest PRIVATE -Wall -Wno-unused-function -Werror)
+target_compile_definitions(test_ak1037_selftest PRIVATE $<$<CONFIG:Release>:OZ_STACK_TRIPWIRE>)
 foreach(m good wrong)
     add_test(NAME ak1037_selftest_${m} COMMAND test_ak1037_selftest ${m})
 endforeach()

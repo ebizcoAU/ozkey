@@ -193,10 +193,68 @@ static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static int parked, go;
 static long passes;
 
+#if defined(__SANITIZE_ADDRESS__)
+#define STACK_MEASURE 0
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define STACK_MEASURE 0
+#endif
+#endif
+#ifndef STACK_MEASURE
+#define STACK_MEASURE 1
+#endif
+
+#define PAINT 0xa5
+
+/* The pthread's own stack: [low, high). */
+static void stack_bounds(uintptr_t *low, uintptr_t *high)
+{
+#ifdef __APPLE__
+    *high = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+    *low = *high - pthread_get_stacksize_np(pthread_self());
+#else
+    pthread_attr_t a;
+    void *addr;
+    size_t size;
+    pthread_getattr_np(pthread_self(), &a);
+    pthread_attr_getstack(&a, &addr, &size);
+    pthread_attr_destroy(&a);
+    *low = (uintptr_t)addr;
+    *high = (uintptr_t)addr + size;
+#endif
+}
+
+/* Paint from just above the guard area up to a little below the caller's
+ * frame; the painter's own small frame sits in the gap. */
+__attribute__((noinline)) static void paint_stack(struct rt_thread *t, uintptr_t sp)
+{
+    uintptr_t low, high;
+    stack_bounds(&low, &high);
+    volatile uint8_t *p = (volatile uint8_t *)(low + 4096);
+    volatile uint8_t *end = (volatile uint8_t *)(sp - 512);
+    t->paint_lo = (uint8_t *)p;
+    t->paint_top = sp;
+    while (p < end)
+        *p++ = PAINT;
+}
+
+static size_t scan_peak(const struct rt_thread *t)
+{
+    const volatile uint8_t *p = t->paint_lo;
+    while ((uintptr_t)p < t->paint_top - 512 && *p == PAINT)
+        p++;
+    return (size_t)(t->paint_top - (uintptr_t)p);
+}
+
 static void *trampoline(void *arg)
 {
     struct rt_thread *t = arg;
+    volatile char here;
+    if (STACK_MEASURE)
+        paint_stack(t, (uintptr_t)&here);
     t->entry(t->param);
+    if (STACK_MEASURE)
+        t->peak_at_exit = scan_peak(t);
     pthread_mutex_lock(&big);
     t->finished = 1;
     pthread_cond_broadcast(&cv);
@@ -242,6 +300,25 @@ rt_err_t rt_thread_startup(rt_thread_t thread)
     int rc = pthread_create(&p, &a, trampoline, thread);
     pthread_attr_destroy(&a);
     return rc ? -RT_ERROR : RT_EOK;
+}
+
+static struct rt_thread *find_thread(const char *name)
+{
+    struct rt_thread *t = NULL;
+    for (unsigned i = 0; i < sizeof threads / sizeof threads[0]; i++)
+        if (threads[i] && !strcmp(threads[i]->name, name))
+            t = threads[i];
+    return t;
+}
+
+/* Called only while the thread is parked or finished, so nothing moves. A
+ * finished thread's stack is unmapped: it measured itself on the way out. */
+size_t mock_stack_peak(const char *name)
+{
+    struct rt_thread *t = find_thread(name);
+    if (!STACK_MEASURE || !t || !t->paint_lo)
+        return 0;
+    return t->finished ? t->peak_at_exit : scan_peak(t);
 }
 
 void mock_join(const char *name)

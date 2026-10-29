@@ -31,6 +31,10 @@ struct rt_thread {
     size_t stack_size;
     int    started;
     int    finished;
+    /* mock only: the painted part of the pthread stack it really runs on */
+    uint8_t  *paint_lo;
+    uintptr_t paint_top;
+    size_t    peak_at_exit;   /* the stack is gone once the thread ends */
 };
 typedef struct rt_thread *rt_thread_t;
 
