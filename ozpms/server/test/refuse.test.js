@@ -20,7 +20,7 @@ const SERVER_DIR = path.join(__dirname, '..');
 function boot(extra) {
   const r = spawnSync(process.execPath, ['server.js'], {
     cwd: SERVER_DIR,
-    timeout: 15000,
+    timeout: 60000, // a cold boot under load has taken >15 s (S1e-3 repro #3)
     encoding: 'utf8',
     env: {
       PATH: process.env.PATH,

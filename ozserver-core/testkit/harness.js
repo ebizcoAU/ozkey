@@ -279,7 +279,7 @@ class Fixture {
     const t0 = Date.now();
     try {
       await waitFor(() => /HTTP directory listening/.test(this.log().slice(logFrom)), {
-        timeoutMs: 30000,
+        timeoutMs: 60000, // matches refuse.test.js; slow spawns under load (S1e-3 repro #3)
         what: 'server listening',
       });
     } catch (err) {
