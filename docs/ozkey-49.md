@@ -107,6 +107,23 @@ roadmap), and the bridge's OZKIE end. A new chip only needs a new `port/` direct
 
 P0–P3 can start now. P4 onwards waits for the AK1037 kits.
 
+### Commit gate (firmware; PM nexus-a8 ruling 2026-10-29)
+
+Firmware commits on its own branch; only the PM merges to main. Commit only when the gate passes:
+
+- `blelock/ozcore/tools/gate.sh <label>` exits 0. It runs ctest from clean build directories, three
+  ways:
+  - **default build** (no build type), so `assert()` and littlefs's `LFS_ASSERT` are live
+  - **Release** (NDEBUG), the optimised code
+  - **ASan + UBSan**, where any sanitizer report fails the run
+- The ruling requires the sanitizer pass for any change under `port/`, `common/` or `src/`. The
+  script runs it every time, which costs about a minute.
+- The log is written to `nexus-lab-backups/ozkey_notes/ctest/<date>_<label>.log`. Cite it in the
+  report to the PM.
+- Why: until 2026-10-29 the gate was Release-only. That compiled out the littlefs assert that, in a
+  default build, exposed the kv bug fixed in 4389aa5 (P4-prep item 2 below).
+- `blelock/common/` (the Arduino-era sketches) has no host build, so the gate doesn't cover it yet.
+
 ### P3 result (2026-10-18, Windows build host, SysGCC RISC-V GCC 10.1.0)
 
 - **`port/ak1037/oz_port_ak1037.c`** (new):
@@ -235,6 +252,11 @@ invites and the lock engine.
     silicon can't do (the CPU stops), and littlefs's own assert fired on it. Release gates hid
     this because NDEBUG compiled the assert out. A cut now longjmps back to the test, and the
     host littlefs build keeps its asserts on in every build type.
+  - 🟢 **Item 2 re-verified after the fix (4389aa5):** every result above still holds (sweep
+    old-or-new / OK-means-done / no temp / mountable, 192-cut soak, 79 checks). It passes the full
+    gate (default, Release, ASan+UBSan). **Mutation check of the gate:** with the pre-fix
+    `oz_kv_lfs.c` put back, default and Release still pass and only the ASan leg fails
+    (stack-use-after-scope in `lfs_file_rawsync`). That's why the sanitizer pass is part of the gate.
 - **AK1037 build:** `-Werror` clean.
   - Link: text 749,100 (**+3,968** over P3b, kv plus the SDK's `lfs.c`, which `app_mcu`
     previously garbage-collected); bss +252.
