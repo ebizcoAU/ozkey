@@ -6,6 +6,7 @@
 #include "oz_crypto.h"
 
 static lfs_t *fs;
+static int stale;                       /* an I/O error left the mount suspect */
 static char ns[2] = {'o', 'z'};         /* namespace, see oz_kv_lfs_namespace() */
 
 /* "oz." + key + ".t" + NUL */
@@ -16,8 +17,11 @@ static int map_err(int e)
     switch (e) {
     case LFS_ERR_NOENT: return OZ_E_NOT_FOUND;
     case LFS_ERR_NOSPC: return OZ_E_NO_SPACE;
-    case LFS_ERR_INVAL:
-    case LFS_ERR_NAMETOOLONG: return OZ_E_ARG;
+    case LFS_ERR_INVAL: return OZ_E_ARG;
+    /* path_of() keeps names far below littlefs's limit, so this is never the
+     * name: littlefs 2.4.1 returns it for ANY failed commit while creating a
+     * file (lfs.c, lfs_file_rawopencfg), I/O errors included. */
+    case LFS_ERR_NAMETOOLONG: return OZ_E_HW;
     default: return OZ_E_HW;
     }
 }
@@ -101,9 +105,43 @@ int oz_kv_lfs_namespace(const char *name)
     return OZ_OK;
 }
 
+/* littlefs 2.4.1 doesn't drop its program cache after a failed program, so
+ * after any I/O error (OZ_E_HW) the mount's caches can't be trusted. Drop the
+ * mount and mount again from flash. If that fails too, the next call retries. */
+static int remount(void)
+{
+    const struct lfs_config *cfg = fs->cfg;
+    (void)lfs_unmount(fs);
+    memset(fs, 0, sizeof *fs);
+    stale = 1;
+    if (lfs_mount(fs, cfg) != 0) {
+        fs->cfg = cfg;                  /* for the retry */
+        return OZ_E_HW;
+    }
+    stale = 0;
+    return remove_all(is_temp);         /* a failed set may have left its temp */
+}
+
+/* Before a call: a mount left suspect by the last error is remounted first. */
+static int ready(void)
+{
+    if (!fs)
+        return OZ_E_HW;
+    return stale ? remount() : OZ_OK;
+}
+
+/* After a call: an I/O error makes the mount suspect. */
+static int checked(int rc)
+{
+    if (rc == OZ_E_HW && fs)
+        (void)remount();
+    return rc;
+}
+
 int oz_kv_lfs_wipe(void)
 {
-    return fs ? remove_all(in_ns) : OZ_E_HW;
+    int rc = ready();
+    return rc ? rc : checked(remove_all(in_ns));
 }
 
 int oz_kv_lfs_attach(lfs_t *lfs)
@@ -111,6 +149,7 @@ int oz_kv_lfs_attach(lfs_t *lfs)
     if (!lfs || lfs->cfg->cache_size > OZ_KV_LFS_CACHE_MAX)
         return OZ_E_ARG;
     fs = lfs;
+    stale = 0;
     /* A set that lost power before its rename leaves "oz.<key>.t" behind:
      * the old value is still intact, so the temp file is just garbage. */
     return remove_all(is_temp);
@@ -132,7 +171,7 @@ static int open_file(kv_file *k, const char *path, int flags)
     return lfs_file_opencfg(fs, &k->f, path, flags, &k->fc);
 }
 
-int oz_kv_lfs_get(const char *key, uint8_t *buf, size_t cap, size_t *len)
+static int get(const char *key, uint8_t *buf, size_t cap, size_t *len)
 {
     char path[PATH_MAX_LEN];
     kv_file k;
@@ -163,7 +202,7 @@ int oz_kv_lfs_get(const char *key, uint8_t *buf, size_t cap, size_t *len)
     return rc;
 }
 
-int oz_kv_lfs_set(const char *key, const uint8_t *buf, size_t len)
+static int set(const char *key, const uint8_t *buf, size_t len)
 {
     char path[PATH_MAX_LEN], temp[PATH_MAX_LEN];
     kv_file k;
@@ -186,18 +225,21 @@ int oz_kv_lfs_set(const char *key, const uint8_t *buf, size_t len)
     e = lfs_file_close(fs, &k.f);         /* close commits the temp file */
     oz_wipe(k.cache, sizeof k.cache);
     if (put < 0 || e < 0 || (size_t)put != len) {
-        (void)lfs_remove(fs, temp);
-        return map_err(put < 0 ? (int)put : e < 0 ? e : LFS_ERR_IO);
+        rc = map_err(put < 0 ? (int)put : e < 0 ? e : LFS_ERR_IO);
+    } else {
+        e = lfs_rename(fs, temp, path);   /* the atomic switch-over */
+        if (e >= 0)
+            return OZ_OK;
+        rc = map_err(e);
     }
-    e = lfs_rename(fs, temp, path);       /* the atomic switch-over */
-    if (e < 0) {
+    /* After an I/O error the remount removes the temp; don't touch the
+     * suspect mount again here. */
+    if (rc != OZ_E_HW)
         (void)lfs_remove(fs, temp);
-        return map_err(e);
-    }
-    return OZ_OK;
+    return rc;
 }
 
-int oz_kv_lfs_erase(const char *key)
+static int erase(const char *key)
 {
     char path[PATH_MAX_LEN];
     int rc = path_of(path, key, 0);
@@ -207,4 +249,22 @@ int oz_kv_lfs_erase(const char *key)
         return OZ_E_HW;
     int e = lfs_remove(fs, path);
     return e < 0 ? map_err(e) : OZ_OK;
+}
+
+int oz_kv_lfs_get(const char *key, uint8_t *buf, size_t cap, size_t *len)
+{
+    int rc = ready();
+    return rc ? rc : checked(get(key, buf, cap, len));
+}
+
+int oz_kv_lfs_set(const char *key, const uint8_t *buf, size_t len)
+{
+    int rc = ready();
+    return rc ? rc : checked(set(key, buf, len));
+}
+
+int oz_kv_lfs_erase(const char *key)
+{
+    int rc = ready();
+    return rc ? rc : checked(erase(key));
 }

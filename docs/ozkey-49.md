@@ -257,6 +257,18 @@ invites and the lock engine.
     gate (default, Release, ASan+UBSan). **Mutation check of the gate:** with the pre-fix
     `oz_kv_lfs.c` put back, default and Release still pass and only the ASan leg fails
     (stack-use-after-scope in `lfs_file_rawsync`). That's why the sanitizer pass is part of the gate.
+  - 🔴 **Remount after any I/O error (PM ruling 2026-10-29, item 4b work):** littlefs 2.4.1 keeps a
+    stale program cache after a failed prog. `oz_kv_lfs` now unmounts and remounts from flash
+    after any `OZ_E_HW`, and retries the mount before the next call if that fails. The new host
+    case `ioerr` fails each prog of a replace in turn with the power still on, and checks
+    old-or-new, no temp left, other keys intact, and usable with no reboot (5 failing progs, all
+    pass). **Mutation check:** without the remount, the asserts-on build aborts on the stale cache,
+    and with asserts off (as on silicon) 4 of the 5 break old-or-new. That is real corruption from
+    one transient flash error.
+  - A second 2.4.1 quirk surfaced along the way: creating a file reports **any** failed commit as
+    `LFS_ERR_NAMETOOLONG` (`lfs_file_rawopencfg`). `oz_kv_lfs` had mapped that to `OZ_E_ARG`, so a
+    flash error looked like a bad key and skipped recovery. Our names are ≤ 21 chars against
+    littlefs's 255, so it now maps to `OZ_E_HW`.
 - **AK1037 build:** `-Werror` clean.
   - Link: text 749,100 (**+3,968** over P3b, kv plus the SDK's `lfs.c`, which `app_mcu`
     previously garbage-collected); bss +252.

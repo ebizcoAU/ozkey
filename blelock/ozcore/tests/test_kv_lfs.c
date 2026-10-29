@@ -28,6 +28,8 @@ static uint8_t flash[SECTORS * SECTOR];
 static long ops_left = -1;              /* -1: no cut armed */
 static int dead;                        /* power is off until reboot */
 static long ops_done, nor_violations;
+static long prog_fail_at;               /* fail the Nth prog, power stays on */
+static long prog_failures;
 static jmp_buf power_off;               /* where the CPU "stops" at a cut */
 
 /* Run one kv call with power that may die during it: rc is OZ_E_HW if it did. */
@@ -61,6 +63,10 @@ static int bd_prog(const struct lfs_config *c, lfs_block_t b, lfs_off_t off, con
     (void)c;
     if (dead)
         return LFS_ERR_IO;
+    if (prog_fail_at > 0 && --prog_fail_at == 0) {
+        prog_failures++;                /* a flash error: nothing written */
+        return LFS_ERR_IO;
+    }
     int torn = cut_now();
     uint8_t *dst = flash + b * SECTOR + off;
     const uint8_t *src = buf;
@@ -353,6 +359,46 @@ static void soak(void)
     if (reboots < 100) { failures++; printf("FAIL soak: only %ld cuts\n", reboots); }
 }
 
+/* A program that fails with the power still on (a flash error, not a cut).
+ * Fail each prog of a replace in turn: the call reports OZ_E_HW or completes,
+ * the key is old-or-new, and with no reboot the very next calls work, read
+ * from flash and not from the stale cache littlefs 2.4.1 keeps. Runs with
+ * littlefs's asserts live, which fire on that stale cache. */
+static void io_error(void)
+{
+    uint8_t a[300], b[300], other[32];
+    fill(a, sizeof a, 0x21);
+    fill(b, sizeof b, 0x42);
+    fill(other, sizeof other, 0x63);
+    long tried = 0, bad = 0, unusable = 0;
+    format_and_boot();
+    expect_int("ioerr: set other", oz_kv_lfs_set("lk", other, sizeof other), OZ_OK);
+    for (long at = 1; at <= 12; at++) {
+        if (oz_kv_lfs_set("b5", a, sizeof a) != OZ_OK) { unusable++; continue; }
+        long before = prog_failures;
+        prog_fail_at = at;
+        int rc = oz_kv_lfs_set("b5", b, sizeof b);
+        prog_fail_at = 0;
+        if (prog_failures == before)
+            break;                      /* the set finished before prog #at */
+        tried++;
+        int w = which("b5", a, sizeof a, b, sizeof b);
+        if (rc != OZ_OK && rc != OZ_E_HW) bad++;
+        if (w != 1 && w != 2) bad++;
+        if (rc == OZ_OK && w != 2) bad++;
+        if (which("lk", other, sizeof other, NULL, 0) != 1) bad++;
+        if (temp_files() != 0) bad++;
+        /* Usable straight away, no reboot. */
+        if (oz_kv_lfs_set("b5", b, sizeof b) != OZ_OK || which("b5", NULL, 0, b, sizeof b) != 2)
+            unusable++;
+    }
+    checks++;
+    if (tried < 3) { failures++; printf("FAIL ioerr: only %ld failing progs tried\n", tried); }
+    printf("ioerr: %ld failing progs\n", tried);
+    expect_int("ioerr: old-or-new, nothing else", bad, 0);
+    expect_int("ioerr: usable without a reboot", unusable, 0);
+}
+
 int main(void)
 {
     basics();
@@ -362,6 +408,7 @@ int main(void)
     sweep(OP_CREATE, "create", 3);
     sweep(OP_ERASE, "erase", 1);      /* one metadata commit, so one cut point */
     soak();
+    io_error();
     expect_int("littlefs never asked NOR for 0->1", nor_violations, 0);
     return report("kv_lfs");
 }

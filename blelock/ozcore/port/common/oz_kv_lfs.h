@@ -9,6 +9,11 @@
  * the key holds the old value or the new one, never a mix and never a
  * half-created empty file. Leftover ".t" files are removed at attach.
  *
+ * After any I/O error (a call returned OZ_E_HW) the filesystem is unmounted
+ * and mounted again from flash, because littlefs 2.4.1 keeps a stale program
+ * cache after a failed program. If the remount fails, every later call tries
+ * again before doing anything else.
+ *
  * Not re-entrant: call from one thread (the OZKIE thread). littlefs's own lock
  * hooks protect the filesystem itself.
  */
