@@ -143,7 +143,7 @@ target_compile_options(ozport_ak1037_host PRIVATE -Wall -Wextra -Werror)
 
 add_executable(test_ak1037_port tests/test_ak1037_port.c)
 target_link_libraries(test_ak1037_port ozport_ak1037_host)
-foreach(m good wrong error blank nopart badpart)
+foreach(m good wrong error blank nopart badpart retry)
     add_test(NAME ak1037_port_${m} COMMAND test_ak1037_port ${m})
 endforeach()
 

@@ -579,9 +579,14 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
     above (notify index, address byte order, adv restart) stay open.
   - Stack use: code runs on pthread stacks, so the self-test's "stack peak" reads 0 here.
     P5-D measures stacks.
-- **Also found (not changed):** after one failed mount, `kv_ready()` never retries, so kv stays down
-  until reboot, and a lock with no kv has no identity. Whether it should retry (say, on the next
-  call) is open, for the PM.
+- **Found, then fixed (PM ruling 2026-10-29):** after one failed mount, `kv_ready()` never retried,
+  so kv stayed down until reboot, and a lock with no kv has no identity. It now tries again on a later
+  call, at most once per 5 s (`OZ_KV_RETRY_MS`), so a dead flash can't spin the OZKIE thread. A failed
+  attach unmounts before the next try. `ak1037_port_retry` covers it:
+  - a partition that appears, then a dead flash that comes back
+  - 20 and 50 calls in between with no new attempt
+  - nothing before 4.999 s, a retry at 5 s
+  - mutation-checked: no rate limit, and no retry, each fail it
 
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 

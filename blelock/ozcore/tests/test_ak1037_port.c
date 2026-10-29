@@ -1,7 +1,7 @@
 /* test_ak1037_port — port/ak1037/oz_port_ak1037.c on the host, against the SDK
  * mocks in port/ak1037/hostmock (ozkey-49 P5-A).
  *
- *   test_ak1037_port good | wrong | error | blank | nopart | badpart
+ *   test_ak1037_port good | wrong | error | blank | nopart | badpart | retry
  *
  * The SKE known-answer test runs once per boot, so each engine behaviour is
  * its own process (its own ctest):
@@ -18,6 +18,8 @@
  *            set/get/erase; a failed program is recovered by the next call
  *   blank    a factory-blank partition is formatted on first use
  *   nopart / badpart   no OZKV partition, or one not sector-aligned: kv fails
+ *   retry    a failed mount is tried again, at most once per 5 s: a partition
+ *            that appears, a flash that comes back; no spinning in between
  * `good` also runs the TRNG (good, stuck, timeout) and the 32-bit ms wrap.
  */
 #include <stdlib.h>
@@ -250,6 +252,47 @@ static void kv_unusable(const char *what)
     expect_int("nothing written", mock_flash_progs + mock_flash_erases, 0);
 }
 
+static void kv_retry(void)
+{
+    uint8_t buf[8];
+    size_t n;
+    mock_ms = 1000;
+
+    mock_part_present = 0;
+    expect_int("no partition: fails", oz_port_kv_get("k", buf, sizeof buf, &n), OZ_E_HW);
+    expect_int("one attempt", mock_part_lookups, 1);
+    for (int i = 0; i < 20; i++)
+        (void)oz_port_kv_set("k", buf, 1);
+    expect_int("20 calls at once: no new attempt", mock_part_lookups, 1);
+    mock_ms += 4999;
+    expect_int("4.999 s later: still refused", oz_port_kv_get("k", buf, sizeof buf, &n), OZ_E_HW);
+    expect_int("no attempt before 5 s", mock_part_lookups, 1);
+    mock_ms += 1;
+    expect_int("5 s later: tried, still missing", oz_port_kv_get("k", buf, sizeof buf, &n), OZ_E_HW);
+    expect_int("second attempt", mock_part_lookups, 2);
+
+    /* The partition is back but the flash is dead. */
+    mock_part_present = 1;
+    mock_flash_dead = 1;
+    mock_ms += 5000;
+    expect_int("dead flash: fails", oz_port_kv_get("k", buf, sizeof buf, &n), OZ_E_HW);
+    expect_int("third attempt", mock_part_lookups, 3);
+    for (int i = 0; i < 50; i++)
+        (void)oz_port_kv_get("k", buf, sizeof buf, &n);
+    expect_int("50 calls on a dead flash: no new attempt", mock_part_lookups, 3);
+
+    /* The flash comes back: mounted (formatted, it's blank) on the next try. */
+    mock_flash_dead = 0;
+    mock_ms += 5000;
+    expect_int("recovered: set", oz_port_kv_set("k", (const uint8_t *)"\x2a", 1), OZ_OK);
+    expect_int("fourth attempt mounted", mock_part_lookups, 4);
+    expect_int("recovered: get", oz_port_kv_get("k", buf, sizeof buf, &n), OZ_OK);
+    expect("recovered value", buf, n, "2a");
+    expect_int("mounted: no more lookups", mock_part_lookups, 4);
+    expect_int("no access outside OZKV", mock_flash_out_of_part, 0);
+    expect_int("NOR rule kept", mock_nor_violations, 0);
+}
+
 int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "good";
@@ -260,6 +303,8 @@ int main(int argc, char **argv)
         trng();
         time_wrap();
         kv();
+    } else if (!strcmp(mode, "retry")) {
+        kv_retry();
     } else if (!strcmp(mode, "blank")) {
         kv_blank();
     } else if (!strcmp(mode, "wrong")) {

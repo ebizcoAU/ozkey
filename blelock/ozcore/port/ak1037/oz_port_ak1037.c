@@ -199,6 +199,7 @@ static lfs_t kv_fs;
 static struct lfs_config kv_cfg;
 static uint32_t kv_start_page;
 static int kv_state;                    /* 0 not tried, 1 mounted, <0 failed */
+static uint64_t kv_retry_at;            /* after a failure: no new attempt before this */
 #ifdef LFS_THREADSAFE
 static struct rt_mutex kv_mutex;
 #endif
@@ -230,12 +231,9 @@ static int bd_lock(const struct lfs_config *c) { (void)c; return rt_mutex_take(&
 static int bd_unlock(const struct lfs_config *c) { (void)c; rt_mutex_release(&kv_mutex); return 0; }
 #endif
 
-static int kv_ready(void)
+/* One mount attempt: OZ_OK, or OZ_E_HW with nothing left mounted. */
+static int kv_mount(void)
 {
-    if (kv_state)
-        return kv_state > 0 ? OZ_OK : OZ_E_HW;
-    kv_state = -1;
-
     T_SPI_FILE_INFO info;
     memset(&info, 0, sizeof info);
     memcpy(info.file_name, OZ_KV_PARTITION, sizeof OZ_KV_PARTITION);
@@ -257,7 +255,11 @@ static int kv_ready(void)
     kv_cfg.erase = bd_erase;
     kv_cfg.sync = bd_sync;
 #ifdef LFS_THREADSAFE
-    rt_mutex_init(&kv_mutex, "ozkv", RT_IPC_FLAG_FIFO);
+    static int mutex_ready;
+    if (!mutex_ready) {
+        rt_mutex_init(&kv_mutex, "ozkv", RT_IPC_FLAG_FIFO);
+        mutex_ready = 1;
+    }
     kv_cfg.lock = bd_lock;
     kv_cfg.unlock = bd_unlock;
 #endif
@@ -281,10 +283,34 @@ static int kv_ready(void)
     }
     if (oz_kv_lfs_attach(&kv_fs) != OZ_OK) {
         oz_port_log("kv: attach failed");
+        (void)lfs_unmount(&kv_fs);
         return OZ_E_HW;
     }
-    kv_state = 1;
     return OZ_OK;
+}
+
+/* Mount on first use. A failed mount is tried again on a later call, at most
+ * once per OZ_KV_RETRY_MS, so a dead flash can't keep the OZKIE thread busy
+ * (PM ruling 2026-10-29). A lock without kv has no identity, so giving up for
+ * the whole boot is not an option. */
+#define OZ_KV_RETRY_MS 5000u
+
+static int kv_ready(void)
+{
+    if (kv_state > 0)
+        return OZ_OK;
+    uint64_t now = oz_port_monotonic_ms();
+    if (kv_state < 0 && now < kv_retry_at)
+        return OZ_E_HW;
+    if (kv_mount() == OZ_OK) {
+        if (kv_state < 0)
+            oz_port_log("kv: mounted on retry");
+        kv_state = 1;
+        return OZ_OK;
+    }
+    kv_state = -1;
+    kv_retry_at = now + OZ_KV_RETRY_MS;
+    return OZ_E_HW;
 }
 
 int oz_ak1037_kv_mount(void) { return kv_ready(); }
