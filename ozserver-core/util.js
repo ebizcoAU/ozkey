@@ -10,6 +10,7 @@
  */
 
 const crypto = require('crypto');
+const { promisify } = require('util');
 const os = require('os');
 const fs = require('fs');
 const { ctx, lazy } = require('./ctx');
@@ -137,6 +138,7 @@ function makeSecret(bytes = 16, prefix = '') {
  *  from the stored hash, and mosquitto dynsec always compares 64 bytes, so
  *  either plugin can verify these rows without a re-mint (Q6a).
  *  Older ozpms rows are scrypt$<salt hex>$<hash hex>; they still verify. */
+const pbkdf2 = promisify(crypto.pbkdf2);
 const PBKDF2_ITERATIONS = 100000;
 const PBKDF2_SALT_BYTES = 16;
 const PBKDF2_KEY_BYTES = 64;
@@ -144,9 +146,11 @@ const HASHED_BROKER_SECRET_PREFIXES = ['PBKDF2$', 'scrypt$'];
 // Longest stored form: 'PBKDF2$sha512$100000$' + 24 + '$' + 88 = 134 chars.
 const BROKER_SECRET_COLUMN = 'VARCHAR(160)';
 
-function hashBrokerSecret(secret) {
+/** Async: 100k PBKDF2 rounds cost ~100 ms, so it runs on the libuv pool, not
+ *  the event loop (a sync hash stalled every MQTT handler behind it). */
+async function hashBrokerSecret(secret) {
   const salt = crypto.randomBytes(PBKDF2_SALT_BYTES);
-  const key = crypto.pbkdf2Sync(secret, salt, PBKDF2_ITERATIONS, PBKDF2_KEY_BYTES, 'sha512');
+  const key = await pbkdf2(secret, salt, PBKDF2_ITERATIONS, PBKDF2_KEY_BYTES, 'sha512');
   return `PBKDF2$sha512$${PBKDF2_ITERATIONS}$${salt.toString('base64')}$${key.toString('base64')}`;
 }
 

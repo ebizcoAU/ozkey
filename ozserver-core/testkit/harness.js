@@ -163,6 +163,8 @@ class Golden {
 }
 
 /* -- Fixture ----------------------------------------------------------------- */
+const OWED_MS = 5000; // longest wait for an owed reply (expectReply)
+
 class Fixture {
   /** `env`: extra server env for this file's instance (e.g. short timers). */
   constructor({ env = {} } = {}) {
@@ -173,6 +175,9 @@ class Fixture {
     this.published = []; // server publishes, in arrival order
     this.nexusCalls = [];
     this.responders = []; // (topic, obj) => void, auto-replies as bridge/lock
+    // Replies the server owes us (see expectReply); since() waits for them.
+    this.owed = new Set();
+    this.credentialed = new Set(); // bridges that have had broker_credentials
     this.procs = [];
   }
 
@@ -219,6 +224,7 @@ class Fixture {
       }
       const msg = { topic, payload: obj, retain: !!packet.retain };
       this.published.push(msg);
+      this.settleOwed(topic, obj);
       for (const r of this.responders) r(topic, obj);
     });
 
@@ -345,8 +351,32 @@ class Fixture {
     if (process.env[envName('TEST_KEEP_LOG')] !== '1') fs.rmSync(this.tmp, { recursive: true, force: true });
   }
 
+  /** S1e-1: the server hashes a broker secret (PBKDF2, ~100 ms, more under
+   *  load) before it sends the enrollment_ack or a bridge's first
+   *  broker_credentials, so either reply can outlast since()'s quiet window and
+   *  land in the next step. Note what a publish obliges the server to send;
+   *  since() waits for it first. A refused enroll sends nothing, so the wait is
+   *  bounded (OWED_MS) and an owed reply that never comes is left to the
+   *  step's own asserts and the golden. */
+  expectReply(topic, payload) {
+    let m = /\/locks\/([^/]+)\/enroll$/.exec(topic);
+    if (m) this.owed.add(`enrollment_ack:${m[1]}`);
+    m = /\/bridges\/([^/]+)\/presence$/.exec(topic);
+    if (m && payload && payload.state === 'online' && !this.credentialed.has(m[1])) {
+      this.owed.add(`broker_credentials:${m[1]}`);
+    }
+  }
+
+  settleOwed(topic, obj) {
+    const m = /\/(locks|bridges)\/([^/]+)\/command$/.exec(topic);
+    if (!m || !obj || typeof obj !== 'object') return;
+    this.owed.delete(`${obj.op}:${m[2]}`);
+    if (obj.op === 'broker_credentials') this.credentialed.add(m[2]);
+  }
+
   /** Publish as a bridge/lock. */
   async pub(topic, payload, opts = {}) {
+    if (typeof payload === 'object') this.expectReply(topic, payload);
     await this.client.publishAsync(topic, typeof payload === 'string' ? payload : JSON.stringify(payload), {
       qos: 1,
       retain: !!opts.retain,
@@ -360,6 +390,9 @@ class Fixture {
   /** Server publishes since `mark`, after the stream has been quiet `quietMs`. */
   async since(mark, { quietMs = 250, minMs = 150 } = {}) {
     await sleep(minMs);
+    const deadline = Date.now() + OWED_MS;
+    while (this.owed.size && Date.now() < deadline) await sleep(25);
+    this.owed.clear();
     let last = this.published.length;
     for (;;) {
       await sleep(quietMs);

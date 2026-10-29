@@ -23,7 +23,9 @@ const { lastGrantSentByDevice, OZKIE_V2 } = require('./relay');
  * `onSent(job, msgId)`, if given, fires for each job actually published —
  * lets a caller that just queued a specific job (e.g. `DELETE /locks/:id`)
  * learn the `msg_id` that went out for it, without every other caller
- * needing to care (ozkey-41 §5.3 correlation). */
+ * needing to care (ozkey-41 §5.3 correlation). It fires synchronously right
+ * after the publish, before this function next yields, so a reply waiter
+ * registered inside it is in place before any reply can be handled. */
 // XF-155 (2026-09-03): found live while investigating App's report of a
 // physical-lock regression after a burst of near-simultaneous revoke
 // requests. Multiple callers can invoke this for the SAME deviceId
@@ -137,6 +139,7 @@ async function flushQueueForDeviceImpl(siteId, deviceId, onSent) {
 
     const ok = mqttPublish(commandTopic, publishBody);
     if (!ok) break;
+    if (onSent) onSent(job, envelope.msg_id);
 
     await pool.query("UPDATE pending_queue SET status = 'sent' WHERE id = ?", [job.id]);
     if (job.grant_id) {
@@ -160,7 +163,6 @@ async function flushQueueForDeviceImpl(siteId, deviceId, onSent) {
       });
     }
     sent++;
-    if (onSent) onSent(job, envelope.msg_id);
     logEvent(
       'sync',
       `${deviceId} wake -> burst ${job.action_type} #${job.id} down ${commandTopic}` +

@@ -42,7 +42,7 @@ async function getOrMintBridgeCredentials(bridgeId) {
     `INSERT INTO bridges (id, broker_username, broker_secret) VALUES (?, ?, ?)
        ON DUPLICATE KEY UPDATE broker_username = VALUES(broker_username),
          broker_secret = VALUES(broker_secret)`,
-    [bridgeId, broker_username, hashBrokerSecret(broker_secret)]
+    [bridgeId, broker_username, await hashBrokerSecret(broker_secret)]
   );
   return { broker_username, broker_secret, minted: true };
 }
@@ -912,7 +912,7 @@ async function handleEnroll(siteId, topicDeviceId, obj) {
      WHERE id = ?`,
     [appId, mac, label, obj.fw || null, ident.transport, ident.caps, tuyaPid, profile,
      CONFIG.DEFAULT_HEARTBEAT_S, brokerUsername,
-     CONFIG.HASH_LOCK_BROKER_SECRETS ? hashBrokerSecret(brokerSecret) : brokerSecret, deviceId]
+     CONFIG.HASH_LOCK_BROKER_SECRETS ? await hashBrokerSecret(brokerSecret) : brokerSecret, deviceId]
   );
 
   // v1 plaintext ack — bench only; production wraps this in the ozkey-04 §8

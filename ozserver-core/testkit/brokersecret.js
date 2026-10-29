@@ -22,13 +22,14 @@ module.exports = function brokerSecretMigrationSuite(harness, { hashLocks }) {
 
   const PLAIN = 'ozl_00112233445566778899aabbccddeeff';
   const KEPT = 'ozl_ffeeddccbbaa99887766554433221100';
-  const kept = hashBrokerSecret(KEPT);
+  let kept; // hashed in before()
   const scryptSalt = crypto.randomBytes(16);
   const legacyScrypt = `scrypt$${scryptSalt.toString('hex')}$${crypto
     .scryptSync(KEPT, scryptSalt, 32)
     .toString('hex')}`;
 
   before(async () => {
+    kept = await hashBrokerSecret(KEPT);
     await fx.start();
     const [{ id: site }] = await fx.query('SELECT id FROM sites LIMIT 1');
     await fx.query('INSERT INTO bridges (id, broker_username, broker_secret) VALUES ?', [

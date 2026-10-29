@@ -25,7 +25,7 @@ async function hashPlaintextBrokerSecrets(table) {
   const [rows] = await pool.query(`SELECT id, broker_secret FROM ${table} WHERE broker_secret IS NOT NULL`);
   const plain = rows.filter((r) => !isHashedBrokerSecret(r.broker_secret));
   for (const row of plain) {
-    await pool.query(`UPDATE ${table} SET broker_secret = ? WHERE id = ?`, [hashBrokerSecret(row.broker_secret), row.id]);
+    await pool.query(`UPDATE ${table} SET broker_secret = ? WHERE id = ?`, [await hashBrokerSecret(row.broker_secret), row.id]);
   }
   if (plain.length) logEvent('info', `hashed ${plain.length} plaintext ${table}.broker_secret row(s)`);
 }

@@ -89,19 +89,19 @@ test('lazy deps are read-only', () => {
 });
 
 /* S1e-1: PM-ruled format, mosquitto-go-auth's PBKDF2 string with a 64-byte key. */
-test('broker secrets hash to PBKDF2$sha512$100000$<16-byte salt>$<64-byte key>', () => {
-  const h = hashBrokerSecret('ozl_0123456789abcdef0123456789abcdef');
+test('broker secrets hash to PBKDF2$sha512$100000$<16-byte salt>$<64-byte key>', async () => {
+  const h = await hashBrokerSecret('ozl_0123456789abcdef0123456789abcdef');
   const f = h.split('$');
   assert.deepStrictEqual(f.slice(0, 3), ['PBKDF2', 'sha512', '100000']);
   assert.strictEqual(Buffer.from(f[3], 'base64').length, 16);
   assert.strictEqual(Buffer.from(f[4], 'base64').length, 64);
   assert.ok(h.length <= 160, 'fits BROKER_SECRET_COLUMN');
-  assert.notStrictEqual(hashBrokerSecret('same'), hashBrokerSecret('same'), 'salted');
+  assert.notStrictEqual(await hashBrokerSecret('same'), await hashBrokerSecret('same'), 'salted');
 });
 
-test('verifyBrokerSecret: PBKDF2 and legacy scrypt verify; anything else never does', () => {
+test('verifyBrokerSecret: PBKDF2 and legacy scrypt verify; anything else never does', async () => {
   const secret = 'ozl_0123456789abcdef0123456789abcdef';
-  const pbkdf2 = hashBrokerSecret(secret);
+  const pbkdf2 = await hashBrokerSecret(secret);
   assert.ok(verifyBrokerSecret(secret, pbkdf2));
   assert.ok(!verifyBrokerSecret('ozl_wrong', pbkdf2));
 
