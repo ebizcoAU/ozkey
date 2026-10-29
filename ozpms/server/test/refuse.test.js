@@ -12,6 +12,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('child_process');
+const os = require('os');
 const path = require('path');
 
 const SERVER_DIR = path.join(__dirname, '..');
@@ -33,7 +34,12 @@ function boot(extra) {
       ...extra,
     },
   });
-  return { code: r.status, out: `${r.stdout}${r.stderr}` };
+  // On a timeout the child is killed and status is null; say so, with the load,
+  // so a slow spawn and a server that didn't refuse read differently.
+  const diag =
+    `status=${r.status} signal=${r.signal} error=${r.error ? r.error.code : 'none'}` +
+    ` loadavg ${os.loadavg().map((l) => l.toFixed(1)).join('/')}`;
+  return { code: r.status, out: `${diag}\n${r.stdout}${r.stderr}` };
 }
 
 for (const [name, extra] of [

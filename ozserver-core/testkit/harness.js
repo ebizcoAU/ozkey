@@ -276,10 +276,23 @@ class Fixture {
       },
     });
     this.procs.push(this.server);
-    await waitFor(() => /HTTP directory listening/.test(this.log().slice(logFrom)), {
-      timeoutMs: 30000,
-      what: 'server listening',
-    });
+    const t0 = Date.now();
+    try {
+      await waitFor(() => /HTTP directory listening/.test(this.log().slice(logFrom)), {
+        timeoutMs: 30000,
+        what: 'server listening',
+      });
+    } catch (err) {
+      // A start timeout used to say only "timed out" (firmware's S1e-3 repro):
+      // say whether the child is alive, how loaded the box is, and what it
+      // printed, so a slow spawn and a broken boot read differently.
+      const s = this.server;
+      const tail = this.log().slice(logFrom).split('\n').slice(-40).join('\n');
+      err.message +=
+        ` after ${Date.now() - t0} ms; server pid ${s.pid} exitCode=${s.exitCode} signal=${s.signalCode};` +
+        ` loadavg ${os.loadavg().map((l) => l.toFixed(1)).join('/')}\n--- server log tail ---\n${tail || '(empty)'}`;
+      throw err;
+    }
   }
 
   /** S1e-1: stop and re-spawn only the server; broker and DB stay. This is
