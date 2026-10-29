@@ -408,6 +408,14 @@ invites and the lock engine.
 - **Also done in this item:**
   - the kv fixes above (4389aa5, 3639482)
   - the commit gate (22d6df9)
+- 🔴 **Fixed 2026-10-29, found while planning P5:** `oz_ct_equal()` returns **0 when equal**, and
+  two AK1037-only callers had it backwards.
+  - The P3 SKE known-answer test (`oz_port_ak1037.c`) trusted the engine when its output
+    **differed** from FIPS-197 C.1 and fell back to software when it matched. A broken engine
+    would have been used for all AES (fail-open); a working one was silently replaced by software.
+  - The 4b `ske_vs_software()` check would have reported every block as a mismatch.
+  - Neither file builds on the host, so no test could see it. The P5 plan proposes host-building
+    the port logic against SDK mocks so this class is covered.
 
 ### P4-prep item 5 (2026-10-29): burning, and the OZKV partition
 

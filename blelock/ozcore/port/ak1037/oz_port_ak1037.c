@@ -83,7 +83,8 @@ static void ske_selftest(void)
         0x69,0xc4,0xe0,0xd8,0x6a,0x7b,0x04,0x30,0xd8,0xcd,0xb7,0x80,0x70,0xb4,0xc5,0x5a };
     uint8_t out[16];
 
-    ske_state = (ske_block(key, pt, out) == OZ_OK && oz_ct_equal(out, ct, 16)) ? 1 : -1;
+    /* oz_ct_equal() is 0 when equal. */
+    ske_state = (ske_block(key, pt, out) == OZ_OK && oz_ct_equal(out, ct, 16) == 0) ? 1 : -1;
     if (ske_state < 0)
         oz_port_log("aes: SKE self-test failed, using software AES");
 }

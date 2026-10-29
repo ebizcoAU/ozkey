@@ -70,7 +70,7 @@ static int ske_vs_software(void)
             break;
         }
         oz_sw_aes128_encrypt_block(key, in, sw);
-        if (oz_ak1037_ske_block(key, in, hw) != OZ_OK || !oz_ct_equal(hw, sw, 16))
+        if (oz_ak1037_ske_block(key, in, hw) != OZ_OK || oz_ct_equal(hw, sw, 16) != 0)
             bad++;
     }
     oz_wipe(key, sizeof key);
