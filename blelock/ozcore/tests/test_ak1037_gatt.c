@@ -442,6 +442,47 @@ static void keypad_lockout(void)
     expect_int("# on nothing checks nothing", count("keypad: wrong"), 0);
 }
 
+/* ── the RFID reader (P5-E), via the shell and the OZKIE thread ─────────── */
+
+static void card_reads(const char *hex, int reads, uint32_t every_ms)
+{
+    char cmd[64];
+    snprintf(cmd, sizeof cmd, "oz.card %s", hex);
+    for (int i = 0; i < reads; i++) {
+        mock_msh_run(cmd);
+        mock_pass();
+        mock_ms += every_ms;
+    }
+}
+
+static void cards_at_reader(void)
+{
+    mock_ms += 2000;
+    capture_start();
+    card_reads("04a1b2c3d4e5f6", 20, 100);      /* held 2 s on the reader */
+    capture_end();
+    expect_int("a card held 2 s: one check", count("card: wrong"), 1);
+
+    capture_start();
+    mock_ms += 2000;
+    card_reads("11223344", 1, 0);
+    card_reads("11223345", 1, 0);
+    card_reads("11223346", 1, 0);
+    card_reads("11223347", 1, 0);
+    capture_end();
+    expect_int("4 more different cards: 4 checks", count("card: wrong"), 4);
+    expect_int("…the 5th miss locked the reader out", count("lock: card reader locked out for 60 s"), 1);
+
+    capture_start();
+    card_reads("04a1b2c3d4e5f7", 1, 0);
+    mock_msh_run("oz.card 04a");                  /* odd length */
+    mock_msh_run("oz.card 0g");                   /* not hex */
+    mock_msh_run("oz.card 00112233445566778899aabbccddeeff00");   /* 17 bytes */
+    capture_end();
+    expect_int("locked out: not checked", count("card: locked out, 60 s left, not checked"), 1);
+    expect_int("bad ids refused by the shell", count("usage: oz.card"), 3);
+}
+
 /* ── the motor (P5-C), log-only driver: every move is unconfirmed ────── */
 
 static void passes(int n)
@@ -575,6 +616,7 @@ int main(void)
     boot();
     claim();
     keypad_lockout();
+    cards_at_reader();
     motor_moves();
     junk_and_limits();
     disconnect_and_adv();

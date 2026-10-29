@@ -296,12 +296,14 @@ int oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_loc
         memcpy(L->nonces, nb + 1, sizeof L->nonces);
     }
     load_creds(L);
+    /* A record that is there but unreadable fails closed (oz_limit.h). */
     uint8_t pl[OZ_LIMIT_SAVED_LEN];
-    if (!oz_port_kv_get("pl", pl, sizeof pl, &n)) {
-        /* A record that is there but unreadable fails closed (oz_limit.h). */
-        if (oz_limit_load(&L->pin_limit, pl, n, oz_port_monotonic_ms()))
-            oz_port_log("lock: keypad limit record unreadable, locked out");
-    }
+    if (!oz_port_kv_get("pl", pl, sizeof pl, &n) &&
+        oz_limit_load(&L->pin_limit, pl, n, oz_port_monotonic_ms()))
+        oz_port_log("lock: keypad limit record unreadable, locked out");
+    if (!oz_port_kv_get("rl", pl, sizeof pl, &n) &&
+        oz_limit_load(&L->card_limit, pl, n, oz_port_monotonic_ms()))
+        oz_port_log("lock: card limit record unreadable, locked out");
     /* Events restart above every seq the last boot could have used. */
     L->ev_reserved = load_u32("es");
     oz_events_init(&L->events, L->ev_reserved);
@@ -763,12 +765,15 @@ static void ok_with_epoch(req_ctx *q, int r, int64_t key1_val, int has_key1)
 }
 
 static void save_pin_limit(oz_lock *L);
+static void save_card_limit(oz_lock *L);
 
 static void v_unlock(req_ctx *q, int unlock)
 {
     /* An owner unlock from the app clears a keypad lockout (PM policy). */
     if (unlock && q->role == OZ_ROLE_ADMIN && oz_limit_success(&q->L->pin_limit))
         save_pin_limit(q->L);
+    if (unlock && q->role == OZ_ROLE_ADMIN && oz_limit_success(&q->L->card_limit))
+        save_card_limit(q->L);
     if (q->L->hooks.actuate)
         q->L->hooks.actuate(q->L->hooks.app, unlock);
     q->L->lock_state = unlock ? OZ_LOCKSTATE_UNLOCKED : OZ_LOCKSTATE_LOCKED;
@@ -1104,6 +1109,7 @@ static void factory_reset(void)
     oz_port_kv_erase("nc");
     oz_port_kv_erase("cr");
     oz_port_kv_erase("pl");
+    oz_port_kv_erase("rl");
     oz_port_kv_erase("es");
     oz_port_kv_erase("lk");
 }
@@ -1246,7 +1252,7 @@ static void put_event(oz_cbor_w *w, const oz_event *ev)
     if (has_utc) { oz_cbor_put_uint(w, 4); oz_cbor_put_int(w, ev->utc); }
     if (has_actor) { oz_cbor_put_uint(w, 5); oz_cbor_put_uint(w, ev->actor); }
     oz_cbor_put_uint(w, 6);
-    if (ev->type == OZ_EV_KEYPAD_LOCKOUT) {
+    if (ev->type == OZ_EV_KEYPAD_LOCKOUT || ev->type == OZ_EV_CARD_LOCKOUT) {
         oz_cbor_put_map(w, 2);
         oz_cbor_put_uint(w, 1); oz_cbor_put_uint(w, ev->a);
         oz_cbor_put_uint(w, 2); oz_cbor_put_uint(w, ev->b);
@@ -1561,13 +1567,16 @@ int oz_lock_tick(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, size_t
 
 /* ── keypad PIN at the door ─────────────────────────────────────────────── */
 
-static void save_pin_limit(oz_lock *L)
+static void save_limit(const oz_limit *l, const char *key)
 {
     uint8_t b[OZ_LIMIT_SAVED_LEN];
-    oz_limit_save(&L->pin_limit, oz_port_monotonic_ms(), b);
-    if (oz_port_kv_set("pl", b, sizeof b))
-        oz_port_log("lock: keypad limit not saved");
+    oz_limit_save(l, oz_port_monotonic_ms(), b);
+    if (oz_port_kv_set(key, b, sizeof b))
+        oz_port_log("lock: limit %s not saved", key);
 }
+
+static void save_pin_limit(oz_lock *L) { save_limit(&L->pin_limit, "pl"); }
+static void save_card_limit(oz_lock *L) { save_limit(&L->card_limit, "rl"); }
 
 uint64_t oz_lock_keypad_lockout_ms(const oz_lock *L)
 {
@@ -1597,8 +1606,8 @@ void oz_lock_actuated(oz_lock *L, int unlock, int result)
     }
 }
 
-/* A live PIN: inside its time window and with uses left. */
-static int pin_live(const oz_cred *c, int64_t now)
+/* A live credential: inside its time window and with uses left. */
+static int cred_live(const oz_cred *c, int64_t now)
 {
     /* Time windows need a set clock; without one a timed PIN is refused. */
     if ((c->from || c->to) && !now)
@@ -1628,7 +1637,7 @@ int oz_lock_keypad_pin(oz_lock *L, const char *digits)
     }
     for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
         oz_cred *c = &L->creds[i];
-        if (!hit[i] || !pin_live(c, now))
+        if (!hit[i] || !cred_live(c, now))
             continue;
         if (c->uses > 0) {
             c->uses--;
@@ -1648,4 +1657,51 @@ int oz_lock_keypad_pin(oz_lock *L, const char *digits)
         event_add(L, OZ_EV_KEYPAD_LOCKOUT, OZ_EV_NO_ACTOR, L->pin_limit.level, ms / 1000u);
     }
     return OZ_PIN_WRONG;
+}
+
+/* ── RFID card at the door (P5-E) ───────────────────────────────────────── */
+
+uint64_t oz_lock_card_lockout_ms(const oz_lock *L)
+{
+    return oz_limit_remaining_ms(&L->card_limit, oz_port_monotonic_ms());
+}
+
+int oz_lock_card(oz_lock *L, const uint8_t *id, size_t len)
+{
+    uint64_t mono = oz_port_monotonic_ms();
+    if (oz_limit_locked(&L->card_limit, mono))
+        return OZ_CARD_LOCKED_OUT;
+
+    /* Every card credential is compared, in constant time per credential;
+     * then the first live match opens. A known card out of its window or
+     * uses is a miss like any other, as for PINs. */
+    int64_t now = oz_lock_utc(L);
+    int hit[OZ_LOCK_MAX_CREDS];
+    for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
+        const oz_cred *c = &L->creds[i];
+        hit[i] = len >= 1 && len <= OZ_LOCK_CRED_SECRET && c->used && c->type == OZ_CRED_RFID &&
+                 c->secret_len == len && !oz_ct_equal(c->secret, id, len);
+    }
+    for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
+        oz_cred *c = &L->creds[i];
+        if (!hit[i] || !cred_live(c, now))
+            continue;
+        if (c->uses > 0) {
+            c->uses--;
+            save_creds(L);
+        }
+        if (oz_limit_success(&L->card_limit))
+            save_card_limit(L);
+        if (L->hooks.actuate)
+            L->hooks.actuate(L->hooks.app, 1);
+        L->lock_state = OZ_LOCKSTATE_UNLOCKED;
+        return OZ_CARD_OPEN;
+    }
+    uint32_t ms = oz_limit_miss(&L->card_limit, mono);
+    save_card_limit(L);
+    if (ms) {
+        oz_port_log("lock: card reader locked out for %u s", (unsigned)(ms / 1000u));
+        event_add(L, OZ_EV_CARD_LOCKOUT, OZ_EV_NO_ACTOR, L->card_limit.level, ms / 1000u);
+    }
+    return OZ_CARD_WRONG;
 }

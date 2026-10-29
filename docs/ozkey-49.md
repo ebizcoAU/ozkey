@@ -804,6 +804,61 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
   - Persisting the ring across reboots (a reboot loses it, shown as a seq jump).
   - The bridge relay transport on AK1037 (relay delivery is engine-level, tested on the host).
 
+### P5-E (2026-10-29): RFID cards, with their own wrong-card limit
+- 🔴 **Card identity is the ISO 14443 UID (type A) or PUPI (type B) for now, and that can be
+  cloned.** Writable "magic" cards copy any UID, and a phone or reader can emulate one.
+  - Whether UID-only cards are acceptable is **OZ-5, open with the operator**.
+  - The engine doesn't care how a card was verified: the port hands it an identity
+  (`oz_lock_card(L, id, len)`), so a stronger check changes the port, not the engine or the wire.
+  - The SDK offers three ways to read a card:
+    - UID read (`hal_rfid_read_card`, `_ex` for type B);
+    - MIFARE Classic block reads (Crypto1, broken, no better than UID);
+    - ISO 7816 CPU-card commands with DES external/internal authenticate
+      (`hal_rfid_cpucard_*`, FM1208-class cards).
+  - If OZ-5 wants clone resistance, the realistic option is per-card keys on CPU cards with
+    internal authenticate (challenge-response). That needs the cards, provisioning, and a check of
+    which DES variant the SDK runs.
+- **Engine:** `oz_lock_card()` opens on an exact match with a live RFID credential (`cred` type 2,
+  secret = the identity bytes).
+  - Every card credential is compared in constant time, then the first live match opens.
+  - A known card that is spent or outside its window is a miss, like a wrong one.
+  - A PIN's bytes never match as a card (type is checked).
+  - Wrong cards count toward their own `oz_limit` (`card_limit`, kv `"rl"`) under the keypad's
+    policy: 5 free, then 60 s doubling to 30 min. It is separate from the keypad's, so a card
+    lockout doesn't stop PINs and a PIN doesn't clear it.
+  - Only the right card, or an owner unlock from the app, clears it. A malformed record fails
+    closed (30 min). A factory reset erases it.
+  - Each lockout raises event type 2, **card reader lockout** `{level, seconds}` (ozkey-48 §5.1).
+- **`oz_card` (`include/oz_card.h`, portable, pure):** one tap per card.
+  - The reader reports a card on every poll while it's in the field. Reads of the same identity
+    within 1.5 s of the last one are the same tap. Without this, one wrong card left on the reader
+    would be 5 misses and a lockout in under a second.
+  - A different card is a new tap at once.
+- **AK1037:**
+  - `oz_gatt_ak1037_card(id, len)` posts the identity to the OZKIE thread (from the reader's
+    thread, or the shell). The thread filters taps and checks.
+  - Bring-up command: `oz.card 04a1b2c3d4e5f6`.
+  - **Not written:** the reader's polling thread on `hal_rfid_*`. Its cadence and low-power
+    detection (`hal_rfid_set_det`) need the board and P5-F's power budget.
+- **Tests:**
+  - New `card` suite (also in the self-test image): a card held 5 s is one tap, across the ms
+    wrap; the 1.5 s edge; a different card or a UID prefix is a new tap; bad lengths dropped.
+  - `lock`:
+    - opening; one-use spent; one byte off; a UID prefix; a PIN's bytes; too long;
+    - 5 misses → 60 s and an event; locked out, the right card unchecked; the keypad independent;
+    - a reboot keeps it; an owner unlock clears it; doubling; a right card resets it;
+    - a bad record → 30 min; a factory reset erases `"rl"`.
+  - `ak1037_gatt`: a wrong card held 2 s is one check; 5 different cards lock the reader; the
+    lockout skips the check; the shell refuses odd-length, non-hex and 17-byte ids.
+- **Mutation-checked, all 17 caught:**
+  - In the hold filter: off; not refreshed while held; the 1.5 s edge off by one; length ignored.
+  - In the lock: no lockout check; a prefix matching; a PIN credential matching as a card; a spent
+    card opening; sharing the keypad's limit; not persisted; not loaded; no owner reset; `"rl"` not
+    erased on reset (caught once the reset test checked it); no event; a right card not resetting.
+  - In the port: no hold filter.
+- **Stack (RV32 static, with littlefs):** `oz_lock_card` 2,928 B; the OZKIE worst case is unchanged
+  at 6,384 B.
+
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
 - **iOS:** minimum 15.0; xcframework with an `ios-arm64` slice and an `ios-arm64_x86_64` simulator slice.

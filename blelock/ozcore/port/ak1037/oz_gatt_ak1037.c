@@ -28,6 +28,7 @@
 #include "oz_ble.h"
 #include "oz_keypad.h"
 #include "oz_motor.h"
+#include "oz_card.h"
 #include "oz_gatt_ak1037.h"
 
 static const T_BT_ATTREC gatt_table[] = {
@@ -45,7 +46,7 @@ static const T_BT_ATTREC gatt_table[] = {
 
 /* ── BLE context → OZKIE thread ──────────────────────────────────────────── */
 
-enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, EV_KEY };
+enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, EV_KEY, EV_CARD };
 
 #define FRAME_MAX (BLE_MTU_MAX_SIZE - 3)
 typedef struct {
@@ -84,6 +85,27 @@ static void post_frame(const void *data, uint16_t len)
     memcpy(m.data, data, len);
     if (rt_mq_send(&mq, &m, offsetof(msg_t, data) + len) != RT_EOK)
         oz_port_log("gatt: queue full, frame dropped");
+}
+
+/* A card's identity, from the reader's thread (or the shell): the same
+ * layout as msg_t up to its 16 bytes of data, on the caller's stack. */
+static int post_card(const uint8_t *id, size_t len)
+{
+    struct {
+        hdr_t   h;
+        uint8_t data[OZ_CARD_ID_MAX];
+    } m;
+    if (len == 0 || len > OZ_CARD_ID_MAX)
+        return OZ_E_ARG;
+    m.h.ev = EV_CARD;
+    m.h.len = (uint16_t)len;
+    m.h.arg = 0;
+    memcpy(m.data, id, len);
+    if (rt_mq_send(&mq, &m, offsetof(msg_t, data) + len) != RT_EOK) {
+        oz_port_log("gatt: queue full, card dropped");
+        return OZ_E_HW;
+    }
+    return OZ_OK;
 }
 
 static void on_write(void *handle, T_BT_ATTRECV_CB *info, uint32_t info_len)
@@ -149,6 +171,7 @@ static oz_ble session;
 static oz_adv adv;
 static oz_keypad keypad;
 static oz_motor motor;
+static oz_card card;
 
 static uint32_t now_ms(void) { return (uint32_t)rt_tick_get() * (1000u / RT_TICK_PER_SECOND); }
 
@@ -242,6 +265,20 @@ static void motor_step(oz_lock *L)
 
 /* One key, on the OZKIE thread. Results are logged until the panel and buzzer
  * are wired (P5). */
+static void card_in(oz_lock *L, const uint8_t *id, size_t len)
+{
+    if (!oz_card_seen(&card, id, len, now_ms()))
+        return;                         /* the same card, still on the reader */
+    int r = oz_lock_card(L, id, len);
+    if (r == OZ_CARD_OPEN)
+        oz_port_log("card: open");
+    else if (r == OZ_CARD_LOCKED_OUT)
+        oz_port_log("card: locked out, %u s left, not checked",
+                    (unsigned)((oz_lock_card_lockout_ms(L) + 999u) / 1000u));
+    else
+        oz_port_log("card: wrong");
+}
+
 static void key_in(oz_lock *L, char key, int connected)
 {
     uint32_t code = 0;
@@ -317,6 +354,9 @@ static void ozkie_thread(void *param)
             case EV_KEY:
                 key_in(L, (char)m.h.arg, connected);
                 break;
+            case EV_CARD:
+                card_in(L, m.data, m.h.len);
+                break;
             default:
                 break;
             }
@@ -355,6 +395,8 @@ int oz_gatt_ak1037_key(char key)
     return OZ_OK;
 }
 
+int oz_gatt_ak1037_card(const uint8_t *id, size_t len) { return post_card(id, len); }
+
 int oz_gatt_ak1037_touch(void)
 {
     post(EV_TOUCH, 0);
@@ -369,6 +411,7 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
     oz_adv_init(&adv, OZ_GATT_ADV_ALWAYS, now_ms());
     oz_keypad_init(&keypad);
     oz_motor_init(&motor, NULL);
+    oz_card_init(&card);
 
     T_BLE_INIT_PARAM init;
     memset(&init, 0, sizeof init);

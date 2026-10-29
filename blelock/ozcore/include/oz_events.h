@@ -23,7 +23,7 @@
 
 /* Event types. The ozkey-48 §5.1 list (access, alarm, duress, battery,
  * doorbell, bolt) takes the next values as each is built. */
-enum { OZ_EV_GAP = 0, OZ_EV_KEYPAD_LOCKOUT = 1 };
+enum { OZ_EV_GAP = 0, OZ_EV_KEYPAD_LOCKOUT = 1, OZ_EV_CARD_LOCKOUT = 2 };
 
 #define OZ_EV_NO_ACTOR 0xff     /* not done by a bond (keypad, sensors) */
 
@@ -32,7 +32,7 @@ typedef struct {
     uint8_t  type;
     uint8_t  actor;             /* bond slot, or OZ_EV_NO_ACTOR */
     int64_t  utc;               /* unix s; 0 = the clock was not set */
-    uint32_t a, b;              /* per type: lockout level, seconds; gap: lost count */
+    uint32_t a, b;              /* per type: lockouts: level, seconds; gap: lost count */
 } oz_event;
 
 typedef struct {

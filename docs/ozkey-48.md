@@ -350,6 +350,7 @@ filtering add roles, not fields):**
   |---|---|---|
   | 0 | gap | `{1: events missed}`. `seq` is the first missed |
   | 1 | keypad lockout | `{1: level (1 = the first, after 5 misses), 2: seconds}` |
+  | 2 | card reader lockout | as type 1, for wrong RFID cards (own counter) |
 
   - Further types (access, alarm, duress, battery, doorbell, bolt) take the next numbers as each
     is built. A receiver ignores data keys it doesn't know.

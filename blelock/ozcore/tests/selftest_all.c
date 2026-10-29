@@ -14,6 +14,7 @@ int oz_t_adv(void);
 int oz_t_keypad(void);
 int oz_t_motor(void);
 int oz_t_events(void);
+int oz_t_card(void);
 int oz_t_lock(void);
 
 static const struct {
@@ -30,6 +31,7 @@ static const struct {
     { "keypad", oz_t_keypad },
     { "motor",  oz_t_motor },
     { "events", oz_t_events },
+    { "card",   oz_t_card },
     { "lock",   oz_t_lock },
 };
 

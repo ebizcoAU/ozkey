@@ -9,6 +9,7 @@
 #ifndef OZ_GATT_AK1037_H
 #define OZ_GATT_AK1037_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "oz_lock.h"
@@ -43,6 +44,12 @@ int oz_gatt_ak1037_pair_code(uint32_t code);
 /* From the keypad driver: one key, '0'..'9', '*' or '#'. The OZKIE thread
  * runs the entry state machine (oz_keypad.h) and checks the PIN there. */
 int oz_gatt_ak1037_key(char key);
+
+/* From the RFID reader's driver: a card's identity, 1..16 bytes (the ISO 14443
+ * UID or PUPI today; OZ-5). Call it on every read while the card is in the
+ * field; the OZKIE thread counts one tap per card (oz_card.h) and checks it.
+ * OZ_E_ARG for a bad length, OZ_E_HW if the queue is full. */
+int oz_gatt_ak1037_card(const uint8_t *id, size_t len);
 
 /* The lock's pair_prompt hook, which runs on the OZKIE thread: while on, an
  * entry on the keypad is the pairing code. */

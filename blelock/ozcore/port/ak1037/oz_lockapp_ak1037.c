@@ -7,6 +7,7 @@
  *   oz.touch     someone is at the door (opens the advertising window).
  *   oz.code N    the owner typed pairing code N on the keypad.
  *   oz.key K…    keys pressed on the keypad, e.g. "oz.key 4826#" ('*' clears).
+ *   oz.card HEX  a card at the reader, e.g. "oz.card 04a1b2c3d4e5f6" (its UID).
  *   oz.state     the lock state and how the last motor move ended.
  *
  * MSH runs commands on the shell thread's small stack, so these only start
@@ -122,6 +123,27 @@ static void oz_key_cmd(char argc, char **argv)
         (void)oz_gatt_ak1037_key(*k);
 }
 
+static void oz_card_cmd(char argc, char **argv)
+{
+    uint8_t id[16];
+    size_t n = 0;
+    const char *h = argc == 2 ? argv[1] : "";
+    for (; h[0] && h[1] && n < sizeof id; h += 2) {
+        char b[3] = { h[0], h[1], 0 };
+        char *end;
+        unsigned long v = strtoul(b, &end, 16);
+        if (*end)
+            break;
+        id[n++] = (uint8_t)v;
+    }
+    if (argc != 2 || *h || n == 0) {
+        printf("usage: oz.card 04a1b2c3   (the card's UID in hex, 1..16 bytes)\r\n");
+        return;
+    }
+    if (!running || oz_gatt_ak1037_card(id, n) != OZ_OK)
+        printf("oz.card: the lock isn't running (oz.start)\r\n");
+}
+
 /* Two bytes the OZKIE thread writes: a torn read can't happen, a stale one
  * only shows the state a moment late. */
 static void oz_state_cmd(char argc, char **argv)
@@ -142,4 +164,5 @@ AK_MSH_CMD_EXPORT(oz_start_cmd, oz.start, start the OZKIE lock with log-only har
 AK_MSH_CMD_EXPORT(oz_touch_cmd, oz.touch, someone is at the door: open the advertising window);
 AK_MSH_CMD_EXPORT(oz_code_cmd, oz.code, the owner typed this pairing code on the keypad);
 AK_MSH_CMD_EXPORT(oz_key_cmd, oz.key, keys pressed on the keypad);
+AK_MSH_CMD_EXPORT(oz_card_cmd, oz.card, a card at the reader: its UID in hex);
 AK_MSH_CMD_EXPORT(oz_state_cmd, oz.state, lock state and the last motor move);

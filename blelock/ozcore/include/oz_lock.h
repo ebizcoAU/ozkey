@@ -13,7 +13,8 @@
  *
  * Persistence through oz_port_kv_*: "lk" identity, "b0".."b15" bonds, "ep"
  * epoch, "nc" nonce cache, "cr" credentials, "r0".."r15" relay contexts,
- * "pl" keypad limit, "es" the event sequence numbers reserved so far.
+ * "pl" keypad limit, "rl" RFID card limit, "es" the event sequence numbers
+ * reserved so far.
  */
 #ifndef OZ_LOCK_H
 #define OZ_LOCK_H
@@ -149,6 +150,7 @@ typedef struct oz_lock {
     uint8_t        pair_failures;
     uint64_t       pair_lockout_until_ms;
     oz_limit       pin_limit;      /* keypad wrong-PIN limit (P5-B), kv "pl" */
+    oz_limit       card_limit;     /* RFID wrong-card limit (P5-E), kv "rl" */
     oz_events      events;         /* RAM ring; seq reserved in kv "es" */
     uint32_t       ev_reserved;    /* seqs below this are reserved in kv */
     oz_observer    relay_obs[OZ_LOCK_MAX_BONDS];   /* `events` over the relay, per bond (RAM) */
@@ -190,6 +192,16 @@ enum { OZ_PIN_WRONG = 0, OZ_PIN_OPEN = 1, OZ_PIN_LOCKED_OUT = 2 };
 int  oz_lock_keypad_pin(oz_lock *L, const char *digits);
 /* Time left in a keypad lockout, 0 when there is none (for the panel). */
 uint64_t oz_lock_keypad_lockout_ms(const oz_lock *L);
+
+/* A card tapped at the reader (one tap: oz_card.h filters a card held on
+ * it). id is what the port verified the card as: today the ISO 14443 UID or
+ * PUPI, which a cloned card copies (OZ-5, open with the operator). It opens
+ * on an exact match with a live RFID credential. Wrong cards count toward
+ * their own oz_limit lockout, the keypad's policy; while locked out nothing is
+ * checked. Returns OZ_CARD_OPEN, OZ_CARD_WRONG or OZ_CARD_LOCKED_OUT. */
+enum { OZ_CARD_WRONG = 0, OZ_CARD_OPEN = 1, OZ_CARD_LOCKED_OUT = 2 };
+int  oz_lock_card(oz_lock *L, const uint8_t *id, size_t len);
+uint64_t oz_lock_card_lockout_ms(const oz_lock *L);
 
 /* The port's motor finished a move (oz_motor.h OZ_MOVE_*): the lock state
  * follows what the move did. A jam leaves the bolt somewhere in between:

@@ -549,6 +549,92 @@ static void keypad_limit(void)
     expect_int("owner clears it", oz_lock_keypad_pin(&L, "482613"), OZ_PIN_OPEN);
 }
 
+/* RFID cards (P5-E): exact UID match, the wrong-card limit (keypad policy,
+ * its own counter), the lockout event. One tap per call here; oz_card's
+ * hold filter is test_card's. */
+static size_t body_card(uint8_t *b, size_t cap, const uint8_t *uid, size_t n, int uses)
+{
+    oz_cbor_w w;
+    size_t bl = body_epoch(b, cap, uses ? 3 : 2);
+    oz_cbor_w_init(&w, b + bl, cap - bl);
+    oz_cbor_put_uint(&w, 1); oz_cbor_put_uint(&w, OZ_CRED_RFID);
+    oz_cbor_put_uint(&w, 3); oz_cbor_put_bstr(&w, uid, n);
+    if (uses) { oz_cbor_put_uint(&w, 6); oz_cbor_put_uint(&w, (uint64_t)uses); }
+    return bl + w.len;
+}
+
+static void cards(void)
+{
+    static const uint8_t UID[7] = { 0x04, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6 };
+    static const uint8_t ONCE[4] = { 0x5a, 0x5b, 0x5c, 0x5d };
+    static const uint8_t OTHER[7] = { 0x04, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf7 };
+    uint8_t b[96];
+    size_t bl;
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    oz_host_advance_ms(oz_lock_keypad_lockout_ms(&L) + 1);
+    bl = body_card(b, sizeof b, UID, sizeof UID, 0);
+    expect_int("add card", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    bl = body_card(b, sizeof b, ONCE, sizeof ONCE, 1);
+    expect_int("add one-use card", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+
+    int before = unlocks;
+    expect_int("the card opens", oz_lock_card(&L, UID, sizeof UID), OZ_CARD_OPEN);
+    expect_int("the one-use card opens once", oz_lock_card(&L, ONCE, sizeof ONCE), OZ_CARD_OPEN);
+    expect_int("…actuated twice", unlocks - before, 2);
+    expect_int("1st miss: a spent card", oz_lock_card(&L, ONCE, sizeof ONCE), OZ_CARD_WRONG);
+    expect_int("2nd miss: one byte off", oz_lock_card(&L, OTHER, sizeof OTHER), OZ_CARD_WRONG);
+    expect_int("3rd miss: a prefix of the UID", oz_lock_card(&L, UID, 4), OZ_CARD_WRONG);
+    expect_int("4th miss: a PIN's bytes are not a card", oz_lock_card(&L, (const uint8_t *)"482613", 6),
+               OZ_CARD_WRONG);
+    expect_int("no lockout after 4", oz_lock_card_lockout_ms(&L) == 0, 1);
+    uint32_t ev0 = L.events.next_seq;
+    expect_int("5th miss: too long", oz_lock_card(&L, b, OZ_LOCK_CRED_SECRET + 1), OZ_CARD_WRONG);
+    uint64_t left = oz_lock_card_lockout_ms(&L);
+    expect_int("5 misses: 60 s lockout", left > 59000 && left <= 60000, 1);
+    expect_int("…raised a card lockout event", L.events.next_seq - ev0, 1);
+    oz_event ev;
+    uint32_t cur = ev0;
+    expect_int("…level 1, 60 s", oz_events_next(&L.events, &cur, &ev) &&
+               ev.type == OZ_EV_CARD_LOCKOUT && ev.a == 1 && ev.b == 60, 1);
+    expect_int("locked out: the right card is not checked", oz_lock_card(&L, UID, sizeof UID), OZ_CARD_LOCKED_OUT);
+    expect_int("…the door stayed shut", unlocks - before, 2);
+    expect_int("the keypad has its own limit", oz_lock_keypad_pin(&L, "482613"), OZ_PIN_OPEN);
+    expect_int("…and a PIN doesn't clear the card's", oz_lock_card_lockout_ms(&L) > 0, 1);
+
+    /* A reboot keeps it; an owner unlock clears it. */
+    boot_lock();
+    left = oz_lock_card_lockout_ms(&L);
+    expect_int("lockout survives a reboot", left > 59000 && left <= 60000, 1);
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    expect_int("owner unlocks from the app", call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0),
+               OZ_R_UNLOCK_OK);
+    expect_int("…clears the card lockout", oz_lock_card_lockout_ms(&L), 0);
+    expect_int("the card opens again", oz_lock_card(&L, UID, sizeof UID), OZ_CARD_OPEN);
+
+    /* After the first lockout each miss doubles, as on the keypad. */
+    for (int i = 0; i < 5; i++)
+        (void)oz_lock_card(&L, OTHER, sizeof OTHER);
+    oz_host_advance_ms(oz_lock_card_lockout_ms(&L) + 1);
+    (void)oz_lock_card(&L, OTHER, sizeof OTHER);
+    left = oz_lock_card_lockout_ms(&L);
+    expect_int("next miss: 120 s", left > 119000 && left <= 120000, 1);
+    oz_host_advance_ms(left + 1);
+    expect_int("a right card resets it", oz_lock_card(&L, UID, sizeof UID), OZ_CARD_OPEN);
+    expect_int("…to 5 free misses", L.card_limit.level == 0 && L.card_limit.misses == 0, 1);
+
+    /* An unreadable record fails closed: 30 min. */
+    oz_port_kv_set("rl", (const uint8_t *)"\x07", 1);
+    boot_lock();
+    left = oz_lock_card_lockout_ms(&L);
+    expect_int("bad card record: 30 min", left > 1799000 && left <= 1800000, 1);
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0);
+    expect_int("owner clears it", oz_lock_card(&L, UID, sizeof UID), OZ_CARD_OPEN);
+}
+
 static void relay_and_reboot(void)
 {
     /* The owner sets up a relay context (persisted per bond). */
@@ -804,11 +890,13 @@ static void events(void)
     oz_host_advance_ms(oz_lock_keypad_lockout_ms(&L) + 1);
     (void)oz_lock_keypad_pin(&L, "482613");      /* a success: the limit starts afresh */
 
-    /* keypad_limit raised one event (seq 0), which reserved 0..31 in kv; two
-     * reboots since then lost the RAM ring and start numbering at 32. */
+    /* keypad_limit and cards raised events, reserving seqs in blocks of 32;
+     * the reboots since lost the RAM ring, and numbering resumes at the
+     * reserved mark. */
+    const int64_t s0 = (int64_t)L.ev_reserved;
     expect_int("plain GET", events_get(&owner, &ble, -1, -1, NULL), OZ_R_OK);
-    expect_int("…next seq after the reboots", resp_int(&owner, 1), 32);
-    expect_int("…nothing held", resp_int(&owner, 2), 32);
+    expect_int("…next seq: the reserved mark", resp_int(&owner, 1) == s0 && s0 > 0 && s0 % 32 == 0, 1);
+    expect_int("…nothing held", resp_int(&owner, 2), s0);
     expect_int("register (BLE)", events_get(&owner, &ble, 0, -1, &wb), OZ_R_OK);
     expect_int("…answer carries Observe", wb.last_obs != 0xffffffffu, 1);
     expect_int("…2.05", owner.code, OZ_COAP_CONTENT);
@@ -817,7 +905,7 @@ static void events(void)
     /* Five misses: the lockout reaches the owner's app (PM ruling). */
     raise_lockout();
     expect_int("lockout notified", notification(&owner, &ble, &wb, &ev), 1);
-    expect_int("…seq 32", (long long)ev.seq, 32);
+    expect_int("…seq s0", (long long)ev.seq, s0);
     expect_int("…keypad lockout", (long long)ev.type, OZ_EV_KEYPAD_LOCKOUT);
     expect_int("…utc basis (clock set)", ev.basis == 1 && ev.utc >= 1790000000, 1);
     expect_int("…no actor", (long long)ev.actor, -1);
@@ -825,7 +913,7 @@ static void events(void)
     expect_int("once only", notification(&owner, &ble, &wb, &ev), 0);
     raise_lockout();
     expect_int("next lockout", notification(&owner, &ble, &wb, &ev), 1);
-    expect_int("…seq 33, level 2, 120 s", ev.seq == 33 && ev.d1 == 2 && ev.d2 == 120, 1);
+    expect_int("…seq s0+1, level 2, 120 s", ev.seq == s0 + 1 && ev.d1 == 2 && ev.d2 == 120, 1);
 
     /* Admin only for now: the service bond gets FORBIDDEN, not a stream. */
     oz_link_open(&relay, 1);
@@ -838,17 +926,17 @@ static void events(void)
     oz_oscore_ctx on_ble = owner.osc, on_relay;
     handshake(&owner, &relay, NULL, 0, NULL);
     on_relay = owner.osc;
-    expect_int("register (relay), after=32", events_get(&owner, &relay, 0, 32, &wr), OZ_R_OK);
-    expect_int("relay gets 33 only", notification(&owner, &relay, &wr, &ev) == 1 && ev.seq == 33, 1);
+    expect_int("register (relay), after=s0", events_get(&owner, &relay, 0, (long)s0, &wr), OZ_R_OK);
+    expect_int("relay gets s0+1 only", notification(&owner, &relay, &wr, &ev) == 1 && ev.seq == s0 + 1, 1);
     expect_int("…and then nothing", notification(&owner, &relay, &wr, &ev), 0);
 
     /* 20 lockouts unread: each reader gets one gap marker, then the 16 held. */
     for (int i = 0; i < 20; i++)
         raise_lockout();
-    int64_t first_held = 34 + 20 - OZ_EVENTS_RING;
+    int64_t first_held = s0 + 2 + 20 - OZ_EVENTS_RING;
     expect_int("relay: gap first", notification(&owner, &relay, &wr, &ev), 1);
-    expect_int("…gap from 34, 4 missed",
-               ev.type == OZ_EV_GAP && ev.seq == 34 && ev.d1 == first_held - 34, 1);
+    expect_int("…gap from s0+2, 4 missed",
+               ev.type == OZ_EV_GAP && ev.seq == s0 + 2 && ev.d1 == first_held - s0 - 2, 1);
     int n = 0, ok = 1;
     while (notification(&owner, &relay, &wr, &ev) == 1) {
         ok &= ev.type == OZ_EV_KEYPAD_LOCKOUT && ev.seq == first_held + n;
@@ -900,6 +988,8 @@ static void events(void)
     uint8_t es[4];
     size_t esl;
     expect_int("…event numbering erased", oz_port_kv_get("es", es, sizeof es, &esl) != OZ_OK, 1);
+    uint8_t rl[OZ_LIMIT_SAVED_LEN];
+    expect_int("…card limit erased", oz_port_kv_get("rl", rl, sizeof rl, &esl) != OZ_OK, 1);
     expect_int("…and restarts at 0", L.events.next_seq, 0);
 }
 
@@ -920,6 +1010,7 @@ static void run_suite(size_t mtu)
     members();
     credentials();
     keypad_limit();
+    cards();
     relay_and_reboot();
     roles();
     events();
