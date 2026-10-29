@@ -6,6 +6,8 @@
 #   -Libs build-ak1037\libozselftest.a,build-ak1037\libozcore.a -Name app_mcu_ozselftest -RootPattern '^oz_selftest_ak1037_'
 #   -Libs build-ak1037\libozselftest.a,build-ak1037\libozcore.a -Name app_mcu_ozlock -RootPattern '^oz_lockapp_ak1037_'
 # Each image's MSH entries (FSymTab, KEEP in app_mcu.lds) come in with its object.
+# -Makefile Makefile.ozkie_fp<0|1>_v<0|1> links onto our own app (item 5b, app\gen_app_mk.py)
+# instead of the SDK demo; build that app first with make -f <the same Makefile>.
 #
 # Prereqs: app_mcu built with Makefile.cli (its objects in app_mcu\build), and
 #          make -f port/ak1037/Makefile run in the ozcore directory.
@@ -15,7 +17,8 @@ param(
     [string]$Tc  = 'C:\Users\sshuser\ak1037\SysGCC\risc-v\bin\riscv64-unknown-elf-',
     [string]$RootPattern = '.',
     [string[]]$Libs = @('build-ak1037\libozcore.a'),
-    [string]$Name = 'app_mcu_oz'
+    [string]$Name = 'app_mcu_oz',
+    [string]$Makefile = 'Makefile.cli'
 )
 $ErrorActionPreference = 'Stop'
 $oz  = (Resolve-Path "$PSScriptRoot\..\..").Path
@@ -28,7 +31,7 @@ $roots = $libs | ForEach-Object { & "${Tc}nm" -g --defined-only $_ } | Where-Obj
          ForEach-Object { $Matches[1] } | Where-Object { $_ -match $RootPattern }
 
 # The SDK link line, taken from Makefile.cli (OBJS + LDFLAGS) so nothing drifts.
-$mk   = Get-Content "$app\Makefile.cli"
+$mk   = Get-Content "$app\$Makefile"
 $objs = (($mk | Where-Object { $_ -like 'OBJS := *' }) -replace '^OBJS := ', '') -split ' '
 $ld   = ((($mk | Where-Object { $_ -like 'LDFLAGS := *' }) -replace '^LDFLAGS := ', '') `
          -replace '\$\(TARGET\)', $Name) -split ' ' | Where-Object { $_ }
@@ -45,5 +48,5 @@ try {
     & "${Tc}gcc" "@build/$Name.rsp"
     if ($LASTEXITCODE -ne 0) { throw "link failed: $LASTEXITCODE" }
     "roots: $($roots.Count)"
-    & "${Tc}size" build/app_mcu.elf "build/$Name.elf"
+    & "${Tc}size" "build/$Name.elf"
 } finally { Pop-Location }

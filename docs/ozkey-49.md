@@ -468,6 +468,62 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
 - UDATA (100 KiB) is the SDK's own littlefs (`ak_lfs`, demo config). ozcore doesn't use it. 5b will
   tell whether anything we keep needs it; if not, it can become OZKV.
 
+### P4-prep item 5b (2026-10-29): our own app_mcu, without the SDK demo
+
+- **What changed versus the SDK app.** No SDK file is edited. Two files are ours:
+  - `port/ak1037/app/main_ozkie.c` replaces `app_mcu/src/main.c`. It's the same boot path
+    (`app_proc` → hal/trap/heap init → `AK_Main` → main thread polling `msh_process()` and
+    `com_ble_process()`), without the demo's boot-time `ble_lp_test_start()` (a low-power test task
+    that would skew every P6 reading) and without the littlefs power-down test.
+  - `port/ak1037/app/gen_app_mk.py` generates `Makefile.ozkie_fp<0|1>_v<0|1>` from the SDK's own
+    `.eide` project: every `app_mcu/sample/*.c` (39 files) and `src/main.c` are dropped.
+  - The CFLAGS, INCS and LDFLAGS of all four variants are byte-identical to the SDK reference, so
+    every platform object is the SDK's.
+  - Each sample registered shell commands, and `KEEP(FSymTab)` kept them, so they had been pulling
+    in the MP3 decoder, fingerprint, LCD, image, RFID, SM2/PKE and nordic-OTA demos.
+- **Optional features** (PM ruling 2026-10-29; kept until the product rules on them):
+  - `OZ_WITH_FP` (`--fp`): the platform fingerprint component (it registers its own command, which
+    keeps `libfp_btl`/`libfp_mrw`) plus the SDK's `fp.*` sample, for kit bring-up.
+  - `OZ_WITH_VOICE` (`--voice`): the audio component plus the SDK's `audio.*` sample player. The
+    MP3 decoder links only if something plays, so the flag has to link a player. Our own voice
+    module replaces the sample in P5 if the product keeps prompts.
+  - RFID is not behind a flag. The SDK's `rfid_*` came in only through `sample_rfid.c`, and P5
+    brings our own driver.
+- **Checks:**
+  - All four variants link with no unresolved symbols and no undefined weak symbols.
+  - Every weak default the demo overrode is overridden the same way in ours.
+  - The lock image carries `com_ble_init/process`, `com_ble_set_gatt_service`, `msh_process` and our
+    `oz.*` table entries, and no `ble_lp_test_start`.
+- **Sizes** (VictorPC, `SOURCE_DATE_EPOCH` pinned; text+data against PROG 780 KiB = 798,720 B):
+
+  | `OZ_WITH_FP` | `OZ_WITH_VOICE` | lock image | free | self-test image | free |
+  |---|---|---|---|---|---|
+  | 0 | 0 | 266,780 | 531,940 | 241,304 | 557,416 |
+  | 1 | 0 | 450,496 | 348,224 | 428,988 | 369,732 |
+  | 0 | 1 | 343,224 | 455,496 | 318,912 | 479,808 |
+  | 1 | 1 | **526,860** | 271,860 | 506,204 | 292,516 |
+  | SDK demo app (item 4b) | | 755,852 | 42,868 | 796,040 | 2,680 |
+
+  - Fingerprint costs about **184 KB** and voice about **77 KB**, measured by link. My estimate from
+    `btl_*` symbols alone (78 KB) missed `libfp_mrw` and the rest of the component.
+  - The self-test image is smaller than the lock image because it never starts BLE, so the BLE
+    stack isn't linked into it.
+  - **Consequences for item 5's decisions:**
+    - Even with everything on (fp1_v1, 515 KiB), the lock fits the secure-boot tables' **PROG 700**
+      with 185 KiB to spare. Decision 3 is no longer a blocker.
+    - On 4 MiB with A/B banks (decision 4), a PROG of about 640 KiB per bank would leave room for
+      P5/P6 growth.
+    - The bss of the lock image is 42 KB of 218 KiB SRAM.
+- **Build:**
+  1. `python3 port/ak1037/app/gen_app_mk.py <sdk> ../../ozcore <out> [--fp] [--voice]` (on the Mac,
+     against the SDK copy)
+  2. copy the Makefile to `app_mcu`, then `make -f Makefile.ozkie_fp1_v1`
+  3. `link_app_mcu.ps1 -Makefile Makefile.ozkie_fp1_v1 -Libs … -Name … -RootPattern …`
+  4. `burn\mkimage.ps1 -Name …`
+- **Unverified until the kit:** whether the board boots and behaves the same without the demo. Any
+  init that a sample did as a side effect would show here; none was found in the link check. The
+  first kit-day boot should compare the boot log with the SDK demo's.
+
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
 - **iOS:** minimum 15.0; xcframework with an `ios-arm64` slice and an `ios-arm64_x86_64` simulator slice.
