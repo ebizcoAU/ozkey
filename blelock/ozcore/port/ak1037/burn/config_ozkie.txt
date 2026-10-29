@@ -1,0 +1,73 @@
+###Project Name
+project name = AnyMicro1037
+
+###Devie Number
+device channel = 4
+
+###COM
+com baud rate = 6000000
+com save flag = 0
+
+Product_UPD_Flag = 1
+Boot_UPD_Flag = 1
+secure boot = 0
+###Product Test Info
+Product_Test_Flag = 0
+Product_Item7 = 0,0,0,0,0,0,0
+###Choose spi Device
+burn spi flag = 0
+path producer = producer_anymicro1037.bin
+path nandboot = bootloader.bin
+
+producer run addr = 0x60030000
+
+chip type = AK1037D
+chip mode = 1
+chip update = 0
+
+wait time = 30
+burned mode = 2
+cmdline support = 1
+cmdline address = 0x0
+cmdline data = 
+
+serial start num = AABBCCXXDDEEFFGGHH11223344556677
+serial addr flag = 0
+fore write serial addr = 0
+BT_addr_flag = 0
+fore_write_BT_addr = 0
+blue_start_addr = 44A6E6000000
+blue_end_addr = 44A6E6FFFFFF
+
+auto burn flag = 0
+channels no fixed = 1
+udisk_burn_massboot = 0
+erase_partition_size_flag = 1
+no_need_erase_flag = 0
+
+partition count = 7
+	partition1 = OTA, 1, 0, 0, 212
+	partition2 = PROG, 1, 0, 0, 780
+	partition3 = LP, 1, 0, 0, 44
+	partition4 = ROMFS, 1, 0, 0, 210
+	partition5 = UDATA, 1, 0, 0, 100
+	partition6 = OZKV, 1, 0, 0, 64
+	partition7 = FPDAT, 1, 0, 0, 564
+
+download_to_nand count = 6
+download_to_nand1 = 1, ..\..\app_ota\bin\app_ota.bin, 0x0, OTA, 0, 0
+download_to_nand2 = 1, ..\..\app_mcu\bin\ozkie_app.bin, 0x0, PROG, 0, 0
+download_to_nand3 = 1, ..\..\app_mcu\bin\lowpower.bin, 0x0, LP, 0, 0
+download_to_nand4 = 1, ..\..\app_mcu\bin\romfs.bin, 0x0, ROMFS, 0, 0
+download_to_nand5 = 1, ..\..\app_mcu\bin\lfs.bin, 0x0, UDATA, 0, 0
+download_to_nand6 = 1, ..\..\app_mcu\bin\ozkv_blank.bin, 0x0, OZKV, 0, 0
+
+download_to_spi_img count = 0
+
+sflash supported count = 6
+sflash 1 = 0x156085, 2097152,  256, 256, 4096, 60000000, 0xc1, 0x0, P25Q16SH, 0x20
+sflash 2 = 0x15405e, 2097152,  256, 256, 4096, 60000000, 0xc1, 0x0, ZB25VQ16C, 0xa0
+sflash 3 = 0x1640c8, 4194304,  256, 256, 4096, 60000000, 0xc1, 0x0, GD25Q32E, 0x20
+sflash 4 = 0x1540c8, 2097152,  256, 256, 4096, 60000000, 0xc1, 0x0, GD25Q16E, 0x20
+sflash 5 = 0x162085, 4194304,  256, 256, 4096, 60000000, 0xc1, 0x0, PY25Q32HB, 0x20
+sflash 6 = 0x152085, 2097152,  256, 256, 4096, 60000000, 0xc1, 0x0, PY25Q16HB, 0x20

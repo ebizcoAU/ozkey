@@ -122,7 +122,9 @@ Firmware commits on its own branch; only the PM merges to main. Commit only when
   report to the PM.
 - Why: until 2026-10-29 the gate was Release-only. That compiled out the littlefs assert that, in a
   default build, exposed the kv bug fixed in 4389aa5 (P4-prep item 2 below).
-- `blelock/common/` (the Arduino-era sketches) has no host build, so the gate doesn't cover it yet.
+- `blelock/common/` (the Arduino-era sketches' headers) is **out of scope**. None of it links into
+  the AK1037 images: the ozcore build includes only `ozcore/{include,port/common,third_party}` and SDK
+  paths (checked 2026-10-29). `ozcore/port/common` is a different directory, and the gate covers it.
 
 ### P3 result (2026-10-18, Windows build host, SysGCC RISC-V GCC 10.1.0)
 
@@ -406,6 +408,65 @@ invites and the lock engine.
 - **Also done in this item:**
   - the kv fixes above (4389aa5, 3639482)
   - the commit gate (22d6df9)
+
+### P4-prep item 5 (2026-10-29): burning, and the OZKV partition
+
+**Burn procedure** (VictorPC; the board on a USB-UART, as the SDK's eide upload task does):
+1. Build and link: `make -f port/ak1037/Makefile selftest`, then
+   `link_app_mcu.ps1 -Libs … -Name app_mcu_ozselftest|app_mcu_ozlock -RootPattern …` (item 4b).
+2. Package: `port\ak1037\burn\mkimage.ps1 -Name <image>`. It writes:
+   - `app_mcu\bin\ozkie_app.bin`: `.bootcode`+`.data`, then `.flash`, the SDK's own layout. It fails
+     if the image is bigger than PROG as read from the config.
+   - `app_mcu\bin\ozkv_blank.bin`: 64 KiB of 0xFF, so the first boot formats OZKV.
+   - `tools\burntool\config_ozkie.txt`, converted to the UTF-16LE + BOM + CRLF the tool reads.
+     Checked byte for byte against the SDK's file.
+3. From `tools\burntool`, run `Anyka_BurnCli_Tool.exe -b 2000000 -f config_ozkie.txt` (the SDK's
+   own command line, from `app_mcu/.eide/eide.json`). The tool says "press the boot button to start
+   the burning mode". It auto-searches COM ports unless they're given.
+   - 🔴 **Not run yet.** There's no board, and VictorPC also hosts the Linkly/EFT sandbox, so the
+     tool must not auto-open its ports. On kit day, give the board's port explicitly. The tool's
+     strings show `-c`, `-s`, `-h` and others, but the help text isn't in the binary; run `-h`
+     once with the board attached to confirm the flag for the port.
+4. Burning `ozkv_blank.bin` wipes the lock's identity and bonds, which is what bring-up wants.
+   Drop download line 6 to keep them across a re-burn. Production updates go through OTA, not the
+   burner.
+
+**Images packaged 2026-10-29** (the `.bin` sha256 varies with the SDK objects' build stamp):
+
+| Image | `ozkie_app.bin` | PROG 798,720 B free |
+|---|---|---|
+| self-test | 796,040 B | 2,680 B |
+| lock | 755,852 B | 42,868 B |
+
+**Partition table `port/ak1037/burn/config_ozkie.txt`** (sizes in KiB). It is the SDK's
+`config_app_mcu.txt` with exactly these changes: OZKV added, FPDAT shrunk to pay for it, and the PROG
+file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size isn't documented.
+
+| | OTA | PROG | LP | ROMFS | UDATA | **OZKV** | FPDAT | total |
+|---|---|---|---|---|---|---|---|---|
+| SDK default | 212 | 780 | 44 | 210 | 100 | — | 628 | 1,974 |
+| ozkie | 212 | 780 | 44 | 210 | 100 | **64** | 564 | 1,974 |
+
+- **PROG stays 780** (PM: size it assuming 5b, so PROG doesn't grow to carry demo code). After 5b
+  drops the demo's MP3 decoder (`mad_*`, 21 KB) and other demo code, both images have room to spare.
+- 🔴 **The fingerprint matcher is probably not demo code.** `btl_*` (about 78 KB) is `libfp_btl`, the
+  SDK's matcher. If the lock ships fingerprint (P5), it stays, and the lock image after 5b is about
+  715 KiB, 65 KiB under PROG. Operator decision, via the PM.
+- **FPDAT 628 → 564** costs about 10% of fingerprint capacity. That's an estimate from the SDK's
+  own ratio (`fpdat100.bin` 1,228 KiB for 100 templates is about 12.3 KiB each), so roughly 51 → 46.
+  The SDK's `fpdat.bin` (628 KiB) no longer fits and isn't burned; the fingerprint store is unused
+  until P5.
+- **ROMFS** holds only the demo's voice prompts (`connected.mp3`, `update.mp3`, …). Whether the lock
+  speaks is a product decision. Without prompts, ROMFS (210) could pay for OZKV instead of FPDAT.
+- **Secure boot (P6):** the SDK's secure configs use **PROG 700** (giving 80 KiB to ROMFS/FPDAT).
+  The lock with fingerprint (about 715 KiB after 5b) would NOT fit 700. Nothing shows secure boot
+  itself needs a smaller PROG, so this looks like a layout choice. Ask Anyka before P6.
+- **4 MiB flash:** the SDK supports 4 MiB parts (GD25Q32E, PY25Q32HB). Its 4 MiB config adds an
+  `UPDATE` bank as large as PROG (A/B, fail-safe OTA) and a 1,228 KiB FPDAT. The 2 MiB table has no
+  second bank, so an OTA (`app_ota`) rewrites PROG in place. If P6's bridge OTA must survive a power
+  cut mid-update, 4 MiB is the clean answer. BOM decision, via the PM.
+- UDATA (100 KiB) is the SDK's own littlefs (`ak_lfs`, demo config). ozcore doesn't use it. 5b will
+  tell whether anything we keep needs it; if not, it can become OZKV.
 
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
