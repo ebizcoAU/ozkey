@@ -611,13 +611,14 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
     lockout can't reveal that a PIN exists.
   - Returns `OZ_PIN_OPEN` (1), `OZ_PIN_WRONG` (0) or `OZ_PIN_LOCKED_OUT` (2, new).
     `oz_lock_keypad_lockout_ms()` gives the time left, for the panel.
-- 🔴 **New rule: PINs are at least 4 digits (`OZ_LOCK_PIN_MIN`); `cred` refuses shorter.**
-  - With anti-peep, a short PIN opens on almost any entry.
-  - Each 16-digit entry tests up to 16 − L + 1 positions of an L-digit PIN, so anti-peep multiplies
-    a guesser's rate by about 13 (4 digits) or 11 (6 digits). Under the limit, covering every
-    4-digit PIN takes about 770 entries, nearly all at the 30 min cap: about 16 days. For 6 digits
-    it's about 90,000 entries: years.
-  - PM decision wanted: whether the minimum should be 6.
+- 🔴 **Rule: PINs are at least 6 digits (`OZ_LOCK_PIN_MIN`; PM ruling 2026-10-29). `cred` refuses
+  shorter, with `OZ_R_BAD_REQUEST`.**
+  - Why: anti-peep lets one 16-digit entry test up to 16 − L + 1 positions of an L-digit PIN. With
+    4 digits, covering every PIN under the lockout takes about 16 days, which is too little. With 6
+    digits it takes about 90,000 entries: about 5 years.
+  - 📣 **Apps and server:** PIN entry and PIN generation must require **6 or more digits** (up to
+    16). A shorter PIN is refused by the lock. Existing v2 locks have not shipped, so there is
+    nothing to migrate.
 - **`oz_keypad` (`include/oz_keypad.h`, portable, pure):** the entry state machine.
   - Digits, `*` clears, `#` enters; a 10 s pause drops a half-typed entry.
   - Up to 17 digits are kept, so an over-long entry still reaches the lock and counts as a miss.

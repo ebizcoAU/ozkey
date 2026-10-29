@@ -164,7 +164,7 @@ int  oz_lock_tick(oz_lock *L, oz_link *k,
  * oz_limit lockout; while locked out nothing is checked.
  * Returns OZ_PIN_OPEN, OZ_PIN_WRONG or OZ_PIN_LOCKED_OUT. */
 #define OZ_LOCK_PIN_ENTRY_MAX 16
-#define OZ_LOCK_PIN_MIN       4      /* shortest PIN `cred` accepts */
+#define OZ_LOCK_PIN_MIN       6      /* shortest PIN `cred` accepts (PM ruling 2026-10-29) */
 enum { OZ_PIN_WRONG = 0, OZ_PIN_OPEN = 1, OZ_PIN_LOCKED_OUT = 2 };
 int  oz_lock_keypad_pin(oz_lock *L, const char *digits);
 /* Time left in a keypad lockout, 0 when there is none (for the panel). */
