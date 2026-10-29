@@ -40,4 +40,12 @@ int oz_gatt_ak1037_touch(void);
 /* From the keypad thread: the owner typed the 6-digit pairing code. */
 int oz_gatt_ak1037_pair_code(uint32_t code);
 
+/* From the keypad driver: one key, '0'..'9', '*' or '#'. The OZKIE thread
+ * runs the entry state machine (oz_keypad.h) and checks the PIN there. */
+int oz_gatt_ak1037_key(char key);
+
+/* The lock's pair_prompt hook, which runs on the OZKIE thread: while on, an
+ * entry on the keypad is the pairing code. */
+void oz_gatt_ak1037_pair_prompt(int on);
+
 #endif

@@ -588,6 +588,64 @@ file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size 
   - nothing before 4.999 s, a retry at 5 s
   - mutation-checked: no rate limit, and no retry, each fail it
 
+### P5-B (2026-10-29): the door keypad, with the wrong-PIN limit
+- **Policy (PM nexus-a8, 2026-10-29), in `oz_limit` (`include/oz_limit.h`, portable, pure):**
+  - 5 misses in a row lock the keypad out for 60 s.
+  - Each further miss locks it out again, doubling: 2, 4, 8, 16 min, then capped at 30 min.
+  - Only a success resets it: the right PIN, or an unlock from the owner's app (admin role,
+    `lock/unlock`).
+  - While locked out nothing is checked at all: the entry is dropped (`OZ_PIN_LOCKED_OUT`) and is
+    not a miss.
+  - The same module serves RFID in P5-E.
+- **Persistence:** kv `"pl"` (8 bytes), saved after every change.
+  - The monotonic clock restarts at boot, so a lockout is saved as the time it still has to run,
+    and that time restarts in full at the next boot. Pulling the battery can only lengthen a
+    lockout, never end it.
+  - A record that exists but can't be read fails closed: a 30 min lockout.
+  - A factory reset erases `"pl"` (it is an authenticated admin action).
+- **`oz_lock_keypad_pin` (engine):**
+  - Anti-peep: it opens if a live PIN appears anywhere in an entry of 1..16 digits. Every window of
+    every PIN credential is compared, then the first live match is used.
+  - Entries over 16 digits, or with non-digits, are misses.
+  - A matching PIN outside its time window or out of uses is a miss like any other, so the
+    lockout can't reveal that a PIN exists.
+  - Returns `OZ_PIN_OPEN` (1), `OZ_PIN_WRONG` (0) or `OZ_PIN_LOCKED_OUT` (2, new).
+    `oz_lock_keypad_lockout_ms()` gives the time left, for the panel.
+- 🔴 **New rule: PINs are at least 4 digits (`OZ_LOCK_PIN_MIN`); `cred` refuses shorter.**
+  - With anti-peep, a short PIN opens on almost any entry.
+  - Each 16-digit entry tests up to 16 − L + 1 positions of an L-digit PIN, so anti-peep multiplies
+    a guesser's rate by about 13 (4 digits) or 11 (6 digits). Under the limit, covering every
+    4-digit PIN takes about 770 entries, nearly all at the 30 min cap: about 16 days. For 6 digits
+    it's about 90,000 entries: years.
+  - PM decision wanted: whether the minimum should be 6.
+- **`oz_keypad` (`include/oz_keypad.h`, portable, pure):** the entry state machine.
+  - Digits, `*` clears, `#` enters; a 10 s pause drops a half-typed entry.
+  - Up to 17 digits are kept, so an over-long entry still reaches the lock and counts as a miss.
+  - While the lock's pairing prompt is on, `#` after exactly 6 digits gives the pairing code.
+- **AK1037:**
+  - The keypad runs on the OZKIE thread: `oz_gatt_ak1037_key()` posts one key per event.
+  - The lock's `pair_prompt` hook switches the keypad into pairing mode.
+  - New shell command for bring-up: `oz.key 4826#`. Results are logged until the panel and buzzer
+    exist.
+- **Tests:**
+  - `keypad` (new suite, also in the self-test image): the full doubling sequence to the cap;
+    300 further misses stay at the cap; a miss during a lockout changes nothing; success resets;
+    save and load (remaining time restarts at boot, level kept, four malformed records fail
+    closed, over-cap values clamped); the keypad state machine (clear, idle drop across the
+    32-bit ms wrap, 17-digit cap, pairing codes with leading zeros, other lengths dropped).
+  - `lock`: anti-peep (inside, at the end, 16 vs 17 digits); 3-digit PIN refused; a spent one-use
+    PIN is a miss; 5 misses give a 60 s lockout in which the right PIN isn't checked; the lockout
+    survives a reboot; an owner unlock clears it; a bad record gives 30 min.
+  - `ak1037_gatt`: the pairing code is now typed via `oz.key`. Over the mocked stack: 4 misses, a
+    60 s lockout on the 5th, the next entry not checked, an owner app unlock clears it, the idle
+    drop, `*`, `#` on nothing.
+- **Mutation-checked, all 10 caught:** no lockout check; no persistence load; no owner reset;
+  exact-length match only (no anti-peep); no 16-digit cap; no 4-digit minimum; no doubling; a
+  bad record fails open; 4 free misses instead of 5; a spent PIN not counted as a miss.
+- **Not in P5-B:** buzzer and panel feedback, and the real keypad driver (touch IC, scan); those
+  need the board. An "owner unlock" means the app's `lock/unlock` with the admin bond; a member
+  unlock does not clear the lockout. The server/app is not told about lockouts (no event yet).
+
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
 - **iOS:** minimum 15.0; xcframework with an `ios-arm64` slice and an `ios-arm64_x86_64` simulator slice.

@@ -11,6 +11,7 @@ int oz_t_oscore(void);
 int oz_t_invite(void);
 int oz_t_frame(void);
 int oz_t_adv(void);
+int oz_t_keypad(void);
 int oz_t_lock(void);
 
 static const struct {
@@ -24,6 +25,7 @@ static const struct {
     { "invite", oz_t_invite },
     { "frame",  oz_t_frame },
     { "adv",    oz_t_adv },
+    { "keypad", oz_t_keypad },
     { "lock",   oz_t_lock },
 };
 

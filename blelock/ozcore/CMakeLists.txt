@@ -18,6 +18,8 @@ add_library(ozcore STATIC
     src/oz_frame.c
     src/oz_ble.c
     src/oz_adv.c
+    src/oz_limit.c
+    src/oz_keypad.c
     src/oz_crypto.c
     src/sha256_sw.c
     src/aes128_sw.c)
@@ -106,6 +108,10 @@ endif()
 add_executable(ozhostlock tools/hostlock.c)
 target_link_libraries(ozhostlock ozport_host)
 
+add_executable(test_keypad tests/test_keypad.c)
+target_link_libraries(test_keypad ozport_host)
+add_test(NAME keypad COMMAND test_keypad)
+
 add_executable(test_adv tests/test_adv.c)
 target_link_libraries(test_adv ozport_host)
 add_test(NAME adv COMMAND test_adv)
@@ -115,7 +121,7 @@ add_test(NAME adv COMMAND test_adv)
 # properties are directory-wide, so the rename goes in a generated wrapper
 # rather than on tests/test_<name>.c, which the standalone tests also build.
 set(OZ_SELFTEST_SOURCES tests/selftest_all.c)
-foreach(t crypto cbor edhoc oscore invite frame adv lock)
+foreach(t crypto cbor edhoc oscore invite frame adv keypad lock)
     set(w ${CMAKE_CURRENT_BINARY_DIR}/selftest_${t}.c)
     file(WRITE ${w}.in "#define main oz_t_${t}\n#include \"${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${t}.c\"\n")
     configure_file(${w}.in ${w} COPYONLY)

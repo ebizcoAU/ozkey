@@ -294,6 +294,12 @@ int oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_loc
         memcpy(L->nonces, nb + 1, sizeof L->nonces);
     }
     load_creds(L);
+    uint8_t pl[OZ_LIMIT_SAVED_LEN];
+    if (!oz_port_kv_get("pl", pl, sizeof pl, &n)) {
+        /* A record that is there but unreadable fails closed (oz_limit.h). */
+        if (oz_limit_load(&L->pin_limit, pl, n, oz_port_monotonic_ms()))
+            oz_port_log("lock: keypad limit record unreadable, locked out");
+    }
     L->lock_state = OZ_LOCKSTATE_LOCKED;
     L->battery = 100;
     return OZ_OK;
@@ -748,8 +754,13 @@ static void ok_with_epoch(req_ctx *q, int r, int64_t key1_val, int has_key1)
     oz_cbor_put_uint(&q->w, q->L->epoch);
 }
 
+static void save_pin_limit(oz_lock *L);
+
 static void v_unlock(req_ctx *q, int unlock)
 {
+    /* An owner unlock from the app clears a keypad lockout (PM policy). */
+    if (unlock && q->role == OZ_ROLE_ADMIN && oz_limit_success(&q->L->pin_limit))
+        save_pin_limit(q->L);
     if (q->L->hooks.actuate)
         q->L->hooks.actuate(q->L->hooks.app, unlock);
     q->L->lock_state = unlock ? OZ_LOCKSTATE_UNLOCKED : OZ_LOCKSTATE_LOCKED;
@@ -966,6 +977,10 @@ static int cred_from_body(req_ctx *q, oz_cbor_r *r, oz_cred *c)
     }
     if (c->type != OZ_CRED_PIN && c->type != OZ_CRED_RFID && c->type != OZ_CRED_FINGERPRINT)
         return -1;
+    /* Anti-peep opens on a PIN anywhere in the entry, so a short PIN would
+     * open on almost anything typed (P5-B). */
+    if (c->type == OZ_CRED_PIN && c->secret_len < OZ_LOCK_PIN_MIN)
+        return -1;
     if (c->type == OZ_CRED_PIN)
         for (size_t i = 0; i < c->secret_len; i++)
             if (c->secret[i] < '0' || c->secret[i] > '9')
@@ -1080,6 +1095,7 @@ static void factory_reset(void)
     oz_port_kv_erase("ep");
     oz_port_kv_erase("nc");
     oz_port_kv_erase("cr");
+    oz_port_kv_erase("pl");
     oz_port_kv_erase("lk");
 }
 
@@ -1362,28 +1378,78 @@ int oz_lock_tick(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, size_t
 
 /* ── keypad PIN at the door ─────────────────────────────────────────────── */
 
+static void save_pin_limit(oz_lock *L)
+{
+    uint8_t b[OZ_LIMIT_SAVED_LEN];
+    oz_limit_save(&L->pin_limit, oz_port_monotonic_ms(), b);
+    if (oz_port_kv_set("pl", b, sizeof b))
+        oz_port_log("lock: keypad limit not saved");
+}
+
+uint64_t oz_lock_keypad_lockout_ms(const oz_lock *L)
+{
+    return oz_limit_remaining_ms(&L->pin_limit, oz_port_monotonic_ms());
+}
+
+/* 1 if PIN c appears anywhere in the entry. Every window is compared, so the
+ * time taken depends on the lengths only. */
+static int pin_in_entry(const oz_cred *c, const char *e, size_t n)
+{
+    int hit = 0;
+    if (c->secret_len == 0 || c->secret_len > n)
+        return 0;
+    for (size_t at = 0; at + c->secret_len <= n; at++)
+        hit |= oz_ct_equal(c->secret, (const uint8_t *)e + at, c->secret_len) == 0;
+    return hit;
+}
+
+/* A live PIN: inside its time window and with uses left. */
+static int pin_live(const oz_cred *c, int64_t now)
+{
+    /* Time windows need a set clock; without one a timed PIN is refused. */
+    if ((c->from || c->to) && !now)
+        return 0;
+    return !((c->from && now < c->from) || (c->to && now > c->to) || c->uses == 0);
+}
+
 int oz_lock_keypad_pin(oz_lock *L, const char *digits)
 {
+    uint64_t mono = oz_port_monotonic_ms();
+    if (oz_limit_locked(&L->pin_limit, mono))
+        return OZ_PIN_LOCKED_OUT;
+
     size_t n = strlen(digits);
+    int ok = n >= 1 && n <= OZ_LOCK_PIN_ENTRY_MAX;
+    for (size_t i = 0; ok && i < n; i++)
+        ok = digits[i] >= '0' && digits[i] <= '9';
+
+    /* Every credential is checked, then the first live match is used. A match
+     * outside its window or out of uses is a miss like any other: the door
+     * answers the same, and the limiter must not tell them apart either. */
     int64_t now = oz_lock_utc(L);
+    int hit[OZ_LOCK_MAX_CREDS];
+    for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
+        const oz_cred *c = &L->creds[i];
+        hit[i] = ok && c->used && c->type == OZ_CRED_PIN && pin_in_entry(c, digits, n);
+    }
     for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
         oz_cred *c = &L->creds[i];
-        if (!c->used || c->type != OZ_CRED_PIN || c->secret_len != n ||
-            oz_ct_equal(c->secret, (const uint8_t *)digits, n))
+        if (!hit[i] || !pin_live(c, now))
             continue;
-        /* Time windows need a set clock; without one a timed PIN is refused. */
-        if ((c->from || c->to) && !now)
-            return 0;
-        if ((c->from && now < c->from) || (c->to && now > c->to) || c->uses == 0)
-            return 0;
         if (c->uses > 0) {
             c->uses--;
             save_creds(L);
         }
+        if (oz_limit_success(&L->pin_limit))
+            save_pin_limit(L);
         if (L->hooks.actuate)
             L->hooks.actuate(L->hooks.app, 1);
         L->lock_state = OZ_LOCKSTATE_UNLOCKED;
-        return 1;
+        return OZ_PIN_OPEN;
     }
-    return 0;
+    uint32_t ms = oz_limit_miss(&L->pin_limit, mono);
+    save_pin_limit(L);
+    if (ms)
+        oz_port_log("lock: keypad locked out for %u s", (unsigned)(ms / 1000u));
+    return OZ_PIN_WRONG;
 }

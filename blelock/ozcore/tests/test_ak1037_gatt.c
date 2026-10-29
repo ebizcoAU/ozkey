@@ -12,6 +12,7 @@
  * and an advertising update the stack refuses.
  */
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "oz_test.h"
 #include "oz_port.h"
@@ -278,14 +279,15 @@ static void claim(void)
     uint32_t code;
     oz_edhoc_pair_code(&e, &code);
     char cmd[32];
-    snprintf(cmd, sizeof cmd, "oz.code %06u", (unsigned)code);
+    snprintf(cmd, sizeof cmd, "oz.key %06u#", (unsigned)code);   /* typed on the keypad */
     got_done = 0;
     oz_reasm_reset(&got);
     notify_full = 3;
     long attempts = notify_attempts, sent = notifies;
     uint32_t t0 = mock_ms;
-    expect_int("oz.code exists", mock_msh_run(cmd), 0);
-    mock_pass();
+    expect_int("oz.key exists", mock_msh_run(cmd), 0);
+    for (int i = 0; i < 7; i++)             /* six digits and '#', one event each */
+        mock_pass();
     expect_int("BUFFER_FULL retried, then sent", notify_attempts - attempts, (notifies - sent) + 3);
     expect_int("waited 5 ms per retry", (long long)(mock_ms - t0) >= 15, 1);
     expect_int("pair answered", got_done, 1);
@@ -314,6 +316,93 @@ static void claim(void)
     notify_full = 0;
 
     expect_int("every notification well formed", got_bad, 0);
+}
+
+/* ── the keypad, through the shell and the OZKIE thread ────────────────── */
+
+static char out_buf[1 << 16];
+static int saved_fd = -1;
+static FILE *cap_file;
+
+static void capture_start(void)
+{
+    fflush(stdout);
+    saved_fd = dup(1);
+    cap_file = tmpfile();
+    if (saved_fd < 0 || !cap_file || dup2(fileno(cap_file), 1) < 0)
+        abort();
+}
+
+static void capture_end(void)
+{
+    fflush(stdout);
+    dup2(saved_fd, 1);
+    close(saved_fd);
+    rewind(cap_file);
+    size_t n = fread(out_buf, 1, sizeof out_buf - 1, cap_file);
+    out_buf[n] = 0;
+    fclose(cap_file);
+    fputs(out_buf, stdout);
+}
+
+static int count(const char *s)
+{
+    int n = 0;
+    for (const char *p = out_buf; (p = strstr(p, s)); p += strlen(s))
+        n++;
+    return n;
+}
+
+/* Press keys; the thread takes one event per key. */
+static void keys(const char *k)
+{
+    char cmd[48];
+    snprintf(cmd, sizeof cmd, "oz.key %s", k);
+    mock_msh_run(cmd);
+    for (size_t i = 0; i < strlen(k); i++)
+        mock_pass();
+}
+
+static void keypad_lockout(void)
+{
+    uint8_t out[600], req[300];
+    oz_oscore_xchg x;
+    int result;
+
+    capture_start();
+    for (int i = 0; i < 4; i++)
+        keys("0000#");
+    capture_end();
+    expect_int("4 wrong PINs", count("keypad: wrong"), 4);
+    expect_int("no lockout yet", count("locked out"), 0);
+
+    capture_start();
+    keys("0000#");
+    keys("4826#");
+    capture_end();
+    expect_int("5th: locked out for 60 s", count("lock: keypad locked out for 60 s"), 1);
+    expect_int("next entry not checked", count("keypad: locked out, 60 s left, not checked"), 1);
+
+    /* An owner unlock from the app clears it. */
+    size_t n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
+    size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    expect_int("owner unlock", response(out, ol, &x, &result) == OZ_COAP_CHANGED && result == OZ_R_UNLOCK_OK, 1);
+    capture_start();
+    keys("0000#");
+    capture_end();
+    expect_int("after the owner unlock: checked again", count("keypad: wrong"), 1);
+
+    /* A half-typed entry is dropped after 10 s; '*' clears. */
+    capture_start();
+    keys("12");
+    mock_ms += 10000;
+    mock_pass();
+    keys("34*");
+    keys("#");
+    capture_end();
+    expect_int("idle entry dropped", count("keypad: entry timed out"), 1);
+    expect_int("* cleared", count("keypad: cleared"), 1);
+    expect_int("# on nothing checks nothing", count("keypad: wrong"), 0);
 }
 
 static void junk_and_limits(void)
@@ -380,6 +469,7 @@ int main(void)
 {
     boot();
     claim();
+    keypad_lockout();
     junk_and_limits();
     disconnect_and_adv();
     expect_int("flash stayed in OZKV", mock_flash_out_of_part, 0);

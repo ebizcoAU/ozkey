@@ -26,6 +26,7 @@
 #include "oz_port.h"
 #include "oz_adv.h"
 #include "oz_ble.h"
+#include "oz_keypad.h"
 #include "oz_gatt_ak1037.h"
 
 static const T_BT_ATTREC gatt_table[] = {
@@ -43,7 +44,7 @@ static const T_BT_ATTREC gatt_table[] = {
 
 /* ── BLE context → OZKIE thread ──────────────────────────────────────────── */
 
-enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH };
+enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, EV_KEY };
 
 #define FRAME_MAX (BLE_MTU_MAX_SIZE - 3)
 typedef struct {
@@ -145,6 +146,7 @@ static uint8_t thread_stack[OZ_GATT_THREAD_STACK] __attribute__((aligned(8)));
 static oz_link link;
 static oz_ble session;
 static oz_adv adv;
+static oz_keypad keypad;
 
 static uint32_t now_ms(void) { return (uint32_t)rt_tick_get() * (1000u / RT_TICK_PER_SECOND); }
 
@@ -208,6 +210,41 @@ static void refresh_info(const oz_lock *L)
     rt_hw_interrupt_enable(level);
 }
 
+void oz_gatt_ak1037_pair_prompt(int on) { oz_keypad_pairing(&keypad, on); }
+
+/* One key, on the OZKIE thread. Results are logged until the panel and buzzer
+ * are wired (P5). */
+static void key_in(oz_lock *L, char key, int connected)
+{
+    uint32_t code = 0;
+    switch (oz_keypad_key(&keypad, key, now_ms(), &code)) {
+    case OZ_KP_PIN: {
+        int r = oz_lock_keypad_pin(L, keypad.entry);
+        oz_keypad_done(&keypad);
+        if (r == OZ_PIN_OPEN)
+            oz_port_log("keypad: open");
+        else if (r == OZ_PIN_LOCKED_OUT)
+            oz_port_log("keypad: locked out, %u s left, not checked",
+                        (unsigned)((oz_lock_keypad_lockout_ms(L) + 999u) / 1000u));
+        else
+            oz_port_log("keypad: wrong");
+        break;
+    }
+    case OZ_KP_PAIR_CODE:
+        if (connected)
+            (void)oz_ble_pair_code(&session, code);
+        else
+            oz_port_log("keypad: pairing code but no app connected");
+        refresh_info(L);
+        break;
+    case OZ_KP_CLEARED:
+        oz_port_log("keypad: cleared");
+        break;
+    default:
+        break;
+    }
+}
+
 static void ozkie_thread(void *param)
 {
     oz_lock *L = param;
@@ -247,12 +284,17 @@ static void ozkie_thread(void *param)
             case EV_TOUCH:
                 oz_adv_touch(&adv, now_ms());
                 break;
+            case EV_KEY:
+                key_in(L, (char)m.h.arg, connected);
+                break;
             default:
                 break;
             }
         }
         if (connected)
             (void)oz_ble_tick(&session);
+        if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
+            oz_port_log("keypad: entry timed out");
 
         /* Claiming the lock or a window closing changes the mode too, so it is
          * recomputed every pass, not only on events. A failed apply is retried
@@ -276,6 +318,12 @@ int oz_gatt_ak1037_pair_code(uint32_t code)
     return OZ_OK;
 }
 
+int oz_gatt_ak1037_key(char key)
+{
+    post(EV_KEY, (uint32_t)(uint8_t)key);
+    return OZ_OK;
+}
+
 int oz_gatt_ak1037_touch(void)
 {
     post(EV_TOUCH, 0);
@@ -288,6 +336,7 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
         return OZ_E_HW;
     oz_ble_init(&session, L, &link, notify, NULL);
     oz_adv_init(&adv, OZ_GATT_ADV_ALWAYS, now_ms());
+    oz_keypad_init(&keypad);
 
     T_BLE_INIT_PARAM init;
     memset(&init, 0, sizeof init);

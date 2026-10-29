@@ -476,6 +476,79 @@ static void credentials(void)
     expect_int("…and only once", oz_lock_keypad_pin(&L, "111222"), 0);
 }
 
+/* Keypad PINs (P5-B): anti-peep, the wrong-PIN limit, its persistence. */
+static size_t body_pin(uint8_t *b, size_t cap, const char *pin)
+{
+    oz_cbor_w w;
+    size_t bl = body_epoch(b, cap, 2);
+    oz_cbor_w_init(&w, b + bl, cap - bl);
+    oz_cbor_put_uint(&w, 1); oz_cbor_put_uint(&w, OZ_CRED_PIN);
+    oz_cbor_put_uint(&w, 3); oz_cbor_put_bstr(&w, (const uint8_t *)pin, strlen(pin));
+    return bl + w.len;
+}
+
+static void keypad_limit(void)
+{
+    uint8_t b[96];
+    size_t bl;
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    bl = body_pin(b, sizeof b, "482");
+    expect_int("3-digit PIN refused", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl) == OZ_R_CRED_OK, 0);
+    bl = body_pin(b, sizeof b, "4826");
+    expect_int("add PIN 4826", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    /* A one-use PIN: once spent, typing it is a miss like any other. */
+    oz_cbor_w w;
+    bl = body_epoch(b, sizeof b, 3);
+    oz_cbor_w_init(&w, b + bl, sizeof b - bl);
+    oz_cbor_put_uint(&w, 1); oz_cbor_put_uint(&w, OZ_CRED_PIN);
+    oz_cbor_put_uint(&w, 3); oz_cbor_put_bstr(&w, (const uint8_t *)"7777", 4);
+    oz_cbor_put_uint(&w, 6); oz_cbor_put_uint(&w, 1);
+    bl += w.len;
+    expect_int("add one-use PIN 7777", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    expect_int("7777 opens once", oz_lock_keypad_pin(&L, "7777"), OZ_PIN_OPEN);
+
+    int before = unlocks;
+    expect_int("anti-peep: PIN inside other digits", oz_lock_keypad_pin(&L, "9948261"), OZ_PIN_OPEN);
+    expect_int("anti-peep: at the very end", oz_lock_keypad_pin(&L, "000000000004826"), OZ_PIN_OPEN);
+    expect_int("16 digits is the most", oz_lock_keypad_pin(&L, "1111111111114826"), OZ_PIN_OPEN);
+    expect_int("17 digits refused, PIN or not", oz_lock_keypad_pin(&L, "11111111111114826"), OZ_PIN_WRONG);
+    expect_int("a prefix is not the PIN", oz_lock_keypad_pin(&L, "482"), OZ_PIN_WRONG);
+    expect_int("non-digits refused", oz_lock_keypad_pin(&L, "48a26"), OZ_PIN_WRONG);
+    expect_int("4th miss: the spent PIN", oz_lock_keypad_pin(&L, "7777"), OZ_PIN_WRONG);
+    expect_int("no lockout after 4 misses", oz_lock_keypad_lockout_ms(&L) == 0, 1);
+    expect_int("5th miss", oz_lock_keypad_pin(&L, "0001"), OZ_PIN_WRONG);
+    uint64_t left = oz_lock_keypad_lockout_ms(&L);
+    expect_int("5 misses: 60 s lockout", left > 59000 && left <= 60000, 1);
+    expect_int("locked out: the right PIN is not checked", oz_lock_keypad_pin(&L, "4826"), OZ_PIN_LOCKED_OUT);
+    expect_int("…and the door stayed shut", unlocks - before, 3);
+
+    /* A reboot (battery pulled) restores the lockout from kv. */
+    boot_lock();
+    left = oz_lock_keypad_lockout_ms(&L);
+    expect_int("lockout survives a reboot", left > 59000 && left <= 60000, 1);
+    expect_int("still not checked after the reboot", oz_lock_keypad_pin(&L, "4826"), OZ_PIN_LOCKED_OUT);
+
+    /* An owner unlock from the app clears it. */
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    expect_int("owner unlocks from the app", call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0),
+               OZ_R_UNLOCK_OK);
+    expect_int("owner unlock clears the lockout", oz_lock_keypad_lockout_ms(&L) == 0, 1);
+    expect_int("PIN opens again", oz_lock_keypad_pin(&L, "4826"), OZ_PIN_OPEN);
+
+    /* An unreadable record fails closed: locked out at the cap. */
+    oz_port_kv_set("pl", (const uint8_t *)"\x07", 1);
+    boot_lock();
+    left = oz_lock_keypad_lockout_ms(&L);
+    expect_int("bad record: locked out 30 min", left > 1799000 && left <= 1800000, 1);
+    expect_int("bad record: nothing checked", oz_lock_keypad_pin(&L, "4826"), OZ_PIN_LOCKED_OUT);
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0);
+    expect_int("owner clears it", oz_lock_keypad_pin(&L, "4826"), OZ_PIN_OPEN);
+}
+
 static void relay_and_reboot(void)
 {
     /* The owner sets up a relay context (persisted per bond). */
@@ -623,6 +696,7 @@ static void run_suite(size_t mtu)
     first_pairing();
     members();
     credentials();
+    keypad_limit();
     relay_and_reboot();
     roles();
     pair_lockout();

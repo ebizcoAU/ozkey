@@ -20,6 +20,7 @@
 #include "oz_edhoc.h"
 #include "oz_oscore.h"
 #include "oz_invite.h"
+#include "oz_limit.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -130,6 +131,7 @@ typedef struct oz_lock {
     uint8_t        clock_set;
     uint8_t        pair_failures;
     uint64_t       pair_lockout_until_ms;
+    oz_limit       pin_limit;      /* keypad wrong-PIN limit (P5-B), kv "pl" */
     /* persisted relay contexts, one per bond (admin / service) */
     oz_oscore_ctx  relay[OZ_LOCK_MAX_BONDS];
     uint8_t        relay_used[OZ_LOCK_MAX_BONDS];
@@ -156,8 +158,17 @@ int  oz_lock_pair_code(oz_lock *L, oz_link *k, uint32_t code,
 /* Call periodically: expires a pairing window that timed out. */
 int  oz_lock_tick(oz_lock *L, oz_link *k,
                   uint8_t *out_type, uint8_t *out, size_t cap, size_t *out_len);
-/* A PIN typed at the door (not during pairing). Returns 1 if it unlocked. */
+/* A PIN typed at the door (not during pairing): 1..OZ_LOCK_PIN_ENTRY_MAX
+ * digits. Anti-peep: it opens if a live PIN appears anywhere in the entry, so
+ * an owner can hide the PIN among other digits. Wrong entries count toward the
+ * oz_limit lockout; while locked out nothing is checked.
+ * Returns OZ_PIN_OPEN, OZ_PIN_WRONG or OZ_PIN_LOCKED_OUT. */
+#define OZ_LOCK_PIN_ENTRY_MAX 16
+#define OZ_LOCK_PIN_MIN       4      /* shortest PIN `cred` accepts */
+enum { OZ_PIN_WRONG = 0, OZ_PIN_OPEN = 1, OZ_PIN_LOCKED_OUT = 2 };
 int  oz_lock_keypad_pin(oz_lock *L, const char *digits);
+/* Time left in a keypad lockout, 0 when there is none (for the panel). */
+uint64_t oz_lock_keypad_lockout_ms(const oz_lock *L);
 
 int64_t oz_lock_utc(const oz_lock *L);   /* 0 when the clock was never set */
 

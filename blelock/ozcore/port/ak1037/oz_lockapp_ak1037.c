@@ -5,6 +5,7 @@
  *   oz.start     oz_lock_init + the OZKIE GATT service.
  *   oz.touch     someone is at the door (opens the advertising window).
  *   oz.code N    the owner typed pairing code N on the keypad.
+ *   oz.key K…    keys pressed on the keypad, e.g. "oz.key 4826#" ('*' clears).
  *
  * MSH runs commands on the shell thread's small stack, so these only start
  * or post to the OZKIE thread. Its priority is compile-time until the kit
@@ -40,7 +41,8 @@ static void log_actuate(void *app, int unlock)
 static void log_prompt(void *app, int on)
 {
     (void)app;
-    oz_port_log("keypad: %s", on ? "enter the pairing code (oz.code N)" : "pairing prompt off");
+    oz_gatt_ak1037_pair_prompt(on);
+    oz_port_log("keypad: %s", on ? "enter the pairing code (oz.key NNNNNN#)" : "pairing prompt off");
 }
 
 int oz_lockapp_ak1037_start(void)
@@ -103,6 +105,21 @@ static void oz_code_cmd(char argc, char **argv)
         printf("oz.code: the lock isn't running (oz.start)\r\n");
 }
 
+static void oz_key_cmd(char argc, char **argv)
+{
+    if (argc != 2) {
+        printf("usage: oz.key 1234#   (digits, * clears, # enters)\r\n");
+        return;
+    }
+    if (!running) {
+        printf("oz.key: the lock isn't running (oz.start)\r\n");
+        return;
+    }
+    for (const char *k = argv[1]; *k; k++)
+        (void)oz_gatt_ak1037_key(*k);
+}
+
 AK_MSH_CMD_EXPORT(oz_start_cmd, oz.start, start the OZKIE lock with log-only hardware);
 AK_MSH_CMD_EXPORT(oz_touch_cmd, oz.touch, someone is at the door: open the advertising window);
 AK_MSH_CMD_EXPORT(oz_code_cmd, oz.code, the owner typed this pairing code on the keypad);
+AK_MSH_CMD_EXPORT(oz_key_cmd, oz.key, keys pressed on the keypad);
