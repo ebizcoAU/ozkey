@@ -301,9 +301,11 @@ const CONFIG = {
   ENFORCE_CAPS: process.env.OZLOCK_ENFORCE_CAPS !== '0',
   PROVISION_WIFI_SSID: SECRETS.PROVISION_WIFI_SSID,
   PROVISION_WIFI_PASSWORD: SECRETS.PROVISION_WIFI_PASSWORD,
-  // Lock broker_secret stays plaintext here for now (ozpms hashes it). Flipping
-  // it is its own step: it changes what the ozlock DB holds (ozkey-50 §7 S1e).
-  HASH_LOCK_BROKER_SECRETS: false,
+  // S1e-2 (ozkey-50 §8.2): lock broker_secret stored hashed, as in ozpms.
+  // Nothing reads it back; the plaintext travels once, in the enrollment_ack.
+  // Boot hashes any plaintext rows left from before (irreversible, so dump
+  // the locks table before the first boot with this on).
+  HASH_LOCK_BROKER_SECRETS: true,
 };
 
 /* ---------------------------------------------------------------------------

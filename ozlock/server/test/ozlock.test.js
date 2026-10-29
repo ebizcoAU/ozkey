@@ -154,6 +154,10 @@ test('MQTT enroll of a paired lock -> enrollment_ack; unknown -> nack', async ()
   // names the lock from its MAC. Today's behaviour; flagged for S1.
   assert.equal(ack.payload.label, 'Doorlock 00:01');
   assert.match(ack.payload.broker_secret, /^ozl_[0-9a-f]{32}$/);
+  // S1e-2: the DB keeps only the hash of what the ack carried.
+  const [lockRow] = await fx.query('SELECT broker_secret FROM locks WHERE id = ?', [L1]);
+  assert.match(lockRow.broker_secret, /^PBKDF2\$sha512\$100000\$/);
+  assert.ok(verifyBrokerSecret(ack.payload.broker_secret, lockRow.broker_secret));
 
   ({ pubs } = await step('enroll-unknown', async () => {
     await fx.pub(T('enroll', 's0-ghost'), { device_id: 's0-ghost', mac: 'AA:BB:CC:00:00:99' });
