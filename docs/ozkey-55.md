@@ -1,6 +1,6 @@
 # ozkey-55: dashboards end to end. Every field traced from the lock to the screen
 
-Status: DRAFT rev 2 2026-11-05 (OZKIE as the common exchange), ozkey-92 (firmware, doorlock team lead). For PM nexus-e3 and server dev
+Status: rev 3 2026-11-05 (OZKIE as the common exchange; any SoC; PM GO on F1/F2/F5), ozkey-92 (firmware, doorlock team lead). For PM nexus-e3 and server dev
 ozkey-f1. Companion to the dashboards brief (`nexus-lab-backups/ozkey_notes/2026-11-05_dashboards-commercial-brief.md`).
 
 Operator directive (2026-11-05): as team lead, firmware makes sure the dashboards work with our bridges,
@@ -34,6 +34,21 @@ Together they mean: **OZKIE is the one common BLE exchange, and any lock that sp
   approved) is a standard OZKIE resource, so every vendor reports them the same way.
 - **v1 (ESP32 era) is legacy.** The bridge keeps relaying it until those locks retire, but no new
   lock targets v1.
+
+3. *"The future doorlock can be any SoC, but to communicate with the bridge through BLE it must use
+   the OZKIE protocol, like the Tuya protocol."*
+
+So OZKIE plays the role the Tuya protocol plays for Tuya devices: **the chip is the lock maker's
+choice; the protocol on the air is not.** There are two ways for a lock maker to get there (Tuya
+offers both as well):
+- **SoC integration:** port `ozcore` (portable C, one small `port/<soc>` layer for BLE, flash, AES
+  and RNG) onto the lock's own BLE SoC. AK1037 is done; ESP32-C6 is F5.
+- **Module integration (option, not scheduled):** a certified OZKIE BLE module does BLE and
+  security, and the vendor's MCU talks to it over a documented UART command set (lock/unlock, state,
+  credential and event callbacks). That fits vendors who won't touch BLE or crypto. It's for the
+  operator to decide whether we offer it; it doesn't change the bridge.
+
+Either way, the lock is accepted when it passes the OZKIE conformance kit (F6).
 
 **This is already proven on ESP32-C6 (operator, 2026-11-05: "we have done this with ESP32C6").** The
 bench locks (`dlch584m_19`, `dlch584m_147`: ESP32-C6, BLE-only) speak **OZKIE v1** over BLE
@@ -132,7 +147,15 @@ firmware columns have no producer for v2. Options:
 - **F5: OZKIE v2 on the existing ESP32-C6 bench locks.** Add `ozcore/port/esp32c6` and run the same
   `ozcore` engine as AK1037 on the `dlch584m_*` boards, advertising the v2 service. Then bench lock
   → bridge → server → dashboard runs live on v2 before the kit (ETA ~11-12). v1 firmware stays
-  available on the same boards, built from its own sketch, for the v1 regression gate.
+  available, built from its own sketch, for the v1 regression gate.
+  - **v1 board kept (PM condition):** the two C6 lock boards are split. One stays on v1, the default
+    being `dlch584m_147` (1.47"); the other gets v2. Both are identified by MAC on the day, not by name
+    ([[bench-board-mac-map]]; names have been reassigned before). If the v2 board is LockA and its
+    08-31 POWERON fault blocks it, use the spare GEEKC6 instead. OZKIT's `AC:EB:E6:0D:AF:BC` is never
+    used.
+  - Fallback if only one board works: both images in the board's two OTA app slots (default_8MB
+    has ota_0/ota_1), switched with `otatool.py switch_ota_partition`, so v1 is testable again
+    without a rebuild.
 - **F6: OZKIE conformance kit.** Test vectors (CBOR, EDHOC, OSCORE, advertising bytes) and a
   conformance runner that drives a lock over BLE through the bridge: claim, invite, unlock, cred
   write, events, time. A vendor's lock that passes it works with our bridges, apps and dashboards.
