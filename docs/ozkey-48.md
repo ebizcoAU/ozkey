@@ -14,6 +14,8 @@
 > `blelock/ozcore` (ozkey-49 P2).
 > Rev 3 (2026-10-18, operator approved via ozkey-50 §9): `issuer` role (§6) and guest-key-bound
 > invites `OZINV2` (§3.3). No server holds bond #0.
+> Rev 5 (2026-11-05, PM nexus-e3 ruling): short id = SHA-256(device_id)[0..3], replacing raw MAC
+> bytes (§2.2, test vectors, 100K-site collision gate). App A: result 35 `PIN_TOO_SHORT`.
 
 ## 0. What changes from v1, in one table
 
@@ -67,6 +69,40 @@ New service, so a v1 phone app can never be confused by a v2 lock:
 
 Advertising, the touch window, the busy flag and the single-connection rule are **unchanged from
 CONTRACT.md**.
+The one exception is the short id (§2.2).
+
+### 2.2 Advertising and the short id (PM ruling 2026-11-05)
+
+ADV (29 of 31 B): flags `06` · complete 128-bit UUID list (the v2 service) · name `OZLOCK`.
+Scan response (23 of 31 B): 128-bit service data for the v2 service = `busy` (1 B: 0 = free,
+1 = a link is up) ‖ **short id** (4 B). Apps scan actively to see it.
+
+**short id = the first 4 bytes of SHA-256(device_id)**, hashed over the device_id's bytes exactly as
+`info` key 1 carries them. There is no case folding and no format assumption, so any maker's id
+format works. The id must be 1..40 bytes; a lock with any other id doesn't advertise.
+
+v1 used the device_id's first 4 MAC bytes. On Espressif boards 3 of those are the vendor OUI, which
+leaves 256 values per site and puts the OUI on the air. A hash spreads evenly whatever the OUI.
+
+The short id is only a **pre-connect filter**. After connecting, the app MUST read `info` and check
+the full device_id, and disconnect on a mismatch. 4 bytes still collide sometimes: at 100K locks,
+about 1 pair is expected.
+
+Test vectors (Python `hashlib.sha256(id.encode()).digest()[:4]`):
+
+| device_id | short id |
+|---|---|
+| `ozk-acebe63acab8` | `2b 9c 2d 79` |
+| `ozk-ACEBE63ACAB8` | `45 21 2d 8d` (no case folding) |
+| `ozk-b0a6048b5fd8` | `84 f5 dc bc` |
+| `x` | `2d 71 16 42` |
+
+Full scan response for `ozk-acebe63acab8`, free:
+`16 21 01 00 00 00 00 00 4b 43 4f 4c 01 00 32 4b 5a 4f 00 2b 9c 2d 79`.
+
+Gate (`test_adv`): a synthetic site of 100 000 Espressif-OUI ids. It requires at most 6 colliding
+short ids (random 32-bit expectation 1.16) and even first-byte buckets. The run on 2026-11-05 gave 0
+collisions; the raw-MAC scheme gave 392 distinct values for the same ids.
 
 ### 2.1 Frame
 

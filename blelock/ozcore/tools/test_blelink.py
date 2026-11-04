@@ -51,8 +51,8 @@ def framing():
     ra.feed(f[0]); chk('out-of-order fragment drops it', ra.feed(f[2]) is None and not ra.active)
     g = blelink.fragment(1, bytes(30), 23); h = blelink.fragment(0, bytes(30), 23)
     ra.feed(g[0]); chk('type change mid-message drops it', ra.feed(h[1]) is None and not ra.active)
-    chk('short id = first 4 bytes after the dash (as v1/oz_adv)',
-        blelink.short_id('ozk-acebe63acab8') == bytes.fromhex('acebe63a'))
+    chk('short id = SHA-256(device_id)[0..3] (ozkey-48 §2.2 vector)',
+        blelink.short_id('ozk-acebe63acab8') == bytes.fromhex('2b9c2d79'))
 
 class FakeGatt:
     """A BLE central's view of the lock, backed by one TCP session to

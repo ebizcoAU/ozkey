@@ -7,6 +7,7 @@
  *
  *   ADV (29 of 31 B): flags 06 · complete 128-bit UUID list (service) · name "OZLOCK"
  *   scan response (23 of 31 B): 128-bit service data = busy byte ‖ 4-byte short id
+ *                               (SHA-256(device_id)[0..3], ozkey-48 §2.2)
  *
  * The v2 service UUID (…4b32) is how a bridge tells a v2 lock from a v1 one
  * (ozkey-48 §7). The UUID list stays in ADV because apps filter on it
@@ -55,8 +56,9 @@ void        oz_adv_touch(oz_adv *a, uint32_t now_ms);
 void        oz_adv_link(oz_adv *a, int up);
 oz_adv_mode oz_adv_mode_at(oz_adv *a, int claimed, uint32_t now_ms);
 
-/* Packet bytes. device_id "ozk-acebe63acab8" → short id ac eb e6 3a, the same
- * 8 hex characters the panel prints. Returns the length, 0 on a bad id. */
+/* Packet bytes. Short id = the first 4 bytes of SHA-256(device_id), over the
+ * id's bytes as-is (ozkey-48 §2.2): "ozk-acebe63acab8" → 2b 9c 2d 79.
+ * Returns the length, 0 on a NULL, empty or over-long (> 40 B) id. */
 size_t oz_adv_data(uint8_t out[OZ_ADV_MAX]);
 size_t oz_adv_scan_rsp(uint8_t out[OZ_ADV_MAX], int busy, const char *device_id);
 

@@ -18,7 +18,7 @@ The 0x8x types stand in for a person at the door, exactly as in hostlock.c;
 on a bench lock they go to its USB serial shell (dlc6v2.ino).
 
 Finding the lock: scan actively for the v2 service, match the scan response's
-4-byte short id against the device_id, connect, then CHECK the full device_id
+4-byte short id (SHA-256 of the device_id), connect, then CHECK the full device_id
 in `info` (the short id is only 4 bytes, see ozkey-55). macOS hides BLE MAC
 addresses, so the short id is the only pre-connect handle.
 
@@ -74,10 +74,10 @@ class Reassembler:
         return t, msg
 
 def short_id(device_id):
-    """The scan-response short id: the first 4 bytes of the hex after '-'
-    (oz_adv_scan_rsp, the same as v1's ozShortId)."""
-    h = device_id.split('-', 1)[1]
-    return bytes.fromhex(h[:8])
+    """The scan-response short id: the first 4 bytes of SHA-256(device_id),
+    over the id's bytes as-is (ozkey-48 §2.2; v1's ozShortId was raw MAC bytes)."""
+    import hashlib
+    return hashlib.sha256(device_id.encode()).digest()[:4]
 
 # ── the link ─────────────────────────────────────────────────────────────────
 

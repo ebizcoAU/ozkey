@@ -3,6 +3,8 @@
 
 #include "oz_adv.h"
 #include "oz_ble.h"
+#include "oz_crypto.h"
+#include "oz_invite.h"
 
 static int before(uint32_t now, uint32_t deadline) { return (int32_t)(deadline - now) > 0; }
 
@@ -62,29 +64,23 @@ size_t oz_adv_data(uint8_t out[OZ_ADV_MAX])
     return (size_t)(p - out);
 }
 
-static int nibble(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
+/* Short id = SHA-256(device_id)[0..3] (ozkey-48 §2.2, PM ruling 2026-11-05):
+ * the device_id's bytes exactly as `info` key 1 carries them, no case folding.
+ * A hash spreads evenly whatever the vendor's OUI, and doesn't put it on air. */
 size_t oz_adv_scan_rsp(uint8_t out[OZ_ADV_MAX], int busy, const char *device_id)
 {
-    const char *dash = device_id ? strchr(device_id, '-') : NULL;
-    if (!dash)
+    size_t n = 0;                                       /* strnlen isn't C11 */
+    while (device_id && n <= OZ_INVITE_MAX_DEVICE_ID && device_id[n])
+        n++;
+    uint8_t h[32];
+    if (n == 0 || n > OZ_INVITE_MAX_DEVICE_ID || oz_sha256((const uint8_t *)device_id, n, h) != 0)
         return 0;
     uint8_t *p = out;
     *p++ = 1 + 16 + 1 + 4;  *p++ = 0x21;                /* service data, 128-bit */
     memcpy(p, service_uuid, 16);
     p += 16;
     *p++ = busy ? 0x01 : 0x00;
-    for (int i = 0; i < 4; i++) {
-        int hi = nibble(dash[1 + 2 * i]), lo = hi < 0 ? -1 : nibble(dash[2 + 2 * i]);
-        if (hi < 0 || lo < 0)
-            return 0;
-        *p++ = (uint8_t)(hi << 4 | lo);
-    }
+    memcpy(p, h, 4);
+    p += 4;
     return (size_t)(p - out);
 }
