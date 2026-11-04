@@ -148,10 +148,13 @@ firmware columns have no producer for v2. Options:
   `ozcore` engine as AK1037 on the `dlch584m_*` boards, advertising the v2 service. Then bench lock
   → bridge → server → dashboard runs live on v2 before the kit (ETA ~11-12). v1 firmware stays
   available, built from its own sketch, for the v1 regression gate.
-  - **v1 board kept (PM condition):** `dlch584m_147` (1.47") stays on v1, and the other C6 lock
-    board gets v2. Both are identified by MAC on the day, not by name ([[bench-board-mac-map]];
-    names have been reassigned before). There is **no third lock board**: the GEEKC6 boards are
-    bridges, and no bridge is taken out of the ≥ 2-bridge failover set to make a lock (PM). OZKIT's
+  - **v1 board kept (PM condition):** there are **three** C6 lock boards ([[bench-board-mac-map]],
+    2026-09-04): LockA `AC:EB:E6:39:F8:C4` (1.9"), LockB `AC:EB:E6:3A:CA:B8` (1.9") and LockC
+    `B0:A6:04:8B:5F:D8` (1.47", `dlch584m_147`). **LockC stays on v1.** v2 goes on one 1.9" board,
+    LockB by default (LockA has the 08-31 POWERON fault). The other 1.9" stays v1 as a second
+    regression lock, or becomes a second v2 lock if a test needs two. Boards are always picked by
+    MAC, never by name (names have been reassigned). Bridges (`98:A3:16:A7:E6:38`,
+    `20:6E:F1:16:F3:90`) stay bridges: none leaves the ≥ 2-bridge failover set (PM). OZKIT's
     `AC:EB:E6:0D:AF:BC` is never used.
   - Fallback if only one board works: both images in the board's two OTA app slots (default_8MB
     has ota_0/ota_1), switched with `otatool.py switch_ota_partition`, so v1 is testable again
