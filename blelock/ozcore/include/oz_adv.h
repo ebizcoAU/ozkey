@@ -55,7 +55,7 @@ void        oz_adv_touch(oz_adv *a, uint32_t now_ms);
 void        oz_adv_link(oz_adv *a, int up);
 oz_adv_mode oz_adv_mode_at(oz_adv *a, int claimed, uint32_t now_ms);
 
-/* Packet bytes. device_id "ozk-acebe63acab8" → short id ac be be 63, the same
+/* Packet bytes. device_id "ozk-acebe63acab8" → short id ac eb e6 3a, the same
  * 8 hex characters the panel prints. Returns the length, 0 on a bad id. */
 size_t oz_adv_data(uint8_t out[OZ_ADV_MAX]);
 size_t oz_adv_scan_rsp(uint8_t out[OZ_ADV_MAX], int busy, const char *device_id);
