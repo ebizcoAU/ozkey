@@ -151,7 +151,8 @@ firmware columns have no producer for v2. Options:
   - **v1 board kept (PM condition):** the two C6 lock boards are split. One stays on v1, the default
     being `dlch584m_147` (1.47"); the other gets v2. Both are identified by MAC on the day, not by name
     ([[bench-board-mac-map]]; names have been reassigned before). If the v2 board is LockA and its
-    08-31 POWERON fault blocks it, use the spare GEEKC6 instead. OZKIT's `AC:EB:E6:0D:AF:BC` is never
+    08-31 POWERON fault blocks it, use another C6 lock board chosen by MAC. The GEEKC6 boards are
+    bridges, not spares. OZKIT's `AC:EB:E6:0D:AF:BC` is never
     used.
   - Fallback if only one board works: both images in the board's two OTA app slots (default_8MB
     has ota_0/ota_1), switched with `otatool.py switch_ota_partition`, so v1 is testable again
@@ -161,6 +162,70 @@ firmware columns have no producer for v2. Options:
   write, events, time. A vendor's lock that passes it works with our bridges, apps and dashboards.
   The first two to pass: the F5 ESP32-C6 bench locks and the AK1037 kit.
 - **D1 (b) if approved:** a `health` resource in `oz_lock` and a bridge poll.
+
+## 5a. The app's OZKIE v2 initiator: interface requirements (for ftpos, OZKIE-V2-APP)
+The operator ruled 2026-11-05: **OZKIE v2 on every lock**. BANOI speaks v1 only today, so v2 end to
+end with the real app needs this. Until then firmware tests v2 over BLE with `tools/ozapp.py`.
+
+**Normative sources.** ozkey-48 §2 (GATT + frame), §3 (EDHOC), §3.3–3.4 (invite in EAD_3, keypad
+pairing), §4 (OSCORE, contexts, freshness, epochs), §5 (verbs), §6 (roles) and **Appendix A** (wire
+details the reference implementation fixed). Where the text is silent, `blelock/ozcore` behaviour
+is the reference.
+
+**What the app must implement.**
+1. **BLE:**
+   - scan for the v2 service UUID (`…4b32`), actively, to get the scan response;
+   - read the busy byte and the 4-byte short id there;
+   - connect; request MTU 247;
+   - read `info`;
+   - write frames to the OZKIE characteristic and receive notifications on it (ozkey-48 §2.1).
+2. **EDHOC initiator:** RFC 9528, method 3 (STAT-STAT), cipher suite 0 (AES-CCM-16-64-128,
+   SHA-256, MAC 8, X25519).
+   - `C_I` is 1 byte.
+   - Credentials are the 44-byte canonical CCS (App. A).
+   - The lock's `ID_CRED_R = {4: h'00'}`.
+   - A bonded app sends `ID_CRED_I = {4: h'<slot>'}` (compact); an unbonded one sends `{14: CCS}`.
+   - Invites ride in EAD_3 as the CBOR array of §3.3.
+   - message_4 is not used: the first OSCORE response is key confirmation.
+3. **OSCORE client:** RFC 8613 over CoAP (RFC 7252).
+   - Master Secret 16 B / Salt 8 B from the EDHOC exporter (RFC 9528 App. A.1).
+   - Handle `4.01 + Echo` by resending with the Echo option (B.1.2).
+4. **Pairing (owner):** after message_3 on an unclaimed lock, `POST pair`. The lock answers only
+   after the owner types the 6-digit code on the keypad: `2.04 {0: BOND_OK, 1: 0}`, or
+   `4.01 {0: PAIR_FAILED}`. Show the code-entry prompt meanwhile.
+5. **Verbs:** lock/state, unlock/lock, cred, bond, events, info, time (§5). Every state-changing
+   request carries the epoch; handle `STALE_EPOCH` (it returns the current epoch at key 1).
+   - **PINs are ≥ 6 digits** (PM ruling). Refuse shorter ones in the UI.
+   - Result codes are language-neutral integers (App. A table); the app translates them.
+6. **Invites:** byte-identical OZINV1 (unchanged, ftpos's frozen vectors). For guest-bound invites,
+   use OZINV2 / canonical v3 with `bind` (first 16 B of SHA-256 of the guest app's public key) and
+   `iss` (§3.3). Refuse labels containing `|`.
+
+**What the app must store (secure storage / keychain):**
+- **Its own X25519 static key pair.** The private key never leaves the device. This is the app's
+  identity on every lock.
+- **Per lock:**
+  - the device_id and the lock's public key / CCS (from `info`, or the QR later);
+  - its bond slot and role;
+  - the last epoch it saw.
+- **Owner only, per lock:** the persistent **relay** OSCORE context (Master Secret/Salt,
+  Sender/Recipient IDs, sender sequence persisted **in blocks** per RFC 8613 B.1.1, the replay
+  window) **if** the app ever sends through the relay. Re-key with a fresh EDHOC at least every 30
+  days or at seq 2^32. A member never gets one (members are on premises only, §4.1).
+- **Never stored:** session contexts. They die with the BLE connection.
+
+**Test vectors and an oracle:**
+- RFC 9529 §3 (EDHOC method 3 trace) and RFC 8613 Appendix C.4–C.6 (OSCORE). Both are checked
+  by `ozcore` tests and by `tools/ozapp.py rfc`.
+- The invite MACs: ftpos's frozen `member_invite_test.dart` vectors, reproduced by `ozcore`
+  (test_invite).
+- **An interop oracle:** `tools/hostlock.c` builds a host lock (`ozhostlock`) on the Mac or Linux,
+  and `python3 -I tools/ozapp.py interop <path>/ozhostlock` is an independent v2 app (written
+  from the RFCs) that runs a scenario against it: claim with the keypad code, owner unlock, set the clock,
+  member invite + door unlock, invite replay refused, PIN add + stale epoch refused, service bond,
+  owner relay context with Echo after a reboot, and service-cannot-unlock. **`events` Observe isn't
+  in the scenario yet**; `ozcore`'s test_events covers it on the lock side. The Dart initiator should pass the same scenario against `ozhostlock` before any real
+  lock, then against the F5 C6 lock over BLE.
 
 ## 6. Acceptance: what "works with our bridges" means
 Each OZLOCK screen group is accepted only when it shows **live values from the bench**, not sample
