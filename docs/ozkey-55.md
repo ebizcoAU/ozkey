@@ -81,7 +81,7 @@ producer and a status. "Sample data" in the mockup is replaced only by a row mar
     beacon), `locks/<id>/uplink` (sealed bytes)
 - Missing over MQTT: the bridge's **firmware version** (only on its BLE `info` characteristic), its
   **clock**, and its uptime.
-- A v2 lock **advertises only** its service UUID, a busy byte and a 4-byte short id (`oz_adv.h`).
+- A v2 lock **advertises only** its service UUID, a busy byte and a 4-byte short id, SHA-256(device_id)[0..3] (`oz_adv.h`, ozkey-48 §2.2).
   There's **no battery or firmware in plaintext**, by design.
 
 ## 3. Field map: OZLOCK screens (first to build)
@@ -177,9 +177,11 @@ is the reference.
 **What the app must implement.**
 1. **BLE:**
    - scan for the v2 service UUID (`…4b32`), actively, to get the scan response;
-   - read the busy byte and the 4-byte short id there;
+   - read the busy byte and the 4-byte short id there. The short id is SHA-256(device_id)[0..3],
+     not hex from the id (ozkey-48 §2.2, test vectors there);
    - connect; request MTU 247;
-   - read `info`;
+   - read `info`, check that key 1 equals the full device_id, and disconnect on a mismatch
+     (ozkey-48 §2.2: the short id is only a filter);
    - write frames to the OZKIE characteristic and receive notifications on it (ozkey-48 §2.1).
 2. **EDHOC initiator:** RFC 9528, method 3 (STAT-STAT), cipher suite 0 (AES-CCM-16-64-128,
    SHA-256, MAC 8, X25519).
