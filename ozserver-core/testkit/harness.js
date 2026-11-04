@@ -229,9 +229,10 @@ class Fixture {
     });
 
     // S1e-4: the server pins its DB sessions to UTC, so its own TZ must not
-    // matter. Run it in a zone that is never MySQL's, so every suite proves
-    // that (before S1e-4 the harness had to match the two to pass).
-    this.serverTz = await zoneUnlikeMysql(this.dbPassword);
+    // matter. Run it hours EAST of MySQL, so every suite proves that (before
+    // S1e-4 the harness had to match the two to pass; with the pool pin
+    // reverted, the goldens and ozlock's direct-lock DELETE fail).
+    this.serverTz = await zoneEastOfMysql(this.dbPassword);
 
     // Server
     this.httpPort = await freePort();
@@ -308,14 +309,15 @@ class Fixture {
     await this.startServer();
   }
 
-  /** Run SQL against this fixture's throwaway DB. */
+  /** Run SQL against this fixture's throwaway DB, in a UTC session like the
+   *  server's pool (S1e-4). */
   async query(sql, args = []) {
     const conn = await mysql.createConnection({
       host: 'localhost',
       user: 'root',
       password: this.dbPassword,
       database: this.dbName,
-      timezone: 'Z', // same session zone as the server's pool (S1e-4)
+      timezone: 'Z',
     });
     try {
       await conn.query("SET time_zone = '+00:00'");
@@ -433,13 +435,17 @@ class Fixture {
   }
 }
 
-/** An IANA zone whose current offset differs from MySQL's by many hours. */
-async function zoneUnlikeMysql(password) {
+/** An IANA zone well east of MySQL's current offset (see the comment inside). */
+async function zoneEastOfMysql(password) {
   const conn = await mysql.createConnection({ host: 'localhost', user: 'root', password });
   const [[{ m }]] = await conn.query('SELECT TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW()) AS m');
   await conn.end();
-  // UTC+14 is as far east as any zone; if MySQL sits east of UTC, go far west.
-  return Number(m) > 0 ? 'Etc/GMT+12' : 'Pacific/Kiritimati';
+  // Put Node AHEAD of MySQL. Then a NOW()-written last_seen_at, read back as
+  // Node-local by an un-pinned pool, looks hours old and likelyOnline() says
+  // offline, so the suites fail without S1e-4. With Node behind (the first cut
+  // of this), the skew made locks look MORE online and nothing failed.
+  // UTC+14 is as far east as any zone; only MySQL at +13/+14 forces the west.
+  return Number(m) < 13 * 60 ? 'Pacific/Kiritimati' : 'Etc/GMT+12';
 }
 
 /** Sorted, masked view of a step's publishes for the golden file. */
