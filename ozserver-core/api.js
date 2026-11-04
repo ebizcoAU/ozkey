@@ -332,7 +332,10 @@ api.get('/apps/:appId/activity', async (req, res) => {
       params
     );
     const [rows] = await pool.query(
-      `SELECT * FROM audit_log WHERE ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      // Explicit columns: C0a added audit_log.actor for console users, and
+      // the app's activity contract must not grow with it.
+      `SELECT id, app_id, device_id, site_id, action, detail, created_at FROM audit_log
+        WHERE ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
     res.json({ ok: true, app_id: req.params.appId, activity: rows, total, limit, offset });
@@ -607,7 +610,9 @@ api.patch('/locks/:id', async (req, res) => {
 async function purgeLockRows(conn, where, args) {
   await conn.query(`DELETE FROM grants WHERE ${where}`, args);
   await conn.query(`DELETE FROM pending_queue WHERE ${where}`, args);
-  await conn.query(`DELETE FROM audit_log WHERE ${where}`, args);
+  // Console rows (actor set, C0a) record staff actions, not the lock's:
+  // a lock purge never removes them.
+  await conn.query(`DELETE FROM audit_log WHERE (${where}) AND actor IS NULL`, args);
   if (hooks.purgeExtraRows) await hooks.purgeExtraRows(conn, where, args);
 }
 

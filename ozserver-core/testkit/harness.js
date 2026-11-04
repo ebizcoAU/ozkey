@@ -242,39 +242,60 @@ class Fixture {
     await waitFor(() => this.published.some((m) => m.topic === `ozkie/${P.site}/time`), { what: 'retained time' });
   }
 
-  /** Spawn the profile's server.js against this fixture's broker and DB. */
-  async startServer() {
+  /** The env every spawn of the profile's server.js gets (server and CLI). */
+  serverEnv() {
     const profileEnv = P.serverEnv(this);
     for (const [k, v] of Object.entries(profileEnv)) if (/_URL$/.test(k)) assertLocal(k, v);
+    return {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      TZ: this.serverTz,
+      [envName('DB_PASSWORD')]: this.dbPassword,
+      [envName('DB_NAME')]: this.dbName,
+      [envName('MQTT_URL')]: this.mqttUrl,
+      [envName('HTTP_PORT')]: String(this.httpPort),
+      [envName('SERVER_IP')]: '127.0.0.1',
+      // S1d: the reset-verdict waits get room on a loaded box (firmware saw
+      // 'unknown' at the 5 s default with a parallel run). The responders
+      // answer at once, so the lock wait only costs time when something is
+      // broken. The bridge wait stays shorter: ozlock's bridge-reset-silent
+      // step waits it out on purpose.
+      [envName('LOCK_RESET_TIMEOUT_MS')]: '20000',
+      [envName('BRIDGE_RESET_TIMEOUT_MS')]: '10000',
+      // S1c: the provision payload's Wi-Fi now comes only from env. These
+      // are the values the source used to carry, so the golden stays
+      // byte-identical and proves the env path is what feeds it.
+      PROVISION_WIFI_SSID: 'OZKEY-LAB',
+      PROVISION_WIFI_PASSWORD: 'labwifi-secret',
+      ...profileEnv,
+      ...this.extraEnv,
+    };
+  }
+
+  /** C0a: run `node server.js <args>` (a CLI subcommand) against this
+   *  fixture's DB and broker; resolves { code, out }. */
+  runCli(args, { timeoutMs = 60000 } = {}) {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, ['server.js', ...args], { cwd: P.serverDir, env: this.serverEnv() });
+      let out = '';
+      child.stdout.on('data', (d) => (out += d));
+      child.stderr.on('data', (d) => (out += d));
+      const t = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+      child.on('exit', (code) => {
+        clearTimeout(t);
+        resolve({ code, out });
+      });
+    });
+  }
+
+  /** Spawn the profile's server.js against this fixture's broker and DB. */
+  async startServer() {
     const logFrom = this.log().length;
     const out = fs.openSync(this.serverLog, 'a');
     this.server = spawn(process.execPath, ['server.js'], {
       cwd: P.serverDir,
       stdio: ['ignore', out, out],
-      env: {
-        PATH: process.env.PATH,
-        HOME: process.env.HOME,
-        TZ: this.serverTz,
-        [envName('DB_PASSWORD')]: this.dbPassword,
-        [envName('DB_NAME')]: this.dbName,
-        [envName('MQTT_URL')]: this.mqttUrl,
-        [envName('HTTP_PORT')]: String(this.httpPort),
-        [envName('SERVER_IP')]: '127.0.0.1',
-        // S1d: the reset-verdict waits get room on a loaded box (firmware saw
-        // 'unknown' at the 5 s default with a parallel run). The responders
-        // answer at once, so the lock wait only costs time when something is
-        // broken. The bridge wait stays shorter: ozlock's bridge-reset-silent
-        // step waits it out on purpose.
-        [envName('LOCK_RESET_TIMEOUT_MS')]: '20000',
-        [envName('BRIDGE_RESET_TIMEOUT_MS')]: '10000',
-        // S1c: the provision payload's Wi-Fi now comes only from env. These
-        // are the values the source used to carry, so the golden stays
-        // byte-identical and proves the env path is what feeds it.
-        PROVISION_WIFI_SSID: 'OZKEY-LAB',
-        PROVISION_WIFI_PASSWORD: 'labwifi-secret',
-        ...profileEnv,
-        ...this.extraEnv,
-      },
+      env: this.serverEnv(),
     });
     this.procs.push(this.server);
     const t0 = Date.now();
