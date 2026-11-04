@@ -53,7 +53,7 @@ enum {
     OZ_R_BOND_DENIED = 24, OZ_R_MEMBER_REPLAY = 25, OZ_R_MEMBER_FULL = 26,
     OZ_R_MEMBER_EXPIRED = 27, OZ_R_INVITE_BOUND_ELSEWHERE = 28, OZ_R_PAIR_FAILED = 29,
     OZ_R_PAIR_LOCKED_OUT = 30, OZ_R_NOT_FOUND = 31, OZ_R_REVOKE_DENIED = 32,
-    OZ_R_TIME_REJECTED = 33, OZ_R_BATTERY_LOW = 34,
+    OZ_R_TIME_REJECTED = 33, OZ_R_BATTERY_LOW = 34, OZ_R_PIN_TOO_SHORT = 35,
 };
 
 /* Matter DoorLock vocabulary (🟡 values to be checked against Matter 1.x, ozkey-48 §5). */

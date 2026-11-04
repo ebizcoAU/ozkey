@@ -491,6 +491,12 @@ value is 8 random bytes, good for one use within 10 s.
 | 19 | NO_SLOT | 32 | REVOKE_DENIED |
 | | | 33 | TIME_REJECTED |
 | | | 34 | BATTERY_LOW |
+| | | 35 | PIN_TOO_SHORT |
+
+`PIN_TOO_SHORT` (2026-11-05, PM ruling): a `cred` POST or a `cred/sync` entry of type PIN with fewer
+than `OZ_LOCK_PIN_MIN` = 6 digits. A sync with one such entry is refused whole and changes nothing.
+Other malformed creds stay `BAD_REQUEST`. The relay can't see sealed digits, so the lock and the
+app enforce this; the server can't.
 
 EDHOC-stage refusals (`BOND_DENIED`, `MEMBER_REPLAY`, `INVITE_BOUND_ELSEWHERE`, `PAIR_LOCKED_OUT`, …)
 travel as EDHOC error code 1 with the name as the text.

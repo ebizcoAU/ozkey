@@ -1000,7 +1000,7 @@ static int cred_from_body(req_ctx *q, oz_cbor_r *r, oz_cred *c)
     /* Anti-peep opens on a PIN anywhere in the entry, so a short PIN would
      * open on almost anything typed (P5-B). */
     if (c->type == OZ_CRED_PIN && c->secret_len < OZ_LOCK_PIN_MIN)
-        return -1;
+        return -2;                      /* its own result code: the app says "6 digits" */
     if (c->type == OZ_CRED_PIN)
         for (size_t i = 0; i < c->secret_len; i++)
             if (c->secret[i] < '0' || c->secret[i] > '9')
@@ -1013,8 +1013,9 @@ static void v_cred_add(req_ctx *q)
     if (!epoch_ok(q))
         return;
     oz_cred c = { 0 };
-    if (cred_from_body(q, NULL, &c)) {
-        result(q, OZ_R_BAD_REQUEST, 0);
+    int cr = cred_from_body(q, NULL, &c);
+    if (cr) {
+        result(q, cr == -2 ? OZ_R_PIN_TOO_SHORT : OZ_R_BAD_REQUEST, 0);
         return;
     }
     for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
@@ -1087,8 +1088,10 @@ static void v_cred_sync(req_ctx *q)
     oz_cred fresh[OZ_LOCK_MAX_CREDS];
     memset(fresh, 0, sizeof fresh);
     for (size_t i = 0; i < n; i++) {
-        if (cred_from_body(q, &r, &fresh[i])) {
-            result(q, OZ_R_BAD_REQUEST, 0);
+        int cr = cred_from_body(q, &r, &fresh[i]);
+        if (cr) {
+            oz_wipe(fresh, sizeof fresh);   /* earlier entries' secrets */
+            result(q, cr == -2 ? OZ_R_PIN_TOO_SHORT : OZ_R_BAD_REQUEST, 0);
             return;
         }
         fresh[i].used = 1;

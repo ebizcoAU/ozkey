@@ -494,9 +494,26 @@ static void keypad_limit(void)
     oz_link_open(&ble, 0);
     handshake(&owner, &ble, NULL, 0, NULL);
     bl = body_pin(b, sizeof b, "48261");
-    expect_int("5-digit PIN refused", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl) == OZ_R_CRED_OK, 0);
+    expect_int("5-digit PIN refused as PIN_TOO_SHORT", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_PIN_TOO_SHORT);
     bl = body_pin(b, sizeof b, "482613");
     expect_int("add PIN 482613", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    {   /* cred/sync with one short PIN: the whole sync is refused, nothing changes */
+        oz_cbor_w w;
+        size_t sl = body_epoch(b, sizeof b, 1);
+        oz_cbor_w_init(&w, b + sl, sizeof b - sl);
+        oz_cbor_put_uint(&w, 1);
+        oz_cbor_put_array(&w, 2);
+        oz_cbor_put_array(&w, 5); oz_cbor_put_uint(&w, OZ_CRED_PIN);
+        oz_cbor_put_bstr(&w, (const uint8_t *)"135792", 6);
+        oz_cbor_put_int(&w, 0); oz_cbor_put_int(&w, 0); oz_cbor_put_int(&w, -1);
+        oz_cbor_put_array(&w, 5); oz_cbor_put_uint(&w, OZ_CRED_PIN);
+        oz_cbor_put_bstr(&w, (const uint8_t *)"13579", 5);
+        oz_cbor_put_int(&w, 0); oz_cbor_put_int(&w, 0); oz_cbor_put_int(&w, -1);
+        expect_int("cred/sync with a 5-digit PIN refused as PIN_TOO_SHORT",
+                   call(&owner, &ble, OZ_COAP_PUT, "cred/sync", b, sl + w.len), OZ_R_PIN_TOO_SHORT);
+        expect_int("refused sync left the old PIN working", oz_lock_keypad_pin(&L, "482613"), OZ_PIN_OPEN);
+        expect_int("refused sync added nothing", oz_lock_keypad_pin(&L, "135792"), OZ_PIN_WRONG);
+    }
     /* A one-use PIN: once spent, typing it is a miss like any other. */
     oz_cbor_w w;
     bl = body_epoch(b, sizeof b, 3);
