@@ -103,6 +103,11 @@ if(Python3_FOUND)
         add_test(NAME interop_python
                  COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/ozapp.py
                          interop $<TARGET_FILE:ozhostlock>)
+        # The same scenario through tools/blelink.py's BLE LockLink over a fake
+        # GATT (MTU 247 and 23), plus its framing (ozkey-55 F5 part 2).
+        add_test(NAME blelink_python
+                 COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_blelink.py
+                         $<TARGET_FILE:ozhostlock>)
     else()
         message(STATUS "python cryptography not found: skipping ccm_differential")
     endif()
