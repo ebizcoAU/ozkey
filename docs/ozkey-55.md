@@ -231,6 +231,52 @@ is the reference.
   in the scenario yet**; `ozcore`'s test_events covers it on the lock side. The Dart initiator should pass the same scenario against `ozhostlock` before any real
   lock, then against the F5 C6 lock over BLE.
 
+## 5b. F1 relay wire: three gaps found before coding (DRAFT 2026-11-05, needs PM sign-off)
+F1 code hasn't started. Reading ozkey-48 §2/§7, `oz_lock.h`, the C6 port and the v1 bridge showed
+three things the spec doesn't settle. Each one is a wire contract shared with the server or the lock,
+so I'm not choosing them alone.
+
+**G1. The lock can't tell the bridge's link from an app's.** `oz_lock` has two link kinds: a
+session link (`relay = 0`, contexts gone on disconnect) and the relay link (`relay = 1`, contexts
+persisted per bond, Echo after a reboot). `ozhostlock` gets this from two TCP ports. A real lock
+has one GATT service, and the C6 port opens every central as a session link. A bridge on
+`ozkie` would therefore lose every relay context at each reconnect, and the server's stored
+contexts would stop working.
+- **Proposal:** a third characteristic, `relay` `4f5a4b32-0004-4c4f-434b-000000000001`, write and
+  notify. The lock feeds writes to it into the relay link, framed exactly like `ozkie` (§2.1).
+  The app keeps using `ozkie`. It needs no auth of its own: everything on it is EDHOC or OSCORE
+  under a stored bond, and a stranger who writes to it gets what they would get on `ozkie`.
+- Rejected: treating every BLE link as the relay. A direct app session would then persist
+  contexts and require Echo, which is the wrong security model at the door.
+- Lock-side cost: one characteristic in each port (C6, AK1037) plus a second `oz_ble` that is
+  bound to the relay link. The engine is unchanged.
+
+**G2. The MQTT payload has no message type.** §2.1 says the payload is the raw reassembled
+message, but the type (EDHOC, OSCORE or error) is in the frame header, which isn't sent. The
+receiver can't tell EDHOC message_1 from an OSCORE request.
+- **Proposal:** payload = `type (1 B) ‖ message`, binary. This is `ozhostlock`'s wire without the
+  2-byte length, since MQTT already carries the length. The bridge still never opens the message.
+
+**G3. Topics and routing.** v1 sends downlink to the bridge's own JSON `command` topic and
+uplink to the lock's `uplink` topic. A binary payload can't carry a JSON `target`.
+- **Proposal:**
+  - Downlink: `ozkie/<site>/bridges/<bridge_id>/ozkie/<lock_id>`. It is addressed to a bridge,
+    so with ≥ 2 bridges only the chosen one writes and the lock never gets a duplicate. The
+    server already picks the bridge by `bridge_id`.
+  - Uplink: `ozkie/<site>/locks/<lock_id>/ozkie`. It is addressed to the lock, which is v1's
+    U3 rule, so a failover changes nothing for the server.
+  - QoS 0 both ways, not retained. OSCORE replay protection and Echo make a lost or repeated
+    message safe.
+  - The bridge doesn't correlate requests and replies. The server matches them by OSCORE `kid`
+    and CoAP token (ozkey-48 §7: route `4.01 + Echo` back to the sender).
+- The bridge's own `bridge` bond (time) is the bridge acting as one more relay client on the same
+  link. It is handled in the bridge and never reaches MQTT.
+- MQTT buffer: 2048, tested with a 1024 B message plus the topic (§7 cliff).
+
+**Impact:** the server (ozkey-97) needs a per-lock v2 path on these topics. The lock needs G1 in
+`port/esp32c6` and `port/ak1037`. ozkey-48 needs a rev 6 for G1 and G2. F5's bench run over direct
+BLE (`ozkie`) is unaffected.
+
 ## 6. Acceptance: what "works with our bridges" means
 Each OZLOCK screen group is accepted only when it shows **live values from the bench**, not sample
 data. The rig is F5 or the AK1037 kit, ≥ 2 bridges, the lab server:
