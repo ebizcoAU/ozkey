@@ -38,6 +38,13 @@ class Browser {
     if (json && json.csrf) this.csrf = json.csrf;
     return { status: res.status, body: json, headers: res.headers };
   }
+  // This browser's own console_sessions.id_hash: the server stores
+  // sha256(cookie token). Picking "the newest session" by last_seen_at
+  // instead was flaky: DATETIME has 1 s resolution, so another session
+  // touched in the same second tied and the test aged the wrong one.
+  sessionHash() {
+    return C.sha256(this.cookie.slice(this.cookie.indexOf('=') + 1));
+  }
 }
 
 const tokenOf = (link) => new URL(link).hash.replace(/^#token=/, '');
@@ -250,15 +257,13 @@ test('sessions expire: 30 min idle and 12 h absolute, measured server-side', asy
   await idle.call('POST', '/auth/login', { email: ADMIN.email, password: ADMIN.password });
   await idle.call('POST', '/auth/recovery', { code: state.adminRecovery[1] });
   assert.equal((await idle.call('GET', '/me')).status, 200);
-  const [s] = await fx.query('SELECT id_hash FROM console_sessions ORDER BY last_seen_at DESC LIMIT 1');
-  await fx.query('UPDATE console_sessions SET last_seen_at = UTC_TIMESTAMP() - INTERVAL 31 MINUTE WHERE id_hash = ?', [s.id_hash]);
+  await fx.query('UPDATE console_sessions SET last_seen_at = UTC_TIMESTAMP() - INTERVAL 31 MINUTE WHERE id_hash = ?', [idle.sessionHash()]);
   assert.equal((await idle.call('GET', '/me')).status, 401);
 
   const abs = new Browser();
   await abs.call('POST', '/auth/login', { email: ADMIN.email, password: ADMIN.password });
   await abs.call('POST', '/auth/recovery', { code: state.adminRecovery[2] });
-  const [s2] = await fx.query('SELECT id_hash FROM console_sessions ORDER BY last_seen_at DESC LIMIT 1');
-  await fx.query('UPDATE console_sessions SET created_at = UTC_TIMESTAMP() - INTERVAL 13 HOUR WHERE id_hash = ?', [s2.id_hash]);
+  await fx.query('UPDATE console_sessions SET created_at = UTC_TIMESTAMP() - INTERVAL 13 HOUR WHERE id_hash = ?', [abs.sessionHash()]);
   assert.equal((await abs.call('GET', '/me')).status, 401);
 });
 
@@ -283,8 +288,7 @@ test('disabling a user ends their sessions at once', async () => {
   const b = new Browser();
   await b.call('POST', '/auth/login', { email: ADMIN.email, password: ADMIN.password });
   await b.call('POST', '/auth/recovery', { code: state.adminRecovery[3] });
-  const [s] = await fx.query('SELECT id_hash FROM console_sessions ORDER BY last_seen_at DESC LIMIT 1');
-  await fx.query('UPDATE console_sessions SET stepped_up_at = UTC_TIMESTAMP() WHERE id_hash = ?', [s.id_hash]);
+  await fx.query('UPDATE console_sessions SET stepped_up_at = UTC_TIMESTAMP() WHERE id_hash = ?', [b.sessionHash()]);
   assert.equal((await state.viewer.call('GET', '/me')).status, 200);
   const r = await b.call('PATCH', `/users/${state.viewerId}`, { status: 'disabled' });
   assert.equal(r.status, 200, JSON.stringify(r.body));
