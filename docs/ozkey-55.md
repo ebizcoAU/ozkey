@@ -285,6 +285,20 @@ uplink to the lock's `uplink` topic. A binary payload can't carry a JSON `target
     wipes both. So **ozlock allows at most one EDHOC handshake in flight per lock** across all
     senders. Every type 0 uplink belongs to that one handshake until it completes, fails or times
     out. The lock never sends type 2 today.
+  - **Lock-side timeout and restart (added 2026-11-05).** Before this change a half-done
+    handshake had **no timeout**. It lasted until message_3, a peer EDHOC error (type 2) or a link
+    drop, so no server lease could safely outlast it. `oz_lock` now:
+    - drops a handshake waiting for message_3 after **`OZ_LOCK_EDHOC_TIMEOUT_MS` = 30 000 ms**,
+      on the rx path and in `oz_lock_tick()`;
+    - treats a **message_1 that arrives mid-handshake as abort-and-restart**. The first byte tells
+      them apart: message_1 opens with METHOD, a CBOR integer (< 0x40), while message_3 is one
+      byte string (0x40–0x5b). The old handshake's late message_3 is then refused;
+    - still resets on a failed message_3 (it sends EDHOC error 1 and clears the handshake), as
+      before.
+    - **Server lease: at least 30 s plus a margin.** With the restart rule, a server that releases
+      early costs one failed handshake, never both. The one-in-flight rule stays the contract.
+    - Tests are in `test_lock` `edhoc_restart`. A mutation check showed they fail without each half
+      of the fix. Gate `f1a_edhoc_restart` rc=0. dlc6v2 compiles (800,447 B).
   - Failover mid-exchange: the server pins the bridge for one exchange (EDHOC m1→m3, or request →
     4.01 + Echo → retry). If the bridge changes, the server aborts the exchange and restarts it on
     the new bridge. On the lock (with G1): when the bridge's link drops, the port calls

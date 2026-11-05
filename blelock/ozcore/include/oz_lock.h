@@ -30,6 +30,9 @@
 extern "C" {
 #endif
 
+/* How long a responder handshake waits for message_3 before it is dropped
+ * (ozkey-55 §5b). A relay EDHOC lease on the server must outlast it. */
+#define OZ_LOCK_EDHOC_TIMEOUT_MS 30000u
 #define OZ_LOCK_MAX_BONDS   16
 #define OZ_LOCK_MAX_CREDS   32
 #define OZ_LOCK_NONCES      32
@@ -111,6 +114,7 @@ typedef struct {
     uint8_t   peer_ccs[OZ_CCS_LEN];
     oz_edhoc  edhoc;
     uint8_t   edhoc_active;
+    uint64_t  edhoc_deadline_ms; /* a handshake waiting for message_3 is dropped after this */
     uint8_t   ctx_ready;       /* session context established (BLE) */
     oz_oscore_ctx osc;
     int       slot;            /* bond of this session, −1 = none */
@@ -179,7 +183,7 @@ int  oz_lock_rx(oz_lock *L, oz_link *k, uint8_t type, const uint8_t *in, size_t 
  * BOND_OK / PAIR_FAILED response for that link. */
 int  oz_lock_pair_code(oz_lock *L, oz_link *k, uint32_t code,
                        uint8_t *out_type, uint8_t *out, size_t cap, size_t *out_len);
-/* Call periodically: expires a pairing window that timed out. */
+/* Call periodically: expires a pairing window or a half-done handshake that timed out. */
 int  oz_lock_tick(oz_lock *L, oz_link *k,
                   uint8_t *out_type, uint8_t *out, size_t cap, size_t *out_len);
 /* A PIN typed at the door (not during pairing): 1..OZ_LOCK_PIN_ENTRY_MAX

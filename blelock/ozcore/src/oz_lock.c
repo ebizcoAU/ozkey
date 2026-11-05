@@ -634,6 +634,16 @@ static int rx_edhoc(oz_lock *L, oz_link *k, const uint8_t *in, size_t len,
                     uint8_t *out_type, uint8_t *out, size_t cap, size_t *out_len)
 {
     *out_type = OZ_FRAME_EDHOC;
+    /* A handshake still waiting for message_3 is abandoned (and this message
+     * taken as a new message_1) when it has timed out, or when this message
+     * is itself a message_1. message_1 opens with METHOD, a CBOR integer;
+     * message_3 is one byte string, so the first byte tells them apart
+     * (ozkey-55 §5b). */
+    if (k->edhoc_active &&
+        (oz_port_monotonic_ms() > k->edhoc_deadline_ms || (len > 0 && in[0] < 0x40))) {
+        oz_edhoc_wipe(&k->edhoc);
+        k->edhoc_active = 0;
+    }
     if (!k->edhoc_active) {
         /* message_1: a new handshake replaces whatever this link had. */
         oz_edhoc_init(&k->edhoc, 0);
@@ -651,8 +661,10 @@ static int rx_edhoc(oz_lock *L, oz_link *k, const uint8_t *in, size_t len,
         k->ctx_ready = 0;
         k->pairing = 0;
         int rc = oz_edhoc_r_msg1(&k->edhoc, in, len, NULL, 0, out, cap, out_len);
-        if (rc == OZ_OK)
+        if (rc == OZ_OK) {
             k->edhoc_active = 1;
+            k->edhoc_deadline_ms = oz_port_monotonic_ms() + OZ_LOCK_EDHOC_TIMEOUT_MS;
+        }
         return rc == OZ_EDHOC_SEND_ERROR ? OZ_OK : rc;
     }
     int rc = oz_edhoc_r_msg3(&k->edhoc, in, len, out, cap, out_len);
@@ -1570,6 +1582,10 @@ int oz_lock_pair_code(oz_lock *L, oz_link *k, uint32_t code,
 int oz_lock_tick(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, size_t cap, size_t *out_len)
 {
     *out_len = 0;
+    if (k->edhoc_active && oz_port_monotonic_ms() > k->edhoc_deadline_ms) {
+        oz_edhoc_wipe(&k->edhoc);
+        k->edhoc_active = 0;
+    }
     if (k->pairing && oz_port_monotonic_ms() > k->pair_deadline_ms)
         return pair_finish(L, k, 0, out_type, out, cap, out_len);
     return OZ_OK;

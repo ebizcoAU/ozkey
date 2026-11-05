@@ -137,10 +137,11 @@ static int app_lock_cred(void *app, const uint8_t *id, size_t len, oz_edhoc_cred
 
 /* Run EDHOC on link k. Returns 0 when the lock accepted message_3 silently,
  * else 1 (the lock answered with an EDHOC error; its text in `why`). */
-static int handshake(app_t *a, oz_link *k, const uint8_t *ead3, size_t ead3_len, char *why)
+/* The two halves of handshake(): message_1 → message_2, then message_3. */
+static int hs_begin(app_t *a, oz_link *k, char *why)
 {
-    uint8_t m1[128], m2[256], m3[512], lo[256];
-    size_t m1l, m2l, m3l, lol;
+    uint8_t m1[128], m2[256], lo[256];
+    size_t m1l, m2l, lol;
     uint8_t lt;
     oz_edhoc_init(&a->e, 1);
     a->e.c_own.len = 1;
@@ -166,6 +167,14 @@ static int handshake(app_t *a, oz_link *k, const uint8_t *ead3, size_t ead3_len,
         if (why) snprintf(why, 32, "msg2 refused");
         return 1;
     }
+    return 0;
+}
+
+static int hs_end(app_t *a, oz_link *k, const uint8_t *ead3, size_t ead3_len, char *why)
+{
+    uint8_t m3[512], lo[256];
+    size_t m3l, lol;
+    uint8_t lt;
     oz_edhoc_i_msg3(&a->e, ead3, ead3_len, m3, sizeof m3, &m3l);
     lock_rx(k, OZ_FRAME_EDHOC, m3, m3l, &lt, lo, sizeof lo, &lol);
     if (lol) {
@@ -183,6 +192,11 @@ static int handshake(app_t *a, oz_link *k, const uint8_t *ead3, size_t ead3_len,
     oz_edhoc_oscore(&a->e, sec, salt, &sid, &rid);
     oz_oscore_derive(&a->osc, sec, 16, salt, 8, sid.b, sid.len, rid.b, rid.len, NULL, 0);
     return 0;
+}
+
+static int handshake(app_t *a, oz_link *k, const uint8_t *ead3, size_t ead3_len, char *why)
+{
+    return hs_begin(a, k, why) || hs_end(a, k, ead3, ead3_len, why);
 }
 
 /* Build an OSCORE request; returns its length in out. */
@@ -692,6 +706,40 @@ static void battery(void)
     expect_int("…until fresh batteries", L.power.level, OZ_BATT_OK);
 }
 
+/* A responder handshake waiting for message_3 must not block the next one
+ * (ozkey-55 §5b: several senders share the relay link). */
+static void edhoc_restart(void)
+{
+    static app_t stale;
+    char why[32];
+    oz_link_open(&relay, 1);
+
+    /* A fresh message_1 abandons a handshake stuck before message_3. */
+    stale = owner;
+    expect_int("stale handshake starts", hs_begin(&stale, &relay, why), 0);
+    expect_int("new message_1 restarts it", handshake(&owner, &relay, NULL, 0, why), 0);
+    expect_int("stale message_3 refused", hs_end(&stale, &relay, NULL, 0, why), 1);
+
+    /* message_3 inside the timeout still completes. */
+    expect_int("slow handshake starts", hs_begin(&owner, &relay, why), 0);
+    oz_host_advance_ms(OZ_LOCK_EDHOC_TIMEOUT_MS - 1000);
+    expect_int("message_3 just in time", hs_end(&owner, &relay, NULL, 0, why), 0);
+
+    /* After the timeout the handshake is gone, on the rx path and on tick. */
+    expect_int("late handshake starts", hs_begin(&owner, &relay, why), 0);
+    oz_host_advance_ms(OZ_LOCK_EDHOC_TIMEOUT_MS + 1);
+    expect_int("late message_3 refused", hs_end(&owner, &relay, NULL, 0, why), 1);
+    expect_int("tick handshake starts", hs_begin(&owner, &relay, why), 0);
+    oz_host_advance_ms(OZ_LOCK_EDHOC_TIMEOUT_MS + 1);
+    {
+        uint8_t lt, out[64];
+        size_t ol;
+        oz_lock_tick(&L, &relay, &lt, out, sizeof out, &ol);
+    }
+    expect_int("tick dropped it", relay.edhoc_active, 0);
+    expect_int("owner still bonds after", handshake(&owner, &relay, NULL, 0, why), 0);
+}
+
 static void relay_and_reboot(void)
 {
     /* The owner sets up a relay context (persisted per bond). */
@@ -1070,6 +1118,7 @@ static void run_suite(size_t mtu)
     cards();
     battery();
     relay_and_reboot();
+    edhoc_restart();
     roles();
     events();
     pair_lockout();
