@@ -263,12 +263,37 @@ uplink to the lock's `uplink` topic. A binary payload can't carry a JSON `target
   - Downlink: `ozkie/<site>/bridges/<bridge_id>/ozkie/<lock_id>`. It is addressed to a bridge,
     so with ≥ 2 bridges only the chosen one writes and the lock never gets a duplicate. The
     server already picks the bridge by `bridge_id`.
-  - Uplink: `ozkie/<site>/locks/<lock_id>/ozkie`. It is addressed to the lock, which is v1's
-    U3 rule, so a failover changes nothing for the server.
+  - Uplink: `ozkie/<site>/locks/<lock_id>/ozkie/<bridge_id>`. It is addressed to the lock,
+    which is v1's U3 rule, so a failover changes nothing for the server. The server subscribes
+    with `locks/+/ozkie/+`. The trailing `bridge_id` replaces the relaying-bridge field that v1
+    carried in JSON. With it, two bridges holding one lock (XF-151) show up as duplicate uplinks
+    from two `bridge_id`s (server ozkey-97).
   - QoS 0 both ways, not retained. OSCORE replay protection and Echo make a lost or repeated
     message safe.
-  - The bridge doesn't correlate requests and replies. The server matches them by OSCORE `kid`
-    and CoAP token (ozkey-48 §7: route `4.01 + Echo` back to the sender).
+  - The bridge doesn't correlate requests and replies. **The server correlates OSCORE
+    responses by (lock_id, CoAP token). The `kid` identifies the context on requests only**: an
+    OSCORE response omits it (RFC 8613 §6.1).
+    - ozlock records token → {sender, kid, expiry} for each forwarded request and decrypts nothing.
+    - Observe notifications reuse the registration token, so that entry lives until
+      deregistration.
+    - Every sender (the app via ozlock, ozpms, ozlodge) uses a random token of at least 4 bytes.
+      ozlock refuses a second in-flight request on the same (lock_id, token). A response that
+      matches no entry is dropped and logged.
+  - **EDHOC on the relay is raw EDHOC (frame type 0), not CoAP**, so it has no token. Checked in
+    `oz_lock.c` `rx_edhoc()`: the relay link holds **one** EDHOC handshake. A message_1 that
+    arrives while another handshake is active is treated as that handshake's message_3, fails, and
+    wipes both. So **ozlock allows at most one EDHOC handshake in flight per lock** across all
+    senders. Every type 0 uplink belongs to that one handshake until it completes, fails or times
+    out. The lock never sends type 2 today.
+  - Failover mid-exchange: the server pins the bridge for one exchange (EDHOC m1→m3, or request →
+    4.01 + Echo → retry). If the bridge changes, the server aborts the exchange and restarts it on
+    the new bridge. On the lock (with G1): when the bridge's link drops, the port calls
+    `oz_link_close()` on the relay link. That wipes any half-done EDHOC and the link's Echo
+    state. Completed relay contexts persist (`L->relay[]`), so an unfinished exchange can't
+    survive a bridge change and a finished one isn't lost.
+  - The server never auto-retries `lock/unlock`, `lock/lock` or `dev/reset`. A lost response is
+    reported as outcome "unknown" (the "unlock never queued" rule). v1's 60 s unlock queue
+    (operator Q2) doesn't carry over to v2.
 - The bridge's own `bridge` bond (time) is the bridge acting as one more relay client on the same
   link. It is handled in the bridge and never reaches MQTT.
 - MQTT buffer: 2048, tested with a 1024 B message plus the topic (§7 cliff).
