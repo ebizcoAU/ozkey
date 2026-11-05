@@ -30,6 +30,7 @@ import asyncio, queue, re, threading, time
 SVC   = '4f5a4b32-0001-4c4f-434b-000000000001'
 INFO  = '4f5a4b32-0002-4c4f-434b-000000000001'
 OZKIE = '4f5a4b32-0003-4c4f-434b-000000000001'
+RELAY = '4f5a4b32-0004-4c4f-434b-000000000001'   # the bridge's link (ozkey-48 rev 6 §2.3)
 MAX_MSG, MAX_FRAGS, MIN_MTU = 1024, 32, 23
 
 # ── framing (ozkey-48 §2.1), written from the spec, not from oz_frame.c ──────
@@ -93,17 +94,20 @@ _loop = None
 class BleLockLink:
     """client_factory/serial are injectable so the host test can run without a
     radio; on the bench they default to bleak and pyserial."""
-    def __init__(self, device_id, serial_port=None, scan_s=10.0, client=None, serial=None):
+    def __init__(self, device_id, serial_port=None, scan_s=10.0, client=None, serial=None, relay=False):
         global _loop
         _loop = _loop or _Loop()
         self.device_id, self.q, self.ra = device_id, queue.Queue(), Reassembler()
+        # relay=True: act as the bridge, on the `relay` characteristic (persisted
+        # relay contexts, Echo for actuation) instead of a session on `ozkie`.
+        self.chr = RELAY if relay else OZKIE
         self.ser = serial
         if self.ser is None and serial_port:
             import serial as pyserial
             self.ser = pyserial.Serial(serial_port, 115200, timeout=0.2)
         self.client = client or _loop.run(self._find_and_connect(scan_s), timeout=scan_s + 30)
         self.mtu = getattr(self.client, 'mtu_size', MIN_MTU) or MIN_MTU
-        _loop.run(self.client.start_notify(OZKIE, self._on_notify))
+        _loop.run(self.client.start_notify(self.chr, self._on_notify))
         got = self._read_info()
         if got is None or got.get(1) != device_id:
             self.close()
@@ -158,7 +162,7 @@ class BleLockLink:
     def send(self, typ, p):
         if typ in (0, 1, 2):
             for f in fragment(typ, p, self.mtu):
-                _loop.run(self.client.write_gatt_char(OZKIE, f, response=True))
+                _loop.run(self.client.write_gatt_char(self.chr, f, response=True))
         elif typ == 0x80:
             self._shell(f'oz.code {int.from_bytes(p, "big")}')
         elif typ == 0x81:

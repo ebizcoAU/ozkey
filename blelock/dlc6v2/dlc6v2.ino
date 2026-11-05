@@ -25,7 +25,7 @@
 #include "oz_port_esp32c6.h"
 #include "oz_gatt_esp32c6.h"
 
-#define FW_VERSION "dlc6v2-0.3"
+#define FW_VERSION "dlc6v2-0.4"
 
 static oz_lock lock;
 

@@ -4,6 +4,14 @@
  * (CONFIG_NIMBLE_ENABLED, confirmed for the v1 sketches in
  * ozdoorlock_core.h); the Bluedroid callbacks are kept for other targets.
  *
+ * Two connections (ozkey-48 rev 6 §2.3, as v1 since 2026-08-30): slot for the
+ * bridge, slot for the app at the door, never more. Each connection has its
+ * own session link on `ozkie`. There is ONE relay link, on `relay`, owned by
+ * the first connection that writes to it until that connection drops; the
+ * other connection's `relay` writes are dropped and counted. Notifications go
+ * to one connection (ble_gatts_notify_custom), never to every subscriber.
+ * NimBLE only: the per-connection handles come from its callbacks.
+ *
  * Advertising lessons carried over from v1 (ozdoorlock_core.h, 2026-08-04..06):
  *   - setAdvertisementType() forwards the raw byte to the backend untranslated,
  *     and NimBLE's conn_mode numbers differ from Bluedroid's PDU types. Use the
@@ -32,13 +40,14 @@ extern "C" {
 }
 #include "oz_gatt_esp32c6.h"
 
-#if defined(CONFIG_NIMBLE_ENABLED)
+#if !defined(CONFIG_NIMBLE_ENABLED)
+#error "oz_gatt_esp32c6 needs the NimBLE backend (per-connection handles and notify)"
+#endif
 #define OZ_ADV_TYPE_IND      BLE_GAP_CONN_MODE_UND /* connectable */
 #define OZ_ADV_TYPE_SCAN_IND BLE_GAP_CONN_MODE_NON /* scannable, not connectable */
-#else
-#define OZ_ADV_TYPE_IND      0x00
-#define OZ_ADV_TYPE_SCAN_IND 0x02
-#endif
+
+#define MAX_CONNS 2                     /* bridge + app at the door; never more */
+enum { CH_OZKIE = 0, CH_RELAY = 1 };
 
 /* ── BLE callbacks → OZKIE task ──────────────────────────────────────────── */
 
@@ -47,6 +56,8 @@ enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, 
 #define FRAME_MAX 244                   /* MTU 247 − 3 (ozkey-48 §2.1) */
 typedef struct {
     uint8_t  ev;
+    uint8_t  chr;                       /* EV_FRAME: CH_OZKIE or CH_RELAY */
+    uint16_t conn;                      /* NimBLE connection handle */
     uint16_t len;
     uint32_t arg;
     uint8_t  data[FRAME_MAX];
@@ -54,14 +65,22 @@ typedef struct {
 
 #define QUEUE_DEPTH 8
 static QueueHandle_t mq;
-static volatile int conn_up;
+static volatile int conn_up;            /* connections up (a racy read, for the shell) */
 
+static void post_c(uint8_t ev, uint16_t conn, uint8_t chr, uint32_t arg, const uint8_t *data, size_t len);
 static void post(uint8_t ev, uint32_t arg, const uint8_t *data, size_t len)
+{
+    post_c(ev, 0, 0, arg, data, len);
+}
+
+static void post_c(uint8_t ev, uint16_t conn, uint8_t chr, uint32_t arg, const uint8_t *data, size_t len)
 {
     static msg_t m;                     /* callers are serialised per source; see below */
     msg_t local;
     msg_t *p = (ev == EV_FRAME) ? &m : &local; /* frames come from the BLE host task only */
     p->ev = ev;
+    p->conn = conn;
+    p->chr = chr;
     p->arg = arg;
     p->len = (uint16_t)len;
     if (len)
@@ -71,34 +90,46 @@ static void post(uint8_t ev, uint32_t arg, const uint8_t *data, size_t len)
 }
 
 static BLEServer *server;
-static BLECharacteristic *chr_info, *chr_ozkie;
+static BLECharacteristic *chr_info, *chr_ozkie, *chr_relay;
 
 class ServerCb : public BLEServerCallbacks {
-#if defined(CONFIG_NIMBLE_ENABLED)
-    void onConnect(BLEServer *, ble_gap_conn_desc *) override { conn_up = 1; post(EV_CONNECT, 0, NULL, 0); }
-    void onDisconnect(BLEServer *, ble_gap_conn_desc *) override { conn_up = 0; post(EV_DISCONNECT, 0, NULL, 0); }
-    void onMtuChanged(BLEServer *, ble_gap_conn_desc *, uint16_t mtu) override { post(EV_MTU, mtu, NULL, 0); }
-#else
-    void onConnect(BLEServer *, esp_ble_gatts_cb_param_t *) override { conn_up = 1; post(EV_CONNECT, 0, NULL, 0); }
-    void onDisconnect(BLEServer *, esp_ble_gatts_cb_param_t *) override { conn_up = 0; post(EV_DISCONNECT, 0, NULL, 0); }
-    void onMtuChanged(BLEServer *, esp_ble_gatts_cb_param_t *p) override { post(EV_MTU, p->mtu.mtu, NULL, 0); }
-#endif
+    void onConnect(BLEServer *, ble_gap_conn_desc *d) override { post_c(EV_CONNECT, d->conn_handle, 0, 0, NULL, 0); }
+    void onDisconnect(BLEServer *, ble_gap_conn_desc *d) override { post_c(EV_DISCONNECT, d->conn_handle, 0, 0, NULL, 0); }
+    void onMtuChanged(BLEServer *, ble_gap_conn_desc *d, uint16_t mtu) override { post_c(EV_MTU, d->conn_handle, 0, mtu, NULL, 0); }
 };
 
-class OzkieCb : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *c) override
+class FrameCb : public BLECharacteristicCallbacks {
+    uint8_t ch;
+public:
+    explicit FrameCb(uint8_t c) : ch(c) {}
+    void onWrite(BLECharacteristic *c, ble_gap_conn_desc *d) override
     {
         size_t n = c->getLength();
         if (n == 0 || n > FRAME_MAX)
             return;                     /* the reassembler would refuse it anyway */
-        post(EV_FRAME, 0, c->getData(), n);
+        post_c(EV_FRAME, d->conn_handle, ch, 0, c->getData(), n);
     }
 };
 
 /* ── the OZKIE task ──────────────────────────────────────────────────────── */
 
-static oz_link link_;
-static oz_ble session;
+typedef struct {
+    int      used;
+    uint16_t h;                         /* NimBLE connection handle */
+    size_t   mtu;
+    oz_link  link;                      /* this connection's session link */
+    oz_ble   ble;
+} conn_t;
+
+typedef struct { BLECharacteristic **chr; int idx; } tx_t;
+
+static conn_t conns[MAX_CONNS];
+static tx_t   tx_session[MAX_CONNS];
+static oz_link relay_link_;
+static oz_ble  relay_ble;
+static tx_t    tx_relay = { &chr_relay, -1 };
+static int     relay_owner = -1;        /* index into conns, −1 = none */
+static uint32_t relay_refused;          /* `relay` writes from the non-owner */
 static oz_adv adv;
 static oz_keypad keypad;
 static oz_motor motor;
@@ -135,15 +166,18 @@ static int adv_apply(const oz_lock *L, oz_adv_mode mode)
     return 0;
 }
 
+/* One frame to one connection: ctx says which characteristic and which slot. */
 static int notify(void *ctx, const uint8_t *frame, size_t len)
 {
-    (void)ctx;
-    if (!conn_up)
+    tx_t *t = (tx_t *)ctx;
+    int i = (t == &tx_relay) ? relay_owner : t->idx;
+    if (i < 0 || !conns[i].used)
         return OZ_E_HW;
-    chr_ozkie->setValue((uint8_t *)frame, len);
-    chr_ozkie->notify();
-    /* The library gives no status; a short yield keeps a burst of fragments
-     * from running the host's buffers dry (AK1037 retries BUFFER_FULL). */
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(frame, (uint16_t)len);
+    if (!om || ble_gatts_notify_custom(conns[i].h, (*t->chr)->getHandle(), om) != 0)
+        return OZ_E_HW;                 /* notify_custom frees om on every path */
+    /* A short yield keeps a burst of fragments from running the host's
+     * buffers dry (AK1037 retries BUFFER_FULL). */
     vTaskDelay(pdMS_TO_TICKS(3));
     return OZ_OK;
 }
@@ -186,7 +220,35 @@ static void card_in(oz_lock *L, const uint8_t *id, size_t len)
     oz_port_log("card: %s", r == OZ_CARD_OPEN ? "open" : r == OZ_CARD_LOCKED_OUT ? "locked out" : "wrong");
 }
 
-static void key_in(oz_lock *L, char key, int connected)
+/* The connection whose session is waiting for the keypad code, or NULL. */
+static oz_ble *pairing_session(void)
+{
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (conns[i].used && conns[i].link.pairing)
+            return &conns[i].ble;
+    return NULL;
+}
+
+static int find_conn(uint16_t h)
+{
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (conns[i].used && conns[i].h == h)
+            return i;
+    return -1;
+}
+
+/* Connections that make the lock busy: every one except the relay owner's
+ * (ozkey-48 §2.3: busy means the app slot is taken). */
+static int app_links(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (conns[i].used && i != relay_owner)
+            n++;
+    return n;
+}
+
+static void key_in(oz_lock *L, char key)
 {
     uint32_t code = 0;
     switch (oz_keypad_key(&keypad, key, now_ms(), &code)) {
@@ -196,13 +258,15 @@ static void key_in(oz_lock *L, char key, int connected)
         oz_port_log("keypad: %s", r == OZ_PIN_OPEN ? "open" : r == OZ_PIN_LOCKED_OUT ? "locked out" : "wrong");
         break;
     }
-    case OZ_KP_PAIR_CODE:
-        if (connected)
-            (void)oz_ble_pair_code(&session, code);
+    case OZ_KP_PAIR_CODE: {
+        oz_ble *s = pairing_session();
+        if (s)
+            (void)oz_ble_pair_code(s, code);
         else
-            oz_port_log("keypad: pairing code but no app connected");
+            oz_port_log("keypad: pairing code but no app is pairing");
         refresh_info(L);
         break;
+    }
     case OZ_KP_CLEARED:
         oz_port_log("keypad: cleared");
         break;
@@ -215,43 +279,82 @@ static void ozkie_task(void *param)
 {
     oz_lock *L = (oz_lock *)param;
     static msg_t m;
-    int connected = 0, applied = -1, failed = 0;
+    int applied = -1, failed = 0;
     refresh_info(L);
     for (;;) {
         TickType_t wait = pdMS_TO_TICKS(motor.phase == OZ_MOTOR_IDLE ? 100 : 10);
         if (xQueueReceive(mq, &m, wait) == pdTRUE) {
+            int i = find_conn(m.conn);
             switch (m.ev) {
-            case EV_CONNECT:
-                oz_ble_connect(&session);
-                if (!connected)
-                    oz_adv_link(&adv, 1);
-                connected = 1;
+            case EV_CONNECT: {
+                int f = -1;
+                for (int j = 0; j < MAX_CONNS && f < 0; j++)
+                    if (!conns[j].used)
+                        f = j;
+                if (f < 0) {
+                    oz_port_log("gatt: a third connection, refused");
+                    server->disconnect(m.conn);
+                    break;
+                }
+                conns[f].used = 1;
+                conns[f].h = m.conn;
+                conns[f].mtu = OZ_FRAME_MIN_MTU;
+                oz_ble_connect(&conns[f].ble);
+                applied = -1;           /* NimBLE stops advertising on a connect */
                 break;
+            }
             case EV_MTU:
-                oz_ble_set_mtu(&session, m.arg);
+                if (i >= 0) {
+                    conns[i].mtu = m.arg;
+                    oz_ble_set_mtu(&conns[i].ble, m.arg);
+                    if (i == relay_owner)
+                        oz_ble_set_mtu(&relay_ble, m.arg);
+                }
                 break;
             case EV_FRAME:
-                if (connected)
-                    (void)oz_ble_rx(&session, m.data, m.len);
-                refresh_info(L);
-                break;
-            case EV_PAIR_CODE:
-                if (connected)
-                    (void)oz_ble_pair_code(&session, m.arg);
-                refresh_info(L);
-                break;
-            case EV_DISCONNECT:
-                if (connected) {
-                    oz_ble_disconnect(&session);
-                    oz_adv_link(&adv, 0);
+                if (i < 0)
+                    break;
+                if (m.chr == CH_OZKIE) {
+                    (void)oz_ble_rx(&conns[i].ble, m.data, m.len);
+                } else {
+                    if (relay_owner < 0) {
+                        relay_owner = i;
+                        oz_ble_connect_as(&relay_ble, 1);
+                        oz_ble_set_mtu(&relay_ble, conns[i].mtu);
+                        oz_port_log("gatt: relay owned by connection %u", (unsigned)m.conn);
+                        applied = -1;   /* this connection no longer makes the lock busy */
+                    }
+                    if (relay_owner == i)
+                        (void)oz_ble_rx(&relay_ble, m.data, m.len);
+                    else if (++relay_refused == 1 || relay_refused % 100 == 0)
+                        oz_port_log("gatt: relay write from a non-owner dropped (%lu)",
+                                    (unsigned long)relay_refused);
                 }
-                connected = 0;
+                refresh_info(L);
+                break;
+            case EV_PAIR_CODE: {
+                oz_ble *s = pairing_session();
+                if (s)
+                    (void)oz_ble_pair_code(s, m.arg);
+                refresh_info(L);
+                break;
+            }
+            case EV_DISCONNECT:
+                if (i >= 0) {
+                    oz_ble_disconnect(&conns[i].ble);
+                    if (i == relay_owner) {
+                        oz_ble_disconnect(&relay_ble);  /* half-done EDHOC + Echo go; contexts stay */
+                        relay_owner = -1;
+                    }
+                    conns[i].used = 0;
+                    applied = -1;
+                }
                 break;
             case EV_TOUCH:
                 oz_adv_touch(&adv, now_ms());
                 break;
             case EV_KEY:
-                key_in(L, (char)m.arg, connected);
+                key_in(L, (char)m.arg);
                 break;
             case EV_CARD:
                 card_in(L, m.data, m.len);
@@ -259,9 +362,19 @@ static void ozkie_task(void *param)
             default:
                 break;
             }
+            int up = 0;
+            for (int j = 0; j < MAX_CONNS; j++)
+                up += conns[j].used;
+            conn_up = up;
+            adv.links = app_links();
+            if (up >= MAX_CONNS && adv.links == 0)
+                adv.links = 1;          /* both slots taken: never connectable */
         }
-        if (connected)
-            (void)oz_ble_tick(&session);
+        for (int j = 0; j < MAX_CONNS; j++)
+            if (conns[j].used)
+                (void)oz_ble_tick(&conns[j].ble);
+        if (relay_owner >= 0)
+            (void)oz_ble_tick(&relay_ble);
         motor_step(L);
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
             oz_port_log("keypad: entry timed out");
@@ -304,7 +417,12 @@ extern "C" int oz_gatt_c6_start(oz_lock *L)
     mq = xQueueCreate(QUEUE_DEPTH, sizeof(msg_t));
     if (!mq)
         return OZ_E_HW;
-    oz_ble_init(&session, L, &link_, notify, NULL);
+    for (int i = 0; i < MAX_CONNS; i++) {
+        tx_session[i].chr = &chr_ozkie;
+        tx_session[i].idx = i;
+        oz_ble_init(&conns[i].ble, L, &conns[i].link, notify, &tx_session[i]);
+    }
+    oz_ble_init(&relay_ble, L, &relay_link_, notify, &tx_relay);
     oz_adv_init(&adv, OZ_GATT_ADV_ALWAYS, now_ms());
     oz_keypad_init(&keypad);
     oz_motor_init(&motor, NULL);
@@ -319,10 +437,10 @@ extern "C" int oz_gatt_c6_start(oz_lock *L)
                                          BLECharacteristic::PROPERTY_READ);
     chr_ozkie = svc->createCharacteristic(BLEUUID((uint8_t *)OZ_BLE_UUID_OZKIE, 16, false),
                                           BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
-#if !defined(CONFIG_NIMBLE_ENABLED)
-    chr_ozkie->addDescriptor(new BLE2902());   /* NimBLE adds the CCCD itself */
-#endif
-    chr_ozkie->setCallbacks(new OzkieCb());
+    chr_relay = svc->createCharacteristic(BLEUUID((uint8_t *)OZ_BLE_UUID_RELAY, 16, false),
+                                          BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+    chr_ozkie->setCallbacks(new FrameCb(CH_OZKIE));   /* NimBLE adds the CCCDs itself */
+    chr_relay->setCallbacks(new FrameCb(CH_RELAY));
     svc->start();
     started = 1;
     if (xTaskCreate(ozkie_task, "ozkie", OZ_GATT_C6_STACK, L, 5, NULL) != pdPASS)

@@ -47,7 +47,15 @@ static oz_link ble, relay;
  * reply comes back through its tx as notifications, reassembled here. The
  * relay link is never framed (MQTT carries whole messages). */
 static size_t framed_mtu;
-static oz_ble gatt;
+static oz_ble gatt, gatt_relay;      /* `ozkie` and `relay` (ozkey-48 §2.3) */
+
+/* The GATT path for a link, or NULL when the engine is called directly. */
+static oz_ble *path(oz_link *k)
+{
+    if (!framed_mtu)
+        return NULL;
+    return k == &ble ? &gatt : k == &relay ? &gatt_relay : NULL;
+}
 static oz_reasm got;
 static int got_done, got_bad;
 static long frames_in, frames_out;
@@ -80,7 +88,8 @@ static void take(uint8_t *lt, uint8_t *out, size_t cap, size_t *ol)
 static int lock_rx(oz_link *k, uint8_t type, const uint8_t *in, size_t len,
                    uint8_t *lt, uint8_t *out, size_t cap, size_t *ol)
 {
-    if (!framed_mtu || k != &ble)
+    oz_ble *g = path(k);
+    if (!g)
         return oz_lock_rx(&L, k, type, in, len, lt, out, cap, ol);
     unsigned count;
     int rc = oz_frag_count(len, framed_mtu, &count);
@@ -90,7 +99,7 @@ static int lock_rx(oz_link *k, uint8_t type, const uint8_t *in, size_t len,
         rc = oz_frag(type, in, len, framed_mtu, i, f, sizeof f, &n);
         frames_in++;
         if (!rc)
-            rc = oz_ble_rx(&gatt, f, n);
+            rc = oz_ble_rx(g, f, n);
     }
     take(lt, out, cap, ol);
     return rc;
@@ -98,9 +107,10 @@ static int lock_rx(oz_link *k, uint8_t type, const uint8_t *in, size_t len,
 
 static int lock_pair_code(oz_link *k, uint32_t code, uint8_t *lt, uint8_t *out, size_t cap, size_t *ol)
 {
-    if (!framed_mtu || k != &ble)
+    oz_ble *g = path(k);
+    if (!g)
         return oz_lock_pair_code(&L, k, code, lt, out, cap, ol);
-    int rc = oz_ble_pair_code(&gatt, code);
+    int rc = oz_ble_pair_code(g, code);
     take(lt, out, cap, ol);
     return rc;
 }
@@ -1002,8 +1012,8 @@ static int notification(app_t *a, oz_link *k, watch_t *wt, ev_t *ev)
     uint8_t out[600], lt;
     size_t ol = 0;
     oz_lock_events_poll(&L, k, &lt, out, sizeof out, &ol);
-    if (ol && framed_mtu && k == &ble) {            /* as the GATT path sends it */
-        oz_ble_send(&gatt, lt, out, ol);
+    if (ol && path(k)) {                            /* as the GATT path sends it */
+        oz_ble_send(path(k), lt, out, ol);
         take(&lt, out, sizeof out, &ol);
     }
     if (!ol)
@@ -1171,6 +1181,10 @@ static void run_suite(size_t mtu)
     framed_mtu = mtu;
     oz_ble_init(&gatt, &L, &ble, capture, NULL);
     oz_ble_set_mtu(&gatt, mtu ? mtu : OZ_FRAME_MIN_MTU);
+    oz_ble_init(&gatt_relay, &L, &relay, capture, NULL);
+    oz_ble_connect_as(&gatt_relay, 1);
+    expect_int("relay oz_ble opens a relay link", relay.relay, 1);
+    oz_ble_set_mtu(&gatt_relay, mtu ? mtu : OZ_FRAME_MIN_MTU);
     oz_reasm_reset(&got);
     unlocks = locks = prompt_on = 0;
     oz_host_kv_reset();

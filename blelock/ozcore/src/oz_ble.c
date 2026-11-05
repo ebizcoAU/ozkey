@@ -14,9 +14,11 @@ void oz_ble_init(oz_ble *s, oz_lock *L, oz_link *link, oz_ble_tx tx, void *tx_ct
     oz_reasm_reset(&s->rx);
 }
 
-void oz_ble_connect(oz_ble *s)
+void oz_ble_connect(oz_ble *s) { oz_ble_connect_as(s, 0); }
+
+void oz_ble_connect_as(oz_ble *s, int relay)
 {
-    oz_link_open(s->link, 0);
+    oz_link_open(s->link, relay);
     oz_reasm_reset(&s->rx);
     s->mtu = OZ_FRAME_MIN_MTU;
 }
