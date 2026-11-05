@@ -305,6 +305,7 @@ static unsigned long g_lastRosterBroadcastAt = 0; // XF-144 Phase 2, declared he
 static void ozBleStartTargetedScan(const String &target, uint32_t durationS);
 static void ozBlePairConsoleCmd(const String &cmd); // paired/seen/pair/unpair, see ozBridgeConsolePoll()
 static bool ozBleAtCapacity(); // true when ozBleConnectedCount() == OZ_BLE_MAX_LOCKS
+static bool oz2OnMqtt(const char *topic, const byte *payload, unsigned int len); // v2 relay, ozbleozkie2.h
 static bool ozBleScanSlotFree(); // XF-144 Phase 2 retry fix, added 2026-09-02 — fwd, defined in ozblecentral.h
 static bool ozBleScanIsFor(const String &target);   // ditto
 static bool ozBleScanFoundFor(const String &target); // ditto
@@ -1027,6 +1028,9 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   // Incoming WiFi/MQTT traffic — no ladder status step of its own, so wake
   // the screen explicitly here (2026-07-27).
   lcdWake();
+  // OZKIE v2 downlink: a binary payload, so it is taken BEFORE the String/JSON
+  // handling below ever sees it (ozkey-48 rev 6 §2.4).
+  if (oz2OnMqtt(topic, payload, len)) return;
   String body;
   body.reserve(len);
   for (unsigned int i = 0; i < len; i++) body += (char)payload[i];
@@ -2891,6 +2895,11 @@ void mqttConnect() {
     mqttClient.publish(willTopic.c_str(), online.c_str(), true /*retain*/);
     Serial.printf("[MQTT] presence ONLINE -> %s\n", willTopic.c_str());
     mqttClient.subscribe(mqttCommandTopic.c_str());
+    {
+      const String v2 = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/ozkie/+";
+      mqttClient.subscribe(v2.c_str());           // OZKIE v2 downlink (ozkey-48 rev 6 §2.4.2)
+      Serial.printf("[MQTT] subscribed %s\n", v2.c_str());
+    }
     if (mqttCommandTopicLegacy.length())
       mqttClient.subscribe(mqttCommandTopicLegacy.c_str()); // S16 transition
     Serial.printf("[MQTT] subscribed %s\n", mqttCommandTopic.c_str());
@@ -2919,7 +2928,10 @@ void mqttBegin() {
   // through. That is exactly why bench tests passed and the app never worked.
   // 1024 leaves headroom for the ozkey-06 sealed envelope, which will be
   // larger again (ver+counter+nonce+ciphertext+tag, hex-encoded).
-  mqttClient.setBufferSize(1024);
+  // 2048 for OZKIE v2 (ozkey-48 rev 6 §2.4.6): the largest relayed packet is
+  // ≤ 1,230 B (1 + 1024 payload, a topic ≤ 200 B from the server's column
+  // maxima, 5 B header). 1024 would silently drop a full v2 message.
+  mqttClient.setBufferSize(2048);
   mqttConnect();
 }
 

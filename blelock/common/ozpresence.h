@@ -67,7 +67,8 @@
 static String ozBuildLockPresence(const String &deviceId, bool online,
                                   const char *reason, const String &msgId,
                                   const char *fw = nullptr,
-                                  const String &via = String()) {
+                                  const String &via = String(),
+                                  int ozkieVersion = 0) {
   JsonDocument doc;
   doc["state"] = online ? "online" : "offline";
   doc["id"] = deviceId;
@@ -78,6 +79,9 @@ static String ozBuildLockPresence(const String &deviceId, bool online,
   if (msgId.length()) doc["msg_id"] = msgId;
   if (fw && *fw) doc["fw"] = fw;
   if (via.length()) doc["via"] = via;
+  // ozkey-48 §7: the protocol the bridge SAW (the advertised service), 1 or 2.
+  // Omitted when unknown (a Thread lock, or no advertisement seen).
+  if (ozkieVersion == 1 || ozkieVersion == 2) doc["ozkie_version"] = ozkieVersion;
   String out;
   serializeJson(doc, out);
   return out;

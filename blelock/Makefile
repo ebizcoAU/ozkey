@@ -118,6 +118,10 @@ OZCORE_STAGE := $(CURDIR)/.ozcore-stage
 ifeq ($(BOARD),dlc6v2)
 LIB_FLAGS := --library $(OZCORE_STAGE)/ozcore
 STAGE_CMD := sh ozcore/port/esp32c6/stage.sh $(OZCORE_STAGE)
+else ifeq ($(BOARD),bridgeBLE)
+# F1 (ozkey-48 rev 6 §2.4): the bridge relays v2 with ozcore's own framing.
+LIB_FLAGS := --library $(OZCORE_STAGE)/ozframe
+STAGE_CMD := sh bridgeBLE/stage_ozframe.sh $(OZCORE_STAGE)
 else
 LIB_FLAGS :=
 STAGE_CMD := true

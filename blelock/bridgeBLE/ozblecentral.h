@@ -165,6 +165,11 @@ struct OzBleLock {
   String   rxBuf;                      // chunked-notify reassembly (see below)
   unsigned long rxLastChunkAt = 0;     // for the stalled-reassembly timeout
   unsigned long connectedAt = 0;
+  // OZKIE v2 (ozbleozkie2.h): 1 = the v1 service and characteristics above,
+  // 2 = the v2 service, relayed unopened on `relay`.
+  uint8_t  ozkie = 1;
+  BLERemoteCharacteristic *chrRelay = nullptr;
+  uint16_t mtu = 23;
 };
 static OzBleLock g_bleLocks[OZ_BLE_MAX_LOCKS];
 
@@ -681,7 +686,10 @@ static void ozBleNotifyCb(BLERemoteCharacteristic *chr, uint8_t *data, size_t le
 
 class OzBleScanCb : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) override {
-    if (!dev.haveServiceUUID() || !dev.isAdvertisingService(BLEUUID(OZL_SVC_UUID))) return;
+    // v1 (…4b31) or v2 (…4b32, ozbleozkie2.h); the connect path tells them apart.
+    if (!dev.haveServiceUUID() ||
+        !(dev.isAdvertisingService(BLEUUID(OZL_SVC_UUID)) ||
+          dev.isAdvertisingService(BLEUUID("4f5a4b32-0001-4c4f-434b-000000000001")))) return;
     const String addr = dev.getAddress().toString();
 
     // XF-144 P2 — a targeted scan is watching for one specific address this
@@ -760,6 +768,8 @@ static bool ozBleScanFoundFor(const String &target) {
 }
 
 /** Connect + discover + subscribe. Main task only. */
+#include "ozbleozkie2.h"
+
 static bool ozBleConnectOne(const String &addr) {
   OzBleLock *slot = nullptr;
   for (auto &l : g_bleLocks) if (!l.inUse) { slot = &l; break; }
@@ -796,6 +806,8 @@ static bool ozBleConnectOne(const String &addr) {
 
   BLERemoteService *svc = cl->getService(BLEUUID(OZL_SVC_UUID));
   if (!svc) {
+    BLERemoteService *svc2 = cl->getService(BLEUUID(OZ2_SVC_UUID));
+    if (svc2) return oz2Attach(slot, cl, svc2, addr);   // OZKIE v2: relay only
     Serial.printf("[BLE] %s: OZKIE service absent — not a lock, dropping\n", addr.c_str());
     cl->disconnect();
     delete cl;
@@ -960,7 +972,7 @@ static bool ozBleConnectOne(const String &addr) {
     // (XF-144, 2026-09-02): lets the server correct locks.bridge_id off a
     // real connect event instead of trusting whatever it last wrote.
     const String out = ozBuildLockPresence(slot->deviceId, true, OZ_PRESENCE_ONLINE,
-                                           String(""), lockFw.c_str(), deviceId);
+                                           String(""), lockFw.c_str(), deviceId, 1);
     const String ptopic = "ozkie/" + cfgSiteId + "/locks/" + slot->deviceId + "/presence";
     const bool ok = mqttClient.publish(ptopic.c_str(), out.c_str(),
                                        ozPresenceShouldRetain(true));
@@ -1169,6 +1181,9 @@ static void ozBleCentralTick() {
   // delaying the reap/uplink-drain/rescan work above and below it — and
   // critically keeps mqttClient.loop() (called later in the same main
   // loop()) from being starved, which was the actual mechanism XF-149 traced.
+  oz2PublishUplinks();
+  if (oz2WriteOneDownlink()) return;            // one write per tick, as below
+
   if (g_bleCmdQCount) {
     OzBleCmdWrite &cmd = g_bleCmdQ[g_bleCmdQHead];
     g_bleCmdQHead = (g_bleCmdQHead + 1) % OZ_BLE_CMDQ;
@@ -1287,6 +1302,7 @@ static void ozBleCentralTick() {
 // harmless, never-first) reader in case call order ever changes, but the
 // real entry point for these commands today is ozBridgeConsolePoll().
 static void ozBlePairConsoleCmd(const String &line) {
+  if (line == "oz2") { oz2PrintCounters(); return; }   // v2 relay counters
   if (line == "paired") {
     Serial.printf("[PAIR] %u paired lock(s):\n", g_pairedCount);
     for (uint8_t i = 0; i < g_pairedCount; i++)
