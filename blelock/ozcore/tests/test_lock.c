@@ -738,6 +738,21 @@ static void edhoc_restart(void)
     }
     expect_int("tick dropped it", relay.edhoc_active, 0);
     expect_int("owner still bonds after", handshake(&owner, &relay, NULL, 0, why), 0);
+
+    /* An unknown type is dropped and counted; it doesn't end a handshake
+     * the way a type 2 error does (PM condition 2). */
+    expect_int("bad type: handshake starts", hs_begin(&owner, &relay, why), 0);
+    {
+        uint8_t lt, out[64], junk[4] = { 1, 2, 3, 4 };
+        size_t ol = 99;
+        uint32_t before = L.rx_bad_type;
+        oz_lock_rx(&L, &relay, 3, junk, sizeof junk, &lt, out, sizeof out, &ol);
+        expect_int("bad type: no reply", (int)ol, 0);
+        expect_int("bad type: counted", (int)(L.rx_bad_type - before), 1);
+        oz_lock_rx(&L, &relay, 0xff, junk, sizeof junk, &lt, out, sizeof out, &ol);
+        expect_int("bad type 0xff: counted", (int)(L.rx_bad_type - before), 2);
+    }
+    expect_int("bad type: handshake survives", hs_end(&owner, &relay, NULL, 0, why), 0);
 }
 
 /* PM condition 1 (ozkey-55 §5b G1): a session context and a relay context

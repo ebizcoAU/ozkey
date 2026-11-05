@@ -1502,10 +1502,16 @@ int oz_lock_rx(oz_lock *L, oz_link *k, uint8_t type, const uint8_t *in, size_t l
         return rx_edhoc(L, k, in, len, out_type, out, cap, out_len);
     case OZ_FRAME_OSCORE:
         return rx_oscore(L, k, in, len, out_type, out, cap, out_len);
-    default:
+    case OZ_FRAME_ERROR:
         /* An EDHOC error from the peer ends any handshake in progress. */
         oz_edhoc_wipe(&k->edhoc);
         k->edhoc_active = 0;
+        return OZ_OK;
+    default:
+        /* The type is a closed set (ozkey-48 §2.4): anything else is dropped
+         * and counted, never parsed, and changes no state. */
+        L->rx_bad_type++;
+        oz_port_log("lock: dropped a message of unknown type %u", (unsigned)type);
         return OZ_OK;
     }
 }

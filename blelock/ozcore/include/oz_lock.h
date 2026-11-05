@@ -158,6 +158,7 @@ typedef struct oz_lock {
     oz_limit       card_limit;     /* RFID wrong-card limit (P5-E), kv "rl" */
     oz_events      events;         /* RAM ring; seq reserved in kv "es" */
     uint32_t       ev_reserved;    /* seqs below this are reserved in kv */
+    uint32_t       rx_bad_type;  /* messages of an unknown OZKIE type, dropped (ozkey-48 §2.4) */
     oz_observer    relay_obs[OZ_LOCK_MAX_BONDS];   /* `events` over the relay, per bond (RAM) */
     uint16_t       mid;            /* CoAP message id of lock-sent notifications */
     /* persisted relay contexts, one per bond (admin / service) */

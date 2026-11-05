@@ -310,8 +310,9 @@ uplink to the lock's `uplink` topic. A binary payload can't carry a JSON `target
   - The server never auto-retries `lock/unlock`, `lock/lock` or `dev/reset`. A lost response is
     reported as outcome "unknown" (the "unlock never queued" rule). v1's 60 s unlock queue
     (operator Q2) doesn't carry over to v2.
-- The bridge's own `bridge` bond (time) is the bridge acting as one more relay client on the same
-  link. It is handled in the bridge and never reaches MQTT.
+- The bridge's own `bridge` bond (time) is a **session on `ozkie`**, on the same BLE connection as the
+  relay. It is not a relay client: the relay accepts admin and service bonds only (`oz_lock.c`). It
+  is handled in the bridge and never reaches MQTT. Corrected in ozkey-48 rev 6 §2.3.
 - MQTT buffer: 2048, tested with a 1024 B message plus the topic (§7 cliff).
 
 **Impact:** the server (ozkey-97) needs a per-lock v2 path on these topics. The lock needs G1 in

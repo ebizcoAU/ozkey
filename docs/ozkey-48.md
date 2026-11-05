@@ -16,6 +16,10 @@
 > invites `OZINV2` (§3.3). No server holds bond #0.
 > Rev 5 (2026-11-05, PM nexus-e3 ruling): short id = SHA-256(device_id)[0..3], replacing raw MAC
 > bytes (§2.2, test vectors, 100K-site collision gate). App A: result 35 `PIN_TOO_SHORT`.
+> Rev 6 (2026-11-05, PM nexus-9e GO on ozkey-55 §5b, server ozkey-97 review): the bridge relay.
+> A `relay` characteristic (§2, §2.3), a closed type byte on MQTT (§2.4.1), topics and
+> correlation (§2.4.2), one relay EDHOC per lock (§2.4.3), timers and retries side by side (§2.4.4),
+> failover hand-off (§2.4.5), MQTT buffer sizing (§2.4.6).
 
 ## 0. What changes from v1, in one table
 
@@ -65,7 +69,8 @@ New service, so a v1 phone app can never be confused by a v2 lock:
 | Characteristic | UUID | Props | Content |
 |---|---|---|---|
 | `info` | `…0002` | read | CBOR map: `{1: device_id, 2: fw, 3: lock X25519 pub (32 B), 4: state (0 = unclaimed, 1 = claimed), 5: profile}`. Readable without a session. Leaks nothing a scanner couldn't learn by connecting |
-| `ozkie` | `…0003` | write + notify | OZKIE frames (§2.1), both EDHOC and OSCORE |
+| `ozkie` | `…0003` | write + notify | OZKIE frames (§2.1), both EDHOC and OSCORE. A **session** link: the app at the door |
+| `relay` | `…0004` | write + notify | The same frames (§2.1) for the **relay** link: the bridge only (§2.3) |
 
 Advertising, the touch window, the busy flag and the single-connection rule are **unchanged from
 CONTRACT.md**.
@@ -115,10 +120,141 @@ byte 1…: payload fragment
 
 Messages larger than one write (ATT MTU − 3) are fragmented.
 
-Over MQTT (bridge relay), a frame travels as a **raw binary payload**, never hex or base64. One MQTT
-message carries one whole reassembled OZKIE message. Apps should negotiate MTU 247 at
+Over MQTT (bridge relay), a message travels as a **binary payload**, never hex or base64: one
+type byte, then one whole reassembled OZKIE message (§2.4.1). Apps should negotiate MTU 247 at
 connect. Then every v2 message in this spec fits one frame except credential-by-value
 enrollment (§3.3), which fits two. The maximum reassembled message is 1024 bytes.
+
+### 2.3 Session link and relay link (rev 6)
+
+The lock has two kinds of link, and the characteristic decides which one a write belongs to:
+
+| | `ozkie` (session) | `relay` |
+|---|---|---|
+| Who | the app at the door, **and the bridge's own `bridge` bond** (time), on the bridge's connection | the bridge, carrying the remote senders: the owner's app via ozlock, ozpms, ozlodge |
+| Roles | all, as §6 allows | **admin and service only** (`oz_lock.c`: other roles are refused at message_3) |
+| OSCORE context | one, made by EDHOC on this connection, **gone on disconnect** | one per bond, **persisted** (`r0`..`r15`), found by `kid` |
+| Echo | not needed | required for `lock/unlock`, `lock/lock`, `dev/reset`, and after a reboot (§4.2, App. A) |
+| Members (§4.1) | allowed | refused (on premises only) |
+| First pairing (§3.4) | allowed | refused: an unclaimed lock answers no relay EDHOC |
+
+- The relay carries **only EDHOC and OSCORE-protected OZKIE messages**. There are no plaintext
+  commands on it, so the bridge stays a blind relay and keeps nothing (PM condition 1). It needs no
+  auth of its own: a stranger who writes to it gets exactly what they would get on `ozkie`.
+- **The contexts are isolated per link.** A relay context can't be used, read or reset from the
+  session link, and the reverse. A new handshake or a disconnect on one link leaves the other
+  link's contexts alone. Tested both ways in `test_lock` `link_isolation`. A mutation check
+  confirms it: a session link that falls back to relay contexts actuates an unlock without Echo.
+- When the bridge's connection drops, the lock closes the relay link (`oz_link_close`). That wipes
+  a half-done EDHOC and the link's Echo state. **Completed relay contexts persist.**
+- One BLE connection can carry both links. The bridge writes its own `bridge` bond traffic to
+  `ozkie` and relayed traffic to `relay`, and the lock keeps a separate `oz_link` for each.
+  A bridge-bond session is a session link, so it ends with the connection, as any session does.
+- The single-connection rule (CONTRACT.md) is unchanged. While a bridge holds the lock, the app
+  at the door sees `busy` and goes through the bridge.
+
+### 2.4 Bridge relay over MQTT (rev 6)
+
+#### 2.4.1 Payload
+
+`type (1 B) ‖ message`, binary. The type is a **closed set**:
+
+| byte | meaning |
+|---|---|
+| `0x00` | EDHOC message (§3) or EDHOC error |
+| `0x01` | OSCORE-protected CoAP message (§4) |
+| `0x02` | error (the lock sends none today; a peer's type 2 ends a handshake in progress) |
+
+Any other value is **dropped and counted, never parsed**, by the bridge in both directions and by
+the lock (`oz_lock.rx_bad_type`; it changes no state, not even a handshake in progress). An empty
+payload, or one over 1 + 1024 bytes, is dropped and counted too. The bridge never opens the message.
+
+#### 2.4.2 Topics and correlation
+
+| direction | topic | addressed to |
+|---|---|---|
+| server → lock | `ozkie/<site>/bridges/<bridge_id>/ozkie/<lock_id>` | the **chosen bridge**, so with ≥ 2 bridges only one writes |
+| lock → server | `ozkie/<site>/locks/<lock_id>/ozkie/<bridge_id>` | the **lock** (v1's U3 rule). The server subscribes to `locks/+/ozkie/+` |
+
+- QoS 0, never retained. Loss and duplicates are handled above MQTT (§2.4.4).
+- The trailing `bridge_id` on the uplink is the relaying bridge. Two bridges holding one lock
+  (XF-151) show up as uplinks from two `bridge_id`s.
+- A downlink for a lock this bridge doesn't hold is dropped and counted. It isn't queued or forwarded.
+- **The server correlates OSCORE responses by (lock_id, CoAP token). The `kid` identifies the
+  context on requests only**, because an OSCORE response omits it (RFC 8613 §6.1).
+  - Every sender uses a **random token of ≥ 4 bytes**. ozlock refuses a second in-flight
+    request on the same (lock_id, token).
+  - Observe notifications reuse the registration's token.
+  - A response that matches nothing is dropped and logged.
+
+#### 2.4.3 One relay EDHOC per lock
+
+EDHOC on the relay is raw EDHOC (type 0), not CoAP, so it has no token. The lock's relay link
+holds **one** responder handshake.
+- **The lock:**
+  - drops a handshake waiting for message_3 after **30 s** (`OZ_LOCK_EDHOC_TIMEOUT_MS`);
+  - treats a message_1 that arrives mid-handshake as **abort and restart**: message_1 opens with
+    a CBOR integer (< 0x40), message_3 is a byte string;
+  - resets on a failed message_3 and sends EDHOC error 1.
+- **The server (ozlock)** holds one EDHOC **lease per lock across all senders, 35 s**. A second
+  sender's message_1 is refused as busy and never queued. Every type 0 uplink belongs to the
+  lease holder. A type 0 uplink with no lease open is dropped and logged.
+- With the restart rule, a lease that ends early costs one failed handshake, never two.
+
+#### 2.4.4 Timers and retries
+
+| timer | value | owner | rule |
+|---|---|---|---|
+| message_3 wait | 30 s | lock | half-done handshake dropped (§2.4.3) |
+| relay EDHOC lease | 35 s | server | must outlast the lock's 30 s |
+| Echo validity | 10 s, one use | lock | the repeat after `4.01 + Echo` goes at once, inside 10 s |
+| request timeout | 10 s | each sender | no response in 10 s = lost |
+| pairing window | §3.4 | lock | session link only (no pairing on the relay) |
+| request timeout value | 🟡 provisional | — | 10 s is the §4.2 end-to-end target; F1 measures it on the bench and rev 7 fixes it |
+
+- **No CoAP-layer retransmission.** The lock keeps no response cache. A retransmitted request has
+  the same PIV, so the replay window drops it **with no reply** (RFC 8613 §7.4). Senders send CON
+  or NON, but never resend the same bytes.
+- **A retry is always a new request** with a new PIV and a new token.
+  - **Reads** (CoAP GET, e.g. `lock/state`; an `events` re-registration) may be retried that
+    way, at most twice.
+  - **Actuation (`lock/unlock`, `lock/lock`, `dev/reset`) is never auto-retried.** A lost response
+    is reported as outcome **"unknown"**. The app shows it, and a user's new tap is a new request.
+    **A v2 unlock is never queued or held for later delivery** (PM nexus-9e).
+  - Today's server (ozkey-97, 2026-11-05): nothing re-sends after a lost or late reply. Each
+    pending_queue row is published at most once, then marked `sent` (queue.js:140-144). A reset with
+    no reply reads `unknown`. But **v1** remote unlock is held for 60 s (30 s when assisted) and
+    delivered at the next wake (api.js:1126-1142). That is operator question Q2, and it doesn't
+    carry over to v2: the v2 path is new code and follows this section.
+- Writes with an epoch (`cred`, `bond`) may be retried as a new request. The epoch rule (§4.3) makes
+  a duplicate harmless: the second write gets `STALE_EPOCH` and the current epoch.
+
+#### 2.4.5 Failover hand-off
+
+1. The lock takes one central. Only the bridge holding the BLE link can write to `relay`.
+2. When that link drops, the lock closes its relay link (§2.3) and advertises again. Another bridge
+   connects and announces it in the lock's presence (`via`, XF-144).
+3. The server moves `lock.bridge_id` to the new bridge and sends from then on to that bridge's
+   downlink topic. The old bridge drops anything still addressed to it (§2.4.2).
+4. An exchange in flight is pinned to its bridge (EDHOC m1 → m3, or request → `4.01 + Echo` →
+   repeat). If the bridge changes mid-exchange, the server aborts it and starts again on the new
+   bridge. It is never split across bridges. An aborted actuation is "unknown" (§2.4.4).
+5. **No new EDHOC is needed after a failover.** The relay contexts are stored on the lock, so the
+   next request just uses them. Actuation needs Echo as always.
+
+#### 2.4.6 MQTT buffer
+
+PubSubClient's buffer holds the whole packet: header + topic + payload.
+
+The largest relayed packet is about **1,140 B**:
+- payload 1 + 1024 = 1,025 B;
+- topic ≤ 110 B (`ozkie/` + a site ≤ 32 + `/bridges/` + a 16-char bridge id + `/ozkie/` + a lock id
+  ≤ 40);
+- header 5 B.
+
+The bridge's buffer is **2,048 B**, a margin of about 900 B (44 %). Before, it was 1,024, and a full
+v2 message would have been silently dropped (the 256-byte cliff at a new size). The F1 gate
+includes a maximum-size message in each direction.
 
 ## 3. Session setup: EDHOC
 
@@ -418,7 +554,8 @@ of hotel rooms is **not** granted. It would need an explicit operator decision r
 - **ftpos (BANOI):** an EDHOC initiator and OSCORE client in Dart. Invite generation is
   unchanged. Recommendation: wrap a C library through FFI (e.g. `ozcore` itself, or the open
   source `uoscore-uedhoc`) rather than write the crypto in Dart. An XF doc follows approval.
-- **bridgeBLE:** relay `ozkie` frames between MQTT and GATT without opening them. It also holds
+- **bridgeBLE:** relay frames between MQTT and the lock's `relay` characteristic without opening
+  them (§2.3, §2.4: the wire, the topics, the timers and the failover are specified there). It also holds
   its own `bridge` bond (time only). The relay part is a small change. 🔴 The MQTT buffer today is
   `setBufferSize(1024)` (`bridgeBLE.ino:2922`), and that buffer includes the topic and header. A
   full 1024-byte v2 message (a large `cred/sync`) would be **silently dropped**, the known 256-byte
