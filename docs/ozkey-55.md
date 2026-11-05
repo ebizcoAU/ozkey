@@ -295,8 +295,10 @@ uplink to the lock's `uplink` topic. A binary payload can't carry a JSON `target
       byte string (0x40–0x5b). The old handshake's late message_3 is then refused;
     - still resets on a failed message_3 (it sends EDHOC error 1 and clears the handshake), as
       before.
-    - **Server lease: at least 30 s plus a margin.** With the restart rule, a server that releases
-      early costs one failed handshake, never both. The one-in-flight rule stays the contract.
+    - **Server lease: 35 s (30 s + 5 s margin)**, one per lock across all senders. A second
+      message_1 is refused as busy, never queued (ozkey-97, 2026-11-05).
+      With the restart rule, a server that releases early costs one failed handshake, never
+      both. The one-in-flight rule stays the contract.
     - Tests are in `test_lock` `edhoc_restart`. A mutation check showed they fail without each half
       of the fix. Gate `f1a_edhoc_restart` rc=0. dlc6v2 compiles (800,447 B).
   - Failover mid-exchange: the server pins the bridge for one exchange (EDHOC m1→m3, or request →
