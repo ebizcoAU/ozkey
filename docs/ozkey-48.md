@@ -147,11 +147,21 @@ The lock has two kinds of link, and the characteristic decides which one a write
   confirms it: a session link that falls back to relay contexts actuates an unlock without Echo.
 - When the bridge's connection drops, the lock closes the relay link (`oz_link_close`). That wipes
   a half-done EDHOC and the link's Echo state. **Completed relay contexts persist.**
-- One BLE connection can carry both links. The bridge writes its own `bridge` bond traffic to
-  `ozkie` and relayed traffic to `relay`, and the lock keeps a separate `oz_link` for each.
-  A bridge-bond session is a session link, so it ends with the connection, as any session does.
-- The single-connection rule (CONTRACT.md) is unchanged. While a bridge holds the lock, the app
-  at the door sees `busy` and goes through the bridge.
+- **Two connections, as v1 has had since 2026-08-30** (`ozdoorlock_core.h` `OZ_BLE_MAX_LINKS 2`,
+  a live bench finding). With one connection, the bridge's permanent link made every app at the
+  door see `busy` forever. A **member** (relay refused, §4.1) would then have no path at all.
+  - **Slot 1, the bridge:** permanent. On it the bridge writes relayed traffic to `relay`, and its
+    own `bridge` bond (time) to `ozkie` as a session.
+  - **Slot 2, the app at the door:** a session on `ozkie`. The `busy` flag and the non-connectable
+    switch (CONTRACT.md [XF-47]) now mean "slot 2 is taken". A connection that holds only `relay`
+    traffic doesn't make the lock busy.
+  - Never more than 2: unbounded connectability is a DoS surface on a lock.
+  - Each connection has its own session `oz_link`. There is **one** relay link. The first
+    connection that writes to `relay` owns it until it disconnects, and `relay` writes from the
+    other connection are dropped and counted.
+  - 🟡 The C6 port supports this (NimBLE, `CONFIG_BT_NIMBLE_MAX_CONNECTIONS`). The AK1037 SDK's
+    peripheral connection count is unverified until the kit (~11-12). If it is 1, the AK1037 lock
+    needs a yield rule (open, ozkey-55), and this section says so then.
 
 ### 2.4 Bridge relay over MQTT (rev 6)
 
@@ -165,8 +175,9 @@ The lock has two kinds of link, and the characteristic decides which one a write
 | `0x01` | OSCORE-protected CoAP message (§4) |
 | `0x02` | error (the lock sends none today; a peer's type 2 ends a handshake in progress) |
 
-Any other value is **dropped and counted, never parsed**, by the bridge in both directions and by
-the lock (`oz_lock.rx_bad_type`; it changes no state, not even a handshake in progress). An empty
+Any other value is **dropped and counted, never parsed**, by the bridge in both directions, by ozlock
+in both directions (a sender's downlink is refused with 400 before it is published; counters in C0b
+metrics), and by the lock (`oz_lock.rx_bad_type`; it changes no state, not even a handshake in progress). An empty
 payload, or one over 1 + 1024 bytes, is dropped and counted too. The bridge never opens the message.
 
 #### 2.4.2 Topics and correlation
@@ -212,6 +223,11 @@ holds **one** responder handshake.
 | pairing window | §3.4 | lock | session link only (no pairing on the relay) |
 | request timeout value | 🟡 provisional | — | 10 s is the §4.2 end-to-end target; F1 measures it on the bench and rev 7 fixes it |
 
+- **These are the SENDER's rules** (the app, ozpms, ozlodge). OSCORE hides the real CoAP method
+  (the outer code is POST/FETCH), so a relay can't tell a read from an unlock. **ozlock's relay
+  never retries, never re-sends and never queues any v2 frame. If the lock's bridge is offline, it
+  fails fast with 503.** That is what makes "a v2 unlock is never held" enforceable on the server
+  (ozkey-97).
 - **No CoAP-layer retransmission.** The lock keeps no response cache. A retransmitted request has
   the same PIV, so the replay window drops it **with no reply** (RFC 8613 §7.4). Senders send CON
   or NON, but never resend the same bytes.
@@ -234,11 +250,15 @@ holds **one** responder handshake.
 1. The lock takes one central. Only the bridge holding the BLE link can write to `relay`.
 2. When that link drops, the lock closes its relay link (§2.3) and advertises again. Another bridge
    connects and announces it in the lock's presence (`via`, XF-144).
-3. The server moves `lock.bridge_id` to the new bridge and sends from then on to that bridge's
-   downlink topic. The old bridge drops anything still addressed to it (§2.4.2).
+3. The server moves `lock.bridge_id` to the new bridge when its presence carries `via`, using the
+   XF-144 reconciliation and the XF-151 gate: while the current bridge is still confirmed online,
+   the claimant is refused and sent `release_lock`. From then on the server sends to the new
+   bridge's downlink topic. The old bridge drops anything still addressed to it (§2.4.2).
 4. An exchange in flight is pinned to its bridge (EDHOC m1 → m3, or request → `4.01 + Echo` →
    repeat). If the bridge changes mid-exchange, the server aborts it and starts again on the new
-   bridge. It is never split across bridges. An aborted actuation is "unknown" (§2.4.4).
+   bridge. It is never split across bridges. The server aborts the exchanges pinned to the old
+   bridge **as soon as it moves `bridge_id`**, without waiting for the 10 s timeout. An aborted
+   actuation is "unknown" (§2.4.4).
 5. **No new EDHOC is needed after a failover.** The relay contexts are stored on the lock, so the
    next request just uses them. Actuation needs Echo as always.
 
@@ -246,15 +266,17 @@ holds **one** responder handshake.
 
 PubSubClient's buffer holds the whole packet: header + topic + payload.
 
-The largest relayed packet is about **1,140 B**:
+The largest relayed packet is at most **1,230 B**, taken from the server's column maxima. No new
+length limits are imposed:
 - payload 1 + 1024 = 1,025 B;
-- topic ≤ 110 B (`ozkie/` + a site ≤ 32 + `/bridges/` + a 16-char bridge id + `/ozkie/` + a lock id
-  ≤ 40);
+- topic ≤ 200 B: `ozkie/` + `sites.id` ≤ 50 + `/bridges/` + `bridges.id` ≤ 64 + `/ozkie/` +
+  `locks.id` ≤ 64;
 - header 5 B.
 
-The bridge's buffer is **2,048 B**, a margin of about 900 B (44 %). Before, it was 1,024, and a full
+The bridge's buffer is **2,048 B**, a margin of about 818 B (40 %). Before, it was 1,024, and a full
 v2 message would have been silently dropped (the 256-byte cliff at a new size). The F1 gate
-includes a maximum-size message in each direction.
+sends a maximum-size message in each direction, **with a 50-character site and 64-character ids**
+(not `lab`).
 
 ## 3. Session setup: EDHOC
 
