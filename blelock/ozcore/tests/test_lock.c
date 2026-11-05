@@ -740,6 +740,59 @@ static void edhoc_restart(void)
     expect_int("owner still bonds after", handshake(&owner, &relay, NULL, 0, why), 0);
 }
 
+/* PM condition 1 (ozkey-55 §5b G1): a session context and a relay context
+ * are isolated per link. Neither can be used, read or reset from the other
+ * link, in either direction. */
+static void link_isolation(void)
+{
+    static app_t sess, rel;
+    uint8_t req[200];
+    oz_oscore_xchg x;
+    size_t n;
+    int before;
+
+    oz_link_open(&ble, 0);
+    oz_link_open(&relay, 1);
+    sess = owner;
+    rel = owner;
+    expect_int("iso: session handshake", handshake(&sess, &ble, NULL, 0, NULL), 0);
+    expect_int("iso: relay handshake", handshake(&rel, &relay, NULL, 0, NULL), 0);
+    expect_int("iso: relay handshake left the session working",
+               call(&sess, &ble, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+
+    /* relay context → session link */
+    before = unlocks;
+    n = make_req(&rel, OZ_COAP_GET, "lock/state", NULL, 0, NULL, req, sizeof req, &x);
+    expect_int("iso: relay context refused on the session link", deliver(&rel, &ble, req, n, &x) != 0, 1);
+    n = make_req(&rel, OZ_COAP_POST, "lock/unlock", NULL, 0, NULL, req, sizeof req, &x);
+    expect_int("iso: relay-context unlock refused on the session link",
+               deliver(&rel, &ble, req, n, &x) != 0, 1);
+    expect_int("iso: …and not actuated", unlocks, before);
+    expect_int("iso: session still works after", call(&sess, &ble, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+    expect_int("iso: relay context still works after", call(&rel, &relay, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+
+    /* session context → relay link */
+    n = make_req(&sess, OZ_COAP_GET, "lock/state", NULL, 0, NULL, req, sizeof req, &x);
+    expect_int("iso: session context refused on the relay link", deliver(&sess, &relay, req, n, &x) != 0, 1);
+    n = make_req(&sess, OZ_COAP_POST, "lock/unlock", NULL, 0, NULL, req, sizeof req, &x);
+    expect_int("iso: session-context unlock refused on the relay link",
+               deliver(&sess, &relay, req, n, &x) != 0, 1);
+    expect_int("iso: …and not actuated", unlocks, before);
+    expect_int("iso: relay still works after", call(&rel, &relay, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+    expect_int("iso: session still works after", call(&sess, &ble, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+
+    /* Resets: a new session handshake, or the session link closing, leaves
+     * the relay context alone; a new relay handshake leaves the session. */
+    expect_int("iso: new session handshake", handshake(&sess, &ble, NULL, 0, NULL), 0);
+    expect_int("iso: relay survives a new session", call(&rel, &relay, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+    oz_link_close(&ble);
+    expect_int("iso: relay survives the session closing", call(&rel, &relay, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+    expect_int("iso: session handshake again", handshake(&sess, &ble, NULL, 0, NULL), 0);
+    expect_int("iso: new relay handshake", handshake(&rel, &relay, NULL, 0, NULL), 0);
+    expect_int("iso: session survives a new relay handshake",
+               call(&sess, &ble, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+}
+
 static void relay_and_reboot(void)
 {
     /* The owner sets up a relay context (persisted per bond). */
@@ -1119,6 +1172,7 @@ static void run_suite(size_t mtu)
     battery();
     relay_and_reboot();
     edhoc_restart();
+    link_isolation();
     roles();
     events();
     pair_lockout();
