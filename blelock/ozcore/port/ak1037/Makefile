@@ -48,8 +48,10 @@ $(OUT)/libozselftest.a: $(TOBJS)
 	$(SIZE) -t $^
 
 # oz_test.h's helpers are static and not every suite uses all of them.
+# OZ_SELFTEST_TARGET: the suite runs on the chip (218 KiB SRAM), so host-only
+# statistical gates (test_adv's 100K-site run, 404 KB of bss) are left out.
 $(OUT)/t_%.o: tests/test_%.c | $(OUT)
-	$(CC) $(BASE) -Wall -Wno-unused-function -Werror $(INC) -Iport/host -Itests -Dmain=oz_t_$* -c $< -o $@
+	$(CC) $(BASE) -Wall -Wno-unused-function -Werror $(INC) -Iport/host -Itests -DOZ_SELFTEST_TARGET=1 -Dmain=oz_t_$* -c $< -o $@
 
 $(OUT)/selftest_all.o: tests/selftest_all.c | $(OUT)
 	$(CC) $(BASE) $(STRICT) $(INC) -Itests -c $< -o $@

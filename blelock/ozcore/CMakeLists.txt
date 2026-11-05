@@ -193,7 +193,7 @@ add_executable(test_ak1037_selftest tests/test_ak1037_selftest.c
 target_link_libraries(test_ak1037_selftest ozport_ak1037_host)
 target_include_directories(test_ak1037_selftest PRIVATE tests port/host)
 target_compile_options(test_ak1037_selftest PRIVATE -Wall -Wno-unused-function -Werror)
-target_compile_definitions(test_ak1037_selftest PRIVATE $<$<CONFIG:Release>:OZ_STACK_TRIPWIRE>)
+target_compile_definitions(test_ak1037_selftest PRIVATE OZ_SELFTEST_TARGET=1 $<$<CONFIG:Release>:OZ_STACK_TRIPWIRE>)
 foreach(m good wrong)
     add_test(NAME ak1037_selftest_${m} COMMAND test_ak1037_selftest ${m})
 endforeach()

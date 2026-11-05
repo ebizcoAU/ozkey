@@ -99,6 +99,10 @@ static void policy(uint32_t t0)
  * bytes = 3 OUI bytes + 1) gave at most 256 distinct values per OUI. SHA-256
  * must behave like a random 32-bit value: n^2 / 2^33 = 1.16 expected colliding
  * pairs for n = 100000, and even buckets. */
+#ifndef OZ_SELFTEST_TARGET
+/* Host only: 400 KB of ids would not fit the AK1037's 218 KiB SRAM. On the
+ * chip, packets()'s fixed vectors check the short id hash; this run checks the
+ * hash's statistics, which don't depend on the CPU. */
 #define SITE 100000
 static int cmp_u32(const void *a, const void *b)
 {
@@ -149,11 +153,14 @@ static void site_collisions(void)
     expect_int("site: buckets even (max < 1.25 x mean)", maxb < 488, 1);
     expect_int("site: the raw-MAC scheme really was the problem (<= 8 x 256 values)", old_distinct <= 2048, 1);
 }
+#endif
 
 int main(void)
 {
     packets();
+#ifndef OZ_SELFTEST_TARGET
     site_collisions();
+#endif
     policy(0);
     policy(0xfffff000u);                /* every deadline straddles the wrap */
     policy(0x7fffffffu);
