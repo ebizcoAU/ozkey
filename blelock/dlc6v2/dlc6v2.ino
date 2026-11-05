@@ -19,12 +19,13 @@
 // Build: make -C blelock compile BOARD=dlc6v2   (stages ozcore first)
 
 #include <Arduino.h>
+#include "esp_mac.h"
 #include "oz_port.h"
 #include "oz_lock.h"
 #include "oz_port_esp32c6.h"
 #include "oz_gatt_esp32c6.h"
 
-#define FW_VERSION "dlc6v2-0.1"
+#define FW_VERSION "dlc6v2-0.3"
 
 static oz_lock lock;
 
@@ -89,9 +90,15 @@ void setup()
   Serial.printf("[FW] %s\n", FW_VERSION);
 
   static const oz_lock_hooks hooks = { actuate, prompt, NULL };
-  uint8_t a[6];
+  uint8_t a[8];  /* 6 used; room for an 8-byte MAC API */
   char id[4 + 12 + 1];
-  oz_gatt_c6_ble_addr(a);
+  /* device_id = "ozk-" + the BASE MAC (eFuse), as v1 does: the same id as the
+   * board's USB serial number, the bench map and the server's lock row. The BLE
+   * address is base + 2 on ESP32-C6; using it gave the board a second identity
+   * on v2 (ozk-…ba instead of ozk-…b8, found on LockB 2026-11-05).
+   * Not esp_efuse_mac_get_default(): on C6 it returns the 8-byte EUI-64
+   * (ac:eb:e6:ff:fe:3a:ca:b8), which overran a[6] in dlc6v2-0.2. */
+  esp_read_mac(a, ESP_MAC_WIFI_STA);
   snprintf(id, sizeof id, "ozk-%02x%02x%02x%02x%02x%02x", a[0], a[1], a[2], a[3], a[4], a[5]);
 
   if (oz_esp32c6_init() != OZ_OK || oz_lock_init(&lock, id, FW_VERSION, &hooks) != OZ_OK) {
