@@ -982,7 +982,9 @@ static int revoke(int slot)
 
 static void bridge_bonds(void)
 {
-    oz_link idle;                      /* connected, never authenticates: rogue or unenrolled bridge */
+    /* static: two oz_links on the stack put oz_t_lock over the AK1037 self-test
+     * thread's 16 KB (F-AK-SELFTEST-STACK-1). oz_link_open() resets it each run. */
+    static oz_link idle;               /* connected, never authenticates: rogue or unenrolled bridge */
     oz_link_open(&idle, 0);
 
     /* Before any bridge is enrolled: the rev 6 rule, unchanged. */
@@ -1011,7 +1013,8 @@ static void bridge_bonds(void)
     expect_int("rogue dropped at 30 s even holding relay", oz_lock_link_squatting(&L, &idle, 1, 30000), 1);
 
     /* A first pairing waiting for its code has its own deadline. */
-    oz_link waiting = idle;
+    static oz_link waiting;            /* static: see idle */
+    waiting = idle;
     waiting.pairing = 1;
     expect_int("pairing-code wait never squats", oz_lock_link_squatting(&L, &waiting, 0, 600000), 0);
 
