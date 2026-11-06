@@ -170,6 +170,11 @@ struct OzBleLock {
   uint8_t  ozkie = 1;
   BLERemoteCharacteristic *chrRelay = nullptr;
   uint16_t mtu = 23;
+  // F1-BRIDGE-BOND-1 (ozbridgebond.h): this bridge's own bond session on `ozkie`.
+  BLERemoteCharacteristic *chrOzkie = nullptr;
+  uint8_t  bb = 0;                     // BB_* state
+  unsigned long bbAt = 0;
+  uint8_t  lockPub[32] = {0};          // the lock's key, from `info` key 3
 };
 static OzBleLock g_bleLocks[OZ_BLE_MAX_LOCKS];
 
@@ -410,6 +415,27 @@ static bool ozBleRecentlyRejected(const String &addr) {
     if (s.addr == addr && s.at && millis() - s.at < OZ_BLE_UNPAIRED_COOLDOWN_MS)
       return true;
   }
+  return false;
+}
+
+// F1-BRIDGE-BOND-1: a v2 lock released because it is UNCLAIMED (relay is
+// useless there, and holding it would block first pairing at the door) is not
+// reconnected for OZ2_UNCLAIMED_HOLDOFF_MS. Keyed on address, like the above.
+#define OZ2_UNCLAIMED_HOLDOFF_MS 60000UL
+struct Oz2Holdoff { String addr; unsigned long at = 0; };
+static Oz2Holdoff g_oz2Holdoff[OZ_BLE_MAX_LOCKS];
+static void oz2HoldOff(const String &addr) {
+  Oz2Holdoff *v = &g_oz2Holdoff[0];
+  for (auto &h : g_oz2Holdoff) {
+    if (h.addr == addr) { v = &h; break; }
+    if (h.at < v->at) v = &h;
+  }
+  v->addr = addr;
+  v->at = millis();
+}
+static bool oz2HeldOff(const String &addr) {
+  for (auto &h : g_oz2Holdoff)
+    if (h.addr == addr && h.at && millis() - h.at < OZ2_UNCLAIMED_HOLDOFF_MS) return true;
   return false;
 }
 
@@ -706,6 +732,7 @@ class OzBleScanCb : public BLEAdvertisedDeviceCallbacks {
     // connect+GATT-discover just to re-learn an identity we already rejected,
     // every 30 s scan, for as long as it stays in range.
     if (ozBleRecentlyRejected(addr)) return;
+    if (oz2HeldOff(addr)) return;                 // an unclaimed v2 lock, released
     portENTER_CRITICAL(&g_bleMux);
     bool dup = false;
     for (uint8_t i = 0; i < g_blePendingCount; i++) if (g_blePending[i] == addr) dup = true;
@@ -1183,6 +1210,7 @@ static void ozBleCentralTick() {
   // loop()) from being starved, which was the actual mechanism XF-149 traced.
   oz2PublishUplinks();
   if (oz2WriteOneDownlink()) return;            // one write per tick, as below
+  if (bbTick()) return;                         // bridge-bond handshake step (ozbridgebond.h)
 
   if (g_bleCmdQCount) {
     OzBleCmdWrite &cmd = g_bleCmdQ[g_bleCmdQHead];
@@ -1416,6 +1444,7 @@ static void ozBlePublishRoster() {
 
 /** Called once BLE is up (startBle() has run BLEDevice::init()). */
 static void ozBleCentralBegin() {
+  bbInit();            // F1-BRIDGE-BOND-1 — the bridge's own key (ozbridgebond.h)
   ozBleLoadPaired();   // P5 F1 — the allowlist decides what we may hold
   g_bleCentralReady = true;
   g_bleLastScanAt = 0;                    // scan on the very next tick

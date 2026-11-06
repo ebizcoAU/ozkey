@@ -16,8 +16,8 @@
 // A downlink for a lock this bridge doesn't hold is dropped and counted; it
 // is never queued for later (§2.4.2, §2.4.4: no v2 frame is ever held).
 //
-// Not here yet (ozkey-55 F1 follow-ups): the bridge's own `bridge` bond for
-// time (a session on `ozkie`, needs a bridge key + enrolment); the counters
+// The bridge's own `bridge` bond (a session on `ozkie`) is in ozbridgebond.h
+// (F1-BRIDGE-BOND-1, rev 7). Not here yet: the time set over it; the counters
 // on MQTT (F2).
 #pragma once
 
@@ -48,6 +48,8 @@ static Oz2Counters g_oz2;
 // One reassembler per lock slot (indexed like g_bleLocks). 1 KB each, so they
 // live here rather than in OzBleLock, which is reset by value.
 static oz_reasm g_oz2Ra[OZ_BLE_MAX_LOCKS];
+
+#include "ozbridgebond.h"                        // F1-BRIDGE-BOND-1: the bridge's own bond
 
 struct Oz2Msg {
   volatile bool inUse = false, ready = false;
@@ -180,31 +182,43 @@ static bool oz2WriteOneDownlink() {
 
 // ── attach: a v2 lock just connected ────────────────────────────────────────
 
-// Device id = `info` key 1 (ozkey-48 §2). Returns "" if unreadable.
-static String oz2InfoDeviceId(BLERemoteCharacteristic *info) {
+// `info` (ozkey-48 §2): {1: device_id, 2: fw, 3: pub, 4: state, 5: profile}.
+// Returns the device id ("" if unreadable); pub/state when present
+// (state −1 = absent; 0 = unclaimed).
+static String oz2ReadInfo(BLERemoteCharacteristic *info, uint8_t pub[32], bool *havePub, int *state) {
+  *havePub = false;
+  *state = -1;
   if (!info || !info->canRead()) return String();
   const String raw = info->readValue();
   oz_cbor_r r;
   oz_cbor_r_init(&r, (const uint8_t *)raw.c_str(), raw.length());
   const size_t pairs = oz_cbor_get_map(&r);
+  String id;
   for (size_t i = 0; i < pairs && !r.err; i++) {
     const uint64_t k = oz_cbor_get_uint(&r);
+    size_t n = 0;
     if (k == 1 && oz_cbor_peek(&r) == OZ_CBOR_TSTR) {
-      size_t n = 0;
       const uint8_t *s = oz_cbor_get_tstr(&r, &n);
-      if (s && n >= 1 && n <= 64) return String((const char *)s, n);
-      return String();
+      if (s && n >= 1 && n <= 64) id = String((const char *)s, n);
+    } else if (k == 3 && oz_cbor_peek(&r) == OZ_CBOR_BSTR) {
+      const uint8_t *b = oz_cbor_get_bstr(&r, &n);
+      if (b && n == 32) { memcpy(pub, b, 32); *havePub = true; }
+    } else if (k == 4 && oz_cbor_peek(&r) == OZ_CBOR_UINT) {
+      *state = (int)oz_cbor_get_uint(&r);
+    } else {
+      (void)oz_cbor_skip(&r, &n);
     }
-    size_t n;
-    (void)oz_cbor_skip(&r, &n);
   }
-  return String();
+  return r.err ? String() : id;
 }
 
 // Called by ozBleConnectOne() when the lock has the v2 service and not v1.
 // Takes over `cl` on success; on failure it disconnects and frees it.
 static bool oz2Attach(OzBleLock *slot, BLEClient *cl, BLERemoteService *svc, const String &addr) {
-  const String id = oz2InfoDeviceId(svc->getCharacteristic(BLEUUID(OZ2_CHR_INFO)));
+  uint8_t lockPub[32];
+  bool havePub = false;
+  int state = -1;
+  const String id = oz2ReadInfo(svc->getCharacteristic(BLEUUID(OZ2_CHR_INFO)), lockPub, &havePub, &state);
   BLERemoteCharacteristic *relay = svc->getCharacteristic(BLEUUID(OZ2_CHR_RELAY));
   if (!id.length() || !relay || !relay->canNotify() || !relay->canWrite()) {
     Serial.printf("[OZ2] %s: v2 lock without a readable id or a `relay` characteristic, dropped\n",
@@ -221,6 +235,18 @@ static bool oz2Attach(OzBleLock *slot, BLEClient *cl, BLERemoteService *svc, con
     delete cl;
     return false;
   }
+  // F1-BRIDGE-BOND-1: never hold an UNCLAIMED v2 lock. Relay is useless there
+  // (an unclaimed lock answers no relay EDHOC), holding it blocks first
+  // pairing at the door (our idle link takes the app slot), and running the
+  // bridge bond on it would START first pairing for the bridge's key.
+  if (state == 0) {
+    Serial.printf("[OZ2] %s is UNCLAIMED: not holding it (no relay possible, frees the door); "
+                  "recheck in %lu s\n", id.c_str(), OZ2_UNCLAIMED_HOLDOFF_MS / 1000);
+    oz2HoldOff(addr);
+    cl->disconnect();
+    delete cl;
+    return false;
+  }
   slot->inUse = true;
   slot->addr = addr;
   slot->client = cl;
@@ -232,6 +258,10 @@ static bool oz2Attach(OzBleLock *slot, BLEClient *cl, BLERemoteService *svc, con
   oz_reasm_reset(&g_oz2Ra[oz2SlotIndex(slot)]);
   relay->registerForNotify(oz2NotifyCb);
   Serial.printf("[OZ2] %s CONNECTED (v2, relay, ATT MTU %u)\n", id.c_str(), (unsigned)slot->mtu);
+  if (havePub && state > 0)
+    bbAttach(slot, svc->getCharacteristic(BLEUUID(OZ2_CHR_OZKIE)), lockPub);
+  else
+    Serial.printf("[BOND] %s: `info` has no key/state, no bridge bond on this link\n", id.c_str());
 
   if (ozClaimLockOnline(id.c_str())) {
     const String out = ozBuildLockPresence(id, true, OZ_PRESENCE_ONLINE, String(""), nullptr,

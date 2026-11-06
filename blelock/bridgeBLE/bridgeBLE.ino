@@ -246,7 +246,10 @@ static char g_advName[16] = BLE_NAME;
 // Own namespace, forked from bridge32-1.44 (2026-08-29) — see file header.
 // 0.45 (2026-11-06): the F1 OZKIE v2 relay (02becd8), which shipped as 0.44 by mistake.
 // 0.46 (2026-11-06): F1-BRIDGE-LOG-1, a downlink dropped while queued is logged (was silent).
-#define FW_VERSION "bridgeBLE-0.46"
+// 0.47 (2026-11-06): F1-BRIDGE-BOND-1, the bridge's own `bridge` bond (EDHOC on
+//      `ozkie`, key in NVS, ozkie_pub in presence + info); never holds an
+//      UNCLAIMED v2 lock (released, 60 s hold-off).
+#define FW_VERSION "bridgeBLE-0.47"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -954,12 +957,20 @@ bool hexToBytes(const String &hex, uint8_t *out, size_t expectLen) {
 // ─────────────────────────────────────────────────────────────────────────────
 // info characteristic — refreshed whenever Thread state changes
 // ─────────────────────────────────────────────────────────────────────────────
+// F1-BRIDGE-BOND-1: this bridge's public key (hex), set by bbInit()
+// (ozbridgebond.h). Defined here because refreshInfo() precedes that header.
+String g_bbPubHex;
+
 void refreshInfo() {
   if (!chrInfo) return;
   JsonDocument doc;
   doc["device_id"] = deviceId;
   doc["mac"] = macStr;
   doc["fw"] = FW_VERSION;
+  // The AUTHORITATIVE copy of the bridge's key for enrolment (ozkey-48 rev 7):
+  // the app reads it here, in BLE range, and refuses on a mismatch with the
+  // server's TOFU-pinned copy.
+  if (g_bbPubHex.length()) doc["ozkie_pub"] = g_bbPubHex;
   doc["transport"] = "bridge";
   doc["mode"] = cfgMode; // F1: stored personality ("mqtt-uplink" | "matter-bridge")
   doc["thread_role"] = thread ? OpenThread::otGetStringDeviceRole() : "disabled";
@@ -2892,8 +2903,13 @@ void mqttConnect() {
     // Clear our own will immediately. Until this lands the retained value at
     // that topic is still "offline" from last time, so a server reading it in
     // the gap would call a live bridge dead.
+    // F1-BRIDGE-BOND-1: + "ozkie_pub" (64 hex) when the bridge key is up;
+    // ~137 B, under the 256 B PubSubClient cliff. A convenience copy: the
+    // server pins it on first sight (TOFU); the BLE info value is authoritative.
     const String online = String("{\"state\":\"online\",\"id\":\"") + deviceId +
-                          "\",\"role\":\"bridge\"}";
+                          "\",\"role\":\"bridge\"" +
+                          (g_bbPubHex.length() ? String(",\"ozkie_pub\":\"") + g_bbPubHex + "\"" : String("")) +
+                          "}";
     mqttClient.publish(willTopic.c_str(), online.c_str(), true /*retain*/);
     Serial.printf("[MQTT] presence ONLINE -> %s\n", willTopic.c_str());
     mqttClient.subscribe(mqttCommandTopic.c_str());
@@ -2964,9 +2980,10 @@ static void ozBridgeConsolePoll() {
     if (!cmd.length()) continue;
 
     if (cmd == "id") {
-      Serial.printf("[BENCH] device_id=%s fw=%s broker=%s:%u mode=%s\n",
+      Serial.printf("[BENCH] device_id=%s fw=%s broker=%s:%u mode=%s ozkie_pub=%s\n",
                     deviceId.c_str(), FW_VERSION, cfgBrokerHost.c_str(),
-                    cfgBrokerPort, cfgMode.c_str());
+                    cfgBrokerPort, cfgMode.c_str(),
+                    g_bbPubHex.length() ? g_bbPubHex.c_str() : "(none)");
     } else if (cmd.startsWith("setbroker ")) {
       String arg = cmd.substring(10);
       arg.trim();
