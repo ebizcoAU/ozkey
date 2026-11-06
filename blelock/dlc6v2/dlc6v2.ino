@@ -2,8 +2,10 @@
 //
 // The same ozcore engine as AK1037, on its second port (ozcore/port/esp32c6),
 // so OZKIE v2 runs lock → bridge → server → dashboard before the AK1037 kit.
-// No display, motor or keypad: the motor is log-only (every move ends
-// "unconfirmed") and the keypad/card come from the serial shell.
+// No motor or keypad: the motor is log-only (every move ends "unconfirmed")
+// and the keypad/card come from the serial shell. Display (F5-DISPLAY-1, 0.6):
+// one read-only status page on the 1.9" board (LockB), ozstatus_lcd19.h. Build
+// with DLC6V2_LCD19 0 for a board without that panel (the 1.47" LockC).
 //
 // The v1 sketches (dlch584m_19/147) are untouched; one C6 board stays on v1
 // for the regression gate (ozkey-55 F5).
@@ -25,7 +27,14 @@
 #include "oz_port_esp32c6.h"
 #include "oz_gatt_esp32c6.h"
 
-#define FW_VERSION "dlc6v2-0.5"
+#define FW_VERSION "dlc6v2-0.6"
+
+#ifndef DLC6V2_LCD19
+#define DLC6V2_LCD19 1
+#endif
+#if DLC6V2_LCD19
+#include "ozstatus_lcd19.h"
+#endif
 
 static oz_lock lock;
 
@@ -110,7 +119,28 @@ void setup()
     for (;;) delay(1000);
   }
   Serial.printf("oz.start: %s %s\n", id, oz_lock_claimed(&lock) ? "claimed" : "UNCLAIMED");
+#if DLC6V2_LCD19
+  s19_begin();
+#endif
 }
+
+#if DLC6V2_LCD19
+static void status_page()
+{
+  static uint32_t last;
+  static bool drawn;
+  static s19_view shown;
+  if (drawn && millis() - last < 250)
+    return;
+  last = millis();
+  s19_view v = { lock.lock_state, (uint8_t)(oz_lock_claimed(&lock) ? 1 : 0), (uint8_t)oz_gatt_c6_bridge_link() };
+  if (drawn && memcmp(&v, &shown, sizeof v) == 0)
+    return;
+  s19_draw(FW_VERSION, lock.device_id, &v, !drawn);
+  shown = v;
+  drawn = true;
+}
+#endif
 
 void loop()
 {
@@ -124,5 +154,8 @@ void loop()
       buf += c;
     }
   }
+#if DLC6V2_LCD19
+  status_page();
+#endif
   delay(10);
 }

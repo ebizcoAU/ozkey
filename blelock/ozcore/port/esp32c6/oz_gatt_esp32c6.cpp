@@ -66,6 +66,7 @@ typedef struct {
 #define QUEUE_DEPTH 8
 static QueueHandle_t mq;
 static volatile int conn_up;            /* connections up (a racy read, for the shell) */
+static volatile int bridge_link;        /* 0 none, 1 relay without bridge auth, 2 authenticated bridge (racy, display) */
 
 static void post_c(uint8_t ev, uint16_t conn, uint8_t chr, uint32_t arg, const uint8_t *data, size_t len);
 static void post(uint8_t ev, uint32_t arg, const uint8_t *data, size_t len)
@@ -409,6 +410,13 @@ static void ozkie_task(void *param)
             }
         if (relay_owner >= 0)
             (void)oz_ble_tick(&relay_ble);
+        {
+            int bl = relay_owner >= 0 ? 1 : 0;
+            for (int j = 0; j < MAX_CONNS; j++)
+                if (conns[j].used && oz_lock_link_is_bridge(L, &conns[j].link))
+                    bl = 2;
+            bridge_link = bl;
+        }
         motor_step(L);
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
             oz_port_log("keypad: entry timed out");
@@ -430,6 +438,7 @@ static void ozkie_task(void *param)
 extern "C" void oz_gatt_c6_ble_addr(uint8_t out[6]) { esp_read_mac(out, ESP_MAC_BT); }
 
 extern "C" int oz_gatt_c6_connected(void) { return conn_up; }
+extern "C" int oz_gatt_c6_bridge_link(void) { return bridge_link; }
 
 extern "C" int oz_gatt_c6_pair_code(uint32_t code) { post(EV_PAIR_CODE, code, NULL, 0); return OZ_OK; }
 extern "C" int oz_gatt_c6_key(char key) { post(EV_KEY, (uint8_t)key, NULL, 0); return OZ_OK; }

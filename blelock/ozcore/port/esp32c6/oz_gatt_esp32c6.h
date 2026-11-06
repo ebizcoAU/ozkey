@@ -46,6 +46,11 @@ void oz_gatt_c6_actuate(int unlock);
 /* 1 while a central is connected (a racy read, for the shell). */
 int oz_gatt_c6_connected(void);
 
+/* The bridge link, for the display (a racy read): 0 none, 1 a central owns
+ * `relay` without bridge authentication (rev 6 rule, no bridge bond enrolled),
+ * 2 an enrolled bridge bond is connected and authenticated (F1-BRIDGE-BOND-1). */
+int oz_gatt_c6_bridge_link(void);
+
 #ifdef __cplusplus
 }
 #endif
