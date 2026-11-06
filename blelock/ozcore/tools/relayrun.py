@@ -134,7 +134,20 @@ def main(dev, port, bridge, n, prefix, host, site):
     def say(s):
         print(s, flush=True); out.write(s + '\n')
 
+    # BRIDGE_CONSOLE=<bridge serial port>: keep the bridge off the lock during
+    # the door phase. An idle bridge link counts as the app link until its first
+    # relay write (oz_gatt_esp32c6.cpp app_links), so the lock advertises BUSY
+    # (non-connectable) and the Mac cannot get in — the 2026-11-06 "rig flake".
+    # `unpair` stops the bridge reattaching after the reset below; `pair` after
+    # the door lets it back in on its next rescan.
+    bcon = os.environ.get('BRIDGE_CONSOLE')
+    def bridge_cmd(line):
+        with open(bcon, 'w') as f:
+            f.write(line + '\n')
+        say(f'{ts()} bridge console << {line}')
     pw = PresenceWatch(host, site, bridge, dev)
+    if bcon:
+        bridge_cmd(f'unpair {dev}')
     ser = TeeSerial(port, prefix + '_lock.log')
     t_open = time.time()
     time.sleep(3.0)                         # the one open may reset the lock: let it boot
@@ -172,6 +185,8 @@ def main(dev, port, bridge, n, prefix, host, site):
     k.close()
     say(f'{ts()} door done: owner slot 0, service slot {svc.slot}')
     ser.mark('door done, Mac BLE closed')
+    if bcon:
+        bridge_cmd(f'pair {dev}')
 
     t0 = time.time()
     held = pw.wait_held(after=t_open, timeout=60.0)
