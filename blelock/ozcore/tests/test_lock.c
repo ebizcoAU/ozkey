@@ -949,6 +949,109 @@ static void roles(void)
     expect_int("revoked member can't reconnect", handshake(&member, &ble, NULL, 0, NULL), 1);
 }
 
+/* ── F1-BRIDGE-BOND-1 (ozkey-48 rev 7 §2.3): who owns `relay`, who takes the
+ * app slot, and the 30 s squat timeout. PM nexus-6e 2026-11-06. ─────────── */
+
+static app_t bridge1, bridge2, bridge3;
+static oz_link conn2;                  /* a second connection's session link */
+
+static int enrol_bridge(app_t *a, const char *label)
+{
+    uint8_t b[128];
+    oz_cbor_w w;
+    size_t bl = body_epoch(b, sizeof b, 3);
+    oz_cbor_w_init(&w, b + bl, sizeof b - bl);
+    oz_cbor_put_uint(&w, 1); oz_cbor_put_uint(&w, OZ_ROLE_BRIDGE);
+    oz_cbor_put_uint(&w, 2); oz_cbor_put_bstr(&w, a->pub, 32);
+    oz_cbor_put_uint(&w, 3); oz_cbor_put_tstr(&w, label, strlen(label));
+    bl += w.len;
+    int r = call(&owner, &ble, OZ_COAP_POST, "bond", b, bl);
+    if (r == OZ_R_BOND_OK)
+        a->slot = (int)resp_int(&owner, 1);
+    return r;
+}
+
+static int revoke(int slot)
+{
+    uint8_t b[32];
+    char p[16];
+    snprintf(p, sizeof p, "bond/%d", slot);
+    size_t bl = body_epoch(b, sizeof b, 0);
+    return call(&owner, &ble, OZ_COAP_DELETE, p, b, bl);
+}
+
+static void bridge_bonds(void)
+{
+    oz_link idle;                      /* connected, never authenticates: rogue or unenrolled bridge */
+    oz_link_open(&idle, 0);
+
+    /* Before any bridge is enrolled: the rev 6 rule, unchanged. */
+    expect_int("no bridge bond yet", oz_lock_has_bridge_bond(&L), 0);
+    expect_int("rev 6: the first relay writer may own it", oz_lock_relay_may_own(&L, &idle), 1);
+    expect_int("rev 6: a relay owner skips the app slot", oz_lock_takes_app_slot(&L, &idle, 1), 0);
+    expect_int("rev 6: an idle connection takes the app slot", oz_lock_takes_app_slot(&L, &idle, 0), 1);
+    expect_int("rev 6: a relay owner is never dropped as a squatter",
+               oz_lock_link_squatting(&L, &idle, 1, 600000), 0);
+
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    expect_int("enrol bridge 1", enrol_bridge(&bridge1, "ozb-test00000001"), OZ_R_BOND_OK);
+    expect_int("enrol bridge 2", enrol_bridge(&bridge2, "ozb-test00000002"), OZ_R_BOND_OK);
+    expect_int("a 3rd bridge bond is refused", enrol_bridge(&bridge3, "ozb-test00000003"), OZ_R_NO_SLOT);
+    expect_int("bridge bond present", oz_lock_has_bridge_bond(&L), 1);
+    expect_int("bond label ties the key to the bridge id",
+               strcmp(L.bonds[bridge1.slot].label, "ozb-test00000001"), 0);
+
+    /* A rogue: connected, subscribed and writing to `relay`, never authenticated. */
+    expect_int("rogue relay writer may not own relay", oz_lock_relay_may_own(&L, &idle), 0);
+    expect_int("rogue subscriber takes the app slot", oz_lock_takes_app_slot(&L, &idle, 0), 1);
+    expect_int("rogue gets no exemption even as owner", oz_lock_takes_app_slot(&L, &idle, 1), 1);
+    expect_int("rogue not dropped at 29.999 s", oz_lock_link_squatting(&L, &idle, 0, 29999), 0);
+    expect_int("rogue dropped at 30 s", oz_lock_link_squatting(&L, &idle, 0, 30000), 1);
+    expect_int("rogue dropped at 30 s even holding relay", oz_lock_link_squatting(&L, &idle, 1, 30000), 1);
+
+    /* A first pairing waiting for its code has its own deadline. */
+    oz_link waiting = idle;
+    waiting.pairing = 1;
+    expect_int("pairing-code wait never squats", oz_lock_link_squatting(&L, &waiting, 0, 600000), 0);
+
+    /* The owner's app: authenticated, but not a bridge. */
+    oz_link_open(&conn2, 0);
+    expect_int("owner session on a 2nd connection", handshake(&owner, &conn2, NULL, 0, NULL), 0);
+    expect_int("owner is not a bridge", oz_lock_link_is_bridge(&L, &conn2), 0);
+    expect_int("owner may not own relay", oz_lock_relay_may_own(&L, &conn2), 0);
+    expect_int("owner's app takes the app slot", oz_lock_takes_app_slot(&L, &conn2, 0), 1);
+    expect_int("authenticated app never squats", oz_lock_link_squatting(&L, &conn2, 0, 600000), 0);
+
+    /* The enrolled bridge, authenticated on `ozkie`. */
+    oz_link_open(&conn2, 0);
+    expect_int("bridge EDHOC on ozkie", handshake(&bridge1, &conn2, NULL, 0, NULL), 0);
+    expect_int("authenticated bridge recognised", oz_lock_link_is_bridge(&L, &conn2), 1);
+    expect_int("authenticated bridge may own relay", oz_lock_relay_may_own(&L, &conn2), 1);
+    expect_int("idle authenticated bridge skips the app slot", oz_lock_takes_app_slot(&L, &conn2, 0), 0);
+    expect_int("authenticated bridge never squats", oz_lock_link_squatting(&L, &conn2, 0, 600000), 0);
+    expect_int("bridge role can't unlock", call(&bridge1, &conn2, OZ_COAP_POST, "lock/unlock", NULL, 0),
+               OZ_R_FORBIDDEN);
+
+    /* The relay link itself is never "the bridge": the bond lives on `ozkie`. */
+    oz_link_open(&relay, 1);
+    expect_int("bridge key refused on the relay link", handshake(&bridge1, &relay, NULL, 0, NULL), 1);
+    expect_int("relay link never counts as bridge", oz_lock_link_is_bridge(&L, &relay), 0);
+
+    /* Revocation takes effect at once, and with no bridge left the rev 6 rule is back.
+     * (The owner's one app context went to conn2 above: handshake on `ble` again.) */
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    expect_int("revoke bridge 1", revoke(bridge1.slot), OZ_R_REVOKE_OK);
+    expect_int("revoked bridge stops counting", oz_lock_link_is_bridge(&L, &conn2), 0);
+    expect_int("revoked bridge may not own relay", oz_lock_relay_may_own(&L, &conn2), 0);
+    expect_int("a 3rd bridge fits again", enrol_bridge(&bridge3, "ozb-test00000003"), OZ_R_BOND_OK);
+    expect_int("revoke bridge 2", revoke(bridge2.slot), OZ_R_REVOKE_OK);
+    expect_int("revoke bridge 3", revoke(bridge3.slot), OZ_R_REVOKE_OK);
+    expect_int("no bridge left", oz_lock_has_bridge_bond(&L), 0);
+    expect_int("rev 6 rule back", oz_lock_relay_may_own(&L, &idle), 1);
+}
+
 /* ── events (§5.1): Observe over BLE and the relay ────────────────────── */
 
 typedef struct {
@@ -1191,6 +1294,7 @@ static void run_suite(size_t mtu)
     boot_lock();
     app_new(&owner); app_new(&member); app_new(&stranger);
     app_new(&issuer); app_new(&guest); app_new(&service);
+    app_new(&bridge1); app_new(&bridge2); app_new(&bridge3);
 
     int before = failures;
     first_pairing();
@@ -1203,6 +1307,7 @@ static void run_suite(size_t mtu)
     edhoc_restart();
     link_isolation();
     roles();
+    bridge_bonds();
     events();
     pair_lockout();
     if (mtu)

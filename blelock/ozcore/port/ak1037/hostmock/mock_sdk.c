@@ -611,3 +611,13 @@ int mock_msh_run(const char *line)
         }
     return -1;
 }
+
+/* sdk-1.02 com_ble.h:289. The host mock has no link; it counts the call so a
+ * test can see the squat timeout fire. */
+int mock_disconnects;
+T_eBLE_RESULT com_ble_disconnect(uint8_t idx)
+{
+    (void)idx;
+    mock_disconnects++;
+    return eBLE_RESULT_SUCCESS;
+}

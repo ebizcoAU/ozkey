@@ -83,6 +83,7 @@ T_eBLE_RESULT com_ble_set_gatt_service(T_BT_ATTREC *gatt_serve_table, uint32_t t
 T_eBLE_RESULT com_ble_server_notify_ext(T_pVOID p_lelink, uint8_t *p_send_buf, uint16_t len,
                                         uint16_t notify_att_rec_idx);
 T_eBLE_RESULT com_ble_set_adv_enable(T_eBLE_ENABLE_TYPE adv_enable);
+T_eBLE_RESULT com_ble_disconnect(uint8_t idx);   /* sdk-1.02 com_ble.h:289 */
 T_eBLE_RESULT com_ble_set_adv_interval(uint8_t adv_type, uint16_t interval_min, uint16_t interval_max,
                                        uint8_t peer_addr_type, T_BLE_ADDR peer_addr);
 T_eBLE_RESULT com_ble_set_adv_data(T_BT_ADV_DATA *p_adv_data, T_BT_ADV_DATA *p_scan_rsp_data);

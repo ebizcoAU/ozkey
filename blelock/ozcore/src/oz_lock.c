@@ -314,6 +314,41 @@ int oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_loc
 
 int oz_lock_claimed(const oz_lock *L) { return L->bonds[0].used && L->bonds[0].role == OZ_ROLE_ADMIN; }
 
+int oz_lock_has_bridge_bond(const oz_lock *L)
+{
+    for (int i = 0; i < OZ_LOCK_MAX_BONDS; i++)
+        if (L->bonds[i].used && L->bonds[i].role == OZ_ROLE_BRIDGE)
+            return 1;
+    return 0;
+}
+
+int oz_lock_link_is_bridge(const oz_lock *L, const oz_link *s)
+{
+    /* Read live from the bond table: a revoked bridge stops counting at once. */
+    return s && !s->relay && s->ctx_ready && s->slot >= 0 && s->slot < OZ_LOCK_MAX_BONDS &&
+           L->bonds[s->slot].used && L->bonds[s->slot].role == OZ_ROLE_BRIDGE;
+}
+
+int oz_lock_relay_may_own(const oz_lock *L, const oz_link *s)
+{
+    return !oz_lock_has_bridge_bond(L) || oz_lock_link_is_bridge(L, s);
+}
+
+int oz_lock_takes_app_slot(const oz_lock *L, const oz_link *s, int owns_relay)
+{
+    if (oz_lock_link_is_bridge(L, s))
+        return 0;
+    /* rev 6 rule for a relay owner, kept only while no bridge is enrolled
+     * (once one is, an owner is always an authenticated bridge). */
+    return !(owns_relay && !oz_lock_has_bridge_bond(L));
+}
+
+int oz_lock_link_squatting(const oz_lock *L, const oz_link *s, int owns_relay, uint64_t connected_ms)
+{
+    return connected_ms >= OZ_LOCK_AUTH_GRACE_MS && oz_lock_takes_app_slot(L, s, owns_relay) &&
+           !s->ctx_ready && !s->pairing;
+}
+
 int oz_lock_info(const oz_lock *L, uint8_t *out, size_t cap, size_t *out_len)
 {
     oz_cbor_w w;
@@ -886,6 +921,17 @@ static void v_bond_add(req_ctx *q)
     if (bond_by_pub(q->L, pub) >= 0) {
         result(q, OZ_R_DENIED, 0);
         return;
+    }
+    /* At most OZ_LOCK_MAX_BRIDGE_BONDS bridges (F1-BRIDGE-BOND-1, PM 2026-11-06):
+     * each one may own `relay` and skips the app slot, so they stay few. */
+    if (role == OZ_ROLE_BRIDGE) {
+        int n = 0;
+        for (int i = 0; i < OZ_LOCK_MAX_BONDS; i++)
+            n += q->L->bonds[i].used && q->L->bonds[i].role == OZ_ROLE_BRIDGE;
+        if (n >= OZ_LOCK_MAX_BRIDGE_BONDS) {
+            result(q, OZ_R_NO_SLOT, 0);
+            return;
+        }
     }
     int s = free_slot(q->L);
     if (s < 0) {

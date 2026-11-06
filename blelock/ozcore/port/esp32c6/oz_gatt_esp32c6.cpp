@@ -119,6 +119,8 @@ typedef struct {
     size_t   mtu;
     oz_link  link;                      /* this connection's session link */
     oz_ble   ble;
+    uint32_t at;                        /* connected at (now_ms, wraps: subtract only) */
+    int      kicked;                    /* squat disconnect already requested */
 } conn_t;
 
 typedef struct { BLECharacteristic **chr; int idx; } tx_t;
@@ -130,6 +132,8 @@ static oz_ble  relay_ble;
 static tx_t    tx_relay = { &chr_relay, -1 };
 static int     relay_owner = -1;        /* index into conns, −1 = none */
 static uint32_t relay_refused;          /* `relay` writes from the non-owner */
+static uint32_t relay_unauth;           /* `relay` writes refused: not an authenticated bridge */
+static uint32_t squat_drops;            /* connections dropped by the 30 s squat timeout */
 static oz_adv adv;
 static oz_keypad keypad;
 static oz_motor motor;
@@ -237,13 +241,14 @@ static int find_conn(uint16_t h)
     return -1;
 }
 
-/* Connections that make the lock busy: every one except the relay owner's
- * (ozkey-48 §2.3: busy means the app slot is taken). */
-static int app_links(void)
+/* Connections that make the lock busy (ozkey-48 rev 7 §2.3: busy means the
+ * app slot is taken). The lock decides: an authenticated bridge never does;
+ * the relay owner doesn't only while no bridge is enrolled (rev 6 rule). */
+static int app_links(const oz_lock *L)
 {
     int n = 0;
     for (int i = 0; i < MAX_CONNS; i++)
-        if (conns[i].used && i != relay_owner)
+        if (conns[i].used && oz_lock_takes_app_slot(L, &conns[i].link, i == relay_owner))
             n++;
     return n;
 }
@@ -298,6 +303,8 @@ static void ozkie_task(void *param)
                 }
                 conns[f].used = 1;
                 conns[f].h = m.conn;
+                conns[f].at = now_ms();
+                conns[f].kicked = 0;
                 conns[f].mtu = OZ_FRAME_MIN_MTU;
                 oz_ble_connect(&conns[f].ble);
                 applied = -1;           /* NimBLE stops advertising on a connect */
@@ -317,6 +324,14 @@ static void ozkie_task(void *param)
                 if (m.chr == CH_OZKIE) {
                     (void)oz_ble_rx(&conns[i].ble, m.data, m.len);
                 } else {
+                    if (relay_owner < 0 && !oz_lock_relay_may_own(L, &conns[i].link)) {
+                        /* F1-BRIDGE-BOND-1: a bridge is enrolled, and this
+                         * connection hasn't authenticated as one. */
+                        if (++relay_unauth == 1 || relay_unauth % 100 == 0)
+                            oz_port_log("gatt: relay write from an unauthenticated connection dropped (%lu)",
+                                        (unsigned long)relay_unauth);
+                        break;
+                    }
                     if (relay_owner < 0) {
                         relay_owner = i;
                         oz_ble_connect_as(&relay_ble, 1);
@@ -366,13 +381,32 @@ static void ozkie_task(void *param)
             for (int j = 0; j < MAX_CONNS; j++)
                 up += conns[j].used;
             conn_up = up;
-            adv.links = app_links();
+            /* An owner that took `relay` under the rev 6 rule loses it as soon
+             * as a bridge is enrolled and it isn't that bridge. */
+            if (relay_owner >= 0 && !oz_lock_relay_may_own(L, &conns[relay_owner].link)) {
+                oz_ble_disconnect(&relay_ble);
+                relay_owner = -1;
+                oz_port_log("gatt: relay released: its owner is not an authenticated bridge");
+            }
+            adv.links = app_links(L);
             if (up >= MAX_CONNS && adv.links == 0)
                 adv.links = 1;          /* both slots taken: never connectable */
         }
         for (int j = 0; j < MAX_CONNS; j++)
             if (conns[j].used)
                 (void)oz_ble_tick(&conns[j].ble);
+        /* F1-BRIDGE-BOND-1 (B): free the app slot from a connection that never
+         * authenticates (a rogue, or an unenrolled idle bridge). */
+        for (int j = 0; j < MAX_CONNS; j++)
+            if (conns[j].used && !conns[j].kicked &&
+                oz_lock_link_squatting(L, &conns[j].link, j == relay_owner, (uint32_t)(now_ms() - conns[j].at))) {
+                conns[j].kicked = 1;
+                ++squat_drops;
+                oz_port_log("gatt: connection %u dropped: no authenticated session in %u s (%lu so far)",
+                            (unsigned)conns[j].h, OZ_LOCK_AUTH_GRACE_MS / 1000u,
+                            (unsigned long)squat_drops);
+                server->disconnect(conns[j].h);
+            }
         if (relay_owner >= 0)
             (void)oz_ble_tick(&relay_ble);
         motor_step(L);

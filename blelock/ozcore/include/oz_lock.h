@@ -34,6 +34,7 @@ extern "C" {
  * (ozkey-55 §5b). A relay EDHOC lease on the server must outlast it. */
 #define OZ_LOCK_EDHOC_TIMEOUT_MS 30000u
 #define OZ_LOCK_MAX_BONDS   16
+#define OZ_LOCK_MAX_BRIDGE_BONDS 2   /* `bridge`-role bonds; a 3rd is NO_SLOT (F1-BRIDGE-BOND-1) */
 #define OZ_LOCK_MAX_CREDS   32
 #define OZ_LOCK_NONCES      32
 #define OZ_LOCK_LABEL       24
@@ -171,6 +172,28 @@ typedef struct oz_lock {
 /* Load state from kv, or mint a new identity (factory-fresh, unclaimed). */
 int  oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_lock_hooks *hooks);
 int  oz_lock_claimed(const oz_lock *L);
+
+/* F1-BRIDGE-BOND-1 (ozkey-48 rev 7 §2.3): which connection may own `relay`
+ * and which one takes the app slot. The port asks; the lock decides.
+ *  - authenticated bridge = the connection's `ozkie` session completed EDHOC
+ *    as a bond that is still enrolled with role `bridge`;
+ *  - with NO bridge bond enrolled the lock keeps the rev 6 rule (the first
+ *    `relay` writer owns it), so nothing changes before enrolment;
+ *  - once one is enrolled, only an authenticated bridge may own `relay`;
+ *  - an authenticated bridge never takes the app slot (never makes the lock
+ *    busy), whether or not it has written to `relay` yet. */
+int  oz_lock_has_bridge_bond(const oz_lock *L);
+int  oz_lock_link_is_bridge(const oz_lock *L, const oz_link *session);
+int  oz_lock_relay_may_own(const oz_lock *L, const oz_link *session);
+int  oz_lock_takes_app_slot(const oz_lock *L, const oz_link *session, int owns_relay);
+/* App-slot squat timeout (F1-BRIDGE-BOND-1 (B), PM 2026-11-06): 1 when this
+ * connection should be dropped. It must take the app slot, have been up for
+ * OZ_LOCK_AUTH_GRACE_MS, and still have no completed `ozkie` EDHOC (any role).
+ * A first pairing waiting for its code is never dropped here (it has its own
+ * deadline). The keypad and card paths don't involve connections at all. */
+#define OZ_LOCK_AUTH_GRACE_MS 30000u
+int  oz_lock_link_squatting(const oz_lock *L, const oz_link *session, int owns_relay,
+                            uint64_t connected_ms);
 /* GATT `info` value (ozkey-48 §2): CBOR {1: device_id, 2: fw, 3: pub, 4: state, 5: profile}. */
 int  oz_lock_info(const oz_lock *L, uint8_t *out, size_t cap, size_t *out_len);
 

@@ -339,6 +339,9 @@ static void ozkie_thread(void *param)
     oz_lock *L = param;
     static msg_t m;
     int connected = 0;
+    uint32_t connected_at = 0;      /* now_ms at connect; wraps, subtract only */
+    int kicked = 0;
+    uint32_t squat_drops = 0;
     int applied = -1, failed = 0;
     refresh_info(L);
     for (;;) {
@@ -351,6 +354,8 @@ static void ozkie_thread(void *param)
                 if (!connected)
                     oz_adv_link(&adv, 1);
                 connected = 1;
+                connected_at = now_ms();
+                kicked = 0;
                 break;
             case EV_MTU:
                 oz_ble_set_mtu(&session, m.h.arg);
@@ -387,6 +392,17 @@ static void ozkie_thread(void *param)
         }
         if (connected)
             (void)oz_ble_tick(&session);
+        /* App-slot squat timeout (F1-BRIDGE-BOND-1 (B), ozkey-48 rev 7 §2.3): the
+         * one connection here IS the app slot. 🟡 com_ble_disconnect(0) — link
+         * index 0 for the single peripheral link — is unverified until the kit. */
+        if (connected && !kicked &&
+            oz_lock_link_squatting(L, &link, 0, (uint32_t)(now_ms() - connected_at))) {
+            kicked = 1;
+            ++squat_drops;
+            oz_port_log("gatt: connection dropped: no authenticated session in %u s (%lu so far)",
+                        OZ_LOCK_AUTH_GRACE_MS / 1000u, (unsigned long)squat_drops);
+            (void)com_ble_disconnect(0);
+        }
         motor_step(L);
         battery_rest(L);
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
