@@ -60,12 +60,54 @@ class MqttRelayLink:
         self.c.loop_stop(); self.c.disconnect()
 
 
+class PresenceWatch:
+    """The lock's retained presence, as the bridge publishes it. Opening the
+    lock's serial port resets the lock, which drops the bridge's relay link;
+    the bridge only gets it back on its next rescan (OZ_BLE_RESCAN_FAST_MS,
+    10 s). The relay steps must not start before that, or the bridge drops
+    the downlink as "not held by this bridge" (seen 2026-11-06, F1 runs 1+3)."""
+    def __init__(self, host, site, bridge, lock_id):
+        import json
+        import paho.mqtt.client as mqtt
+        self.bridge, self.events = bridge, queue.Queue()
+
+        def on_msg(c, u, m):
+            try:
+                d = json.loads(m.payload)
+            except ValueError:
+                return
+            self.events.put((time.time(), d.get('state'), d.get('via')))
+        self.c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f'mqttrun-p-{os.getpid()}')
+        self.c.on_message = on_msg
+        self.c.connect(host, 1883, 30)
+        self.c.subscribe(f'ozkie/{site}/locks/{lock_id}/presence', qos=0)
+        self.c.loop_start()
+        time.sleep(0.5)
+
+    def wait_held(self, after, timeout=40.0):
+        """True once an 'online via <bridge>' arrives later than `after`."""
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                t, state, via = self.events.get(timeout=end - time.time())
+            except queue.Empty:
+                break
+            if t > after and state == 'online' and via == self.bridge:
+                return True
+        return False
+
+    def close(self):
+        self.c.loop_stop(); self.c.disconnect()
+
+
 def main(dev, port, bridge, host, site):
     import serial as pyserial
+    pw = PresenceWatch(host, site, bridge, dev)
     ser = pyserial.Serial()
     ser.port, ser.baudrate, ser.timeout = port, 115200, 0.2
     ser.dtr = ser.rts = False
     ser.open()
+    t_open = time.time()
     time.sleep(3.0)                      # the open reset the lock: let it boot
     ser.reset_input_buffer()
     global _ser_for_dump
@@ -109,6 +151,11 @@ def main(dev, port, bridge, host, site):
     k.close()
 
     # --- remote, through the bridge ---
+    t0 = time.time()
+    held = pw.wait_held(after=t_open)
+    pw.close()
+    chk('bridge holds the lock again after the reset', held)
+    print(f'    waited {time.time() - t0:.1f} s for the bridge', flush=True)
     m = MqttRelayLink(host, site, bridge, dev)
     print(f'downlink {m.down}\nuplink   {m.up}', flush=True)
     t0 = time.time()
