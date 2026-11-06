@@ -65,6 +65,7 @@ FQBN_dlch584m_147 := esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=default_8M
 # bridgeBLE — BLE-central fork of bridge32 (ozkey-45), SAME physical board
 # as GEEKC6 (N16, 16MB) — bridge32 stays untouched/production; this is a
 # separate firmware, not a replacement. See file header for why.
+FQBN_dlc6v2 := esp32:esp32:esp32c6:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=cdc
 FQBN_bridgeBLE := esp32:esp32:esp32c6:FlashSize=16M,PartitionScheme=custom,CDCOnBoot=cdc
 # P4C6COMBO — reserved slot, NOT configured yet. The ESP32-P4 uses a
 # different Arduino core (esp32:esp32:esp32p4, not esp32c6) and this board's
@@ -81,6 +82,7 @@ SKETCH_SIMLOCK := simlock
 SKETCH_dlch584m_19 := dlch584m_19
 SKETCH_dlch584m_147 := dlch584m_147
 SKETCH_bridgeBLE := bridgeBLE
+SKETCH_dlc6v2 := dlc6v2
 
 FQBN   := $(FQBN_$(BOARD))
 SKETCH := $(SKETCH_$(BOARD))
@@ -111,6 +113,19 @@ SKETCH := $(SKETCH_$(BOARD))
 # The five ids this comment used to name were all deleted or renamed in
 # a6db8c3 and every one of them survived here as a bench instruction that
 # would have silently mispinned a board.
+# dlc6v2 (ozkey-55 F5): ozcore is staged as an Arduino library first.
+OZCORE_STAGE := $(CURDIR)/.ozcore-stage
+ifeq ($(BOARD),dlc6v2)
+LIB_FLAGS := --library $(OZCORE_STAGE)/ozcore
+STAGE_CMD := sh ozcore/port/esp32c6/stage.sh $(OZCORE_STAGE)
+else ifeq ($(BOARD),bridgeBLE)
+# F1 (ozkey-48 rev 6 §2.4): the bridge relays v2 with ozcore's own framing.
+LIB_FLAGS := --library $(OZCORE_STAGE)/ozframe
+STAGE_CMD := sh bridgeBLE/stage_ozframe.sh $(OZCORE_STAGE)
+else
+LIB_FLAGS :=
+STAGE_CMD := true
+endif
 PROFILE ?=
 ifneq ($(PROFILE),)
 PROFILE_FLAGS := --build-property "compiler.cpp.extra_flags=-DOZ_PROFILE_BUILD=\"$(PROFILE)\" -DOZ_PROFILE_PINNED=1"
@@ -130,13 +145,15 @@ help:
 compile:
 	@test -n "$(BOARD)" || { echo "BOARD is required — one of: 147, 19, GEEKC6, dlock19, SIMLOCK, dlch584m_19, dlch584m_147, bridgeBLE"; exit 1; }
 	@test -n "$(FQBN)"  || { echo "unknown/unconfigured BOARD '$(BOARD)' — one of: 147, 19, GEEKC6, dlock19, SIMLOCK, dlch584m_19, dlch584m_147, bridgeBLE (P4C6COMBO reserved, not configured yet)"; exit 1; }
-	$(ARDUINO_CLI) compile $(PROFILE_FLAGS) --fqbn "$(FQBN)" $(SKETCH)
+	$(STAGE_CMD)
+	$(ARDUINO_CLI) compile $(PROFILE_FLAGS) $(LIB_FLAGS) --fqbn "$(FQBN)" $(SKETCH)
 
 flash:
 	@test -n "$(BOARD)" || { echo "BOARD is required — one of: 147, 19, GEEKC6, dlock19, SIMLOCK, dlch584m_19, dlch584m_147, bridgeBLE"; exit 1; }
 	@test -n "$(FQBN)"  || { echo "unknown/unconfigured BOARD '$(BOARD)' — one of: 147, 19, GEEKC6, dlock19, SIMLOCK, dlch584m_19, dlch584m_147, bridgeBLE (P4C6COMBO reserved, not configured yet)"; exit 1; }
 	@test -n "$(PORT)"  || { echo "PORT is required — e.g. PORT=/dev/cu.usbmodem14101 (see: make list-ports)"; exit 1; }
-	$(ARDUINO_CLI) compile $(PROFILE_FLAGS) --upload -p "$(PORT)" --fqbn "$(FQBN)" $(SKETCH)
+	$(STAGE_CMD)
+	$(ARDUINO_CLI) compile $(PROFILE_FLAGS) $(LIB_FLAGS) --upload -p "$(PORT)" --fqbn "$(FQBN)" $(SKETCH)
 
 monitor:
 	@test -n "$(PORT)" || { echo "PORT is required — see: make list-ports"; exit 1; }

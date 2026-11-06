@@ -145,13 +145,14 @@ static int ccm_mac(const uint8_t key[16], const uint8_t *nonce, size_t nonce_len
         /* Length prefix, then aad, packed into 16-byte blocks. */
         uint8_t hdr[10];
         size_t hl;
-        if (aad_len < 0xFF00) {
-            hdr[0] = (uint8_t)(aad_len >> 8);
-            hdr[1] = (uint8_t)aad_len;
+        uint64_t al = aad_len;      /* 64-bit, so the test below holds where size_t is 32 */
+        if (al < 0xFF00) {
+            hdr[0] = (uint8_t)(al >> 8);
+            hdr[1] = (uint8_t)al;
             hl = 2;
-        } else if ((uint64_t)aad_len <= 0xFFFFFFFFu) {
+        } else if (al <= 0xFFFFFFFFu) {
             hdr[0] = 0xFF; hdr[1] = 0xFE;
-            for (int i = 0; i < 4; i++) hdr[2 + i] = (uint8_t)((uint64_t)aad_len >> (24 - 8 * i));
+            for (int i = 0; i < 4; i++) hdr[2 + i] = (uint8_t)(al >> (24 - 8 * i));
             hl = 6;
         } else {
             return OZ_E_ARG;

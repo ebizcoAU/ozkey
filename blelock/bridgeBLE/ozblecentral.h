@@ -165,6 +165,16 @@ struct OzBleLock {
   String   rxBuf;                      // chunked-notify reassembly (see below)
   unsigned long rxLastChunkAt = 0;     // for the stalled-reassembly timeout
   unsigned long connectedAt = 0;
+  // OZKIE v2 (ozbleozkie2.h): 1 = the v1 service and characteristics above,
+  // 2 = the v2 service, relayed unopened on `relay`.
+  uint8_t  ozkie = 1;
+  BLERemoteCharacteristic *chrRelay = nullptr;
+  uint16_t mtu = 23;
+  // F1-BRIDGE-BOND-1 (ozbridgebond.h): this bridge's own bond session on `ozkie`.
+  BLERemoteCharacteristic *chrOzkie = nullptr;
+  uint8_t  bb = 0;                     // BB_* state
+  unsigned long bbAt = 0;
+  uint8_t  lockPub[32] = {0};          // the lock's key, from `info` key 3
 };
 static OzBleLock g_bleLocks[OZ_BLE_MAX_LOCKS];
 
@@ -405,6 +415,33 @@ static bool ozBleRecentlyRejected(const String &addr) {
     if (s.addr == addr && s.at && millis() - s.at < OZ_BLE_UNPAIRED_COOLDOWN_MS)
       return true;
   }
+  return false;
+}
+
+// F1-BRIDGE-BOND-1: a v2 lock released because it is UNCLAIMED (relay is
+// useless there, and holding it would block first pairing at the door) is not
+// reconnected for OZ2_UNCLAIMED_HOLDOFF_MS. Keyed on address, like the above.
+#define OZ2_UNCLAIMED_HOLDOFF_MS 60000UL
+// A v2 lock whose `info` couldn't be read (typically: it was rebooting as we
+// connected) gets this short hold-off, NOT the 5 min stranger cooldown. With
+// the cooldown, one reboot mid-identification cost 5 min of remote access
+// (F1 acceptance r6/r9 2026-11-06: "no message_2" = "not held by this bridge").
+#define OZ2_UNREADABLE_HOLDOFF_MS 15000UL
+struct Oz2Holdoff { String addr; unsigned long at = 0; unsigned long ms = 0; };
+static Oz2Holdoff g_oz2Holdoff[OZ_BLE_MAX_LOCKS];
+static void oz2HoldOff(const String &addr, unsigned long ms) {
+  Oz2Holdoff *v = &g_oz2Holdoff[0];
+  for (auto &h : g_oz2Holdoff) {
+    if (h.addr == addr) { v = &h; break; }
+    if (h.at < v->at) v = &h;
+  }
+  v->addr = addr;
+  v->at = millis();
+  v->ms = ms;
+}
+static bool oz2HeldOff(const String &addr) {
+  for (auto &h : g_oz2Holdoff)
+    if (h.addr == addr && h.at && millis() - h.at < h.ms) return true;
   return false;
 }
 
@@ -681,7 +718,10 @@ static void ozBleNotifyCb(BLERemoteCharacteristic *chr, uint8_t *data, size_t le
 
 class OzBleScanCb : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) override {
-    if (!dev.haveServiceUUID() || !dev.isAdvertisingService(BLEUUID(OZL_SVC_UUID))) return;
+    // v1 (…4b31) or v2 (…4b32, ozbleozkie2.h); the connect path tells them apart.
+    if (!dev.haveServiceUUID() ||
+        !(dev.isAdvertisingService(BLEUUID(OZL_SVC_UUID)) ||
+          dev.isAdvertisingService(BLEUUID("4f5a4b32-0001-4c4f-434b-000000000001")))) return;
     const String addr = dev.getAddress().toString();
 
     // XF-144 P2 — a targeted scan is watching for one specific address this
@@ -698,6 +738,7 @@ class OzBleScanCb : public BLEAdvertisedDeviceCallbacks {
     // connect+GATT-discover just to re-learn an identity we already rejected,
     // every 30 s scan, for as long as it stays in range.
     if (ozBleRecentlyRejected(addr)) return;
+    if (oz2HeldOff(addr)) return;                 // an unclaimed v2 lock, released
     portENTER_CRITICAL(&g_bleMux);
     bool dup = false;
     for (uint8_t i = 0; i < g_blePendingCount; i++) if (g_blePending[i] == addr) dup = true;
@@ -760,6 +801,8 @@ static bool ozBleScanFoundFor(const String &target) {
 }
 
 /** Connect + discover + subscribe. Main task only. */
+#include "ozbleozkie2.h"
+
 static bool ozBleConnectOne(const String &addr) {
   OzBleLock *slot = nullptr;
   for (auto &l : g_bleLocks) if (!l.inUse) { slot = &l; break; }
@@ -796,6 +839,8 @@ static bool ozBleConnectOne(const String &addr) {
 
   BLERemoteService *svc = cl->getService(BLEUUID(OZL_SVC_UUID));
   if (!svc) {
+    BLERemoteService *svc2 = cl->getService(BLEUUID(OZ2_SVC_UUID));
+    if (svc2) return oz2Attach(slot, cl, svc2, addr);   // OZKIE v2: relay only
     Serial.printf("[BLE] %s: OZKIE service absent — not a lock, dropping\n", addr.c_str());
     cl->disconnect();
     delete cl;
@@ -960,7 +1005,7 @@ static bool ozBleConnectOne(const String &addr) {
     // (XF-144, 2026-09-02): lets the server correct locks.bridge_id off a
     // real connect event instead of trusting whatever it last wrote.
     const String out = ozBuildLockPresence(slot->deviceId, true, OZ_PRESENCE_ONLINE,
-                                           String(""), lockFw.c_str(), deviceId);
+                                           String(""), lockFw.c_str(), deviceId, 1);
     const String ptopic = "ozkie/" + cfgSiteId + "/locks/" + slot->deviceId + "/presence";
     const bool ok = mqttClient.publish(ptopic.c_str(), out.c_str(),
                                        ozPresenceShouldRetain(true));
@@ -1169,6 +1214,10 @@ static void ozBleCentralTick() {
   // delaying the reap/uplink-drain/rescan work above and below it — and
   // critically keeps mqttClient.loop() (called later in the same main
   // loop()) from being starved, which was the actual mechanism XF-149 traced.
+  oz2PublishUplinks();
+  if (oz2WriteOneDownlink()) return;            // one write per tick, as below
+  if (bbTick()) return;                         // bridge-bond handshake step (ozbridgebond.h)
+
   if (g_bleCmdQCount) {
     OzBleCmdWrite &cmd = g_bleCmdQ[g_bleCmdQHead];
     g_bleCmdQHead = (g_bleCmdQHead + 1) % OZ_BLE_CMDQ;
@@ -1287,6 +1336,7 @@ static void ozBleCentralTick() {
 // harmless, never-first) reader in case call order ever changes, but the
 // real entry point for these commands today is ozBridgeConsolePoll().
 static void ozBlePairConsoleCmd(const String &line) {
+  if (line == "oz2") { oz2PrintCounters(); return; }   // v2 relay counters
   if (line == "paired") {
     Serial.printf("[PAIR] %u paired lock(s):\n", g_pairedCount);
     for (uint8_t i = 0; i < g_pairedCount; i++)
@@ -1400,6 +1450,7 @@ static void ozBlePublishRoster() {
 
 /** Called once BLE is up (startBle() has run BLEDevice::init()). */
 static void ozBleCentralBegin() {
+  bbInit();            // F1-BRIDGE-BOND-1 — the bridge's own key (ozbridgebond.h)
   ozBleLoadPaired();   // P5 F1 — the allowlist decides what we may hold
   g_bleCentralReady = true;
   g_bleLastScanAt = 0;                    // scan on the very next tick

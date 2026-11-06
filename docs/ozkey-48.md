@@ -9,6 +9,17 @@
 > Rev 2 (2026-10-18): server team review folded in: held-credential rollback (§4.3), one active
 > sender per context, the Echo roles corrected, service bond as the audit source, lock-side UTC stamps,
 > MQTT buffer size, and ozlock routing.
+> Rev 4 (2026-10-19, P2 implementation): pairing-code exporter label corrected to the private-use
+> range (§3.4), provisional EAD label for invites (§3.3). Implemented and RFC-vector-tested in
+> `blelock/ozcore` (ozkey-49 P2).
+> Rev 3 (2026-10-18, operator approved via ozkey-50 §9): `issuer` role (§6) and guest-key-bound
+> invites `OZINV2` (§3.3). No server holds bond #0.
+> Rev 5 (2026-11-05, PM nexus-e3 ruling): short id = SHA-256(device_id)[0..3], replacing raw MAC
+> bytes (§2.2, test vectors, 100K-site collision gate). App A: result 35 `PIN_TOO_SHORT`.
+> Rev 6 (2026-11-05, PM nexus-9e GO on ozkey-55 §5b, server ozkey-97 review): the bridge relay.
+> A `relay` characteristic (§2, §2.3), a closed type byte on MQTT (§2.4.1), topics and
+> correlation (§2.4.2), one relay EDHOC per lock (§2.4.3), timers and retries side by side (§2.4.4),
+> failover hand-off (§2.4.5), MQTT buffer sizing (§2.4.6).
 
 ## 0. What changes from v1, in one table
 
@@ -42,6 +53,11 @@ so no part of it is our own invention.
   a standard.
 - **CBOR** (RFC 8949) is a compact binary JSON. The data model is the same as v1's JSON, at
   roughly half the bytes, which matters on BLE.
+- **Why AES-128 instead of v1's AES-256 (operator asked, 2026-10-18):**
+  - It gives 128-bit security, and it is the cipher of BLE, Thread, Zigbee and Matter.
+  - The AK1037 has AES-128 in hardware and lacks AES-256/GCM, so it is faster and uses less battery.
+  - Fresh EDHOC keys per session give **forward secrecy**, which v1 explicitly lacked (claim C18).
+    That is a bigger real-world gain than key length.
 - None of these need a membership, a licence fee or a certification program.
 
 ## 2. Transport: BLE GATT
@@ -53,10 +69,45 @@ New service, so a v1 phone app can never be confused by a v2 lock:
 | Characteristic | UUID | Props | Content |
 |---|---|---|---|
 | `info` | `…0002` | read | CBOR map: `{1: device_id, 2: fw, 3: lock X25519 pub (32 B), 4: state (0 = unclaimed, 1 = claimed), 5: profile}`. Readable without a session. Leaks nothing a scanner couldn't learn by connecting |
-| `ozkie` | `…0003` | write + notify | OZKIE frames (§2.1), both EDHOC and OSCORE |
+| `ozkie` | `…0003` | write + notify | OZKIE frames (§2.1), both EDHOC and OSCORE. A **session** link: the app at the door |
+| `relay` | `…0004` | write + notify | The same frames (§2.1) for the **relay** link: the bridge only (§2.3) |
 
 Advertising, the touch window, the busy flag and the single-connection rule are **unchanged from
 CONTRACT.md**.
+The one exception is the short id (§2.2).
+
+### 2.2 Advertising and the short id (PM ruling 2026-11-05)
+
+ADV (29 of 31 B): flags `06` · complete 128-bit UUID list (the v2 service) · name `OZLOCK`.
+Scan response (23 of 31 B): 128-bit service data for the v2 service = `busy` (1 B: 0 = free,
+1 = a link is up) ‖ **short id** (4 B). Apps scan actively to see it.
+
+**short id = the first 4 bytes of SHA-256(device_id)**, hashed over the device_id's bytes exactly as
+`info` key 1 carries them. There is no case folding and no format assumption, so any maker's id
+format works. The id must be 1..40 bytes; a lock with any other id doesn't advertise.
+
+v1 used the device_id's first 4 MAC bytes. On Espressif boards 3 of those are the vendor OUI, which
+leaves 256 values per site and puts the OUI on the air. A hash spreads evenly whatever the OUI.
+
+The short id is only a **pre-connect filter**. After connecting, the app MUST read `info` and check
+the full device_id, and disconnect on a mismatch. 4 bytes still collide sometimes: at 100K locks,
+about 1 pair is expected.
+
+Test vectors (Python `hashlib.sha256(id.encode()).digest()[:4]`):
+
+| device_id | short id |
+|---|---|
+| `ozk-acebe63acab8` | `2b 9c 2d 79` |
+| `ozk-ACEBE63ACAB8` | `45 21 2d 8d` (no case folding) |
+| `ozk-b0a6048b5fd8` | `84 f5 dc bc` |
+| `x` | `2d 71 16 42` |
+
+Full scan response for `ozk-acebe63acab8`, free:
+`16 21 01 00 00 00 00 00 4b 43 4f 4c 01 00 32 4b 5a 4f 00 2b 9c 2d 79`.
+
+Gate (`test_adv`): a synthetic site of 100 000 Espressif-OUI ids. It requires at most 6 colliding
+short ids (random 32-bit expectation 1.16) and even first-byte buckets. The run on 2026-11-05 gave 0
+collisions; the raw-MAC scheme gave 392 distinct values for the same ids.
 
 ### 2.1 Frame
 
@@ -69,10 +120,163 @@ byte 1…: payload fragment
 
 Messages larger than one write (ATT MTU − 3) are fragmented.
 
-Over MQTT (bridge relay), a frame travels as a **raw binary payload**, never hex or base64. One MQTT
-message carries one whole reassembled OZKIE message. Apps should negotiate MTU 247 at
+Over MQTT (bridge relay), a message travels as a **binary payload**, never hex or base64: one
+type byte, then one whole reassembled OZKIE message (§2.4.1). Apps should negotiate MTU 247 at
 connect. Then every v2 message in this spec fits one frame except credential-by-value
 enrollment (§3.3), which fits two. The maximum reassembled message is 1024 bytes.
+
+### 2.3 Session link and relay link (rev 6)
+
+The lock has two kinds of link, and the characteristic decides which one a write belongs to:
+
+| | `ozkie` (session) | `relay` |
+|---|---|---|
+| Who | the app at the door, **and the bridge's own `bridge` bond** (time), on the bridge's connection | the bridge, carrying the remote senders: the owner's app via ozlock, ozpms, ozlodge |
+| Roles | all, as §6 allows | **admin and service only** (`oz_lock.c`: other roles are refused at message_3) |
+| OSCORE context | one, made by EDHOC on this connection, **gone on disconnect** | one per bond, **persisted** (`r0`..`r15`), found by `kid` |
+| Echo | not needed | required for `lock/unlock`, `lock/lock`, `dev/reset`, and after a reboot (§4.2, App. A) |
+| Members (§4.1) | allowed | refused (on premises only) |
+| First pairing (§3.4) | allowed | refused: an unclaimed lock answers no relay EDHOC |
+
+- The relay carries **only EDHOC and OSCORE-protected OZKIE messages**. There are no plaintext
+  commands on it, so the bridge stays a blind relay and keeps nothing (PM condition 1). It needs no
+  auth of its own: a stranger who writes to it gets exactly what they would get on `ozkie`.
+- **The contexts are isolated per link.** A relay context can't be used, read or reset from the
+  session link, and the reverse. A new handshake or a disconnect on one link leaves the other
+  link's contexts alone. Tested both ways in `test_lock` `link_isolation`. A mutation check
+  confirms it: a session link that falls back to relay contexts actuates an unlock without Echo.
+- When the bridge's connection drops, the lock closes the relay link (`oz_link_close`). That wipes
+  a half-done EDHOC and the link's Echo state. **Completed relay contexts persist.**
+- **Two connections, as v1 has had since 2026-08-30** (`ozdoorlock_core.h` `OZ_BLE_MAX_LINKS 2`,
+  a live bench finding). With one connection, the bridge's permanent link made every app at the
+  door see `busy` forever. A **member** (relay refused, §4.1) would then have no path at all.
+  - **Slot 1, the bridge:** permanent. On it the bridge writes relayed traffic to `relay`, and its
+    own `bridge` bond (time) to `ozkie` as a session.
+  - **Slot 2, the app at the door:** a session on `ozkie`. The `busy` flag and the non-connectable
+    switch (CONTRACT.md [XF-47]) now mean "slot 2 is taken". A connection that holds only `relay`
+    traffic doesn't make the lock busy.
+  - Never more than 2: unbounded connectability is a DoS surface on a lock.
+  - Each connection has its own session `oz_link`. There is **one** relay link. The first
+    connection that writes to `relay` owns it until it disconnects, and `relay` writes from the
+    other connection are dropped and counted.
+  - 🟡 The C6 port supports this (NimBLE, `CONFIG_BT_NIMBLE_MAX_CONNECTIONS`). The AK1037 SDK's
+    peripheral connection count is unverified until the kit (~11-12). If it is 1, the AK1037 lock
+    needs a yield rule (open, ozkey-55), and this section says so then.
+
+### 2.4 Bridge relay over MQTT (rev 6)
+
+#### 2.4.1 Payload
+
+`type (1 B) ‖ message`, binary. The type is a **closed set**:
+
+| byte | meaning |
+|---|---|
+| `0x00` | EDHOC message (§3) or EDHOC error |
+| `0x01` | OSCORE-protected CoAP message (§4) |
+| `0x02` | error (the lock sends none today; a peer's type 2 ends a handshake in progress) |
+
+Any other value is **dropped and counted, never parsed**, by the bridge in both directions, by ozlock
+in both directions (a sender's downlink is refused with 400 before it is published; counters in C0b
+metrics), and by the lock (`oz_lock.rx_bad_type`; it changes no state, not even a handshake in progress). An empty
+payload, or one over 1 + 1024 bytes, is dropped and counted too. The bridge never opens the message.
+
+#### 2.4.2 Topics and correlation
+
+| direction | topic | addressed to |
+|---|---|---|
+| server → lock | `ozkie/<site>/bridges/<bridge_id>/ozkie/<lock_id>` | the **chosen bridge**, so with ≥ 2 bridges only one writes |
+| lock → server | `ozkie/<site>/locks/<lock_id>/ozkie/<bridge_id>` | the **lock** (v1's U3 rule). The server subscribes to `locks/+/ozkie/+` |
+
+- QoS 0, never retained. Loss and duplicates are handled above MQTT (§2.4.4).
+- The trailing `bridge_id` on the uplink is the relaying bridge. Two bridges holding one lock
+  (XF-151) show up as uplinks from two `bridge_id`s.
+- A downlink for a lock this bridge doesn't hold is dropped and counted. It isn't queued or forwarded.
+- **The server correlates OSCORE responses by (lock_id, CoAP token). The `kid` identifies the
+  context on requests only**, because an OSCORE response omits it (RFC 8613 §6.1).
+  - Every sender uses a **random token of ≥ 4 bytes**. ozlock refuses a second in-flight
+    request on the same (lock_id, token).
+  - Observe notifications reuse the registration's token.
+  - A response that matches nothing is dropped and logged.
+
+#### 2.4.3 One relay EDHOC per lock
+
+EDHOC on the relay is raw EDHOC (type 0), not CoAP, so it has no token. The lock's relay link
+holds **one** responder handshake.
+- **The lock:**
+  - drops a handshake waiting for message_3 after **30 s** (`OZ_LOCK_EDHOC_TIMEOUT_MS`);
+  - treats a message_1 that arrives mid-handshake as **abort and restart**: message_1 opens with
+    a CBOR integer (< 0x40), message_3 is a byte string;
+  - resets on a failed message_3 and sends EDHOC error 1.
+- **The server (ozlock)** holds one EDHOC **lease per lock across all senders, 35 s**. A second
+  sender's message_1 is refused as busy and never queued. Every type 0 uplink belongs to the
+  lease holder. A type 0 uplink with no lease open is dropped and logged.
+- With the restart rule, a lease that ends early costs one failed handshake, never two.
+
+#### 2.4.4 Timers and retries
+
+| timer | value | owner | rule |
+|---|---|---|---|
+| message_3 wait | 30 s | lock | half-done handshake dropped (§2.4.3) |
+| relay EDHOC lease | 35 s | server | must outlast the lock's 30 s |
+| Echo validity | 10 s, one use | lock | the repeat after `4.01 + Echo` goes at once, inside 10 s |
+| request timeout | 10 s | each sender | no response in 10 s = lost |
+| pairing window | §3.4 | lock | session link only (no pairing on the relay) |
+| request timeout value | 🟡 provisional | — | 10 s is the §4.2 end-to-end target; F1 measures it on the bench and rev 7 fixes it |
+
+- **These are the SENDER's rules** (the app, ozpms, ozlodge). OSCORE hides the real CoAP method
+  (the outer code is POST/FETCH), so a relay can't tell a read from an unlock. **ozlock's relay
+  never retries, never re-sends and never queues any v2 frame. If the lock's bridge is offline, it
+  fails fast with 503.** That is what makes "a v2 unlock is never held" enforceable on the server
+  (ozkey-97).
+- **No CoAP-layer retransmission.** The lock keeps no response cache. A retransmitted request has
+  the same PIV, so the replay window drops it **with no reply** (RFC 8613 §7.4). Senders send CON
+  or NON, but never resend the same bytes.
+- **A retry is always a new request** with a new PIV and a new token.
+  - **Reads** (CoAP GET, e.g. `lock/state`; an `events` re-registration) may be retried that
+    way, at most twice.
+  - **Actuation (`lock/unlock`, `lock/lock`, `dev/reset`) is never auto-retried.** A lost response
+    is reported as outcome **"unknown"**. The app shows it, and a user's new tap is a new request.
+    **A v2 unlock is never queued or held for later delivery** (PM nexus-9e).
+  - Today's server (ozkey-97, 2026-11-05): nothing re-sends after a lost or late reply. Each
+    pending_queue row is published at most once, then marked `sent` (queue.js:140-144). A reset with
+    no reply reads `unknown`. But **v1** remote unlock is held for 60 s (30 s when assisted) and
+    delivered at the next wake (api.js:1126-1142). That is operator question Q2, and it doesn't
+    carry over to v2: the v2 path is new code and follows this section.
+- Writes with an epoch (`cred`, `bond`) may be retried as a new request. The epoch rule (§4.3) makes
+  a duplicate harmless: the second write gets `STALE_EPOCH` and the current epoch.
+
+#### 2.4.5 Failover hand-off
+
+1. The lock takes one central. Only the bridge holding the BLE link can write to `relay`.
+2. When that link drops, the lock closes its relay link (§2.3) and advertises again. Another bridge
+   connects and announces it in the lock's presence (`via`, XF-144).
+3. The server moves `lock.bridge_id` to the new bridge when its presence carries `via`, using the
+   XF-144 reconciliation and the XF-151 gate: while the current bridge is still confirmed online,
+   the claimant is refused and sent `release_lock`. From then on the server sends to the new
+   bridge's downlink topic. The old bridge drops anything still addressed to it (§2.4.2).
+4. An exchange in flight is pinned to its bridge (EDHOC m1 → m3, or request → `4.01 + Echo` →
+   repeat). If the bridge changes mid-exchange, the server aborts it and starts again on the new
+   bridge. It is never split across bridges. The server aborts the exchanges pinned to the old
+   bridge **as soon as it moves `bridge_id`**, without waiting for the 10 s timeout. An aborted
+   actuation is "unknown" (§2.4.4).
+5. **No new EDHOC is needed after a failover.** The relay contexts are stored on the lock, so the
+   next request just uses them. Actuation needs Echo as always.
+
+#### 2.4.6 MQTT buffer
+
+PubSubClient's buffer holds the whole packet: header + topic + payload.
+
+The largest relayed packet is at most **1,230 B**, taken from the server's column maxima. No new
+length limits are imposed:
+- payload 1 + 1024 = 1,025 B;
+- topic ≤ 200 B: `ozkie/` + `sites.id` ≤ 50 + `/bridges/` + `bridges.id` ≤ 64 + `/ozkie/` +
+  `locks.id` ≤ 64;
+- header 5 B.
+
+The bridge's buffer is **2,048 B**, a margin of about 818 B (40 %). Before, it was 1,024, and a full
+v2 message would have been silently dropped (the 256-byte cliff at a new size). The F1 gate
+sends a maximum-size message in each direction, **with a 50-character site and 64-character ids**
+(not `lab`).
 
 ## 3. Session setup: EDHOC
 
@@ -124,14 +328,45 @@ travels in EDHOC's External Authorization Data field in message_3, encrypted and
 handshake, instead of in a plaintext `member_enroll` write. The nonce replay cache, its
 "successful enrollments only" rule and the idempotent-retry rule carry over unchanged.
 
+**Guest-key binding (🟢 operator approved 2026-10-18, ozkey-50 §4).** An invite can name the one app
+key that may redeem it.
+- **Format:** `OZINV2:`, the same fields as OZINV1 plus:
+  - `bind` = the first 16 bytes of SHA-256 of the redeeming app's X25519 static public key;
+  - `iss` = the issuing bond's id.
+  Both are covered by the invite MAC.
+  - **Naming (P2, 2026-10-19):** the app's existing invite already has a JSON `"v":2` (XF-87, signed
+    membership expiry), still under the `OZINV1:` prefix. So the guest-bound form is **canonical
+    version 3** under the `OZINV2:` prefix:
+    `3|d|i|r|l|n|e|me|bind_hex|iss`, with the same HKDF key as v1/v2.
+    `blelock/ozcore` reproduces ftpos's frozen v1 and v2 MACs byte for byte.
+  - **Transport in EAD_3:** a CBOR array `[v, d, i(32 B), r, l, n(16 B), e, me, m(32 B)
+    (, bind(16 B), iss)]`, not the QR's base64url JSON. The fields and the MAC are unchanged. The app
+    transcodes what it scanned, and the lock needs no JSON or base64 decoder. Labels containing `|`
+    are refused (they would make the canonical string ambiguous), so the app should refuse them at
+    invite time.
+- **Lock check:** EDHOC method 3 already authenticates the initiator's static key (ID_CRED_I), so
+  the lock checks `bind` against the key that just completed the handshake.
+- **On mismatch:** `INVITE_BOUND_ELSEWHERE`, not consumed. The rightful guest can still redeem it.
+- **When required:** `bind` is mandatory on invites created by `issuer`, and optional on admin-made
+  invites. OZINV1 stays valid from admin.
+- **What it buys:** an invite intercepted at a reseller, in Cloudflare, or in a message thread is
+  useless to anyone else.
+- **Vectors:** `OZINV2` vectors are added to the P2 deliverables for ftpos.
+- **EAD label** 🟡 (P2, 2026-10-19): RFC 9528 §10.5 has **no private-use EAD range**. Labels 24–65535
+  are "Specification Required" with IANA. Provisional label **20297** (0x4F49, "OI"), sent as
+  **critical** (−20297), so a lock that doesn't understand it refuses the handshake. It is safe
+  inside our closed system, but before any public release either register it (this doc can serve
+  as the specification) or accept the small collision risk. **Operator's call.**
+
 ### 3.4 First pairing: keypad confirmation code (operator, 2026-10-18)
 
 The operator rejected a QR sticker (labour on every unit, and it can peel off). Instead:
 
 1. On an **unclaimed** lock, after message_3, both sides compute
-   `code = (uint32 big-endian of EDHOC_Exporter(label 0x4F50, context empty, 4 bytes)) mod 10^6`,
-   shown as 6 digits with leading zeros. 0x4F50 is ASCII "OP", for OZKIE pairing; it is a
-   private-use exporter label (RFC 9528 §10.1).
+   `code = (uint32 big-endian of EDHOC_Exporter(label 0xCF50, context empty, 4 bytes)) mod 10^6`,
+   shown as 6 digits with leading zeros. 0xCF50 (53072) is in the private-use exporter label range
+   32768–65535 (RFC 9528 §10.1). **Correction 2026-10-19 (P2):** rev 3 said 0x4F50, which is in the
+   Expert Review range (24–32767), not private use. Nothing had shipped with it.
 2. The app shows the code. The lock beeps and lights its keypad to ask for it.
 3. The owner types the 6 digits and presses confirm on the lock keypad, within **60 s**.
 4. **Match:** bond #0 is created, and the first OSCORE response to the app says `BOND_OK`.
@@ -155,7 +390,9 @@ Every request is a CoAP message (RFC 7252 header, no UDP) protected by OSCORE:
 - AES-CCM-16-64-128, so an 8-byte tag per message.
 - Sender sequence number and replay window per RFC 8613 §7.4.
 - The verb is the encrypted **Uri-Path**. Arguments are a **CBOR** body with integer keys (§5).
-- Responses carry a CoAP code plus a CBOR result `{1: result code (int), …data}`.
+- Responses carry a CoAP code plus a CBOR result `{0: result code (int), …data}`, with data keys
+  as in the §5 table (**rev 4:** the result moved to key 0 because the §5 table already used key 1
+  for data; see Appendix A).
 
 ### 4.1 Two kinds of security context
 
@@ -243,7 +480,7 @@ operation source, alarm code and similar are taken from Matter so we don't inven
 |---|---|---|---|---|
 | `lock/unlock` | POST | `lock.unlock` | member (BLE only), admin (BLE or relay) | — (Echo on relay) |
 | `lock/lock` | POST | (new) | member+ | — |
-| `lock/state` | GET | `lock.state` | member+ | → `{1: lock_state, 2: door_state, 3: battery %}` |
+| `lock/state` | GET | `lock.state` | member+ | → `{1: lock_state, 2: door_state, 3: battery %, 4: battery level (0 ok, 1 low, 2 critical)}`. `lock/lock` answers 5.03 `BATTERY_LOW` at critical; `lock/unlock` is never refused for the battery (ozkey-49 P5-F) |
 | `lock/settings` | GET / PUT | `lock.settings.*` | admin | `{1: volume, 2: autolock, 3: autolock_delay_s}` |
 | `cred` | POST | `cred.put` | admin, service | `{0: epoch, 1: type, 2: cred_id, 3: secret, 4: from, 5: to, 6: uses}` (§4.3) |
 | `cred/<id>` | DELETE | `cred.delete` | admin, service | — |
@@ -290,6 +527,36 @@ Who else observes events:
 - **apps:** their own bond's events over BLE.
 - **residential ozlock:** no service bond and no usage logs, unchanged.
 
+**Wire (built 2026-10-29 for the admin bond, ozkey-49 P5-E0; the service bond and member
+filtering add roles, not fields):**
+- `GET events`: answers 2.05 `{0: OK, 1: next_seq, 2: oldest_seq_held}`.
+  - With **Observe 0** it also registers. There is one registration per BLE session and one per
+    bond on the relay; a new one replaces the old. Optional **Uri-Query `after=N`** is the last
+    seq the reader already has. Without it, the lock sends every event it still holds.
+  - **Observe 1** deregisters. A BLE registration ends with the session. A relay registration ends
+    with a new relay context for that bond, a revoke, or a reboot; re-register after a restart.
+  - Roles today: **admin only**; anyone else gets `FORBIDDEN`.
+- **Notifications:** CoAP NON 2.05 with the registration's token, an increasing Observe value and
+  an OSCORE Partial IV. The payload is one event:
+  `{1: seq, 2: type, 3: time basis (0 none, 1 utc), ?4: utc_s, ?5: actor bond slot, 6: data}`.
+
+  | type | name | data |
+  |---|---|---|
+  | 0 | gap | `{1: events missed}`. `seq` is the first missed |
+  | 1 | keypad lockout | `{1: level (1 = the first, after 5 misses), 2: seconds}` |
+  | 2 | card reader lockout | as type 1, for wrong RFID cards (own counter) |
+  | 3 | battery | `{1: level (0 ok, 1 low, 2 critical), 2: percent}`, on each level change (ozkey-49 P5-F) |
+
+  - Further types (access, alarm, duress, doorbell, bolt) take the next numbers as each
+    is built. A receiver ignores data keys it doesn't know.
+- **Ring and loss:** the lock holds the last **16** events in RAM. When the ring is full the oldest
+  is dropped. A reader that fell behind gets one `gap` event first, then the oldest held.
+  - Notifications are NON and not retransmitted. The receiver detects loss from `seq` and
+    re-registers with `after=` to refill from the ring.
+  - Sequence numbers are 32-bit (modulo 2^32) and never repeat across reboots: the lock reserves
+    them in blocks of 32 in kv. A reboot loses the ring and shows as a jump in `seq`.
+  - A factory reset restarts them at 0.
+
 ## 6. Roles (lock-enforced)
 
 | Role | Gets it how | May |
@@ -298,13 +565,19 @@ Who else observes events:
 | `member` | invite from admin | unlock/lock, state, info, own events, **on premises only** (direct BLE session, never via the bridge, §4.1). Expiry enforced, as since v1 1.58 |
 | `service` | admin enrolls the operator's own ozpms / ozlodge key | credential put/delete/sync, **event observe**. **No actuation**: it cannot unlock (the audit source, §5.1). **Never** bonds or bond #0 (CONTRACT.md "Service bond") |
 | `bridge` | admin enrolls the bridge's key during bridge pairing | **time set only**. No events, nothing that opens a door |
+| `issuer` | admin enrolls the hotel server's (ozlodge's) key. 🟢 **Operator approved 2026-10-18** (ozkey-50 §3) | **Create member invites only**, each with: a validity window ≤ `max_days` (set by admin at enrolment; default 30, range 1–90); `start` ≥ now − 1 h; a guest-key binding (§3.3), which is required. **No actuation, no credentials, no events, no bond or admin verbs.** The lock rejects anything else with `FORBIDDEN`. Admin can revoke it like any bond, and revocation voids the unredeemed invites it issued (by the issuer's bond id in the invite) |
+
+**No server ever holds bond #0** (ozkey-50 §3, server review). The servers hold only `service`,
+`issuer` and the ozpms custodian, whose limits the lock enforces (ozkey-51). Server-side remote unlock
+of hotel rooms is **not** granted. It would need an explicit operator decision recorded here.
 
 ## 7. What other teams need to do (after approval)
 
 - **ftpos (BANOI):** an EDHOC initiator and OSCORE client in Dart. Invite generation is
   unchanged. Recommendation: wrap a C library through FFI (e.g. `ozcore` itself, or the open
   source `uoscore-uedhoc`) rather than write the crypto in Dart. An XF doc follows approval.
-- **bridgeBLE:** relay `ozkie` frames between MQTT and GATT without opening them. It also holds
+- **bridgeBLE:** relay frames between MQTT and the lock's `relay` characteristic without opening
+  them (§2.3, §2.4: the wire, the topics, the timers and the failover are specified there). It also holds
   its own `bridge` bond (time only). The relay part is a small change. 🔴 The MQTT buffer today is
   `setBufferSize(1024)` (`bridgeBLE.ino:2922`), and that buffer includes the topic and header. A
   full 1024-byte v2 message (a large `cred/sync`) would be **silently dropped**, the known 256-byte
@@ -355,3 +628,74 @@ Who else observes events:
 - No Ed25519 in the lock for the protocol. Firmware-image signing is the AK1037 secure-boot
   RSA/SM2 chain (ozkey-49 §3) and is separate.
 - No change to the CH584M-era sims (`dlch584m_19/147`). They stay on v1 until retired.
+
+## Appendix A — wire details fixed by the P2 implementation (rev 4, 2026-10-19)
+
+These are the choices `blelock/ozcore` (`oz_lock.c`) makes where the text above was silent. They
+are tested end to end in `tests/test_lock.c`. Server and app builds should match them; raise any
+disagreement before S3 interop.
+
+**Credentials.** `CRED_x` for every party is the canonical 44-byte CCS
+`a1 08 a1 01 a3 01 01 20 04 21 58 20 ‖ X25519 public key`, i.e.
+`{8: {1: {1: 1 (OKP), -1: 4 (X25519), -2: x}}}`.
+- The lock's `ID_CRED_R` is `{4: h'00'}`.
+- A bonded app's `ID_CRED_I` is `{4: h'<slot>'}`, sent in compact form as the one-byte integer.
+- An app that is not yet bonded sends `{14: CCS}` (kccs). The lock accepts only the canonical form
+  above, so both sides hash identical bytes.
+
+**Connection IDs.** The lock picks `C_R` = `0x01` on BLE. On the relay it picks the first value in
+`0x02…0x17` that no stored relay context uses as its Recipient ID. The relay finds a context by
+the OSCORE `kid`.
+
+**Pairing (§3.4).** After message_3 on an unclaimed lock, the app sends `POST pair` (no body). The
+lock holds the response until the keypad answers:
+- `2.04 {0: BOND_OK, 1: 0}` on a match;
+- `4.01 {0: PAIR_FAILED}` on a mismatch or timeout.
+
+Any other request during pairing gets `4.03 {0: PAIR_PENDING}`. The owner's later sessions use
+`ID_CRED_I = {4: h'00'}`.
+
+**Extra verb.** `POST bond {0: epoch, 1: role (3 service, 4 bridge, 5 issuer), 2: pub (32 B),
+3: label, 4: max_days (issuer, 1–90, default 30)}`, admin only, answers
+`{0: BOND_OK, 1: slot, 2: epoch}`. It is the enrolment §6 describes.
+
+**State-changing answers** carry the new epoch at key 2, and `STALE_EPOCH` carries the current
+epoch at key 1. Cred and bond listings never include secrets: bonds show the first 8 bytes of
+the key as a tag.
+
+**Echo.** It is required on the relay for `lock/unlock`, `lock/lock` and `dev/reset`. After a
+lock reboot it is required on the first request of each restored relay context (B.1.2). The Echo
+value is 8 random bytes, good for one use within 10 s.
+
+**Result codes** (§5; names as in v1, ozkey-28 §4):
+
+| int | name | int | name |
+|---|---|---|---|
+| 0 | OK | 20 | CRED_NOT_FOUND |
+| 1 | UNLOCK_OK | 21 | EXPIRED |
+| 2 | LOCK_OK | 22 | STALE_EPOCH |
+| 3 | BOND_OK | 23 | FORBIDDEN |
+| 4 | MEMBER_OK | 24 | BOND_DENIED |
+| 5 | REVOKE_OK | 25 | MEMBER_REPLAY |
+| 6 | CRED_OK | 26 | MEMBER_FULL |
+| 7 | TIME_OK | 27 | MEMBER_EXPIRED |
+| 8 | PAIR_PENDING | 28 | INVITE_BOUND_ELSEWHERE |
+| 16 | DENIED | 29 | PAIR_FAILED |
+| 17 | BAD_REQUEST | 30 | PAIR_LOCKED_OUT |
+| 18 | UNSUPPORTED | 31 | NOT_FOUND |
+| 19 | NO_SLOT | 32 | REVOKE_DENIED |
+| | | 33 | TIME_REJECTED |
+| | | 34 | BATTERY_LOW |
+| | | 35 | PIN_TOO_SHORT |
+
+`PIN_TOO_SHORT` (2026-11-05, PM ruling): a `cred` POST or a `cred/sync` entry of type PIN with fewer
+than `OZ_LOCK_PIN_MIN` = 6 digits. A sync with one such entry is refused whole and changes nothing.
+Other malformed creds stay `BAD_REQUEST`. The relay can't see sealed digits, so the lock and the
+app enforce this; the server can't.
+
+EDHOC-stage refusals (`BOND_DENIED`, `MEMBER_REPLAY`, `INVITE_BOUND_ELSEWHERE`, `PAIR_LOCKED_OUT`, …)
+travel as EDHOC error code 1 with the name as the text.
+
+**Not built yet:** `events` for the service bond and members (admin is built, §5.1), `lock/settings`, custodial mode (ozkey-51), `ozkie_version` on
+the bridge. 🟡 The Matter enum values (lock state 0/1/2, credential types PIN 1, RFID 2,
+Fingerprint 3) are still unchecked against the Matter 1.x spec.

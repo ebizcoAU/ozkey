@@ -244,7 +244,14 @@ static char g_advName[16] = BLE_NAME;
 //             about this device: a doorlock (LockB) had taken Leader and the
 //             border router was hanging off it.
 // Own namespace, forked from bridge32-1.44 (2026-08-29) — see file header.
-#define FW_VERSION "bridgeBLE-0.44"
+// 0.45 (2026-11-06): the F1 OZKIE v2 relay (02becd8), which shipped as 0.44 by mistake.
+// 0.46 (2026-11-06): F1-BRIDGE-LOG-1, a downlink dropped while queued is logged (was silent).
+// 0.47 (2026-11-06): F1-BRIDGE-BOND-1, the bridge's own `bridge` bond (EDHOC on
+//      `ozkie`, key in NVS, ozkie_pub in presence + info); never holds an
+//      UNCLAIMED v2 lock (released, 60 s hold-off).
+// 0.48 (2026-11-06): a v2 lock whose `info` read fails (mid-reboot) is retried
+//      after 15 s, not the 5 min stranger cooldown (F1 acceptance r6/r9).
+#define FW_VERSION "bridgeBLE-0.48"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -305,6 +312,7 @@ static unsigned long g_lastRosterBroadcastAt = 0; // XF-144 Phase 2, declared he
 static void ozBleStartTargetedScan(const String &target, uint32_t durationS);
 static void ozBlePairConsoleCmd(const String &cmd); // paired/seen/pair/unpair, see ozBridgeConsolePoll()
 static bool ozBleAtCapacity(); // true when ozBleConnectedCount() == OZ_BLE_MAX_LOCKS
+static bool oz2OnMqtt(const char *topic, const byte *payload, unsigned int len); // v2 relay, ozbleozkie2.h
 static bool ozBleScanSlotFree(); // XF-144 Phase 2 retry fix, added 2026-09-02 — fwd, defined in ozblecentral.h
 static bool ozBleScanIsFor(const String &target);   // ditto
 static bool ozBleScanFoundFor(const String &target); // ditto
@@ -951,12 +959,20 @@ bool hexToBytes(const String &hex, uint8_t *out, size_t expectLen) {
 // ─────────────────────────────────────────────────────────────────────────────
 // info characteristic — refreshed whenever Thread state changes
 // ─────────────────────────────────────────────────────────────────────────────
+// F1-BRIDGE-BOND-1: this bridge's public key (hex), set by bbInit()
+// (ozbridgebond.h). Defined here because refreshInfo() precedes that header.
+String g_bbPubHex;
+
 void refreshInfo() {
   if (!chrInfo) return;
   JsonDocument doc;
   doc["device_id"] = deviceId;
   doc["mac"] = macStr;
   doc["fw"] = FW_VERSION;
+  // The AUTHORITATIVE copy of the bridge's key for enrolment (ozkey-48 rev 7):
+  // the app reads it here, in BLE range, and refuses on a mismatch with the
+  // server's TOFU-pinned copy.
+  if (g_bbPubHex.length()) doc["ozkie_pub"] = g_bbPubHex;
   doc["transport"] = "bridge";
   doc["mode"] = cfgMode; // F1: stored personality ("mqtt-uplink" | "matter-bridge")
   doc["thread_role"] = thread ? OpenThread::otGetStringDeviceRole() : "disabled";
@@ -1027,6 +1043,9 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   // Incoming WiFi/MQTT traffic — no ladder status step of its own, so wake
   // the screen explicitly here (2026-07-27).
   lcdWake();
+  // OZKIE v2 downlink: a binary payload, so it is taken BEFORE the String/JSON
+  // handling below ever sees it (ozkey-48 rev 6 §2.4).
+  if (oz2OnMqtt(topic, payload, len)) return;
   String body;
   body.reserve(len);
   for (unsigned int i = 0; i < len; i++) body += (char)payload[i];
@@ -2886,11 +2905,21 @@ void mqttConnect() {
     // Clear our own will immediately. Until this lands the retained value at
     // that topic is still "offline" from last time, so a server reading it in
     // the gap would call a live bridge dead.
+    // F1-BRIDGE-BOND-1: + "ozkie_pub" (64 hex) when the bridge key is up;
+    // ~137 B, under the 256 B PubSubClient cliff. A convenience copy: the
+    // server pins it on first sight (TOFU); the BLE info value is authoritative.
     const String online = String("{\"state\":\"online\",\"id\":\"") + deviceId +
-                          "\",\"role\":\"bridge\"}";
+                          "\",\"role\":\"bridge\"" +
+                          (g_bbPubHex.length() ? String(",\"ozkie_pub\":\"") + g_bbPubHex + "\"" : String("")) +
+                          "}";
     mqttClient.publish(willTopic.c_str(), online.c_str(), true /*retain*/);
     Serial.printf("[MQTT] presence ONLINE -> %s\n", willTopic.c_str());
     mqttClient.subscribe(mqttCommandTopic.c_str());
+    {
+      const String v2 = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/ozkie/+";
+      mqttClient.subscribe(v2.c_str());           // OZKIE v2 downlink (ozkey-48 rev 6 §2.4.2)
+      Serial.printf("[MQTT] subscribed %s\n", v2.c_str());
+    }
     if (mqttCommandTopicLegacy.length())
       mqttClient.subscribe(mqttCommandTopicLegacy.c_str()); // S16 transition
     Serial.printf("[MQTT] subscribed %s\n", mqttCommandTopic.c_str());
@@ -2919,7 +2948,10 @@ void mqttBegin() {
   // through. That is exactly why bench tests passed and the app never worked.
   // 1024 leaves headroom for the ozkey-06 sealed envelope, which will be
   // larger again (ver+counter+nonce+ciphertext+tag, hex-encoded).
-  mqttClient.setBufferSize(1024);
+  // 2048 for OZKIE v2 (ozkey-48 rev 6 §2.4.6): the largest relayed packet is
+  // ≤ 1,230 B (1 + 1024 payload, a topic ≤ 200 B from the server's column
+  // maxima, 5 B header). 1024 would silently drop a full v2 message.
+  mqttClient.setBufferSize(2048);
   mqttConnect();
 }
 
@@ -2950,9 +2982,10 @@ static void ozBridgeConsolePoll() {
     if (!cmd.length()) continue;
 
     if (cmd == "id") {
-      Serial.printf("[BENCH] device_id=%s fw=%s broker=%s:%u mode=%s\n",
+      Serial.printf("[BENCH] device_id=%s fw=%s broker=%s:%u mode=%s ozkie_pub=%s\n",
                     deviceId.c_str(), FW_VERSION, cfgBrokerHost.c_str(),
-                    cfgBrokerPort, cfgMode.c_str());
+                    cfgBrokerPort, cfgMode.c_str(),
+                    g_bbPubHex.length() ? g_bbPubHex.c_str() : "(none)");
     } else if (cmd.startsWith("setbroker ")) {
       String arg = cmd.substring(10);
       arg.trim();

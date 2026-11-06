@@ -65,7 +65,7 @@ int oz_port_random(uint8_t *out, size_t len)
 
 /* ── In-memory kv ────────────────────────────────────────────────────────── */
 
-#define KV_SLOTS     32
+#define KV_SLOTS     48              /* the lock engine uses up to 36 keys */
 #define KV_KEY_MAX   32
 #define KV_VALUE_MAX 1024
 
@@ -76,7 +76,40 @@ static struct {
     int     used;
 } kv[KV_SLOTS];
 
+static const char *kv_path;         /* optional backing file (host lock) */
+
 void oz_host_kv_reset(void) { memset(kv, 0, sizeof kv); }
+
+/* Write the whole table to <path>.tmp, then rename: a crash leaves either
+ * the old file or the new one, the same atomicity a real port must give. */
+static void kv_flush(void)
+{
+    if (!kv_path)
+        return;
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s.tmp", kv_path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f)
+        return;
+    size_t ok = fwrite(kv, sizeof kv, 1, f);
+    fclose(f);
+    if (ok == 1)
+        rename(tmp, kv_path);
+}
+
+int oz_host_kv_file(const char *path)
+{
+    kv_path = path;
+    memset(kv, 0, sizeof kv);
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return OZ_OK;                   /* first run: empty */
+    size_t ok = fread(kv, sizeof kv, 1, f);
+    fclose(f);
+    if (ok != 1)
+        memset(kv, 0, sizeof kv);       /* wrong size: start fresh */
+    return OZ_OK;
+}
 
 static int kv_find(const char *key)
 {
@@ -106,6 +139,7 @@ int oz_port_kv_set(const char *key, const uint8_t *buf, size_t len)
     memcpy(kv[i].val, buf, len);
     kv[i].len = len;
     kv[i].used = 1;
+    kv_flush();
     return OZ_OK;
 }
 
@@ -114,14 +148,19 @@ int oz_port_kv_erase(const char *key)
     int i = kv_find(key);
     if (i < 0) return OZ_E_NOT_FOUND;
     memset(&kv[i], 0, sizeof kv[i]);
+    kv_flush();
     return OZ_OK;
 }
+
+static uint64_t advanced_ms;
+
+void oz_host_advance_ms(uint64_t ms) { advanced_ms += ms; }
 
 uint64_t oz_port_monotonic_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u + advanced_ms;
 }
 
 void oz_port_log(const char *fmt, ...)

@@ -60,11 +60,11 @@ void oz_sw_aes128_encrypt_block(const uint8_t key[16], const uint8_t in[16],
             for (int c = 0; c < 4; c++) {
                 uint8_t *p = t + 4 * c;
                 uint8_t a0 = p[0], a1 = p[1], a2 = p[2], a3 = p[3];
-                uint8_t all = a0 ^ a1 ^ a2 ^ a3;
-                p[0] ^= all ^ xtime(a0 ^ a1);
-                p[1] ^= all ^ xtime(a1 ^ a2);
-                p[2] ^= all ^ xtime(a2 ^ a3);
-                p[3] ^= all ^ xtime(a3 ^ a0);
+                uint8_t all = (uint8_t)(a0 ^ a1 ^ a2 ^ a3);
+                p[0] = (uint8_t)(a0 ^ all ^ xtime((uint8_t)(a0 ^ a1)));
+                p[1] = (uint8_t)(a1 ^ all ^ xtime((uint8_t)(a1 ^ a2)));
+                p[2] = (uint8_t)(a2 ^ all ^ xtime((uint8_t)(a2 ^ a3)));
+                p[3] = (uint8_t)(a3 ^ all ^ xtime((uint8_t)(a3 ^ a0)));
             }
         }
         for (int i = 0; i < 16; i++)

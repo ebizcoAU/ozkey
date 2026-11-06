@@ -82,8 +82,8 @@ roadmap), and the bridge's OZKIE end. A new chip only needs a new `port/` direct
 
 | Need | AK1037 hardware | Plan |
 |---|---|---|
-| SHA-256 / HKDF | ✅ `hal_hash` SHA-256/384/512 | HW hash; HKDF in core |
-| RNG | ✅ `hal_trng` | HW |
+| SHA-256 / HKDF | 🟡 `hal_hash` lists SHA-256/384/512, **but the shipped `hal_hash.h` enables only SM3** (`SUPPORT_HASH_SHA256` is not defined) | **Software for now** (correction 2026-10-18, P3). Bench-test the engine's SHA-256 at P4, then switch. HKDF in core |
+| RNG | ✅ `hal_trng` (true-random mode, health test) | HW, one word per ready flag, conditioned through SHA-256, with a stuck-output check. The SDK's own burst read takes several words per ready flag (see §7, next email) |
 | X25519 | 🟡 PKE microcode exists (`C25519_PMUL`), **no HAL API** | Asked Anyka 2026-10-18. Until then software (Monocypher 4.0.2, vendored) |
 | Ed25519 | 🟡 microcode, no API | **Not needed**: ozkey-48 uses EDHOC method 3 (static DH), with no signatures |
 | AEAD | 🟡 AES-128 + SM4, ECB/CBC/CFB/OFB/CTR; **no AES-256, no GCM/CCM** | v2 suite = **AES-128-CCM** (EDHOC suite 0): HW AES block + CCM mode in core. Asked Anyka whether HW GCM/CCM exists |
@@ -95,13 +95,857 @@ roadmap), and the bridge's OZKIE end. A new chip only needs a new `port/` direct
 |---|---|---|---|
 | P0 | `ozcore` skeleton + `port/host`, CMake, unit tests; Monocypher vendored | No | `ctest` green on macOS. 🟢 **DONE 2026-10-18**: `blelock/ozcore/`, 35 RFC/FIPS known-answer checks + 20k-case AES-CCM differential vs OpenSSL, all pass |
 | P1 | Move bond / member / expiry / cred-store (ozkey-47) logic into `ozcore`, behaviour-matched to `ozdoorlock_core.h` | No | The same test vectors pass that `ozdoorlock_core` passes today |
-| P2 | OZKIE v2 in `ozcore` (ozkey-48 approved 2026-10-18): EDHOC + OSCORE + CBOR, keypad pairing code. Deliverables for ftpos (XF-387 §5): host test lock over a socket, byte-exact vectors, and, if FFI is chosen, a reproducible iOS xcframework + Android per-ABI `.so` | No | Interop test: host lock ⇄ host "app" (Python); mobile libraries build bit-identical twice |
-| P3 | Toolchain: build `ozcore` with the Anyka RISC-V GCC. **The tools are Windows-only.** The operator has a Windows machine firmware can use (2026-10-18; access method TBD). Linux/macOS tools are also asked of Anyka | No (compile only) | `.bin` links; size report against 2/4 MiB flash, 218 KiB SRAM |
+| P2 | OZKIE v2 in `ozcore` (ozkey-48 approved 2026-10-18): EDHOC + OSCORE + CBOR, keypad pairing code. Deliverables for ftpos (XF-387 §5): host test lock over a socket, byte-exact vectors, and, if FFI is chosen, a reproducible iOS xcframework + Android per-ABI `.so` | No | Interop test: host lock ⇄ host "app" (Python); mobile libraries build bit-identical twice 🟡 **MOSTLY DONE 2026-10-19:** CBOR, EDHOC (method 3), CoAP, OSCORE, invites and the lock engine (`oz_lock`: pairing code, roles, invites v1/v2/v3, creds with epoch, Echo on relay, persisted relay contexts across reboot) are in `ozcore`.
+- **RFC vectors:** RFC 9529 §3 and RFC 8613 App. C 1–8 pass byte for byte, as do ftpos's frozen invite MACs.
+- **Host test lock** `ozhostlock` (TCP 7001 BLE / 7002 relay) and the **independent Python app** `tools/ozapp.py` (written from the RFCs) pass a 20-step interop scenario.
+- **8/8 ctest suites** pass, and the key rules were mutation-checked.
+- **Still to do:** `events` Observe, `lock/settings`, custodial mode (ozkey-51), mobile FFI libraries, AK1037 rebuild with the new sources |
+| P3 | Toolchain: build `ozcore` with the Anyka RISC-V GCC. **The tools are Windows-only.** The operator has a Windows machine firmware can use (2026-10-18; access method TBD). Linux/macOS tools are also asked of Anyka | No (compile only) | `.bin` links; size report against 2/4 MiB flash, 218 KiB SRAM. 🟢 **DONE 2026-10-18** (details below) |
 | P4 | `port/ak1037` on the dev board: GATT service, littlefs KV, HW crypto, TRNG, RTC | **Yes** (dev board) | ozkit suite: pair, unlock, member add/revoke over BLE |
 | P5 | Peripherals: touch keypad PIN, RFID 13.56 MHz, fingerprint enrol/match, motor H-bridge | **Yes** (+ peripherals) | ozkit suite on real parts |
 | P6 | Power: sleep / advertising / connection current against the datasheet (4 / 31 / 40 µA); secure boot; OTA via the bridge | **Yes** | Measured µA table; signed-OTA round trip |
 
 P0–P3 can start now. P4 onwards waits for the AK1037 kits.
+
+### Commit gate (firmware; PM nexus-a8 ruling 2026-10-29)
+
+Firmware commits on its own branch; only the PM merges to main. Commit only when the gate passes:
+
+- `blelock/ozcore/tools/gate.sh <label>` exits 0. It runs ctest from clean build directories, three
+  ways:
+  - **default build** (no build type), so `assert()` and littlefs's `LFS_ASSERT` are live
+  - **Release** (NDEBUG), the optimised code
+  - **ASan + UBSan**, where any sanitizer report fails the run
+- The ruling requires the sanitizer pass for any change under `port/`, `common/` or `src/`. The
+  script runs it every time, which costs about a minute.
+- The log is written to `nexus-lab-backups/ozkey_notes/ctest/<date>_<label>.log`. Cite it in the
+  report to the PM.
+- Why: until 2026-10-29 the gate was Release-only. That compiled out the littlefs assert that, in a
+  default build, exposed the kv bug fixed in 4389aa5 (P4-prep item 2 below).
+- `blelock/common/` (the Arduino-era sketches' headers) is **out of scope**. None of it links into
+  the AK1037 images: the ozcore build includes only `ozcore/{include,port/common,third_party}` and SDK
+  paths (checked 2026-10-29). `ozcore/port/common` is a different directory, and the gate covers it.
+
+### P3 result (2026-10-18, Windows build host, SysGCC RISC-V GCC 10.1.0)
+
+- **`port/ak1037/oz_port_ak1037.c`** (new):
+  - AES-128 on the SKE engine, ECB, with a FIPS-197 self-test on first use that falls back to
+    software. Interrupts are off around each use, since the driver isn't re-entrant. The key
+    registers are overwritten afterwards, because `hal_ske_final()` leaves the key in them.
+  - TRNG as above; software SHA-256; Monocypher X25519.
+  - `get_ms_tick_func()` extended from 32 to 64 bits.
+  - kv returns `OZ_E_HW` until P4. Plan: the SDK's **littlefs** (power-loss safe, so the atomic-set
+    rule holds).
+- **Build:** `make -f port/ak1037/Makefile`. The core gets the same `-Wpedantic -Wconversion -Werror`
+  as the host build.
+  - GCC 10 found two real 32-bit issues the Mac's clang didn't: MixColumns integer promotion, and
+    a CCM AAD-length test that's always true when `size_t` is 32-bit. Both are fixed.
+  - Host tests still pass after the fixes.
+- **Link:** the SDK `app_mcu` objects plus `libozcore.a`, with the v2 primitives forced in as GC roots.
+  This is a separate `app_mcu_oz.elf`, so the SDK image is untouched.
+
+  | | text | data | bss |
+  |---|---|---|---|
+  | SDK `app_mcu` | 708,496 | 2,024 | 16,132 |
+  | + ozcore | 721,428 | 2,024 | 16,156 |
+  | **Δ** | **+12,932** | 0 | **+24** |
+
+  That is ~0.7 MB of 2 MiB flash. EDHOC/OSCORE/CBOR (P2) will add to it, estimated 15–25 KB more.
+- **No symbol collisions** with the SDK libraries.
+- **Stack:** the deepest frame is ~1 KB (HKDF → HMAC → SHA-256). Give the OZKIE thread **≥ 4 KB** once
+  EDHOC is in.
+- **Not run:** no board yet. The self-tests and KATs run on the device at P4.
+
+### P3b result (2026-10-29, VictorPC, SysGCC RISC-V GCC 10.1.0): the full P2 stack
+
+The 10-18 build was crypto only. This one is everything P2 added: CBOR, EDHOC, CoAP, OSCORE,
+invites and the lock engine.
+
+- **Build host:** VictorPC (Windows 11). It's the permanent station, so Mac2 Boot Camp is no
+  longer needed. All 11 objects build at the same `-Werror` level as before, with no new warnings.
+- **Reproducible:** the SDK stamps `__DATE__`/`__TIME__` into three files. With
+  `SOURCE_DATE_EPOCH` pinned, two clean `app_mcu` builds give a byte-identical `.bin`.
+- **Library** (`libozcore.a`): text 81,931, bss 1,252. Monocypher is 48.6 KB of that before
+  dead-code removal (`--gc-sections`).
+- **Link** (`port/ak1037/link_app_mcu.ps1`): builds `app_mcu_oz.elf`. The SDK's own image is
+  untouched.
+
+  | | text | data | bss |
+  |---|---|---|---|
+  | SDK `app_mcu` | 708,496 | 2,024 | 16,132 |
+  | + ozcore, realistic (`-RootPattern '^oz_lock_'`: the API the app calls) | 745,132 | 2,024 | 17,384 |
+  | + ozcore, upper bound (every global, all of Monocypher) | 787,036 | 2,024 | 17,384 |
+  | **Δ realistic** | **+36,636** | 0 | **+1,252** |
+
+  The P3 estimate was 13 + 15–25 KB, and this is in line with it.
+  - On a 2 MiB part: two ~750 KB OTA banks plus the bootloader and a littlefs partition leave
+    under 0.5 MiB of headroom. It fits, but it's tight, which is why the 2 vs 4 MiB question to
+    Anyka matters.
+  - On 4 MiB there's no concern.
+- **RAM:** `sizeof(oz_lock)` is **5,864 B** on rv32, allocated by the app. Plus 1,252 B bss and
+  the thread stack below, ozcore needs about 15 KB of the 218 KiB SRAM.
+- **Stack** (`-fcallgraph-info=su`, `tools/stack_report.py`): worst-case chain per entry point,
+  not counting indirect calls.
+
+  | entry | bytes | deepest chain |
+  |---|---|---|
+  | `oz_lock_rx` | **5,328** | rx_oscore (2,176) → admin `dev/reset` re-runs oz_lock_init (1,936) → X25519 |
+  | `oz_lock_init` | 2,768 | init (1,936) → X25519 |
+  | `oz_lock_pair_code` / `_tick` | ~1,560 | pair_finish → OSCORE protect → CCM → AES → log (224) |
+  | `oz_lock_keypad_pin` | 1,184 | save_creds (1,056) → CBOR |
+
+  - Not included: indirect calls (the app hooks, the EDHOC `dh`/`resolve_peer` callbacks,
+    OSCORE `next_ssn` persist → kv), plus libc and the SDK.
+  - CBOR `skip_item` is the only recursion. It's capped at `OZ_CBOR_MAX_DEPTH` 8 × 48 B, so
+    hostile CBOR can't overflow the stack.
+  - **Give the OZKIE thread an 8 KB stack**, up from the ≥ 4 KB said at P3. Check it on silicon
+    at P4 with RT-Thread's stack high-water mark.
+  - Follow-up worth doing: `rx_oscore` (2,176 B) and `oz_lock_init` (1,936 B) have large local
+    frames. Moving their buffers into `oz_lock` would cut the worst case by about 3 KB.
+- **Not run:** there's still no board.
+
+### P4-prep item 2 (2026-10-29): kv on littlefs, power-cut tested on the host
+
+- **Code:**
+  - `port/common/oz_kv_lfs.c` holds the kv logic. Each key is one file, `oz.<key>`.
+  - A set writes `oz.<key>.t` and then `lfs_rename`s it over the old file. littlefs commits a
+    rename atomically, which satisfies the `oz_port.h` rule (old value or new, never a mix).
+    Leftover `.t` files are swept at attach.
+  - The same file is built by the host CMake (against upstream littlefs) and by the AK1037
+    Makefile (against the SDK's `lfs.h`).
+- **Why not the SDK's `ak_lfs` wrapper:**
+  - It has no remove or rename.
+  - It never formats; it expects a pre-built `lfs.bin` to be burned.
+  - 🔴 It reads through the XIP window straight after programming, with
+    `hal_dcache_flush_all()` commented out, so a read-back can return stale cached data.
+  - Our block device (`port/ak1037/oz_port_ak1037.c`) reads with `spi_flash_read()` instead.
+    It mounts its own **`OZKV`** partition and formats it on first boot. A mount that can't be
+    repaired also ends in a format, which leaves the lock unpaired, the same as a factory reset.
+- **The SDK's littlefs is upstream v2.4.1**, checked by diff:
+  - Changes are cosmetic only: CRLF, blank lines, `\r\n` in trace output.
+  - `lfs_util.h` adds `LFS_THREADSAFE` under RTOS, `LFS_NO_ASSERT`, and its own allocator.
+  - The host test vendors upstream v2.4.1 (`third_party/littlefs`, BSD-3), so it tests the same
+    filesystem code.
+- **Host test `kv_lfs`** (ctest 9/9 now):
+  - Geometry matches AK1037: RAM NOR, 256 B pages, 4 KiB sectors, 64 KiB.
+  - Program only clears bits. A power cut tears the operation in flight (half a page, or half a
+    sector erased), then everything fails until a "reboot" remounts the image.
+  - The sweep cuts every flash operation of a replace, a create and an erase. Results: always
+    old-or-new, an OK return always means committed, no temp files left, always mountable, other
+    keys untouched.
+  - A 3,000-operation soak with 192 random cuts stays consistent.
+  - The full working set (16 bonds, 16 relay contexts, creds, keys) fits in 64 KiB and survives
+    3,200 rewrites.
+  - littlefs never asked the flash for a 0→1 program.
+  - **Mutation check:** writing the final file directly, without temp+rename, fails the test.
+    A cut while creating a key leaves an empty file (8 cut points), and the soak goes
+    inconsistent. Replacing an existing key is atomic even without the rename, because littlefs
+    file writes are copy-on-write; the rename is what protects *new* keys.
+  - 🔴 **Bug fixed 2026-10-29 (item 4b work):** `oz_kv_lfs.c` passed littlefs a
+    `struct lfs_file_config` that lived only for the open call. littlefs keeps that pointer
+    (`file->cfg`) and commits `cfg->attr_count` user attributes from `cfg->attrs` on every
+    sync/close, so each close read a dead stack frame and could write garbage attributes into
+    the metadata. It would have happened on silicon too, unchecked (the SDK's `lfs_util.h` sets
+    `LFS_NO_ASSERT`). Found because the soak's cut count depended on the optimization level
+    (Debug 200 vs Release 192); ASan at -O2 then named it as stack-use-after-scope. The config
+    now lives in a `kv_file` alongside the file and its cache. The count is 192 under every
+    -O level and stack-init pattern, and the whole ctest is clean under ASan+UBSan.
+  - The same review found that the test kept running littlefs after a simulated cut, which
+    silicon can't do (the CPU stops), and littlefs's own assert fired on it. Release gates hid
+    this because NDEBUG compiled the assert out. A cut now longjmps back to the test, and the
+    host littlefs build keeps its asserts on in every build type.
+  - 🟢 **Item 2 re-verified after the fix (4389aa5):** every result above still holds (sweep
+    old-or-new / OK-means-done / no temp / mountable, 192-cut soak, 79 checks). It passes the full
+    gate (default, Release, ASan+UBSan). **Mutation check of the gate:** with the pre-fix
+    `oz_kv_lfs.c` put back, default and Release still pass and only the ASan leg fails
+    (stack-use-after-scope in `lfs_file_rawsync`). That's why the sanitizer pass is part of the gate.
+  - 🔴 **Remount after any I/O error (PM ruling 2026-10-29, item 4b work):** littlefs 2.4.1 keeps a
+    stale program cache after a failed prog. `oz_kv_lfs` now unmounts and remounts from flash
+    after any `OZ_E_HW`, and retries the mount before the next call if that fails. The new host
+    case `ioerr` fails each prog of a replace in turn with the power still on, and checks
+    old-or-new, no temp left, other keys intact, and usable with no reboot (5 failing progs, all
+    pass). **Mutation check:** without the remount, the asserts-on build aborts on the stale cache,
+    and with asserts off (as on silicon) 4 of the 5 break old-or-new. That is real corruption from
+    one transient flash error.
+  - A second 2.4.1 quirk surfaced along the way: creating a file reports **any** failed commit as
+    `LFS_ERR_NAMETOOLONG` (`lfs_file_rawopencfg`). `oz_kv_lfs` had mapped that to `OZ_E_ARG`, so a
+    flash error looked like a bad key and skipped recovery. Our names are ≤ 21 chars against
+    littlefs's 255, so it now maps to `OZ_E_HW`.
+- **AK1037 build:** `-Werror` clean.
+  - Link: text 749,100 (**+3,968** over P3b, kv plus the SDK's `lfs.c`, which `app_mcu`
+    previously garbage-collected); bss +252.
+- **Stack with littlefs on the path** (SDK `lfs.c` built with `-fcallgraph-info`):
+  - Single-pass worst case is `oz_lock_rx` at **6,128 B** (dev/reset → init → kv_set → rename →
+    dir_commit). Each kv call costs about 1.5–1.6 KB.
+  - littlefs 2.4.1 also recurses (`dir_commit`↔`dir_compact`/`dir_drop`, `dir_traverse`).
+    Upstream removed recursion in 2.5, but the SDK ships 2.4.1.
+  - **Raise the OZKIE thread to 12 KB until it's measured on silicon.** SRAM is not the limit
+    (≈19 KB of 218 KiB in total).
+- **Needs the burn config (item 5):** an `OZKV` partition, sector-aligned, ≥ 16 KiB; 64 KiB
+  recommended.
+- **Default 2 MiB layout** (`tools/burntool/config_app_mcu.txt`, KB):
+
+  | OTA | PROG | LP | ROMFS | UDATA | FPDAT | total |
+  |---|---|---|---|---|---|---|
+  | 212 | 780 | 44 | 210 | 100 | 628 | 1,974 / 2,048 |
+
+  - Our realistic image (751,124 B `.bin` = text + data, 733.5 KiB) fits PROG (780 KiB) with
+    ~46 KiB spare. Stripping the SDK samples we never call will free more.
+  - There's no second app bank: OTA goes through the separate 212 KB `app_ota` updater.
+  - `UDATA` is the SDK's own littlefs, which we don't use, so 64 KiB of it can become `OZKV`.
+  - Layout options go to the PM if Anyka confirms 2 MiB.
+- **Not run on silicon:**
+  - the real flash
+  - erase/program while executing XIP from the same chip
+  - read alignment
+  - power-cut behaviour of the real NOR part (P25Q16SH in the config's flash list)
+
+### P4-prep item 3 (2026-10-29): BLE GATT transport
+
+- **Portable, host-tested:**
+  - `src/oz_frame.c`: the §2.1 framer. It reassembles fragments and fragments replies at the ATT MTU.
+    - Fragment 0 always starts a new message, so a central that gave up mid-message recovers.
+    - Out-of-order fragments, a type change mid-message, an empty non-final fragment, fragment 31
+      marked "more", and anything over 1,024 bytes are all refused, and the partial message is
+      dropped.
+  - `src/oz_ble.c`: one connection. Frame in → reassemble → `oz_lock_rx` → reply fragmented →
+    the port's tx, one notification per frame.
+    - Pairing-code and tick replies take the same path.
+    - Malformed frames get no reply, so a stranger learns nothing.
+  - GATT UUIDs as LE byte strings (`OZ_BLE_UUID_*` in `oz_ble.h`), following the v1 pattern
+    (second group = characteristic): info `…-0002-…`, ozkie `…-0003-…`.
+- **Tests (ctest 10/10):**
+  - `frame`:
+    - every message length 0–1,024 at MTU 23/64/185/247/517 (4,709 round trips)
+    - all the refusal cases above
+    - 200k fuzzed frames (bounded, clean state after an error)
+    - the UUID bytes checked against the spec strings
+  - `lock` now runs its **whole suite three times**: engine direct, then every BLE-link message
+    through `oz_ble` at **MTU 23** (235 frames in, 131 out) and at **MTU 247**. Results are
+    identical (208 checks). The relay link stays unframed, as on MQTT.
+  - Mutation check: drop one byte of a reassembled message and the framed runs fail (3 + 3),
+    while the direct run doesn't.
+  - At MTU 23 the most one message can be is 608 bytes (32 × 19). Everything in the current
+    suite fits. Credential-by-value at ~480 B fits too, but only just, so apps should still
+    negotiate 247 as §2.1 says. A reply that doesn't fit is logged and dropped.
+- **AK1037 glue `port/ak1037/oz_gatt_ak1037.c`** (compile + link only):
+  - The service table follows the SDK's Nordic DFU sample: primary service + `info` (read) +
+    `ozkie` (write + notify + CCCD), 128-bit UUIDs.
+  - BLE callbacks only copy into an RT-Thread message queue (8 deep). The **OZKIE thread**
+    (12 KB stack) owns the `oz_lock` and runs everything.
+  - `info` reads are served from a snapshot the thread refreshes, so the BLE context never
+    touches the lock.
+  - Connect requests MTU 247. `eBT_MSG_LE_MTU_EXCHANGED` (MTU in `param1`, seen in the SDK
+    source) sets the fragment size.
+  - Notify retries while the stack's send ring is full.
+  - The keypad posts the pairing code with `oz_gatt_ak1037_pair_code()`.
+  - Build: `-Werror` clean, +1.4 KB text, 23.5 KB bss (12 KB stack, ~4.3 KB queue, 2 KB
+    session buffers, link state).
+  - Link with `oz_gatt_ak1037_start` rooted: text 751,604 / bss 41,092, with **no unresolved SDK
+    symbols**.
+- **Open, needs the kit or Anyka:**
+  - the notify `att_rec_idx` meaning (Anyka question 5; the code uses 4, the ozkie value record)
+  - real-phone MTU/PHY behaviour
+  - notify back-pressure
+  - ~~advertising per CONTRACT.md: not written yet~~ Done in item 4a (ef2844d, `oz_adv`).
+    Default `OZ_GATT_ADV_ALWAYS=1` confirmed by PM nexus-a8 2026-10-29 (AK1037-ADV); CONTRACT.md
+    amended to match, touch window is the compile-time alternative. Still open for the kit:
+    - whether `ADV_SCAN_IND` works while a link is up in the single-link build
+      (`SUPPORT_MULTI_BLE` off; v1 had two links, bridge + app)
+    - measured current draw of always-advertise (feeds P6 and the battery estimate)
+  - Nothing calls `oz_gatt_ak1037_start()` yet. That's item 4's self-test app.
+
+### P4-prep item 4b (2026-10-29): on-target self-test and lock bring-up images
+
+- **Portable runner** `tests/selftest_all.c` (`oz_selftest.h`):
+  - `oz_selftest_suites()` runs the 8 suites: crypto, cbor, edhoc, oscore, invite, frame, adv, lock.
+  - Each `tests/test_<name>.c` is compiled with `main` renamed `oz_t_<name>`, so its statics stay
+    its own. `nm` showed no other exported symbol in any suite.
+  - The host builds the same thing as ctest `selftest_all`, so the runner is tested before
+    silicon. `kv_lfs` stays host-only: it simulates power cuts on a RAM flash.
+- **Two images**, picked by the link roots (`link_app_mcu.ps1 -Libs … -Name … -RootPattern …`):
+  - **Self-test** (`oz_selftest_ak1037.c`, `^oz_selftest_ak1037_`). MSH `oz.selftest` runs the
+    suites in a 16 KB thread under kv namespace `zt`, wiped before and after. Then the silicon-only
+    checks:
+    - SKE engine vs software AES over 256 random blocks
+    - FIPS 140-2 monobit on 20,000 raw TRNG bits and on 20,000 conditioned bits
+    - no repeat among 64 × 32 B from `oz_port_random`
+    - It ends with one line, `OZ SELFTEST PASS|FAIL: n failing, t ms, stack peak x of 16384 B`.
+      The stack peak comes from RT-Thread's `#` fill and is the number we need to size the OZKIE
+      thread.
+  - **Lock** (`oz_lockapp_ak1037.c`, `^oz_lockapp_ak1037_`). MSH `oz.start` runs `oz_lock_init`
+    with device_id `ozk-` + the BLE address, log-only actuate/prompt hooks, then
+    `oz_gatt_ak1037_start`. `oz.touch` and `oz.code N` stand in for the keypad until P5.
+  - kv has one owner per boot (`oz_ak1037_kv_claim`): the self-test wipes its namespace between
+    cases, so the lock can't start after it without a reboot, and the reverse. A first version used
+    weak cross-references, which made ld pull the whole self-test into the lock image through the
+    archive index. Replaced.
+- **Build (VictorPC, GCC 10.1.0):** `make -f port/ak1037/Makefile selftest` is `-Werror` clean.
+  - Suites: `-Wall -Wno-unused-function` (the shared `oz_test.h` helpers). One dead variable was
+    removed from `test_lock.c`.
+  - Commands: `-Wno-cast-function-type`, because the SDK's `AK_MSH_CMD_EXPORT` casts every command
+    to `long (*)(void)`.
+  - Both images link with no unresolved symbols. Each map keeps exactly its own FSymTab entries.
+
+  | Image | text | data | bss | text+data vs PROG (798,720 B) |
+  |---|---|---|---|---|
+  | SDK `app_mcu` (reference) | 708,496 | 2,024 | 16,132 | |
+  | self-test | 794,016 | 2,024 | 101,504 | 796,040 B, **2.6 KiB headroom** |
+  | lock | 753,828 | 2,024 | 47,076 | 755,852 B, 42.8 KiB headroom |
+  | both together (not built) | 797,488 | 2,024 | 130,924 | **744 B over** |
+
+  - The suites add 47 KB of text. `t_lock`'s simulated apps and locks are 42 KB of bss.
+  - The image budget goes mostly to the SDK's demo `app_mcu`: about 78 KB fingerprint matcher
+    (`btl_*`) and 21 KB MP3 decoder (`mad_*`). Our own app without those is the real headroom
+    lever. Item 5's partition table is the other lever (the default table has no 2nd app bank).
+- **Unverified until the kit:**
+  - whether the shell actually reaches the commands
+  - thread priorities: `rtconfig.h` says 8 levels but the shell asks for 20, so the priorities are
+    macros (self-test `RT_THREAD_PRIORITY_MAX−2`, lock `/2`)
+  - the byte order of `com_ble_get_dev_addr()` against what a phone scans
+  - whether the SDK `printf` handles `%zu`/`%lld` in the suites' messages (pass/fail counts don't
+    depend on it)
+- **Also done in this item:**
+  - the kv fixes above (4389aa5, 3639482)
+  - the commit gate (22d6df9)
+- 🔴 **Fixed 2026-10-29, found while planning P5:** `oz_ct_equal()` returns **0 when equal**, and
+  two AK1037-only callers had it backwards.
+  - The P3 SKE known-answer test (`oz_port_ak1037.c`) trusted the engine when its output
+    **differed** from FIPS-197 C.1 and fell back to software when it matched. A broken engine
+    would have been used for all AES (fail-open); a working one was silently replaced by software.
+  - The 4b `ske_vs_software()` check would have reported every block as a mismatch.
+  - Neither file built on the host, so no test could see it. P5-A below now host-builds both, and
+    its SKE good/wrong/error cases fail if either comparison is inverted again.
+
+### P4-prep item 5 (2026-10-29): burning, and the OZKV partition
+
+**Burn procedure** (VictorPC; the board on a USB-UART, as the SDK's eide upload task does):
+1. Build and link: `make -f port/ak1037/Makefile selftest`, then
+   `link_app_mcu.ps1 -Libs … -Name app_mcu_ozselftest|app_mcu_ozlock -RootPattern …` (item 4b).
+2. Package: `port\ak1037\burn\mkimage.ps1 -Name <image>`. It writes:
+   - `app_mcu\bin\ozkie_app.bin`: `.bootcode`+`.data`, then `.flash`, the SDK's own layout. It fails
+     if the image is bigger than PROG as read from the config.
+   - `app_mcu\bin\ozkv_blank.bin`: 64 KiB of 0xFF, so the first boot formats OZKV.
+   - `tools\burntool\config_ozkie.txt`, converted to the UTF-16LE + BOM + CRLF the tool reads.
+     Checked byte for byte against the SDK's file.
+3. From `tools\burntool`, run `Anyka_BurnCli_Tool.exe -b 2000000 -f config_ozkie.txt` (the SDK's
+   own command line, from `app_mcu/.eide/eide.json`). The tool says "press the boot button to start
+   the burning mode". It auto-searches COM ports unless they're given.
+   - 🔴 **Not run yet.** There's no board, and VictorPC also hosts the Linkly/EFT sandbox, so the
+     tool must not auto-open its ports. On kit day, give the board's port explicitly. The tool's
+     strings show `-c`, `-s`, `-h` and others, but the help text isn't in the binary; run `-h`
+     once with the board attached to confirm the flag for the port.
+4. Burning `ozkv_blank.bin` wipes the lock's identity and bonds, which is what bring-up wants.
+   Drop download line 6 to keep them across a re-burn. Production updates go through OTA, not the
+   burner.
+
+**Images packaged 2026-10-29** (the `.bin` sha256 varies with the SDK objects' build stamp):
+
+| Image | `ozkie_app.bin` | PROG 798,720 B free |
+|---|---|---|
+| self-test | 796,040 B | 2,680 B |
+| lock | 755,852 B | 42,868 B |
+
+**Partition table `port/ak1037/burn/config_ozkie.txt`** (sizes in KiB). It is the SDK's
+`config_app_mcu.txt` with exactly these changes: OZKV added, FPDAT shrunk to pay for it, and the PROG
+file renamed. The total stays the SDK's 1,974 KiB, because the boot area's size isn't documented.
+
+| | OTA | PROG | LP | ROMFS | UDATA | **OZKV** | FPDAT | total |
+|---|---|---|---|---|---|---|---|---|
+| SDK default | 212 | 780 | 44 | 210 | 100 | — | 628 | 1,974 |
+| ozkie | 212 | 780 | 44 | 210 | 100 | **64** | 564 | 1,974 |
+
+- **PROG stays 780** (PM: size it assuming 5b, so PROG doesn't grow to carry demo code). After 5b
+  drops the demo's MP3 decoder (`mad_*`, 21 KB) and other demo code, both images have room to spare.
+- 🔴 **The fingerprint matcher is probably not demo code.** `btl_*` (about 78 KB) is `libfp_btl`, the
+  SDK's matcher. If the lock ships fingerprint (P5), it stays, and the lock image after 5b is about
+  715 KiB, 65 KiB under PROG. Operator decision, via the PM.
+- **FPDAT 628 → 564** costs about 10% of fingerprint capacity. That's an estimate from the SDK's
+  own ratio (`fpdat100.bin` 1,228 KiB for 100 templates is about 12.3 KiB each), so roughly 51 → 46.
+  The SDK's `fpdat.bin` (628 KiB) no longer fits and isn't burned; the fingerprint store is unused
+  until P5.
+- **ROMFS** holds only the demo's voice prompts (`connected.mp3`, `update.mp3`, …). Whether the lock
+  speaks is a product decision. Without prompts, ROMFS (210) could pay for OZKV instead of FPDAT.
+- **Secure boot (P6):** the SDK's secure configs use **PROG 700** (giving 80 KiB to ROMFS/FPDAT).
+  The lock with fingerprint (about 715 KiB after 5b) would NOT fit 700. Nothing shows secure boot
+  itself needs a smaller PROG, so this looks like a layout choice. Ask Anyka before P6.
+- **4 MiB flash:** the SDK supports 4 MiB parts (GD25Q32E, PY25Q32HB). Its 4 MiB config adds an
+  `UPDATE` bank as large as PROG (A/B, fail-safe OTA) and a 1,228 KiB FPDAT. The 2 MiB table has no
+  second bank, so an OTA (`app_ota`) rewrites PROG in place. If P6's bridge OTA must survive a power
+  cut mid-update, 4 MiB is the clean answer. BOM decision, via the PM.
+- UDATA (100 KiB) is the SDK's own littlefs (`ak_lfs`, demo config). ozcore doesn't use it. 5b will
+  tell whether anything we keep needs it; if not, it can become OZKV.
+
+### P4-prep item 5b (2026-10-29): our own app_mcu, without the SDK demo
+
+- **What changed versus the SDK app.** No SDK file is edited. Two files are ours:
+  - `port/ak1037/app/main_ozkie.c` replaces `app_mcu/src/main.c`. It's the same boot path
+    (`app_proc` → hal/trap/heap init → `AK_Main` → main thread polling `msh_process()` and
+    `com_ble_process()`), without the demo's boot-time `ble_lp_test_start()` (a low-power test task
+    that would skew every P6 reading) and without the littlefs power-down test.
+  - `port/ak1037/app/gen_app_mk.py` generates `Makefile.ozkie_fp<0|1>_v<0|1>` from the SDK's own
+    `.eide` project: every `app_mcu/sample/*.c` (39 files) and `src/main.c` are dropped.
+  - The CFLAGS, INCS and LDFLAGS of all four variants are byte-identical to the SDK reference, so
+    every platform object is the SDK's.
+  - Each sample registered shell commands, and `KEEP(FSymTab)` kept them, so they had been pulling
+    in the MP3 decoder, fingerprint, LCD, image, RFID, SM2/PKE and nordic-OTA demos.
+- **Optional features** (PM ruling 2026-10-29; kept until the product rules on them):
+  - `OZ_WITH_FP` (`--fp`): the platform fingerprint component (it registers its own command, which
+    keeps `libfp_btl`/`libfp_mrw`) plus the SDK's `fp.*` sample, for kit bring-up.
+  - `OZ_WITH_VOICE` (`--voice`): the audio component plus the SDK's `audio.*` sample player. The
+    MP3 decoder links only if something plays, so the flag has to link a player. Our own voice
+    module replaces the sample in P5 if the product keeps prompts.
+  - RFID is not behind a flag. The SDK's `rfid_*` came in only through `sample_rfid.c`, and P5
+    brings our own driver.
+- **Checks:**
+  - All four variants link with no unresolved symbols and no undefined weak symbols.
+  - Every weak default the demo overrode is overridden the same way in ours.
+  - The lock image carries `com_ble_init/process`, `com_ble_set_gatt_service`, `msh_process` and our
+    `oz.*` table entries, and no `ble_lp_test_start`.
+- **Sizes** (VictorPC, `SOURCE_DATE_EPOCH` pinned; text+data against PROG 780 KiB = 798,720 B):
+
+  | `OZ_WITH_FP` | `OZ_WITH_VOICE` | lock image | free | self-test image | free |
+  |---|---|---|---|---|---|
+  | 0 | 0 | 266,780 | 531,940 | 241,304 | 557,416 |
+  | 1 | 0 | 450,496 | 348,224 | 428,988 | 369,732 |
+  | 0 | 1 | 343,224 | 455,496 | 318,912 | 479,808 |
+  | 1 | 1 | **526,860** | 271,860 | 506,204 | 292,516 |
+  | SDK demo app (item 4b) | | 755,852 | 42,868 | 796,040 | 2,680 |
+
+  - Fingerprint costs about **184 KB** and voice about **77 KB**, measured by link. My estimate from
+    `btl_*` symbols alone (78 KB) missed `libfp_mrw` and the rest of the component.
+  - The self-test image is smaller than the lock image because it never starts BLE, so the BLE
+    stack isn't linked into it.
+  - **Consequences for item 5's decisions:**
+    - Even with everything on (fp1_v1, 515 KiB), the lock fits the secure-boot tables' **PROG 700**
+      with 185 KiB to spare. Decision 3 is no longer a blocker.
+    - On 4 MiB with A/B banks (decision 4), a PROG of about 640 KiB per bank would leave room for
+      P5/P6 growth.
+    - The bss of the lock image is 42 KB of 218 KiB SRAM.
+- **Build:**
+  1. `python3 port/ak1037/app/gen_app_mk.py <sdk> ../../ozcore <out> [--fp] [--voice]` (on the Mac,
+     against the SDK copy)
+  2. copy the Makefile to `app_mcu`, then `make -f Makefile.ozkie_fp1_v1`
+  3. `link_app_mcu.ps1 -Makefile Makefile.ozkie_fp1_v1 -Libs … -Name … -RootPattern …`
+  4. `burn\mkimage.ps1 -Name …`
+- **Unverified until the kit:** whether the board boots and behaves the same without the demo. Any
+  init that a sample did as a side effect would show here; none was found in the link check. The
+  first kit-day boot should compare the boot log with the SDK demo's.
+
+### P5 summary for the merge review (2026-10-30)
+P5 runs everything on the host against mocks of the AK1037 SDK. Nothing has run on silicon. Each
+phase passed the gate (default, Release, ASan+UBSan) and was mutation-checked. Commits, oldest
+first: 13960dd P5-A, f8964c8 kv retry, 68837ee P5-B, b9ba6f6 6-digit PINs, 6563887 P5-D,
+e4dc087 P5-C1, ebf0a47 P5-E0, 23aac88 P5-E, 8063e33 P5-F. None are pushed.
+
+| Phase | Real, portable logic (tested) | Mocked on the host | Needs the board or a ruling |
+|---|---|---|---|
+| P5-A port | kv on littlefs at the OZKV partition, the SKE KAT and key wipe, TRNG checks, mount retry | the whole SDK: SKE, TRNG, NOR flash, BLE stack, RT-Thread queues and threads, time | the SDK's real behaviour; notify index, address byte order, adv restart |
+| P5-B keypad | entry state machine, wrong-PIN limit (5 free, 60 s doubling to 30 min), PINs ≥ 6 digits | keys arrive via `oz.key` | touch IC and scan driver, buzzer and panel feedback |
+| P5-C1 motor | drive/brake/rest state machine, jam and timeout detection, latest-wins commands | the motor and bolt sensor (driver only logs) | real driver, sensor and timings (OZ-7); jam policy **6a**; reply timing 6b; auto-relock |
+| P5-D stack | host tripwire in Release; RV32 static bound 6,384 B | host pthread stacks | confirm 12 KB / 16 KB with RT-Thread's high-water mark on silicon |
+| P5-E0 events | `events` Observe (admin), seq reserved in kv, gap events, keypad lockout event | BLE and relay transport | service-bond and member observers |
+| P5-E cards | card matching, own wrong-card limit, 1.5 s hold filter, lockout event | cards arrive via `oz.card` | reader polling thread on `hal_rfid_*` and its low-power detect; UID clone risk **OZ-5** |
+| P5-F battery | levels with hysteresis, sag under load, unlock never refused, lock refused at CRITICAL | the SAR ADC | channel, divider and thresholds (OZ-7 5a/5b); brown-out point; low-battery chime/icon |
+
+- **Operator decisions pending:** OZ-7 5a with `OZ_POWER_LOCK_AT_CRITICAL` (lock refused at
+  CRITICAL today), jam policy 6a, and OZ-5 (UID-only cards).
+- **What the mocks can't prove:** they encode our reading of the SDK headers, not the SDK itself.
+  The first board run should start with the self-test image (`oz.selftest`, every suite plus its
+  own stack peak), then claim and unlock over real BLE.
+- **Wire changes in P5** (ozkey-48 §5.1, Appendix A): `events` with types 0–3, `lock/state` keys 3
+  and 4, result code 34 `BATTERY_LOW`.
+
+**Resume (stand-down 2026-10-30):** P5-A..F and this summary were accepted by the PM. Next is
+P5-C part 2 (the real motor), which waits for the operator's jam policy 6a. Resume from branch
+`ozkey58/ak1037-port` (tip = this commit); recreate the worktree with
+`git worktree add ../ozkey-wt/ak1037-port ozkey58/ak1037-port`. The v1 unsealed-unlock fix
+(`ozkey58/v1-unsealed-unlock`, 81d0063) still waits for a bench check that the PM will schedule.
+Nothing is pushed; only the PM merges.
+
+### P5-A (2026-10-29): port/ak1037 on the host, against SDK mocks
+- **What:** `oz_port_ak1037.c`, `oz_gatt_ak1037.c`, `oz_lockapp_ak1037.c` and `oz_selftest_ak1037.c`
+  now build and run in ctest under the gate (all three legs, ASan+UBSan included). They link the
+  AK1037 port, not the host one.
+  - `port/ak1037/hostmock/`: fake SDK headers with the SDK's names and the prototypes the port
+    uses, written from the SDK's headers, not copied (the SDK stays out of the repo), plus
+    `mock_sdk.c`. The SKE engine is software AES, or one that flips a bit, or one that errors.
+    The TRNG is good, stuck or timing out. The flash is a 2 MiB RAM NOR (programming only clears
+    bits) with an OZKV partition at 1 MiB; any access outside it is counted. "Interrupts off" is a
+    counter, and the SKE driver counts calls made with interrupts on. Message queues have
+    RT-Thread's capacity (a 4-byte header per message, as on RV32). Threads are pthreads; the
+    OZKIE thread runs in lockstep with the test (it parks in `rt_mq_recv`), so runs are
+    deterministic. Time is virtual. `AK_MSH_CMD_EXPORT` registers the command so tests run it by
+    name.
+- **Tests (9 ctests):**
+  - `ak1037_port_{good,wrong,error}`: the SKE KAT keeps a good engine and rejects a wrong or
+    failing one. AES equals software every time. The key registers hold zeros after each block.
+    SKE runs only with interrupts off.
+  - `ak1037_port_good` also covers the TRNG (stuck and timeout refused, then recovers) and the
+    32-bit ms wrap. For kv: a filesystem that plain littlefs wrote at the partition offset is
+    read, not reformatted. What the port writes, plain littlefs reads back. A failed program
+    fails that call only.
+  - `ak1037_port_{blank,nopart,badpart}`: a factory-blank partition is formatted. A missing or
+    unaligned partition fails kv, and nothing is written.
+  - `ak1037_gatt`: `oz.start`, then a simulated phone claims the lock and unlocks it using only
+    the mocked BLE stack: GATT writes and reads, link events, notifications.
+    - Covered: advertising checked byte for byte on every change (open, busy, open); a 247 MTU
+      request; EDHOC at MTU 23 over several notifications; the pair request held until `oz.code`;
+      `info` flipping to claimed.
+    - Back-pressure: BUFFER_FULL ×3 retried 5 ms apart. A ring that never drains is given up
+      after 50 tries. A notify refused outright loses that reply, and nothing hangs.
+    - Junk writes are dropped: wrong row, empty, over MTU−3. A 12-frame burst overflows the
+      8-deep queue safely.
+    - Frames after a disconnect are ignored. An advertising update the stack refuses is retried
+      every pass. A second `oz.start` is refused.
+  - `ak1037_selftest_{good,wrong}`: `oz.selftest` runs all 8 suites on the AK1037 port and mock
+    flash, then the SKE and TRNG checks. It reports PASS with a good engine; with a wrong one the
+    suites pass (software fallback) and the SKE check says FAIL. Afterwards `oz.start` is refused
+    (one kv owner per boot), and so is a second `oz.selftest`.
+- **Mutation-checked (each caught by at least one test):** KAT comparison inverted (5 fail);
+  `ske_vs_software()` comparison inverted; key-register wipe skipped; SKE with interrupts on;
+  BUFFER_FULL treated as fatal; kv blocks addressed without the partition offset.
+- **What it does not show:**
+  - The real SDK's behaviour: these mocks encode our reading of its headers, and the open items
+    above (notify index, address byte order, adv restart) stay open.
+  - Stack use: code runs on pthread stacks, so the self-test's "stack peak" reads 0 here.
+    P5-D measures stacks.
+- **Found, then fixed (PM ruling 2026-10-29):** after one failed mount, `kv_ready()` never retried,
+  so kv stayed down until reboot, and a lock with no kv has no identity. It now tries again on a later
+  call, at most once per 5 s (`OZ_KV_RETRY_MS`), so a dead flash can't spin the OZKIE thread. A failed
+  attach unmounts before the next try. `ak1037_port_retry` covers it:
+  - a partition that appears, then a dead flash that comes back
+  - 20 and 50 calls in between with no new attempt
+  - nothing before 4.999 s, a retry at 5 s
+  - mutation-checked: no rate limit, and no retry, each fail it
+
+### P5-B (2026-10-29): the door keypad, with the wrong-PIN limit
+- **Policy (PM nexus-a8, 2026-10-29), in `oz_limit` (`include/oz_limit.h`, portable, pure):**
+  - 5 misses in a row lock the keypad out for 60 s.
+  - Each further miss locks it out again, doubling: 2, 4, 8, 16 min, then capped at 30 min.
+  - Only a success resets it: the right PIN, or an unlock from the owner's app (admin role,
+    `lock/unlock`).
+  - While locked out nothing is checked at all: the entry is dropped (`OZ_PIN_LOCKED_OUT`) and is
+    not a miss.
+  - The same module serves RFID in P5-E.
+- **Persistence:** kv `"pl"` (8 bytes), saved after every change.
+  - The monotonic clock restarts at boot, so a lockout is saved as the time it still has to run,
+    and that time restarts in full at the next boot. Pulling the battery can only lengthen a
+    lockout, never end it.
+  - A record that exists but can't be read fails closed: a 30 min lockout.
+  - A factory reset erases `"pl"` (it is an authenticated admin action).
+- **`oz_lock_keypad_pin` (engine):**
+  - Anti-peep: it opens if a live PIN appears anywhere in an entry of 1..16 digits. Every window of
+    every PIN credential is compared, then the first live match is used.
+  - Entries over 16 digits, or with non-digits, are misses.
+  - A matching PIN outside its time window or out of uses is a miss like any other, so the
+    lockout can't reveal that a PIN exists.
+  - Returns `OZ_PIN_OPEN` (1), `OZ_PIN_WRONG` (0) or `OZ_PIN_LOCKED_OUT` (2, new).
+    `oz_lock_keypad_lockout_ms()` gives the time left, for the panel.
+- 🔴 **Rule: PINs are at least 6 digits (`OZ_LOCK_PIN_MIN`; PM ruling 2026-10-29). `cred` refuses
+  shorter, with `OZ_R_BAD_REQUEST`.**
+  - Why: anti-peep lets one 16-digit entry test up to 16 − L + 1 positions of an L-digit PIN. With
+    4 digits, covering every PIN under the lockout takes about 16 days, which is too little. With 6
+    digits it takes about 90,000 entries: about 5 years.
+  - 📣 **Apps and server:** PIN entry and PIN generation must require **6 or more digits** (up to
+    16). A shorter PIN is refused by the lock. Existing v2 locks have not shipped, so there is
+    nothing to migrate.
+- **`oz_keypad` (`include/oz_keypad.h`, portable, pure):** the entry state machine.
+  - Digits, `*` clears, `#` enters; a 10 s pause drops a half-typed entry.
+  - Up to 17 digits are kept, so an over-long entry still reaches the lock and counts as a miss.
+  - While the lock's pairing prompt is on, `#` after exactly 6 digits gives the pairing code.
+- **AK1037:**
+  - The keypad runs on the OZKIE thread: `oz_gatt_ak1037_key()` posts one key per event.
+  - The lock's `pair_prompt` hook switches the keypad into pairing mode.
+  - New shell command for bring-up: `oz.key 4826#`. Results are logged until the panel and buzzer
+    exist.
+- **Tests:**
+  - `keypad` (new suite, also in the self-test image): the full doubling sequence to the cap;
+    300 further misses stay at the cap; a miss during a lockout changes nothing; success resets;
+    save and load (remaining time restarts at boot, level kept, four malformed records fail
+    closed, over-cap values clamped); the keypad state machine (clear, idle drop across the
+    32-bit ms wrap, 17-digit cap, pairing codes with leading zeros, other lengths dropped).
+  - `lock`: anti-peep (inside, at the end, 16 vs 17 digits); 3-digit PIN refused; a spent one-use
+    PIN is a miss; 5 misses give a 60 s lockout in which the right PIN isn't checked; the lockout
+    survives a reboot; an owner unlock clears it; a bad record gives 30 min.
+  - `ak1037_gatt`: the pairing code is now typed via `oz.key`. Over the mocked stack: 4 misses, a
+    60 s lockout on the 5th, the next entry not checked, an owner app unlock clears it, the idle
+    drop, `*`, `#` on nothing.
+- **Mutation-checked, all 10 caught:** no lockout check; no persistence load; no owner reset;
+  exact-length match only (no anti-peep); no 16-digit cap; no 4-digit minimum; no doubling; a
+  bad record fails open; 4 free misses instead of 5; a spent PIN not counted as a miss.
+- **Not in P5-B:** buzzer and panel feedback, and the real keypad driver (touch IC, scan); those
+  need the board. An "owner unlock" means the app's `lock/unlock` with the admin bond; a member
+  unlock does not clear the lockout. The server/app is not told about lockouts (no event yet).
+
+### P5-C, part 1 (2026-10-29): the motor's state machine, against a simulated motor
+- **Built ahead of the hardware spec (OZ-7), per PM nexus-a8.** Nothing here is tuned. The
+  drive, timeout, brake and rest times are placeholders (`OZ_MOTOR_*_MS` in `include/oz_motor.h`).
+- **`oz_motor` (`include/oz_motor.h`, portable, pure):** idle → driving → braking → resting → idle.
+  - With a bolt sensor, a move is **OK** when the sensor reads the target position. It is
+    **JAMMED** on a stall, or after `timeout_ms`.
+  - Without one, the motor runs for `drive_ms` and the move is **UNCONFIRMED** (JAMMED if the
+    driver reports a stall). Nothing claims a position it didn't see.
+  - After every move it brakes, then rests with the motor off before the next move (thermal,
+    OZ-7 1d).
+  - A command while busy waits. If several arrive, the latest wins. A command for the direction
+    the motor is already driving is dropped. It never reverses mid-move.
+  - On a jam it only reports: no retry and no reverse, until OZ-7 6a rules.
+  - The output is off at init and whenever no move runs (OZ-7 1a).
+- **Engine:** `oz_lock_actuated(L, unlock, result)` takes each finished move.
+  - OK or UNCONFIRMED sets the lock state to the direction driven.
+  - JAMMED sets `OZ_LOCKSTATE_NOT_FULLY_LOCKED` (Matter's value for a jam) and logs it.
+  - The result is kept in `oz_lock.last_move`.
+  - The `actuate` hook still sets the commanded state at once, and `lock/unlock` still answers at
+    once. **No wire change:** whether the app should see "unconfirmed" or "jammed", and whether the
+    answer should wait for the move, is OZ-7 6b.
+- **AK1037:** the lock image's `actuate` hook calls `oz_gatt_ak1037_actuate()`. The OZKIE thread
+  steps the motor every 10 ms while it moves (100 ms otherwise) and hands each result to the
+  engine.
+  - The driver only logs (`motor: to unlock`, `brake`, `off`, `unlock unconfirmed`) until OZ-7
+    gives the driver IC, its pins and a sensor.
+  - New bring-up shell command: `oz.state` prints the lock state and the last move.
+- **Tests:**
+  - New `motor` suite, also in the self-test image. It runs a simulated bolt that moves, can stick
+    halfway, and may or may not report a stall.
+    - Sensorless timing to the ms, across the 32-bit ms wrap.
+    - A sensor ending the move at the end stop; already there means no drive.
+    - Timeout jam and stall jam, each stopping the motor and leaving the bolt where it stuck.
+    - A position reading is ignored without a sensor.
+    - Latest-wins queueing; brake and rest before the next move; the motor driven only while
+      driving.
+    - The lock state after OK, UNCONFIRMED, JAMMED and an unknown result.
+  - `ak1037_gatt`: an owner unlock drives for the drive time, then brakes and goes off. A lock
+    queued during the rest is replaced by a later unlock. From idle, a lock then an unlock run in
+    order. `oz.state` shows that the result reached the engine.
+- **Mutation-checked, all 17 caught:**
+  - Drive time off by one; the sensor's OK ignored; a sensorless move reading the bolt; a stall
+    ignored; no timeout; no rest; no brake; a queued command lost; a same-direction command
+    queued; a reverse mid-move; a jam not setting "not fully locked".
+  - In the port: the motor not stepped, not commanded, or the result not reported to the engine
+    (caught only after `oz.state` was added).
+- **Still open:**
+  - Waiting on OZ-7: the real driver, sensor and timings; auto-relock; manual and key sensing;
+    low-battery refusal; the jam policy; what the app sees.
+  - The RV32 static stack was not re-run for this change. The host OZKIE peak (debug) went from
+    3,743 to 4,303 B, well inside 12 KB.
+
+### P5-D (2026-10-29): stack budgets, measured on the host and bounded on RV32
+- **Static bound on RV32** (VictorPC, SysGCC GCC 10.1.0, `-Os`, `-fcallgraph-info=su`,
+  `tools/stack_report.py`; the SDK's `lfs.c` built with the same flags so littlefs is on the path):
+
+  | entry | bytes | deepest chain |
+  |---|---|---|
+  | `oz_lock_rx` | **6,160** | rx_oscore (2,176) → admin `dev/reset` → oz_lock_init (1,936) → kv_set → `lfs_rename` → dir_commit → … |
+  | `oz_lockapp_ak1037_start` | 3,664 | oz_lock_init → kv_set → littlefs |
+  | `oz_lock_init` | 3,600 | as above |
+  | `oz_lock_keypad_pin` (P5-B) | 2,928 | save_creds (1,056) → kv_set → littlefs |
+  | `oz_lock_pair_code` / `_tick` | ~2,280 | pair_finish → OSCORE → CCM → kv |
+  | `oz_gatt_ak1037_*` posts | ≤ 288 | they only queue for the OZKIE thread |
+
+  - The worst case is unchanged in kind since P4-prep item 2 (6,128 B then; +32 B now). P5-B's
+    keypad path is under half of it.
+  - Still not counted: indirect calls (app hooks, EDHOC `dh`/`resolve_peer`, OSCORE `next_ssn`
+    persist, littlefs's block-device callbacks), libc and the SDK. littlefs 2.4.1 recursion
+    (`dir_commit`↔`dir_compact`/`dir_drop`, `dir_traverse`, `file_flush`↔`file_rawwrite`) is
+    reported, not followed.
+- **Measured on the host** (`mock_stack_peak`, new in the hostmock): the mock paints each
+  thread's real pthread stack at start and scans for the deepest touched byte, the same idea as
+  RT-Thread's `#` fill.
+
+  | thread | budget | debug | Release |
+  |---|---|---|---|
+  | `ozkie` (`test_ak1037_gatt`: claim, EDHOC, kv, keypad lockout) | 12,288 | 3,743 | 3,279 |
+  | `oztest` (`test_ak1037_selftest`: every suite) | 16,384 | 9,003 | 11,871 |
+
+  - Release builds of both tests assert peak ≤ budget (`OZ_STACK_TRIPWIRE`), so a change that
+    blows a thread's stack fails the gate. ASan builds don't measure (returns 0).
+  - The host number covers only the paths the test runs. It does not reach the static worst case
+    (dev/reset with a littlefs compaction), so the static bound stays the sizing number.
+  - Mutation-checked, all 4 caught: scan returns 0; no paint; OZKIE budget cut to 3,000 B;
+    self-test budget cut to 8 KB.
+- **Verdict:** keep **12 KB** for the OZKIE thread (2× the static bound) and **16 KB** for the
+  self-test thread. Confirm both on silicon with RT-Thread's high-water mark (the self-test image
+  already prints its own).
+- **Still open:** moving the large locals of `rx_oscore` and `oz_lock_init` into `oz_lock` would
+  cut ~3 KB from the worst case; not needed while SRAM isn't short.
+
+### P5-E0 (2026-10-29): `events`, starting with the keypad lockout
+- **PM ruling (nexus-a8, 2026-10-29), option (a):** the keypad lockout reaches the owner's app as
+  the first type of ozkey-48 §5.1 `events`, not as a one-off path.
+  - Scope: the admin bond only; delivery on the open BLE session or the admin relay context.
+  - Built so the service bond (audit trail) and members (their own events) slot in later as new
+    roles, with no wire change.
+  - The wire format is in ozkey-48 §5.1.
+- **`oz_events` (`include/oz_events.h`, portable, pure):** a 16-event RAM ring (384 B).
+  - Every event gets a 32-bit sequence number. When the ring is full the oldest is dropped.
+  - Each reader has its own cursor. A reader behind the ring gets one **gap** event (first missed
+    seq plus a count), then the oldest held. A cursor ahead of the lock waits.
+- **Engine (`oz_lock.c`):**
+  - `GET events` (Observe 0 registers, 1 deregisters, `after=N`), answering
+    `{0: OK, 1: next_seq, 2: oldest}`.
+  - A registration lives in `oz_link.obs` (BLE, ends with the session) or `oz_lock.relay_obs[slot]`
+    (relay, RAM). A new relay context for that bond, or a revoke, drops it.
+  - `oz_lock_events_poll()` builds at most one notification per call: NON 2.05, the registration's
+    token, an increasing Observe value, and a Partial IV (RFC 8613 §8.3). The reader's cursor moves
+    only once the message is built.
+  - `oz_ble_tick()` sends up to 4 a tick.
+  - The keypad raises `keypad lockout {level, seconds}` when a lockout starts.
+  - Sequence numbers are reserved in kv `"es"` 32 at a time, written lazily on the first event
+    of a block, so booting writes nothing. A reboot jumps past the reserved block. A factory reset
+    erases `"es"`.
+- **AK1037:** nothing port-specific; the OZKIE thread's existing `oz_ble_tick` delivers. The self-test
+  image gains `oz_host_advance_ms()` (via `oz_ak1037_clock_advance`) so test_lock can step past
+  lockouts on silicon. The kv owner rule keeps the lock from starting in a boot that ran the
+  self-test, so the lock never runs on a moved clock.
+- **Tests:**
+  - New `events` suite (pure; also in the self-test image): order, overflow with a gap per reader,
+    an ahead cursor, the 2^32 wrap.
+  - `lock` (direct, and over GATT at MTU 23 and 247), the BLE and relay paths:
+    - a plain GET; registering; the lockout arriving with seq, utc basis and level/seconds;
+    - the service bond refused;
+    - `after=` on the relay; 20 unread events giving each reader its own gap and then the 16 held,
+      in order;
+    - deregistering; a session ending; a new relay context;
+    - a reboot jumping the numbers; a factory reset erasing them.
+    - Notifications are checked as an app would: OSCORE-verified against the registering request,
+      same token, Partial IV present, NON, Observe increasing.
+  - `ak1037_gatt`: register over the mocked GATT, type 5 wrong PINs on the keypad, and the
+    notification arrives from the thread's tick.
+- **Mutation-checked: 16 of 18 caught.**
+  - Caught:
+    - in the ring: no gap marker; ring not capped; an ahead cursor read as behind; a wrong gap
+      count;
+    - in the numbering: not reserved; not loaded at boot; not erased on reset;
+    - in the verb: any role allowed; Observe 1 ignored; `after=` ignored;
+    - in delivery: no Partial IV; a static Observe value; the token not kept; the relay
+      registration kept across a new context; no event raised on a lockout; `oz_ble_tick` not
+      polling.
+  - Missed, both by design for now: dropping the observer on a revoke, and the bond/role re-check
+    at send time. Only bond 0 can be admin and it can't be revoked, so neither can be reached
+    until the service bond observes. Test both then.
+- **Stack (RV32 static, VictorPC, with littlefs, PM ask):**
+  - From the OZKIE thread's entry the worst case is **6,384 B**: the thread's own 176 B plus the
+    same `oz_lock_rx` chain at 6,160 B.
+  - `oz_lock_events_poll` is 1,280 B on its own branch; `oz_ble_tick` is 2,304 B.
+  - The 12 KB budget stands.
+- **Not in P5-E0:**
+  - Other event types. The service bond and audit trail (re-register on restart, per ozkey-48).
+  - Members' own events.
+  - Persisting the ring across reboots (a reboot loses it, shown as a seq jump).
+  - The bridge relay transport on AK1037 (relay delivery is engine-level, tested on the host).
+
+### P5-E (2026-10-29): RFID cards, with their own wrong-card limit
+- 🔴 **Card identity is the ISO 14443 UID (type A) or PUPI (type B) for now, and that can be
+  cloned.** Writable "magic" cards copy any UID, and a phone or reader can emulate one.
+  - Whether UID-only cards are acceptable is **OZ-5, open with the operator**.
+  - The engine doesn't care how a card was verified: the port hands it an identity
+  (`oz_lock_card(L, id, len)`), so a stronger check changes the port, not the engine or the wire.
+  - The SDK offers three ways to read a card:
+    - UID read (`hal_rfid_read_card`, `_ex` for type B);
+    - MIFARE Classic block reads (Crypto1, broken, no better than UID);
+    - ISO 7816 CPU-card commands with DES external/internal authenticate
+      (`hal_rfid_cpucard_*`, FM1208-class cards).
+  - If OZ-5 wants clone resistance, the realistic option is per-card keys on CPU cards with
+    internal authenticate (challenge-response). That needs the cards, provisioning, and a check of
+    which DES variant the SDK runs.
+- **Engine:** `oz_lock_card()` opens on an exact match with a live RFID credential (`cred` type 2,
+  secret = the identity bytes).
+  - Every card credential is compared in constant time, then the first live match opens.
+  - A known card that is spent or outside its window is a miss, like a wrong one.
+  - A PIN's bytes never match as a card (type is checked).
+  - Wrong cards count toward their own `oz_limit` (`card_limit`, kv `"rl"`) under the keypad's
+    policy: 5 free, then 60 s doubling to 30 min. It is separate from the keypad's, so a card
+    lockout doesn't stop PINs and a PIN doesn't clear it.
+  - Only the right card, or an owner unlock from the app, clears it. A malformed record fails
+    closed (30 min). A factory reset erases it.
+  - Each lockout raises event type 2, **card reader lockout** `{level, seconds}` (ozkey-48 §5.1).
+- **`oz_card` (`include/oz_card.h`, portable, pure):** one tap per card.
+  - The reader reports a card on every poll while it's in the field. Reads of the same identity
+    within 1.5 s of the last one are the same tap. Without this, one wrong card left on the reader
+    would be 5 misses and a lockout in under a second.
+  - A different card is a new tap at once.
+- **AK1037:**
+  - `oz_gatt_ak1037_card(id, len)` posts the identity to the OZKIE thread (from the reader's
+    thread, or the shell). The thread filters taps and checks.
+  - Bring-up command: `oz.card 04a1b2c3d4e5f6`.
+  - **Not written:** the reader's polling thread on `hal_rfid_*`. Its cadence and low-power
+    detection (`hal_rfid_set_det`) need the board and P5-F's power budget.
+- **Tests:**
+  - New `card` suite (also in the self-test image): a card held 5 s is one tap, across the ms
+    wrap; the 1.5 s edge; a different card or a UID prefix is a new tap; bad lengths dropped.
+  - `lock`:
+    - opening; one-use spent; one byte off; a UID prefix; a PIN's bytes; too long;
+    - 5 misses → 60 s and an event; locked out, the right card unchecked; the keypad independent;
+    - a reboot keeps it; an owner unlock clears it; doubling; a right card resets it;
+    - a bad record → 30 min; a factory reset erases `"rl"`.
+  - `ak1037_gatt`: a wrong card held 2 s is one check; 5 different cards lock the reader; the
+    lockout skips the check; the shell refuses odd-length, non-hex and 17-byte ids.
+- **Mutation-checked, all 17 caught:**
+  - In the hold filter: off; not refreshed while held; the 1.5 s edge off by one; length ignored.
+  - In the lock: no lockout check; a prefix matching; a PIN credential matching as a card; a spent
+    card opening; sharing the keypad's limit; not persisted; not loaded; no owner reset; `"rl"` not
+    erased on reset (caught once the reset test checked it); no event; a right card not resetting.
+  - In the port: no hold filter.
+- **Stack (RV32 static, with littlefs):** `oz_lock_card` 2,928 B; the OZKIE worst case is unchanged
+  at 6,384 B.
+
+### P5-F (2026-10-30): the battery policy, against a mocked ADC
+PM nexus-a8's GO: policy and state machine only. Every threshold is a placeholder until OZ-7 5a/5b
+(the real cells, the divider, the brown-out point). Low battery must never lock anyone out.
+- **`oz_power` (`include/oz_power.h`, portable, pure):** takes mV readings and keeps a level
+  (OK, LOW, CRITICAL) and a percentage. Placeholders for a 4×AA alkaline pack: 6000 mV = 100 %,
+  4400 = 0 %, LOW below 4800, CRITICAL below 4500, 150 mV hysteresis.
+  - A level gets worse at once and better only with 150 mV of margin, so a reading near a
+    threshold doesn't flap.
+  - **Sag:** the lowest reading during a motor move is fed in too. Below 4000 mV the battery is
+    CRITICAL however well it reads at rest, because a weak cell recovers at rest and sags again on
+    the next move. It clears when a later move stays above 4000 mV, or when a rest reading looks
+    like fresh cells (≥ 5600 mV). A rest reading of 5200 mV alone does not clear it; the first
+    draft let it, and the tests now pin that down.
+  - A reading of 0 (ADC error) is no reading. With no reading yet, everything is allowed.
+- 🔴 **Never lock anyone out:**
+  - **Unlock is never refused for the battery**, at any level, with or without readings. That
+    covers the app, the relay, the keypad and cards.
+  - **Lock is refused at CRITICAL** (`lock/lock` → 5.03 `BATTERY_LOW`, result 34;
+    `OZ_POWER_LOCK_AT_CRITICAL` 0). A bolt thrown on a battery that may not retract it again is
+    the lock-out. The cost is a door left unlocked until the battery is changed.
+  - 🟡 **That trade-off is the operator's (OZ-7 5a, together with the jam policy 6a).** One
+    `#define` flips it if the operator would rather keep locking.
+- **Engine:** `oz_lock_power_rest()` and `oz_lock_power_load()`.
+  - Each level change logs and raises event type 3, **battery** `{level, percent}`
+    (ozkey-48 §5.1). The same level again raises nothing.
+  - `lock/state` gains key 4, the battery level; key 3 is now the real percentage.
+- **AK1037:**
+  - `oz_ak1037_battery_mv()` reads the SAR ADC (12-bit; an error reads as 0). Placeholders:
+    channel AIN1, divider ×3, 2400 mV reference.
+  - The OZKIE thread takes a rest reading at start, then every 10 min while the motor is idle.
+    While the motor drives, it keeps the lowest reading of each 10 ms step and reports it when the
+    move ends.
+  - **Not written:** the real channel and divider, a low-battery chime or panel icon, and the
+    brown-out point. All need the board (OZ-7 5a/5b).
+- **Tests:**
+  - New `power` suite: the levels with hysteresis both ways; sag and what clears it (5200 and
+    5599 at rest don't, a good move or 5600 does); a good move after a sag settles to the rest
+    level; 0 ignored; percent clamped at both ends.
+  - `lock`: 100 % and OK before any reading; one event per level change; at CRITICAL, lock is
+    refused with 5.03 and the bolt isn't driven, while unlock and the keypad still open; new
+    batteries let it lock again; a sag under load refuses lock until fresh batteries.
+  - `ak1037_gatt`: the ADC is read on the placeholder channel; a critical rest reading refuses
+    lock without driving the motor; new batteries read OK; an unlock that sags to 3900 and reads
+    5200 at rest stays critical; an ADC error changes nothing.
+- **Mutation-checked, all 16 caught:**
+  - In `oz_power`: unlock refused at critical; lock allowed at critical; no hysteresis; sag
+    ignored; a sag cleared by any rest reading; fresh cells not clearing it; a good move not
+    clearing it; a 0 reading taken as a value; percent not clamped at 100.
+  - In the engine: no refusal; no event; `lock/state` key 4 always 0.
+  - In the port: the load reading not reported; no rest reading; the highest load reading kept
+    instead of the lowest; an ADC error taken as a value (caught once the test checked it).
+- **Gate** passed (default, Release, ASan+UBSan, 27/27 tests), log
+  `ozkey_notes/ctest/2026-10-30_p5f_power.log`.
+- **Stack (RV32 static, with littlefs):** `oz_lock_power_rest` and `oz_lock_power_load` 1,760 B
+  each (through the event-sequence kv write); `oz_motor_step` 0 B. The OZKIE worst case is
+  unchanged at 6,384 B.
 
 ### P2 mobile build targets (ftpos5, 2026-10-18; apply only if XF-387 OZV2-1 goes FFI)
 
@@ -148,3 +992,24 @@ LE Secure Connections + central role / GATT client example · English PKE/SKE re
   whether secure-boot signing and eFuse programming can run from the CLI (signing keys stay offline) ·
   Windows 11 support · license terms for the SDK, the BLE host source and the closed `libbt.a`, and
   whether we may modify the host stack · how SDK updates and errata are announced · dev-kit ETA.
+
+**For the next email (found in P3, 2026-10-18), alongside ozkey-52 §6:**
+1. **SHA-256 in the hash engine:** `hal_hash.h` defines only `SUPPORT_HASH_SM3`. Is SHA-256 supported
+   in hardware on AK1037, and is it safe to define `SUPPORT_HASH_SHA256`?
+2. **TRNG FIFO:** `hal_trng_get_randbuff_bytes()` reads several words from `TRNG_DR` after a single
+   `DRDY`. What is the FIFO depth? Is each read of `TRNG_DR` fresh entropy? Also,
+   `hal_trng_get_rand()` returns 0 on timeout with no error, and `hal_trng_init()` writes
+   `TRNG_CR |= 17` (probably meant `1 << 17`). Please confirm.
+3. **SKE key registers:** after `hal_ske_final()` the key stays in the SKE key registers. Is that
+   register readable over the bus or a debug port?
+4. **`ak_lfs` (found 2026-10-29, P4-prep item 2):**
+   - `user_provided_block_device_read()` reads the littlefs partition through the XIP window
+     straight after `spi_flash_write()`/`spi_flash_sector_erase()`, with `hal_dcache_flush_all()`
+     commented out. Can that return stale cached data?
+   - The wrapper also has no remove/rename/format. Is it maintained, or should customers use
+     littlefs directly, as we do (reading via `spi_flash_read()`)?
+   - Is `spi_flash_write`/`sector_erase` safe while code is executing XIP from the same chip?
+5. **GATT (found 2026-10-29, item 3):**
+   - In `com_ble_server_notify_ext(…, att_rec_idx)`, what does the index count? The Nordic DFU
+     sample passes `0` with `//IDX_DFU_CTRL_VAL` commented out.
+   - (The MTU question is answered by the SDK itself: `eBT_MSG_LE_MTU_EXCHANGED`, MTU in `param1`.)
