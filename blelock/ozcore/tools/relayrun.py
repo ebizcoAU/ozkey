@@ -14,7 +14,20 @@ Writes, next to <log prefix>:
   <prefix>_mqtt.log    every downlink/uplink this script saw, timestamped, with
                        uplinks that arrive AFTER a round gave up marked LATE
 
-Precondition: the lock is UNCLAIMED and the bridge holds its relay link.
+Precondition: the lock is UNCLAIMED. The bridge may hold it (rev 6) or not.
+
+Environment (all optional):
+  BRIDGE_CONSOLE=<port>  unpair the lock on the bridge before the door, pair it
+                         after (the rev 6 rig workaround; not needed from
+                         bridgeBLE-0.47, which releases an unclaimed lock itself)
+  BRIDGE_BOND=1          enrol the bridge's key (its retained presence
+                         "ozkie_pub") as a `bridge` bond at the door, label =
+                         the bridge id (F1-BRIDGE-BOND-1, rev 7)
+  DOOR_AFTER_REBOOT=K    after the relay rounds, K times: reset the lock (serial
+                         reopen), wait for the bridge to hold it again, then the
+                         owner connects AT THE DOOR over direct BLE and reads
+                         lock/state. The rev 7 acceptance check: an idle bridge
+                         must not keep the app out.
 """
 import os, queue, sys, threading, time
 
@@ -129,6 +142,26 @@ class LoggedRelayLink:
         self.c.loop_stop(); self.c.disconnect(); self.f.close()
 
 
+def bridge_pub(host, site, bridge, timeout=5.0):
+    """The bridge's ozkie_pub from its retained presence (lab: the rig stands in
+    for the app, which reads it from the bridge's BLE info and checks)."""
+    import json
+    import paho.mqtt.client as mqtt
+    got = queue.Queue()
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f'relayrun-b-{os.getpid()}')
+    c.on_message = lambda cl, u, m: got.put(bytes(m.payload))
+    c.connect(host, 1883, 30)
+    c.subscribe(f'ozkie/{site}/bridges/{bridge}/presence', qos=0)
+    c.loop_start()
+    try:
+        d = json.loads(got.get(timeout=timeout))
+    except Exception:                       # noqa: BLE001
+        d = {}
+    c.loop_stop(); c.disconnect()
+    pub = d.get('ozkie_pub')
+    return bytes.fromhex(pub) if pub and len(pub) == 64 else None
+
+
 def main(dev, port, bridge, n, prefix, host, site):
     out = open(prefix + '.log', 'a', buffering=1)
     def say(s):
@@ -182,6 +215,15 @@ def main(dev, port, bridge, n, prefix, host, site):
     rc, res = owner.call(0x01, 'bond')
     rc, res = owner.call(0x02, 'bond', {0: res[1], 1: 3, 2: svc.pub, 3: 'ozlodge'})
     svc.slot = res[1]
+    if os.environ.get('BRIDGE_BOND'):
+        bp = bridge_pub(host, site, bridge)
+        if bp is None:
+            say(f'{ts()} BRIDGE_BOND: {bridge} publishes no ozkie_pub (firmware < 0.47?)'); return False
+        rc, res = owner.call(0x01, 'bond')
+        rc, res = owner.call(0x02, 'bond', {0: res[1], 1: 4, 2: bp, 3: bridge})
+        if not (res and res[0] == R['BOND_OK']):
+            say(f'{ts()} BRIDGE_BOND: enrolment refused: {res}'); return False
+        say(f'{ts()} bridge bond enrolled: {bridge} key {bp.hex()[:16]}… slot {res[1]}')
     k.close()
     say(f'{ts()} door done: owner slot 0, service slot {svc.slot}')
     ser.mark('door done, Mac BLE closed')
@@ -189,7 +231,7 @@ def main(dev, port, bridge, n, prefix, host, site):
         bridge_cmd(f'pair {dev}')
 
     t0 = time.time()
-    held = pw.wait_held(after=t_open, timeout=60.0)
+    held = pw.wait_held(after=t_open, timeout=100.0)   # 0.47 holds off an unclaimed lock 60 s
     pw.close()
     say(f'{ts()} bridge holds the lock: {held} after {time.time() - t0:.1f} s')
 
@@ -228,9 +270,39 @@ def main(dev, port, bridge, n, prefix, host, site):
         ser.mark(f'round {r} {"PASS" if ok else "FAIL at " + step}')
         time.sleep(3.0)                     # spacing; late uplinks still land in _mqtt.log
     time.sleep(3.0)
-    m.close(); ser.close()
-    say(f'TOTAL {passes}/{n} PASS; failed rounds {fails}')
-    return not fails
+    m.close()
+
+    # --- the owner at the door after a lock reboot, bridge attached ---
+    door_n = int(os.environ.get('DOOR_AFTER_REBOOT') or 0)
+    door_ok = 0
+    for d in range(1, door_n + 1):
+        ser.mark(f'door-after-reboot {d}: resetting the lock')
+        pw2 = PresenceWatch(host, site, bridge, dev)
+        ser.s.close(); time.sleep(0.5); ser.s.open()        # the reopen resets the lock
+        t_rst = time.time()
+        held = pw2.wait_held(after=t_rst, timeout=60.0)
+        pw2.close()
+        time.sleep(4.0)                     # let the bridge finish its bridge-bond EDHOC
+        t0 = time.time()
+        ok, why = False, ''
+        try:
+            kk = BleLockLink(dev, serial=ser, scan_s=20.0)
+            ok = owner.connect(kk, lock_pub) is None
+            if ok:
+                code, _, _ = owner.request(0x01, 'lock/state')
+                ok = code is not None
+            kk.close()
+        except Exception as e:              # noqa: BLE001
+            why = f'{type(e).__name__} {e}'
+        door_ok += ok
+        say(f'{ts()} door-after-reboot {d}: bridge held={held}, owner at the door '
+            f'{"PASS" if ok else "FAIL " + why} ({time.time() - t0:.1f} s)')
+        ser.mark(f'door-after-reboot {d} {"PASS" if ok else "FAIL"}')
+        time.sleep(3.0)
+    ser.close()
+    say(f'TOTAL {passes}/{n} PASS; failed rounds {fails}'
+        + (f'; door-after-reboot {door_ok}/{door_n}' if door_n else ''))
+    return not fails and door_ok == door_n
 
 
 if __name__ == '__main__':
