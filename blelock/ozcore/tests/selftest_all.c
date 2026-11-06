@@ -16,6 +16,7 @@ int oz_t_motor(void);
 int oz_t_events(void);
 int oz_t_card(void);
 int oz_t_power(void);
+int oz_t_wdt(void);
 int oz_t_lock(void);
 
 static const struct {
@@ -34,6 +35,7 @@ static const struct {
     { "events", oz_t_events },
     { "card",   oz_t_card },
     { "power",  oz_t_power },
+    { "wdt",    oz_t_wdt },
     { "lock",   oz_t_lock },
 };
 

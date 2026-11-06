@@ -31,6 +31,7 @@
 #include "oz_card.h"
 #include "oz_gatt_ak1037.h"
 #include "oz_port_ak1037.h"
+#include "oz_wdt_ak1037.h"
 
 static const T_BT_ATTREC gatt_table[] = {
     { arPrimaryService, arLongUUID, OZ_BLE_UUID_SERVICE },
@@ -238,7 +239,21 @@ static void refresh_info(const oz_lock *L)
 
 void oz_gatt_ak1037_pair_prompt(int on) { oz_keypad_pairing(&keypad, on); }
 
-void oz_gatt_ak1037_actuate(int unlock) { oz_motor_command(&motor, unlock, now_ms()); }
+/* F-AK-WDT-1 SAFE mode (a watchdog reset loop): unlocking is never refused
+ * (the oz_power rule: never lock anyone out), but a LOCK move is, in case the
+ * motor is what keeps resetting the lock. The refusal ends the move as
+ * JAMMED, so the lock reports "not fully locked" rather than a bolt it never
+ * threw. Runs on the OZKIE thread, as motor_step does. */
+static int safe_refused;
+
+void oz_gatt_ak1037_actuate(int unlock)
+{
+    if (!unlock && oz_ak1037_wdt_safe()) {
+        safe_refused = 1;
+        return;
+    }
+    oz_motor_command(&motor, unlock, now_ms());
+}
 
 /* The motor driver: log-only until OZ-7 gives the driver IC, its pins and a
  * bolt sensor. Nothing is sensed, so every move ends OZ_MOVE_UNCONFIRMED. */
@@ -268,6 +283,11 @@ static void motor_step(oz_lock *L)
     static uint8_t driven = OZ_MOTOR_OFF;
     static uint16_t load_min;
     int unlock = 0;
+    if (safe_refused) {
+        safe_refused = 0;
+        oz_lock_actuated(L, 0, OZ_MOVE_JAMMED);
+        oz_port_log("motor: lock refused: SAFE MODE after repeated watchdog resets");
+    }
     if (motor.phase == OZ_MOTOR_DRIVING) {
         uint16_t mv = oz_ak1037_battery_mv();
         if (mv && (!load_min || mv < load_min))
@@ -343,8 +363,10 @@ static void ozkie_thread(void *param)
     int kicked = 0;
     uint32_t squat_drops = 0;
     int applied = -1, failed = 0;
+    int wdt_id = oz_ak1037_wdt_add(OZ_GATT_WDT_MS);
     refresh_info(L);
     for (;;) {
+        oz_ak1037_wdt_checkin(wdt_id);
         /* 10 ms while the motor moves (oz_motor_step's cadence), else 100. */
         rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE ? 100 : 10;
         if (rt_mq_recv(&mq, &m, sizeof m, (rt_int32_t)rt_tick_from_millisecond(wait)) == RT_EOK) {

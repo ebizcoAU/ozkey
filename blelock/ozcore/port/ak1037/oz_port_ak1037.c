@@ -316,9 +316,12 @@ static int kv_ready(void)
 
 int oz_ak1037_kv_mount(void) { return kv_ready(); }
 
+static volatile int kv_owner;
+
+int oz_ak1037_kv_owner(void) { return kv_owner; }
+
 int oz_ak1037_kv_claim(int owner)
 {
-    static int kv_owner;
     rt_base_t level = rt_hw_interrupt_disable();
     int ok = kv_owner == 0 || kv_owner == owner;
     if (ok) kv_owner = owner;

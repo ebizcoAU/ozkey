@@ -24,6 +24,7 @@ add_library(ozcore STATIC
     src/oz_events.c
     src/oz_card.c
     src/oz_power.c
+    src/oz_wdt.c
     src/oz_crypto.c
     src/sha256_sw.c
     src/aes128_sw.c)
@@ -136,6 +137,9 @@ add_test(NAME card COMMAND test_card)
 add_executable(test_power tests/test_power.c)
 target_link_libraries(test_power ozport_host)
 add_test(NAME power COMMAND test_power)
+add_executable(test_wdt tests/test_wdt.c)
+target_link_libraries(test_wdt ozport_host)
+add_test(NAME wdt COMMAND test_wdt)
 
 add_executable(test_adv tests/test_adv.c)
 target_link_libraries(test_adv ozport_host)
@@ -146,7 +150,7 @@ add_test(NAME adv COMMAND test_adv)
 # properties are directory-wide, so the rename goes in a generated wrapper
 # rather than on tests/test_<name>.c, which the standalone tests also build.
 set(OZ_SELFTEST_SOURCES tests/selftest_all.c)
-foreach(t crypto cbor edhoc oscore invite frame adv keypad motor events card power lock)
+foreach(t crypto cbor edhoc oscore invite frame adv keypad motor events card power wdt lock)
     set(w ${CMAKE_CURRENT_BINARY_DIR}/selftest_${t}.c)
     file(WRITE ${w}.in "#define main oz_t_${t}\n#include \"${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${t}.c\"\n")
     configure_file(${w}.in ${w} COPYONLY)
@@ -168,7 +172,8 @@ target_link_libraries(ak1037_mock PUBLIC ozcore Threads::Threads)
 target_compile_options(ak1037_mock PRIVATE -Wall -Wextra -Werror)
 
 # The same warnings as port/ak1037/Makefile gives these files.
-add_library(ozport_ak1037_host STATIC port/ak1037/oz_port_ak1037.c port/ak1037/oz_gatt_ak1037.c)
+add_library(ozport_ak1037_host STATIC port/ak1037/oz_port_ak1037.c port/ak1037/oz_gatt_ak1037.c
+    port/ak1037/oz_wdt_ak1037.c)
 target_link_libraries(ozport_ak1037_host PUBLIC ak1037_mock ozkv_lfs monocypher ozcore)
 target_compile_options(ozport_ak1037_host PRIVATE -Wall -Wextra -Werror)
 
@@ -178,10 +183,18 @@ foreach(m good wrong error blank nopart badpart retry)
     add_test(NAME ak1037_port_${m} COMMAND test_ak1037_port ${m})
 endforeach()
 
+add_executable(test_ak1037_wdt tests/test_ak1037_wdt.c)
+target_link_libraries(test_ak1037_wdt ozport_ak1037_host)
+target_compile_options(test_ak1037_wdt PRIVATE -Wall -Wextra -Wno-unused-function -Werror)
+foreach(m por wdt aowdt soft wake feed stable safestay selftest)
+    add_test(NAME ak1037_wdt_${m} COMMAND test_ak1037_wdt ${m})
+endforeach()
+
 add_executable(test_ak1037_gatt tests/test_ak1037_gatt.c port/ak1037/oz_lockapp_ak1037.c)
 target_link_libraries(test_ak1037_gatt ozport_ak1037_host)
 target_compile_options(test_ak1037_gatt PRIVATE -Wall -Wextra -Werror)
 add_test(NAME ak1037_gatt COMMAND test_ak1037_gatt)
+add_test(NAME ak1037_gatt_safe COMMAND test_ak1037_gatt safe)
 # P5-D: optimised builds hold the measured host stack peaks to the threads'
 # budgets (unoptimised frames are far bigger than the target's -Os ones).
 target_compile_definitions(test_ak1037_gatt PRIVATE $<$<CONFIG:Release>:OZ_STACK_TRIPWIRE>)

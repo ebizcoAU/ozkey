@@ -16,6 +16,11 @@
 #include "hal_lpc.h"
 #include "encoding.h"
 
+/* port/ak1037/oz_wdt_ak1037.h (F-AK-WDT-1); this file builds with the SDK
+ * include path only, so declared here as the SDK names are below. */
+extern int  oz_ak1037_wdt_boot(void);
+extern void oz_ak1037_wdt_service(void);
+
 extern void hal_set_total_callback(void (*fun)(void));
 extern void msh_process();
 
@@ -40,10 +45,9 @@ static void app_main_thread_entry(void *parameter)
     hal_ao_gpio_set_interrupt_callback(6, ble_freq_intr);
     osc_init_adjust_cap();
 #endif
-#ifndef SUPP_WATCHDOG
-    extern void hal_wdt_stop(void);
-    hal_wdt_stop();
-#endif
+    /* F-AK-WDT-1: keep the core watchdog the SDK armed (12.8 s) instead of
+     * the SDK main.c's hal_wdt_stop(), and run the boot guard. */
+    (void)oz_ak1037_wdt_boot();
     for (;;) {
 #ifdef SUPP_MSH
         msh_process();
@@ -58,9 +62,7 @@ static void app_main_thread_entry(void *parameter)
             ble_freq_adj_mk = 0;
         }
 #endif
-#ifdef SUPP_WATCHDOG
-        hal_wdt_feed();
-#endif
+        oz_ak1037_wdt_service();    /* feeds only while every task checks in */
         osDelay(1);
     }
 }
@@ -77,17 +79,14 @@ static void app_main_thread_init(void *argument)
 
 void main_loop(void)
 {
-#ifndef SUPP_WATCHDOG
-    extern void hal_wdt_stop(void);
-    hal_wdt_stop();
-#endif
+    /* F-AK-WDT-1: keep the core watchdog the SDK armed (12.8 s) instead of
+     * the SDK main.c's hal_wdt_stop(), and run the boot guard. */
+    (void)oz_ak1037_wdt_boot();
     for (;;) {
 #ifdef SUPP_MSH
         msh_process();
 #endif
-#ifdef SUPP_WATCHDOG
-        hal_wdt_feed();
-#endif
+        oz_ak1037_wdt_service();    /* feeds only while every task checks in */
     }
 }
 

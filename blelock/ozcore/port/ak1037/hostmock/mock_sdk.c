@@ -621,3 +621,17 @@ T_eBLE_RESULT com_ble_disconnect(uint8_t idx)
     mock_disconnects++;
     return eBLE_RESULT_SUCCESS;
 }
+
+/* ── watchdog, reset status, boot state (F-AK-WDT-1) ───────────────────── */
+#include "hal_watchdog.h"
+#include "hal_sysclock.h"
+#include "hal_lpc.h"
+int mock_wdt_enabled, mock_wdt_period = -1;
+long mock_wdt_feeds;
+int mock_reset_status = HAL_AO_POR_RST;
+int mock_boot_state;
+void hal_wdt_start(T_eWDT_TIME feed_time) { mock_wdt_enabled = 1; mock_wdt_period = (int)feed_time; }
+void hal_wdt_feed(void) { if (mock_wdt_enabled) mock_wdt_feeds++; }
+void hal_wdt_stop(void) { mock_wdt_enabled = 0; }
+T_eRST_STATUS hal_clock_get_reset_status(void) { return (T_eRST_STATUS)mock_reset_status; }
+int32_t hal_lpc_get_boot_state(void) { return mock_boot_state; }

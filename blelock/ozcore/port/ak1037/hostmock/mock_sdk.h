@@ -86,6 +86,13 @@ void mock_ble_event(void *link, T_eBT_MSG msg, int32_t param1);
 void mock_ble_write(void *link, const void *att_rec, const uint8_t *data, uint16_t len);
 uint16_t mock_ble_read(void *link, const void *att_rec, uint8_t *buf, uint16_t cap);
 
+/* ── watchdog, reset status, boot state (F-AK-WDT-1) ───────────────────── */
+extern int mock_wdt_enabled;            /* hal_wdt_start .. hal_wdt_stop */
+extern int mock_wdt_period;             /* the T_eWDT_TIME last started */
+extern long mock_wdt_feeds;
+extern int mock_reset_status;           /* hal_clock_get_reset_status() */
+extern int mock_boot_state;             /* hal_lpc_get_boot_state(), 0 = cold boot */
+
 /* ── the shell ─────────────────────────────────────────────────────────── */
 /* Run "cmd arg ..." as MSH would. Returns -1 if no such command. */
 int mock_msh_run(const char *line);

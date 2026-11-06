@@ -17,6 +17,9 @@
 /* 12 KB until measured on silicon: worst static chain 6,160 B with littlefs
  * (ozkey-49 P5-D), plus indirect calls and littlefs recursion. */
 #define OZ_GATT_THREAD_STACK (12 * 1024)
+/* The OZKIE thread checks in with the watchdog policy (F-AK-WDT-1) at least
+ * this often; its loop wakes every 100 ms or less. */
+#define OZ_GATT_WDT_MS 2000u
 
 /* 1 = always advertising, for a lock its bridge must reach at any moment (the
  * CH584M ruling, ozdoorlock_core.h bleAdvertisingAllowed()); 0 = CONTRACT.md's

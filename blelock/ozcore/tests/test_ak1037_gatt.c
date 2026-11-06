@@ -27,6 +27,9 @@
 #include "oz_gatt_ak1037.h"
 #include "oz_motor.h"
 #include "mock_sdk.h"
+#include "hal_sysclock.h"
+#include "oz_wdt.h"
+#include "oz_wdt_ak1037.h"
 
 #define LINK ((void *)0x1234)
 
@@ -227,9 +230,12 @@ static void expect_adv(const char *what, oz_adv_mode mode)
 
 /* ── the scenario ──────────────────────────────────────────────────────── */
 
+static int keep_flash;                  /* safe mode: kv is already mounted */
+
 static void boot(void)
 {
-    mock_flash_blank();
+    if (!keep_flash)
+        mock_flash_blank();
     mock_ms = 5000;
     mock_on_notify = on_notify;
     expect_int("oz.start exists", mock_msh_run("oz.start"), 0);
@@ -666,8 +672,61 @@ static void disconnect_and_adv(void)
     expect_adv("an hour later", OZ_ADV_OPEN);
 }
 
-int main(void)
+/* ── F-AK-WDT-1 SAFE mode: the 3rd watchdog reset in a row ───────────── */
+
+/* Before oz.start: two watchdog resets already counted in kv, and this boot
+ * is the third. */
+static void safe_boot(void)
 {
+    mock_flash_blank();
+    uint8_t two = 2;
+    expect_int("count preset", oz_port_kv_set("bg", &two, 1), OZ_OK);
+    mock_reset_status = HAL_CORE_WDT_RST;
+    expect_int("3rd watchdog reset: SAFE", oz_ak1037_wdt_boot(), 1);
+    expect_int("watchdog kept on", mock_wdt_enabled, 1);
+}
+
+static void safe_moves(void)
+{
+    uint8_t out[600], req[300];
+    oz_oscore_xchg x;
+    int result;
+
+    passes(200);                        /* claim()'s moves end */
+    capture_start();
+    size_t n = request(OZ_COAP_POST, "lock/lock", req, sizeof req, &x);
+    size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    passes(200);
+    mock_msh_run("oz.state");
+    capture_end();
+    expect_int("lock answered", response(out, ol, &x, &result) == OZ_COAP_CHANGED, 1);
+    expect_int("the motor never drove to lock", count("motor: to lock"), 0);
+    expect_int("refusal logged", count("motor: lock refused: SAFE MODE"), 1);
+    expect_int("state: not fully locked, JAMMED (not a bolt it never threw)",
+               count("oz.state: not fully locked, last move JAMMED"), 1);
+
+    /* Never lock anyone out: unlocking still drives the motor. */
+    capture_start();
+    n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
+    ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    passes(200);
+    mock_msh_run("oz.state");
+    capture_end();
+    expect_int("unlock OK", response(out, ol, &x, &result) == OZ_COAP_CHANGED && result == OZ_R_UNLOCK_OK, 1);
+    expect_int("driven to unlock", count("motor: to unlock"), 1);
+    expect_int("state: unlocked", count("oz.state: unlocked, last move unconfirmed"), 1);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && !strcmp(argv[1], "safe")) {
+        safe_boot();
+        keep_flash = 1;
+        boot();
+        claim();
+        safe_moves();
+        return report("ak1037_gatt_safe");
+    }
     boot();
     claim();
     keypad_lockout();

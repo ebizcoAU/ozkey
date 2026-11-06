@@ -20,6 +20,8 @@ int oz_ak1037_kv_mount(void);
  * OZ_OK if kv was free or already this owner's, OZ_E_ARG otherwise. */
 enum { OZ_AK1037_KV_SELFTEST = 1, OZ_AK1037_KV_LOCK = 2 };
 int oz_ak1037_kv_claim(int owner);
+/* The current owner, 0 = none yet. */
+int oz_ak1037_kv_owner(void);
 
 /* The battery in mV from the SAR ADC (P5-F). Channel, divider and reference
  * are placeholders until OZ-7 5a: OZ_BATT_AIN, OZ_BATT_DIV, OZ_BATT_VREF_MV.
