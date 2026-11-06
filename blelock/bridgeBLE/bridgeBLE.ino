@@ -245,7 +245,8 @@ static char g_advName[16] = BLE_NAME;
 //             border router was hanging off it.
 // Own namespace, forked from bridge32-1.44 (2026-08-29) — see file header.
 // 0.45 (2026-11-06): the F1 OZKIE v2 relay (02becd8), which shipped as 0.44 by mistake.
-#define FW_VERSION "bridgeBLE-0.45"
+// 0.46 (2026-11-06): F1-BRIDGE-LOG-1, a downlink dropped while queued is logged (was silent).
+#define FW_VERSION "bridgeBLE-0.46"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen

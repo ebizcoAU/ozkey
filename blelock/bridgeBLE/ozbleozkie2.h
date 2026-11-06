@@ -163,6 +163,13 @@ static bool oz2WriteOneDownlink() {
                     (unsigned)(m.len - 1), count, ok ? "" : " WRITE FAILED");
     } else {
       g_oz2.notHeld++;                          // dropped while queued
+      // F1-BRIDGE-LOG-1: this drop was silent. The lock went away (or its relay
+      // characteristic did) between queueing and writing; say so, like the
+      // enqueue-time "not held by this bridge, dropped" line does.
+      Serial.printf("[OZ2-DN] %s: type %u, %u B dropped while queued (lock %s)\n", m.dev,
+                    m.buf[0], (unsigned)(m.len - 1),
+                    !l ? "not held" : l->ozkie != 2 ? "not v2" :
+                    !ozBleConnected(*l) ? "disconnected" : "has no relay characteristic");
     }
     if (ok) g_oz2.dn++; else g_oz2.writeFail++;
     m.inUse = false;
