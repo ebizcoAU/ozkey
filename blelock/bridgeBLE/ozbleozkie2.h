@@ -221,9 +221,9 @@ static bool oz2Attach(OzBleLock *slot, BLEClient *cl, BLERemoteService *svc, con
   const String id = oz2ReadInfo(svc->getCharacteristic(BLEUUID(OZ2_CHR_INFO)), lockPub, &havePub, &state);
   BLERemoteCharacteristic *relay = svc->getCharacteristic(BLEUUID(OZ2_CHR_RELAY));
   if (!id.length() || !relay || !relay->canNotify() || !relay->canWrite()) {
-    Serial.printf("[OZ2] %s: v2 lock without a readable id or a `relay` characteristic, dropped\n",
-                  addr.c_str());
-    ozBleNoteProbeFailed(addr);
+    Serial.printf("[OZ2] %s: v2 lock without a readable id or a `relay` characteristic, dropped; "
+                  "retry in %lu s\n", addr.c_str(), OZ2_UNREADABLE_HOLDOFF_MS / 1000);
+    oz2HoldOff(addr, OZ2_UNREADABLE_HOLDOFF_MS);   // short: usually a lock mid-reboot (was the 5 min cooldown)
     cl->disconnect();
     delete cl;
     return false;
@@ -242,7 +242,7 @@ static bool oz2Attach(OzBleLock *slot, BLEClient *cl, BLERemoteService *svc, con
   if (state == 0) {
     Serial.printf("[OZ2] %s is UNCLAIMED: not holding it (no relay possible, frees the door); "
                   "recheck in %lu s\n", id.c_str(), OZ2_UNCLAIMED_HOLDOFF_MS / 1000);
-    oz2HoldOff(addr);
+    oz2HoldOff(addr, OZ2_UNCLAIMED_HOLDOFF_MS);
     cl->disconnect();
     delete cl;
     return false;

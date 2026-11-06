@@ -249,7 +249,9 @@ static char g_advName[16] = BLE_NAME;
 // 0.47 (2026-11-06): F1-BRIDGE-BOND-1, the bridge's own `bridge` bond (EDHOC on
 //      `ozkie`, key in NVS, ozkie_pub in presence + info); never holds an
 //      UNCLAIMED v2 lock (released, 60 s hold-off).
-#define FW_VERSION "bridgeBLE-0.47"
+// 0.48 (2026-11-06): a v2 lock whose `info` read fails (mid-reboot) is retried
+//      after 15 s, not the 5 min stranger cooldown (F1 acceptance r6/r9).
+#define FW_VERSION "bridgeBLE-0.48"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen

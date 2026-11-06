@@ -422,9 +422,14 @@ static bool ozBleRecentlyRejected(const String &addr) {
 // useless there, and holding it would block first pairing at the door) is not
 // reconnected for OZ2_UNCLAIMED_HOLDOFF_MS. Keyed on address, like the above.
 #define OZ2_UNCLAIMED_HOLDOFF_MS 60000UL
-struct Oz2Holdoff { String addr; unsigned long at = 0; };
+// A v2 lock whose `info` couldn't be read (typically: it was rebooting as we
+// connected) gets this short hold-off, NOT the 5 min stranger cooldown. With
+// the cooldown, one reboot mid-identification cost 5 min of remote access
+// (F1 acceptance r6/r9 2026-11-06: "no message_2" = "not held by this bridge").
+#define OZ2_UNREADABLE_HOLDOFF_MS 15000UL
+struct Oz2Holdoff { String addr; unsigned long at = 0; unsigned long ms = 0; };
 static Oz2Holdoff g_oz2Holdoff[OZ_BLE_MAX_LOCKS];
-static void oz2HoldOff(const String &addr) {
+static void oz2HoldOff(const String &addr, unsigned long ms) {
   Oz2Holdoff *v = &g_oz2Holdoff[0];
   for (auto &h : g_oz2Holdoff) {
     if (h.addr == addr) { v = &h; break; }
@@ -432,10 +437,11 @@ static void oz2HoldOff(const String &addr) {
   }
   v->addr = addr;
   v->at = millis();
+  v->ms = ms;
 }
 static bool oz2HeldOff(const String &addr) {
   for (auto &h : g_oz2Holdoff)
-    if (h.addr == addr && h.at && millis() - h.at < OZ2_UNCLAIMED_HOLDOFF_MS) return true;
+    if (h.addr == addr && h.at && millis() - h.at < h.ms) return true;
   return false;
 }
 
