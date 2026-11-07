@@ -719,8 +719,78 @@ static void safe_moves(void)
     expect_int("state: unlocked", count("oz.state: unlocked, last move unconfirmed"), 1);
 }
 
+/* ── oz.wdthang (OZ_DEBUG_HOOKS only) ──────────────────────────────────── */
+
+/* The command's name, built at run time so this file never holds it as a
+ * string: the release-binary scan (CMake) must find it only where the hook
+ * is compiled in. */
+static const char *hook_name(void)
+{
+    static char n[16];
+    static volatile const char rev[] = "gnahtdw.zo";
+    size_t len = sizeof rev - 1;
+    for (size_t i = 0; i < len; i++)
+        n[i] = rev[len - 1 - i];
+    n[len] = 0;
+    return n;
+}
+
+/* Release and every default build: the shell has no such command. */
+static void no_hooks(void)
+{
+    expect_int("no debug hook in the shell", mock_msh_run(hook_name()), -1);
+}
+
+#ifdef OZ_DEBUG_HOOKS
+/* Debug build: the command stops the OZKIE thread's check-ins, so the main
+ * loop stops feeding and the watchdog would reset the lock. */
+static void wdthang(void)
+{
+    mock_flash_blank();
+    mock_reset_status = HAL_AO_POR_RST;
+    expect_int("power-on boot: NORMAL", oz_ak1037_wdt_boot(), 0);
+    keep_flash = 1;
+    boot();
+    long f0 = mock_wdt_feeds;
+    for (int i = 0; i < 10; i++) {
+        passes(1);
+        oz_ak1037_wdt_service();
+    }
+    expect_int("fed while the OZKIE thread checks in", mock_wdt_feeds - f0 > 0, 1);
+    capture_start();
+    expect_int("the debug hook exists", mock_msh_run(hook_name()), 0);
+    capture_end();
+    expect_int("…and says what it does", count("stops checking in"), 1);
+    long f1 = mock_wdt_feeds;
+    for (int i = 0; i < 60; i++) {      /* the thread runs on: about 6 s of passes */
+        passes(1);
+        oz_ak1037_wdt_service();
+    }
+    expect_int("a few feeds until the thread is 2 s late, then none",
+               mock_wdt_feeds - f1 > 0 && mock_wdt_feeds - f1 < 30, 1);
+    long f2 = mock_wdt_feeds;
+    for (int i = 0; i < 60; i++) {
+        passes(1);
+        oz_ak1037_wdt_service();
+    }
+    expect_int("…no feeds at all: the watchdog will reset the lock", mock_wdt_feeds - f2, 0);
+}
+#endif
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "nohooks")) {
+        no_hooks();
+        return report("ak1037_gatt_nohooks");
+    }
+    if (argc > 1 && !strcmp(argv[1], "wdthang")) {
+#ifdef OZ_DEBUG_HOOKS
+        wdthang();
+#else
+        expect_int("built with OZ_DEBUG_HOOKS", 0, 1);
+#endif
+        return report("ak1037_gatt_wdthang");
+    }
     if (argc > 1 && !strcmp(argv[1], "safe")) {
         safe_boot();
         keep_flash = 1;
