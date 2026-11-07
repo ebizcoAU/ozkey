@@ -9,6 +9,7 @@
  * forwarders so load order never matters.
  */
 
+const crypto = require('crypto');
 const { ctx, lazy } = require('./ctx');
 const CONFIG = lazy(() => ctx.CONFIG);
 const pool = lazy(() => ctx.pool);
@@ -18,6 +19,47 @@ const logEvent = (...args) => ctx.logEvent(...args);
 const recordAudit = (...args) => require('./audit').recordAudit(...args);
 const mqttPublish = (...args) => require('./transport').mqttPublish(...args);
 const { lastGrantSentByDevice, OZKIE_V2 } = require('./relay');
+
+/** The command one queued job becomes on the wire: topic + body (+ its msg_id).
+ * The ONE builder for both the queue flush and the live unlock below, so the
+ * two can never drift apart (two builders diverging is a recurring bug here). */
+function buildCommand(siteId, deviceId, bridgeId, job) {
+  const sealed = job.msg_type === 'sealed_envelope';
+
+  const commandTopic = bridgeId
+    ? CONFIG.topicBridgeCommand(siteId, bridgeId)
+    : CONFIG.topicCommand(siteId, deviceId);
+  const envelope = {
+    msg_id: `ozl-${job.id}-${Date.now()}`,
+    device_id: deviceId,
+    action: job.action_type,
+    grant_id: job.grant_id,
+    ...(sealed ? { envelope_hex: job.envelope_hex } : { payload_hex: job.payload_hex }),
+    issued_at: new Date().toISOString(),
+    source: CONFIG.SERVICE_NAME,
+  };
+  // bridge32 demuxes on {target, payload}/{target, envelope_hex}
+  // (CONTRACT-BRIDGE / ozkey-11 §3, extended ozkey-13 §8 S7/BR1/F7). Send
+  // it a MINIMAL envelope: the bridge reads only target + one content
+  // field and rebuilds its own datagram from them, so msg_id/action/
+  // grant_id/issued_at/source never cross the Thread hop and are pure
+  // overhead on a constrained link. Keeping them nearly broke the product:
+  // PubSubClient's default MQTT_MAX_PACKET_SIZE is 256 bytes and silently
+  // discards anything larger, so the ~280-byte full envelope was dropped
+  // by every bridge without a trace while short hand-made test publishes
+  // sailed through (found live 2026-07-29). bridge32 now also calls
+  // setBufferSize(1024), but keeping the wire small is the belt to that
+  // braces — a stock-configured bridge, or one on an older build, still
+  // works. The bridge never decodes `envelope_hex` — pure pass-through,
+  // same as `payload` always was; only the field name differs.
+  const publishBody = bridgeId
+    ? (sealed
+        ? { msg_id: envelope.msg_id, target: deviceId, envelope_hex: job.envelope_hex }
+        : { msg_id: envelope.msg_id, target: deviceId, payload: job.payload_hex })
+    : envelope;
+
+  return { topic: commandTopic, body: publishBody, msgId: envelope.msg_id };
+}
 
 /** Drain queued actions for a device; expired unlock-style rows are skipped.
  * `onSent(job, msgId)`, if given, fires for each job actually published —
@@ -80,6 +122,16 @@ async function flushQueueForDeviceImpl(siteId, deviceId, onSent) {
 
   let sent = 0;
   for (const job of queued) {
+    // Live-only remote unlock (operator 2026-11-05, PM nexus-6e 2026-11-07):
+    // a remote unlock is published once, live, by publishUnlockNow() and is
+    // never queued. A queued 'unlock' row can only be left over from an older
+    // server, and it must never fire late: expire it unsent. ('assisted-unlock'
+    // is the listed exception and still flows through here.)
+    if (job.action_type === 'unlock') {
+      await pool.query("UPDATE pending_queue SET status = 'expired' WHERE id = ?", [job.id]);
+      logEvent('warn', `Queue #${job.id} (unlock) dropped unsent for ${deviceId}: remote unlock is live-only, never queued`);
+      continue;
+    }
     // ozkey-05 §6.3: commands must never fire stale.
     if (job.expires_at && new Date(job.expires_at).getTime() < Date.now()) {
       await pool.query("UPDATE pending_queue SET status = 'expired' WHERE id = ?", [job.id]);
@@ -103,43 +155,11 @@ async function flushQueueForDeviceImpl(siteId, deviceId, onSent) {
       continue;
     }
 
-    const sealed = job.msg_type === 'sealed_envelope';
-
-    const commandTopic = bridgeId
-      ? CONFIG.topicBridgeCommand(siteId, bridgeId)
-      : CONFIG.topicCommand(siteId, deviceId);
-    const envelope = {
-      msg_id: `ozl-${job.id}-${Date.now()}`,
-      device_id: deviceId,
-      action: job.action_type,
-      grant_id: job.grant_id,
-      ...(sealed ? { envelope_hex: job.envelope_hex } : { payload_hex: job.payload_hex }),
-      issued_at: new Date().toISOString(),
-      source: CONFIG.SERVICE_NAME,
-    };
-    // bridge32 demuxes on {target, payload}/{target, envelope_hex}
-    // (CONTRACT-BRIDGE / ozkey-11 §3, extended ozkey-13 §8 S7/BR1/F7). Send
-    // it a MINIMAL envelope: the bridge reads only target + one content
-    // field and rebuilds its own datagram from them, so msg_id/action/
-    // grant_id/issued_at/source never cross the Thread hop and are pure
-    // overhead on a constrained link. Keeping them nearly broke the product:
-    // PubSubClient's default MQTT_MAX_PACKET_SIZE is 256 bytes and silently
-    // discards anything larger, so the ~280-byte full envelope was dropped
-    // by every bridge without a trace while short hand-made test publishes
-    // sailed through (found live 2026-07-29). bridge32 now also calls
-    // setBufferSize(1024), but keeping the wire small is the belt to that
-    // braces — a stock-configured bridge, or one on an older build, still
-    // works. The bridge never decodes `envelope_hex` — pure pass-through,
-    // same as `payload` always was; only the field name differs.
-    const publishBody = bridgeId
-      ? (sealed
-          ? { msg_id: envelope.msg_id, target: deviceId, envelope_hex: job.envelope_hex }
-          : { msg_id: envelope.msg_id, target: deviceId, payload: job.payload_hex })
-      : envelope;
+    const { topic: commandTopic, body: publishBody, msgId } = buildCommand(siteId, deviceId, bridgeId, job);
 
     const ok = mqttPublish(commandTopic, publishBody);
     if (!ok) break;
-    if (onSent) onSent(job, envelope.msg_id);
+    if (onSent) onSent(job, msgId);
 
     await pool.query("UPDATE pending_queue SET status = 'sent' WHERE id = ?", [job.id]);
     if (job.grant_id) {
@@ -172,8 +192,44 @@ async function flushQueueForDeviceImpl(siteId, deviceId, onSent) {
   return sent;
 }
 
+/** Live-only remote unlock (operator 2026-11-05: never queued; PM nexus-6e
+ * GO 2026-11-07). Publishes the sealed unlock ONCE, now, with the same builder
+ * and routing as a queued job, on the device's flush chain so it never
+ * interleaves with a burst being flushed. Never retried. Resolves to
+ * { ok, topic, msgId, bridgeId }; ok=false means MQTT refused the publish. */
+function publishUnlockNow(siteId, deviceId, envelopeHex) {
+  const prev = flushQueueQueues.get(deviceId) || Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(async () => {
+      const [[lockRow]] = await pool.query('SELECT bridge_id FROM locks WHERE id = ?', [deviceId]);
+      const bridgeId = lockRow && lockRow.bridge_id ? lockRow.bridge_id : null;
+      const job = {
+        id: `u${crypto.randomBytes(4).toString('hex')}`,
+        action_type: 'unlock',
+        grant_id: null,
+        msg_type: 'sealed_envelope',
+        envelope_hex: envelopeHex,
+      };
+      const { topic, body, msgId } = buildCommand(siteId, deviceId, bridgeId, job);
+      const ok = mqttPublish(topic, body);
+      if (ok) {
+        logEvent(
+          'key',
+          `${deviceId} remote unlock published once (live, not queued) down ${topic}` +
+            (bridgeId ? ` (via bridge ${bridgeId})` : '')
+        );
+      }
+      return { ok, topic, msgId, bridgeId };
+    });
+  flushQueueQueues.set(deviceId, next);
+  return next;
+}
+
 module.exports = {
   flushQueueQueues,
   flushQueueForDevice,
   flushQueueForDeviceImpl,
+  buildCommand,
+  publishUnlockNow,
 };

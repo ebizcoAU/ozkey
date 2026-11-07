@@ -21,6 +21,7 @@ const makeSecret = (...args) => require('./util').makeSecret(...args);
 const recordAudit = (...args) => require('./audit').recordAudit(...args);
 const refuseIfOzkieV2 = (...args) => require('./relay').refuseIfOzkieV2(...args);
 const flushQueueForDevice = (...args) => require('./queue').flushQueueForDevice(...args);
+const publishUnlockNow = (...args) => require('./queue').publishUnlockNow(...args);
 const eventsAtRisk = (...args) => require('./registry').eventsAtRisk(...args);
 const eventsPending = (...args) => require('./registry').eventsPending(...args);
 const waitForBridgeResetVerdict = (...args) => require('./registry').waitForBridgeResetVerdict(...args);
@@ -30,7 +31,7 @@ const backupAvailableSet = (...args) => require('./registry').backupAvailableSet
 const likelyOnline = (...args) => require('./registry').likelyOnline(...args);
 const effectiveCaps = (...args) => require('./registry').effectiveCaps(...args);
 const mqttPublish = (...args) => require('./transport').mqttPublish(...args);
-const { OZKIE_V2 } = require('./relay');
+const { OZKIE_V2, unlockWatches, lastGrantSentByDevice } = require('./relay');
 const { eventsAtRiskLogged } = require('./registry');
 
 const SUPPORTED_CRED_TYPES = ['pin', 'rfid'];
@@ -1100,16 +1101,6 @@ api.post('/locks/:id/unlock', async (req, res) => {
       });
     }
 
-    // §6.3: an unlock MUST NOT fire stale. Queue with an expiry; the flush drops
-    // it if the lock doesn't wake in time.
-    //
-    // XF-58: an ASSISTED unlock additionally carries `action_type =
-    // 'assisted-unlock'`, which doorlock-1.5 refuses unless the keypad was
-    // touched in the last 30 s. The expiry alone would not be enough — it bounds
-    // WHEN the command may run, never WHETHER anybody was at the door, and a
-    // sleeping lock wakes on its heartbeat timer too. The device-side check is
-    // what makes "someone must be there" a requirement instead of a probability.
-    //
     // XF-120 §2 step 2, 2026-08-21: `envelope_hex` is now REQUIRED. The
     // accept-both rollout shim (S10) is gone — both REST-unlock callers
     // (`unlock()`, `assistedUnlock()`) ship sealing as of `ftpos 34bc1e6`,
@@ -1128,8 +1119,107 @@ api.post('/locks/:id/unlock', async (req, res) => {
         ref: 'XF-120 §2',
       });
     }
-    const actionType = assisted ? 'assisted-unlock' : 'unlock';
-    const windowMs = assisted ? ASSISTED_UNLOCK_MS : 60_000;
+
+    // LIVE-ONLY remote unlock (operator 2026-11-05: "remote unlock must NEVER
+    // be queued"; PM nexus-6e GO 2026-11-07, R1 (A)). Publish ONCE, now; no
+    // pending_queue row, no retry, no failover re-send. A v1 lock never reports
+    // success to the server (UNLOCK_OK rides BLE only), so the server watches
+    // the uplink for a REFUSAL code for UNLOCK_REFUSAL_WATCH_MS:
+    //   code    -> 502 lock_refused {lock_code}
+    //   silence -> 200 result 'sent_unconfirmed' (the app says "sent, check the
+    //              door", never "opened"; 504 no_ack is reserved for v2, whose
+    //              OSCORE response IS an ACK, OZKIE-V2-SERVER-1).
+    // ASSISTED unlock is the one listed exception (R2 (i)): it stays queued
+    // below until the operator rules on the doorbell redesign.
+    if (!assisted) {
+      if (unlockWatches.has(deviceId)) {
+        return res.status(409).json({
+          ok: false,
+          code: 'unlock_in_progress',
+          error: 'unlock_in_progress',
+          detail:
+            'A remote unlock for this lock is already in flight. Wait for its answer; ' +
+            'a second one could not be told apart from the first.',
+          device_id: deviceId,
+        });
+      }
+      let gotCode;
+      const codeP = new Promise((resolve) => (gotCode = resolve));
+      const watch = { onCode: gotCode };
+      unlockWatches.set(deviceId, watch); // reserved before any await
+      let timer;
+      try {
+        const pub = await publishUnlockNow(lock.site_id, deviceId, envelope_hex);
+        if (!pub.ok) {
+          logEvent('warn', `Remote UNLOCK for "${lock.label}" NOT sent — MQTT publish refused (never queued)`);
+          await recordAudit(lock.app_id, deviceId, 'unlock', 'remote unlock: not sent (transport down)');
+          return res.status(503).json({
+            ok: false,
+            code: 'transport_unavailable',
+            error: 'transport_unavailable',
+            detail: 'The server could not hand the command to the broker. Nothing was queued; try again.',
+            device_id: deviceId,
+          });
+        }
+        // Last-sent-wins: from here on, a code answers this unlock, not an
+        // earlier grant (the side bug). That grant stays in flight ('pending'
+        // or 'revoking'), which is the truth: its outcome is now unknown.
+        const stale = lastGrantSentByDevice.get(deviceId);
+        if (stale) {
+          lastGrantSentByDevice.delete(deviceId);
+          logEvent(
+            'warn',
+            `Grant #${stale.grantId} (${stale.actionType}) on ${deviceId}: outcome no longer attributable, a remote unlock was sent after it`
+          );
+        }
+        const code = await Promise.race([
+          codeP,
+          new Promise((resolve) => (timer = setTimeout(() => resolve(null), CONFIG.UNLOCK_REFUSAL_WATCH_MS))),
+        ]);
+        if (code) {
+          await recordAudit(lock.app_id, deviceId, 'unlock', `remote unlock: refused ${code}`);
+          return res.status(502).json({
+            ok: false,
+            code: 'lock_refused',
+            error: 'lock_refused',
+            lock_code: code,
+            detail: `The lock refused the command (${code}). It will not be retried.`,
+            device_id: deviceId,
+            msg_id: pub.msgId,
+          });
+        }
+        await recordAudit(lock.app_id, deviceId, 'unlock', 'remote unlock: sent_unconfirmed');
+        return res.json({
+          ok: true,
+          device_id: deviceId,
+          result: 'sent_unconfirmed',
+          msg_id: pub.msgId,
+          envelope_hex,
+          // KEPT for compat (the app parses it): handed to the broker, once.
+          delivery: 'delivered',
+          transport_ok: true,
+          mode: 'remote',
+          requires_touch: false,
+          window_s: null, // nothing waits to fire later
+          refusal_watch_s: CONFIG.UNLOCK_REFUSAL_WATCH_MS / 1000,
+        });
+      } finally {
+        clearTimeout(timer);
+        if (unlockWatches.get(deviceId) === watch) unlockWatches.delete(deviceId);
+      }
+    }
+
+    // ASSISTED unlock (the listed exception): queued with an expiry; the flush
+    // drops it if the lock doesn't wake in time.
+    //
+    // XF-58: an ASSISTED unlock additionally carries `action_type =
+    // 'assisted-unlock'`, which doorlock-1.5 refuses unless the keypad was
+    // touched in the last 30 s. The expiry alone would not be enough — it bounds
+    // WHEN the command may run, never WHETHER anybody was at the door, and a
+    // sleeping lock wakes on its heartbeat timer too. The device-side check is
+    // what makes "someone must be there" a requirement instead of a probability.
+    const actionType = 'assisted-unlock';
+    const windowMs = ASSISTED_UNLOCK_MS;
     const expiresAt = new Date(Date.now() + windowMs);
     const [queueResult] = await pool.query(
       `INSERT INTO pending_queue (device_id, site_id, grant_id, action_type, envelope_hex, msg_type, status, expires_at)
@@ -1139,11 +1229,10 @@ api.post('/locks/:id/unlock', async (req, res) => {
 
     logEvent(
       'key',
-      `${assisted ? 'ASSISTED' : 'Remote'} UNLOCK queued for "${lock.label}" ` +
-        `(queue #${queueResult.insertId}, expires ${windowMs / 1000}s` +
-        `${assisted ? ', needs a keypad touch' : ''}, sealed)`
+      `ASSISTED UNLOCK queued for "${lock.label}" ` +
+        `(queue #${queueResult.insertId}, expires ${windowMs / 1000}s, needs a keypad touch, sealed)`
     );
-    await recordAudit(lock.app_id, deviceId, 'unlock', 'remote unlock');
+    await recordAudit(lock.app_id, deviceId, 'unlock', 'assisted unlock: queued');
     const sent = await flushQueueForDevice(lock.site_id, deviceId);
 
     res.json({
@@ -1168,9 +1257,9 @@ api.post('/locks/:id/unlock', async (req, res) => {
       // "bảo khách chạm vào bàn phím" and show the seconds ticking — on this path
       // `delivered` means the command is ARMED, not that the door opened, since
       // the lock will still refuse it if nobody touches.
-      mode: assisted ? 'assisted' : 'remote',
+      mode: 'assisted',
       window_s: windowMs / 1000,
-      requires_touch: assisted,
+      requires_touch: true,
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });

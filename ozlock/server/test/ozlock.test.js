@@ -351,6 +351,7 @@ test('unlock of a bridged lock relays the sealed envelope via its bridge, unchan
   assert.equal(res.body.delivery, 'delivered');
   assert.equal(res.body.transport_ok, true);
   assert.equal(res.body.mode, 'remote');
+  assert.equal(res.body.result, 'sent_unconfirmed', 'live-only: sent once, success never claimed');
   assert.equal(pubs.length, 1);
   assert.equal(pubs[0].topic, TB('command', B1));
   assert.deepEqual(Object.keys(pubs[0].payload).sort(), ['envelope_hex', 'msg_id', 'target']);
@@ -482,8 +483,11 @@ test('sim heartbeat + queue introspection', async () => {
   ({ res } = await step('sim-heartbeat-unknown', () => call('POST', '/sim/heartbeat', { device_id: 'nope' })));
   assert.equal(res.status, 404);
   ({ res } = await step('queue', () => call('GET', '/queue')));
-  assert.ok(res.body.queue.length >= 8);
+  // Live-only unlock (PM nexus-6e 2026-11-07): the remote unlock above is
+  // published once and never queued, so it leaves no row (was >= 8 with it).
+  assert.ok(res.body.queue.length >= 7);
   assert.ok(res.body.queue.every((q) => q.status === 'sent'));
+  assert.ok(!res.body.queue.some((q) => q.action_type === 'unlock'), 'no remote-unlock row');
 });
 
 /* ===========================================================================

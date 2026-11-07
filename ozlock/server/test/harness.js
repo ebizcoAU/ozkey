@@ -29,6 +29,9 @@ harness.configure({
     // S1e-KEYGUARD: each fixture gets its own server identity file, so a run
     // never writes beside the code or reuses another run's key.
     OZLOCK_SERVER_ECDH_KEY_PATH: path.join(fx.tmp, 'server_ecdh_key.json'),
+    // Live-only unlock: the refusal watch is 10 s in production; every unlock
+    // step would wait that long on silence. liveunlock.test.js sets its own.
+    OZLOCK_UNLOCK_WATCH_MS: '1000',
   }),
 });
 

@@ -25,6 +25,16 @@ const deviceIdentity = (...args) => require('./registry').deviceIdentity(...args
 // what a fresh outcome code is answering, not a guess dressed up as one.
 const lastGrantSentByDevice = new Map(); // deviceId -> { grantId, queueId }
 
+// Live-only remote unlock (PM nexus-6e 2026-11-07, R1 (A)): at most one remote
+// unlock in flight per lock. deviceId -> { onCode(code) }, open for
+// CONFIG.UNLOCK_REFUSAL_WATCH_MS after the single publish. A v1 lock reports
+// only REFUSALS on the uplink (UNLOCK_OK rides BLE only), so a code that
+// arrives while a watch is open answers that unlock. Last-sent-wins: the
+// unlock route also drops the device's lastGrantSentByDevice entry once its
+// publish is out, so a late code can no longer land on an earlier grant (the
+// side bug: a refusal of a remote unlock used to mark that grant 'failed').
+const unlockWatches = new Map();
+
 /* -- OZKIE v2 gate (ozkey-48, operator-approved 2026-10-18) -------------------
  * Every relay route below carries v1 sealed envelopes. A v2 (AK1037) lock
  * speaks EDHOC + OSCORE instead, and its relay path (pass OSCORE bytes
@@ -230,6 +240,14 @@ async function handleUplinkOutcome(fromDeviceId, payloadStr) {
   }
   if (typeof obj.code !== 'string' || !obj.code) return;
 
+  const watch = unlockWatches.get(fromDeviceId);
+  if (watch) {
+    unlockWatches.delete(fromDeviceId);
+    logEvent('warn', `${fromDeviceId} REFUSED the remote unlock — lock reported ${obj.code}`);
+    watch.onCode(obj.code);
+    return;
+  }
+
   const pending = lastGrantSentByDevice.get(fromDeviceId);
   if (!pending) {
     logEvent(
@@ -262,6 +280,7 @@ async function handleUplinkOutcome(fromDeviceId, payloadStr) {
 
 module.exports = {
   lastGrantSentByDevice,
+  unlockWatches,
   OZKIE_V2,
   refuseIfOzkieV2,
   handleUplinkReset,

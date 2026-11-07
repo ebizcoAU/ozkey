@@ -303,6 +303,10 @@ const CONFIG = {
   // XF-48: refuse a remote unlock the lock's caps don't allow. OZLOCK_ENFORCE_CAPS=0
   // turns it off (lab escape hatch); anything else, including unset, enforces.
   ENFORCE_CAPS: process.env.OZLOCK_ENFORCE_CAPS !== '0',
+  // Live-only remote unlock (PM nexus-6e 2026-11-07): how long the single
+  // publish waits for a v1 refusal code on the uplink before answering
+  // 'sent_unconfirmed'. 10 s by default; tests shorten it.
+  UNLOCK_REFUSAL_WATCH_MS: Number(process.env.OZLOCK_UNLOCK_WATCH_MS) || 10_000,
   PROVISION_WIFI_SSID: SECRETS.PROVISION_WIFI_SSID,
   PROVISION_WIFI_PASSWORD: SECRETS.PROVISION_WIFI_PASSWORD,
   // S1e-2 (ozkey-50 §8.2): lock broker_secret stored hashed, as in ozpms.

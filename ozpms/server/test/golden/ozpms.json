@@ -277,13 +277,14 @@
           "delivery": "delivered",
           "device_id": "s1-pms-bridged-02",
           "envelope_hex": "c0ffee11",
-          "expires_at": "<masked>",
           "mode": "remote",
+          "msg_id": "ozl-u<id>-<ms>",
           "ok": true,
-          "queue_id": 1,
+          "refusal_watch_s": 1,
           "requires_touch": false,
+          "result": "sent_unconfirmed",
           "transport_ok": true,
-          "window_s": 60
+          "window_s": null
         },
         "status": 200
       }
@@ -292,7 +293,7 @@
       {
         "payload": {
           "envelope_hex": "c0ffee11",
-          "msg_id": "ozl-1-<ms>",
+          "msg_id": "ozl-u<id>-<ms>",
           "target": "s1-pms-bridged-02"
         },
         "retain": false,
@@ -341,7 +342,7 @@
           "envelope_hex": "beef0011",
           "grant_id": 1,
           "ok": true,
-          "queue_id": 2,
+          "queue_id": 1,
           "sync_status": "pending"
         },
         "status": 200
@@ -351,7 +352,7 @@
       {
         "payload": {
           "envelope_hex": "beef0011",
-          "msg_id": "ozl-2-<ms>",
+          "msg_id": "ozl-1-<ms>",
           "target": "s1-pms-bridged-02"
         },
         "retain": false,
@@ -376,7 +377,7 @@
           "expires_at": "<masked>",
           "grant_id": 1,
           "ok": true,
-          "queue_id": 3,
+          "queue_id": 2,
           "sync_status": "revoking"
         },
         "status": 200
@@ -386,7 +387,7 @@
       {
         "payload": {
           "envelope_hex": "dead0011",
-          "msg_id": "ozl-3-<ms>",
+          "msg_id": "ozl-2-<ms>",
           "target": "s1-pms-bridged-02"
         },
         "retain": false,
@@ -618,7 +619,7 @@
               "action": "unlock",
               "app_id": "a2b38cb4a2c0a6dd345346af8f9f37478eb37dce6b144bab02e5d7248308c01c",
               "created_at": "<masked>",
-              "detail": "remote unlock",
+              "detail": "remote unlock: sent_unconfirmed",
               "device_id": "s1-pms-bridged-02",
               "id": 4,
               "site_id": "pms"
@@ -750,7 +751,7 @@
       {
         "payload": {
           "envelope_hex": "reset11",
-          "msg_id": "ozl-4-<ms>",
+          "msg_id": "ozl-3-<ms>",
           "target": "s1-pms-bridged-02"
         },
         "retain": false,
