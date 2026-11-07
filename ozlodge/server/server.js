@@ -40,6 +40,7 @@
 const express = require('express');
 const cors = require('cors');
 const mysql = require('mysql2/promise');
+const { createUtcPool, clearPreUtcSyncStamps } = require('./dbutc');
 const mqtt = require('mqtt');
 const os = require('os');
 const crypto = require('crypto');
@@ -355,8 +356,9 @@ async function initDatabase() {
   );
   await admin.end();
 
-  // 2. Pooled connection into the ozkey schema.
-  pool = mysql.createPool(CONFIG.DB);
+  // 2. Pooled connection into the ozkey schema. S1e-5: pinned to UTC on both
+  //    sides (dbutc.js), so NOW() and JS Dates agree whatever the host zone.
+  pool = createUtcPool(mysql, CONFIG.DB, logEvent);
 
   // 3. Relational tables.
   await pool.query(`
@@ -414,6 +416,8 @@ async function initDatabase() {
   if (!hasIdx) {
     await pool.query('ALTER TABLE rooms ADD UNIQUE INDEX uniq_maoi_id (maoi_id)');
   }
+  // S1e-5: drop sync stamps written before the pool was pinned (once per DB).
+  await clearPreUtcSyncStamps(pool, logEvent);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
