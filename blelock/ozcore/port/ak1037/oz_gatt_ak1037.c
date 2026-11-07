@@ -241,7 +241,8 @@ void oz_gatt_ak1037_pair_prompt(int on) { oz_keypad_pairing(&keypad, on); }
 
 /* F-AK-WDT-1 SAFE mode (a watchdog reset loop): unlocking is never refused
  * (the oz_power rule: never lock anyone out), but a LOCK move is, in case the
- * motor is what keeps resetting the lock. The refusal ends the move as
+ * motor is what keeps resetting the lock. Since F-AK-WDT-2 oz_lock refuses
+ * LOCK requests itself (5.03 SAFE_MODE); this stays as the last guard. The refusal ends the move as
  * JAMMED, so the lock reports "not fully locked" rather than a bolt it never
  * threw. Runs on the OZKIE thread, as motor_step does. */
 static int safe_refused;
@@ -470,6 +471,8 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
 {
     if (rt_mq_init(&mq, "ozkie", mq_pool, SLOT_SIZE, sizeof mq_pool, RT_IPC_FLAG_FIFO) != RT_EOK)
         return OZ_E_HW;
+    if (oz_ak1037_wdt_safe())
+        oz_lock_set_safe(L, oz_ak1037_wdt_resets());   /* F-AK-WDT-2: refusals + the event */
     oz_ble_init(&session, L, &link, notify, NULL);
     oz_adv_init(&adv, OZ_GATT_ADV_ALWAYS, now_ms());
     oz_keypad_init(&keypad);

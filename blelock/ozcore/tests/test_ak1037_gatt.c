@@ -699,11 +699,13 @@ static void safe_moves(void)
     passes(200);
     mock_msh_run("oz.state");
     capture_end();
-    expect_int("lock answered", response(out, ol, &x, &result) == OZ_COAP_CHANGED, 1);
+    /* F-AK-WDT-2: oz_lock refuses it (5.03 SAFE_MODE), so the port's own
+     * guard is never reached. */
+    expect_int("lock refused: 5.03 SAFE_MODE",
+               response(out, ol, &x, &result) == OZ_COAP_SERVICE_UNAVAILABLE && result == OZ_R_SAFE_MODE, 1);
     expect_int("the motor never drove to lock", count("motor: to lock"), 0);
-    expect_int("refusal logged", count("motor: lock refused: SAFE MODE"), 1);
-    expect_int("state: not fully locked, JAMMED (not a bolt it never threw)",
-               count("oz.state: not fully locked, last move JAMMED"), 1);
+    expect_int("refusal logged", count("lock: LOCK refused: SAFE MODE"), 1);
+    expect_int("state: not fully locked (not a bolt it never threw)", count("oz.state: not fully locked"), 1);
 
     /* Never lock anyone out: unlocking still drives the motor. */
     capture_start();

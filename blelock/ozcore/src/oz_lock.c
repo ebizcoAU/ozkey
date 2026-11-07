@@ -1394,7 +1394,15 @@ static int dispatch(req_ctx *q, uint8_t *out, size_t cap, size_t *out_len)
     long id;
     q->code = OZ_COAP_CHANGED;
 
-    if (!strcmp(p, "lock/unlock") || !strcmp(p, "lock/lock")) {
+    /* SAFE mode (F-AK-WDT-2): unlock as usual; LOCK refused; the rest owner only. */
+    if (q->L->safe && strcmp(p, "lock/unlock") && (role != OZ_ROLE_ADMIN || !strcmp(p, "lock/lock"))) {
+        if (!strcmp(p, "lock/lock")) {
+            q->L->lock_state = OZ_LOCKSTATE_NOT_FULLY_LOCKED;
+            oz_port_log("lock: LOCK refused: SAFE MODE");
+        }
+        q->code = OZ_COAP_SERVICE_UNAVAILABLE;
+        result(q, OZ_R_SAFE_MODE, 0);
+    } else if (!strcmp(p, "lock/unlock") || !strcmp(p, "lock/lock")) {
         int unlock = p[5] == 'u';
         unsigned mask = R_ADMIN | R_MEMBER;   /* service never actuates (§6) */
         if (meth != OZ_COAP_POST) { q->code = OZ_COAP_METHOD_NOT_ALLOWED; result(q, OZ_R_BAD_REQUEST, 0); }
@@ -1446,9 +1454,11 @@ static int dispatch(req_ctx *q, uint8_t *out, size_t cap, size_t *out_len)
             char dev[OZ_INVITE_MAX_DEVICE_ID + 1];
             const char *fw = q->L->fw;
             oz_lock_hooks hooks = q->L->hooks;
+            uint8_t safe = q->L->safe;      /* this boot's, not the bond table's */
             strcpy(dev, q->L->device_id);
             factory_reset();
             oz_lock_init(q->L, dev, fw, &hooks);
+            q->L->safe = safe;
             return rc;
         }
     } else {
@@ -1672,6 +1682,17 @@ static int pin_in_entry(const oz_cred *c, const char *e, size_t n)
         hit |= oz_ct_equal(c->secret, (const uint8_t *)e + at, c->secret_len) == 0;
     return hit;
 }
+
+void oz_lock_set_safe(oz_lock *L, uint32_t resets)
+{
+    if (L->safe)
+        return;
+    L->safe = 1;
+    oz_port_log("lock: SAFE MODE after %u watchdog resets in a row", (unsigned)resets);
+    event_add(L, OZ_EV_SAFE_MODE, OZ_EV_NO_ACTOR, resets, 0);
+}
+
+int oz_lock_safe(const oz_lock *L) { return L->safe; }
 
 void oz_lock_actuated(oz_lock *L, int unlock, int result)
 {

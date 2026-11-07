@@ -105,3 +105,5 @@ void oz_ak1037_wdt_service(void)
 }
 
 int oz_ak1037_wdt_safe(void) { return safe; }
+
+uint32_t oz_ak1037_wdt_resets(void) { return bg_count; }

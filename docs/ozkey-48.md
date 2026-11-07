@@ -20,6 +20,9 @@
 > A `relay` characteristic (§2, §2.3), a closed type byte on MQTT (§2.4.1), topics and
 > correlation (§2.4.2), one relay EDHOC per lock (§2.4.3), timers and retries side by side (§2.4.4),
 > failover hand-off (§2.4.5), MQTT buffer sizing (§2.4.6).
+> Rev 7 (2026-11-07, PM nexus-6e accepted, F-AK-WDT-2): SAFE mode after a watchdog reset loop
+> (§6.1): unlock never refused, LOCK refused, the rest owner only. Result 36 `SAFE_MODE` (App. A),
+> event type 4 `safe mode` (§5.1). 36 is sealed: only OSCORE context holders see it (§6.1).
 
 ## 0. What changes from v1, in one table
 
@@ -546,6 +549,7 @@ filtering add roles, not fields):**
   | 1 | keypad lockout | `{1: level (1 = the first, after 5 misses), 2: seconds}` |
   | 2 | card reader lockout | as type 1, for wrong RFID cards (own counter) |
   | 3 | battery | `{1: level (0 ok, 1 low, 2 critical), 2: percent}`, on each level change (ozkey-49 P5-F) |
+  | 4 | safe mode | `{1: watchdog resets in a row, 2: 0}`, once per boot that starts in SAFE mode (§6.1) |
 
   - Further types (access, alarm, duress, doorbell, bolt) take the next numbers as each
     is built. A receiver ignores data keys it doesn't know.
@@ -566,6 +570,42 @@ filtering add roles, not fields):**
 | `service` | admin enrolls the operator's own ozpms / ozlodge key | credential put/delete/sync, **event observe**. **No actuation**: it cannot unlock (the audit source, §5.1). **Never** bonds or bond #0 (CONTRACT.md "Service bond") |
 | `bridge` | admin enrolls the bridge's key during bridge pairing | **time set only**. No events, nothing that opens a door |
 | `issuer` | admin enrolls the hotel server's (ozlodge's) key. 🟢 **Operator approved 2026-10-18** (ozkey-50 §3) | **Create member invites only**, each with: a validity window ≤ `max_days` (set by admin at enrolment; default 30, range 1–90); `start` ≥ now − 1 h; a guest-key binding (§3.3), which is required. **No actuation, no credentials, no events, no bond or admin verbs.** The lock rejects anything else with `FORBIDDEN`. Admin can revoke it like any bond, and revocation voids the unredeemed invites it issued (by the issuer's bond id in the invite) |
+
+### 6.1 SAFE mode (F-AK-WDT-2, PM rulings 2026-11-06)
+
+A lock whose watchdog reset it `OZ_BOOTGUARD_LIMIT` = 3 times in a row boots in SAFE mode for that
+boot (ozkey-49, F-AK-WDT-1). A power-on reset (batteries out and in) clears the count. A run that
+stays up 2 minutes clears it too, but never while in SAFE mode. While SAFE:
+
+- **Unlock is never refused.** `lock/unlock` from anyone who may unlock (admin, member), a keypad
+  PIN and an RFID card all work as usual. This is the never-lock-anyone-out rule, the same rule as
+  the battery's (P5-F).
+- **LOCK is refused for everyone.** `lock/lock` answers 5.03 `SAFE_MODE`, the motor is not driven,
+  and `lock/state` reads `not fully locked`. The motor may be what keeps resetting the lock.
+- **Everything else is owner (admin) only.** Any other request from member, service, bridge or issuer
+  answers 5.03 `SAFE_MODE`. That covers state, info, time, credentials and invites. The admin keeps
+  every verb, including `events` and `dev/reset`. A factory reset does not leave SAFE mode, because
+  SAFE belongs to the boot, not the bond table.
+- **One `safe mode` event** (§5.1 type 4) is logged when SAFE starts, `{1: resets in a row}`. The owner
+  sees it on `events`.
+- **Who can see SAFE mode.** 5.03 / 36 sits *inside* OSCORE. The outer code is 2.04 (2.05 for Observe),
+  so the bridge relay, the broker and ozlock never see it (ozkey-67, 2026-11-07). Only the holder of the
+  OSCORE context sees it: the owner app for its own requests, the service-bond client (ozpms /
+  ozlodge, not built yet) for `cred` requests, and the bridge for its own `bridge`-bond requests.
+  A client that gets 36 surfaces "lock in SAFE mode" and does not retry in a loop. It clears the flag
+  on a non-36 sealed response from the lock. Bridge presence is not a clear signal, because a bridge
+  reconnects within the same boot.
+- **Bench recipe: forcing SAFE mode.** This is the app team's acceptance step 1 (ozkey-67's
+  XF draft, 2026-11-07). 🟡 **NOT BUILT.** No shell command or hook forces a watchdog reset today.
+  - Host proof: `test_ak1037_wdt aowdt` and `test_ak1037_gatt safe` preset the count and boot the
+    third reset.
+  - On the kit, once a forcing hook is ruled on: trigger a watchdog reset 3 times in a row with no
+    power-on reset in between. The `oz.start` log then shows `wdt: reset WATCHDOG, watchdog resets
+    in a row 3: SAFE MODE …`.
+  - To leave SAFE mode: take the batteries out and put them back (power-on reset).
+- **No plaintext SAFE flag** in presence or advertising (PM nexus-6e, 2026-11-07): it would tell anyone
+  who reads it that this door can't lock. For now the owner app is the signal (36, event type 4). The
+  server and console signal waits for the v2 server-side OSCORE client.
 
 **No server ever holds bond #0** (ozkey-50 §3, server review). The servers hold only `service`,
 `issuer` and the ozpms custodian, whose limits the lock enforces (ozkey-51). Server-side remote unlock
@@ -687,6 +727,7 @@ value is 8 random bytes, good for one use within 10 s.
 | | | 33 | TIME_REJECTED |
 | | | 34 | BATTERY_LOW |
 | | | 35 | PIN_TOO_SHORT |
+| | | 36 | SAFE_MODE |
 
 `PIN_TOO_SHORT` (2026-11-05, PM ruling): a `cred` POST or a `cred/sync` entry of type PIN with fewer
 than `OZ_LOCK_PIN_MIN` = 6 digits. A sync with one such entry is refused whole and changes nothing.

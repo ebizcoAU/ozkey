@@ -1273,13 +1273,69 @@ static void events(void)
     /* A factory reset forgets the numbering. */
     oz_link_open(&ble, 0);
     handshake(&owner, &ble, NULL, 0, NULL);
+    oz_lock_set_safe(&L, 3);            /* F-AK-WDT-2: the owner may still reset */
     expect_int("factory reset", call(&owner, &ble, OZ_COAP_POST, "dev/reset", NULL, 0), OZ_R_OK);
+    expect_int("…SAFE mode kept: it belongs to this boot", oz_lock_safe(&L), 1);
     uint8_t es[4];
     size_t esl;
     expect_int("…event numbering erased", oz_port_kv_get("es", es, sizeof es, &esl) != OZ_OK, 1);
     uint8_t rl[OZ_LIMIT_SAVED_LEN];
     expect_int("…card limit erased", oz_port_kv_get("rl", rl, sizeof rl, &esl) != OZ_OK, 1);
     expect_int("…and restarts at 0", L.events.next_seq, 0);
+}
+
+/* ── F-AK-WDT-2: SAFE mode after a watchdog reset loop (ozkey-48 §6.1) ── */
+
+static void safe_mode(void)
+{
+    uint32_t e0 = L.events.next_seq;
+    oz_lock_set_safe(&L, 3);
+    expect_int("SAFE: on", oz_lock_safe(&L), 1);
+    expect_int("…one safe-mode event", L.events.next_seq - e0, 1);
+    oz_event ev;
+    uint32_t cur = e0;
+    expect_int("…type 4, 3 resets, no actor", oz_events_next(&L.events, &cur, &ev) &&
+               ev.type == OZ_EV_SAFE_MODE && ev.a == 3 && ev.b == 0 && ev.actor == OZ_EV_NO_ACTOR, 1);
+    oz_lock_set_safe(&L, 4);
+    expect_int("…a second call adds nothing", L.events.next_seq - e0, 1);
+
+    /* A member: may still unlock; nothing else. */
+    oz_link_open(&ble, 0);
+    expect_int("member session", handshake(&member, &ble, NULL, 0, NULL), 0);
+    int l0 = locks, u0 = unlocks;
+    expect_int("member unlock still works", call(&member, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0),
+               OZ_R_UNLOCK_OK);
+    expect_int("member lock refused", call(&member, &ble, OZ_COAP_POST, "lock/lock", NULL, 0), OZ_R_SAFE_MODE);
+    expect_int("…5.03", member.code, OZ_COAP_SERVICE_UNAVAILABLE);
+    expect_int("member state: owner only now", call(&member, &ble, OZ_COAP_GET, "lock/state", NULL, 0),
+               OZ_R_SAFE_MODE);
+    expect_int("member info: owner only now", call(&member, &ble, OZ_COAP_GET, "dev/info", NULL, 0),
+               OZ_R_SAFE_MODE);
+    expect_int("member time: owner only now", call(&member, &ble, OZ_COAP_GET, "time", NULL, 0),
+               OZ_R_SAFE_MODE);
+
+    /* The keypad still opens (never lock anyone out). */
+    expect_int("PIN still opens", oz_lock_keypad_pin(&L, "482613"), OZ_PIN_OPEN);
+
+    /* The owner: unlock and everything else, but no LOCK. */
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    expect_int("owner lock refused", call(&owner, &ble, OZ_COAP_POST, "lock/lock", NULL, 0), OZ_R_SAFE_MODE);
+    expect_int("…the bolt never driven to lock", locks, l0);
+    expect_int("…state: not fully locked", call(&owner, &ble, OZ_COAP_GET, "lock/state", NULL, 0) == OZ_R_OK &&
+               resp_int(&owner, 1) == OZ_LOCKSTATE_NOT_FULLY_LOCKED, 1);
+    expect_int("owner unlock works", call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0), OZ_R_UNLOCK_OK);
+    expect_int("…member, PIN and owner all actuated", unlocks - u0, 3);
+    expect_int("owner lists bonds", call(&owner, &ble, OZ_COAP_GET, "bond", NULL, 0), OZ_R_OK);
+    expect_int("owner reads info", call(&owner, &ble, OZ_COAP_GET, "dev/info", NULL, 0), OZ_R_OK);
+
+    /* The next boot is a fresh one: the port's boot guard decides again. */
+    boot_lock();
+    expect_int("reboot: SAFE off", oz_lock_safe(&L), 0);
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    expect_int("lock works again", call(&owner, &ble, OZ_COAP_POST, "lock/lock", NULL, 0), OZ_R_LOCK_OK);
+    expect_int("…driven", locks, l0 + 1);
 }
 
 static void run_suite(size_t mtu)
@@ -1306,6 +1362,7 @@ static void run_suite(size_t mtu)
     keypad_limit();
     cards();
     battery();
+    safe_mode();
     relay_and_reboot();
     edhoc_restart();
     link_isolation();
