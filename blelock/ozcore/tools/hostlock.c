@@ -121,15 +121,17 @@ int main(int argc, char **argv)
         fprintf(stderr, "init failed\n");
         return 1;
     }
+    /* Bind first: a port in use exits here, before the banner and the key, so a
+     * harness never mistakes another process's lock for this one (RIG-BLE-FLAKE-1). */
+    int lb = listen_on(ble_port), lr = listen_on(relay_port);
+    oz_link_open(&ble_link, 0);
+    oz_link_open(&relay_link, 1);
     printf("ozhostlock %s  %s  ble 127.0.0.1:%d  relay 127.0.0.1:%d  state %s\n",
            dev, oz_lock_claimed(&L) ? "claimed" : "UNCLAIMED", ble_port, relay_port, state);
     printf("lock key ");
     for (int i = 0; i < 32; i++) printf("%02x", L.pub[i]);
     printf("\n");
 
-    oz_link_open(&ble_link, 0);
-    oz_link_open(&relay_link, 1);
-    int lb = listen_on(ble_port), lr = listen_on(relay_port);
     client cl[8];
     int ncl = 0;
     for (;;) {

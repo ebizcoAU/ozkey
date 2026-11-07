@@ -109,6 +109,10 @@ if(Python3_FOUND)
         add_test(NAME blelink_python
                  COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_blelink.py
                          $<TARGET_FILE:ozhostlock>)
+        # Both start ozhostlock on the fixed TCP ports 17001/17002: never in
+        # parallel (ctest -j), or one binds and the other fails (RIG-BLE-FLAKE-1).
+        set_tests_properties(interop_python blelink_python
+                             PROPERTIES RESOURCE_LOCK ozhostlock_tcp_17001)
     else()
         message(STATUS "python cryptography not found: skipping ccm_differential")
     endif()
