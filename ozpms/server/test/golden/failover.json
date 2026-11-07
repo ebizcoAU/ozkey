@@ -1,0 +1,272 @@
+[
+  {
+    "mqtt": [
+      {
+        "payload": {
+          "broker_secret": "<masked>",
+          "broker_username": "ozb-s1-pms-fo1",
+          "op": "broker_credentials"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-fo1/command"
+      },
+      {
+        "payload": {
+          "broker_secret": "<masked>",
+          "broker_username": "ozb-s1-pms-fo2",
+          "op": "broker_credentials"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-fo2/command"
+      },
+      {
+        "payload": {
+          "utc": "<masked>"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-fo1/command"
+      },
+      {
+        "payload": {
+          "utc": "<masked>"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-fo2/command"
+      }
+    ],
+    "step": "bridges-online"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "app_id": "67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349",
+          "bridge_id": "ozb-s1-pms-fo1",
+          "device_id": "s1-pms-fo-01"
+        },
+        "method": "POST",
+        "path": "/pairings"
+      },
+      "response": {
+        "body": {
+          "app_id": "67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349",
+          "bridge_id": "ozb-s1-pms-fo1",
+          "device_id": "s1-pms-fo-01",
+          "ok": true,
+          "ozkie_version": null,
+          "provision_payload": {
+            "app_id": "67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349",
+            "broker_host": "127.0.0.1",
+            "broker_tcp_port": "<harness-broker-port>",
+            "broker_ws_path": "/mqtt",
+            "broker_ws_port": 9001,
+            "device_id": "s1-pms-fo-01",
+            "heartbeat_s": 60,
+            "mode": "ozkey-cloud",
+            "password": "labwifi-secret",
+            "server_ip": "<masked>",
+            "server_port": "<masked>",
+            "site_id": "pms",
+            "ssid": "OZKEY-LAB",
+            "v": 1
+          }
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "pair-LA"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "bridge_id": "ozb-s1-pms-fo2"
+        },
+        "method": "PATCH",
+        "path": "/locks/s1-pms-fo-01"
+      },
+      "response": {
+        "body": {
+          "id": "s1-pms-fo-01",
+          "lock": {
+            "app_id": "67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349",
+            "battery_pct": null,
+            "bonds": null,
+            "bridge_id": "ozb-s1-pms-fo2",
+            "caps": [
+              "remote_unlock",
+              "audit"
+            ],
+            "caps_source": "inferred",
+            "direct_presence": "unknown",
+            "dropped_before_seq": null,
+            "enrolled_at": "<masked>",
+            "events_at_risk": false,
+            "events_pending": false,
+            "fw": null,
+            "has_doorbell": null,
+            "heartbeat_s": 60,
+            "id": "s1-pms-fo-01",
+            "label": "New Doorlock",
+            "last_pulled_seq": null,
+            "last_seen_at": null,
+            "mac": null,
+            "mcu_last_frame_s": null,
+            "mcu_link_up": null,
+            "ozkie_version": 1,
+            "power_profile": "eco",
+            "presence": "unknown",
+            "presence_at": null,
+            "presence_reason": null,
+            "profile": null,
+            "profile_mismatch": null,
+            "seq_highwater": null,
+            "site_id": "pms",
+            "status": "registered",
+            "transport": null,
+            "tuya_pid": null
+          },
+          "ok": true
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "patch-LA-B2"
+  },
+  {
+    "http": {
+      "request": {
+        "body": {
+          "bridge_id": "ozb-s1-pms-fo1"
+        },
+        "method": "PATCH",
+        "path": "/locks/s1-pms-fo-01"
+      },
+      "response": {
+        "body": {
+          "id": "s1-pms-fo-01",
+          "lock": {
+            "app_id": "67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349",
+            "battery_pct": null,
+            "bonds": null,
+            "bridge_id": "ozb-s1-pms-fo1",
+            "caps": [
+              "remote_unlock",
+              "audit"
+            ],
+            "caps_source": "inferred",
+            "direct_presence": "unknown",
+            "dropped_before_seq": null,
+            "enrolled_at": "<masked>",
+            "events_at_risk": false,
+            "events_pending": false,
+            "fw": null,
+            "has_doorbell": null,
+            "heartbeat_s": 60,
+            "id": "s1-pms-fo-01",
+            "label": "New Doorlock",
+            "last_pulled_seq": null,
+            "last_seen_at": null,
+            "mac": null,
+            "mcu_last_frame_s": null,
+            "mcu_link_up": null,
+            "ozkie_version": 1,
+            "power_profile": "eco",
+            "presence": "unknown",
+            "presence_at": null,
+            "presence_reason": null,
+            "profile": null,
+            "profile_mismatch": null,
+            "seq_highwater": null,
+            "site_id": "pms",
+            "status": "registered",
+            "transport": null,
+            "tuya_pid": null
+          },
+          "ok": true
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "patch-LA-B1"
+  },
+  {
+    "mqtt": [],
+    "step": "presence-LA-online"
+  },
+  {
+    "mqtt": [
+      {
+        "payload": {
+          "id": "s1-pms-fo-01",
+          "op": "pair_lock"
+        },
+        "retain": false,
+        "topic": "ozkie/pms/bridges/ozb-s1-pms-fo2/command"
+      }
+    ],
+    "step": "failover-LA"
+  },
+  {
+    "http": {
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/apps/67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349/activity?limit=50"
+      },
+      "response": {
+        "body": {
+          "activity": [
+            {
+              "action": "bridge_failover",
+              "app_id": "67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349",
+              "created_at": "<masked>",
+              "detail": "auto-failover from ozb-s1-pms-fo1 to ozb-s1-pms-fo2 after sustained bridge_offline (pair_lock dispatched)",
+              "device_id": "s1-pms-fo-01",
+              "id": 4,
+              "site_id": "pms"
+            },
+            {
+              "action": "pair",
+              "app_id": "67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349",
+              "created_at": "<masked>",
+              "detail": "bridge_id set to ozb-s1-pms-fo1",
+              "device_id": "s1-pms-fo-01",
+              "id": 3,
+              "site_id": "pms"
+            },
+            {
+              "action": "pair",
+              "app_id": "67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349",
+              "created_at": "<masked>",
+              "detail": "bridge_id set to ozb-s1-pms-fo2",
+              "device_id": "s1-pms-fo-01",
+              "id": 2,
+              "site_id": "pms"
+            },
+            {
+              "action": "pair",
+              "app_id": "67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349",
+              "created_at": "<masked>",
+              "detail": "registered pairing",
+              "device_id": "s1-pms-fo-01",
+              "id": 1,
+              "site_id": "pms"
+            }
+          ],
+          "app_id": "67a9f8d96ced11273e8e1e1420cf3111eb7c033bec02bceadc51d1d4c6f73349",
+          "limit": 50,
+          "offset": 0,
+          "ok": true,
+          "total": 4
+        },
+        "status": 200
+      }
+    },
+    "mqtt": [],
+    "step": "activity-after-LA"
+  }
+]

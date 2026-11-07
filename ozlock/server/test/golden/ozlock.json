@@ -241,7 +241,7 @@
           "device_id": "s0-direct-01",
           "heartbeat_s": 60,
           "issued_by": "OZLOCK/",
-          "label": "Doorlock 00:01",
+          "label": "Front door",
           "op": "enrollment_ack",
           "site_id": "lab"
         },

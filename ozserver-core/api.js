@@ -99,13 +99,16 @@ async function registerPairing(appId, deviceId, label, bridgeId, ozkieVersion) {
   }
   // Fresh registration lands as 'registered' (awaiting the lock's first
   // contact); an already-enrolled lock keeps its status on re-register.
+  // S1e-3: the 'New Doorlock' default is for a fresh row only. It used to be
+  // the inserted VALUE, so the update's COALESCE always saw a label and a
+  // label-less re-register overwrote the owner's name with the default.
   await pool.query(
     `INSERT INTO locks (id, site_id, app_id, bridge_id, label, status, heartbeat_s)
        VALUES (?, ?, ?, ?, ?, 'registered', ?)
      ON DUPLICATE KEY UPDATE app_id = VALUES(app_id),
        bridge_id = COALESCE(VALUES(bridge_id), bridge_id),
-       label = COALESCE(VALUES(label), label)`,
-    [deviceId, CONFIG.SITE_ID, appId, bridgeId || null, label || 'New Doorlock', CONFIG.DEFAULT_HEARTBEAT_S]
+       label = COALESCE(?, label)`,
+    [deviceId, CONFIG.SITE_ID, appId, bridgeId || null, label || 'New Doorlock', CONFIG.DEFAULT_HEARTBEAT_S, label || null]
   );
   // Only written when the app says so — an older app build that never sends
   // it must not flip an existing row back to the default.
@@ -684,7 +687,7 @@ api.delete('/locks/:id', async (req, res) => {
     let attempted = false;
     let transportOk = false;
     let likelyDelivered = false;
-    let resetMsgId = null; // ozkey-41 §5.3: only the sealed branch below gets one
+    let resetVerdict = null; // ozkey-41 §5.3: only the sealed branch below gets one
     // XF-119 §6/§9.3 ask 2: the lock may have ALREADY told us it reset —
     // BOOT hold, the DL-MCU's own button, or a prior request this server
     // never issued or already forgot about. That message carries no
@@ -720,7 +723,12 @@ api.delete('/locks/:id', async (req, res) => {
         );
         attempted = true;
         const sent = await flushQueueForDevice(lock.site_id, id, (job, msgId) => {
-          if (job.id === queueResult.insertId) resetMsgId = msgId;
+          // Open the waiter here, not after the DB delete below: a lock that
+          // answers before then would have its verdict dropped and the
+          // request would sit out LOCK_RESET_TIMEOUT_MS as 'unknown'.
+          if (job.id === queueResult.insertId) {
+            resetVerdict = waitForLockResetVerdict(id, msgId, CONFIG.LOCK_RESET_TIMEOUT_MS);
+          }
         });
         transportOk = sent > 0;
         logEvent(
@@ -799,8 +807,8 @@ api.delete('/locks/:id', async (req, res) => {
     if (alreadyReset) {
       verdict = 'reset_confirmed';
       cause = 'already_reset';
-    } else if (transportOk && resetMsgId) {
-      ({ verdict, cause } = await waitForLockResetVerdict(id, resetMsgId, CONFIG.LOCK_RESET_TIMEOUT_MS));
+    } else if (transportOk && resetVerdict) {
+      ({ verdict, cause } = await resetVerdict);
     }
 
     logEvent(

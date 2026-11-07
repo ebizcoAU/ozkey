@@ -35,6 +35,7 @@ const {
   waitFor,
   S0_JWT_SECRET,
 } = require('./harness');
+const { verifyBrokerSecret } = require('../../../ozserver-core/util');
 
 const fx = new Fixture();
 const golden = new Golden(path.join(__dirname, 'golden', 'ozlock.json'));
@@ -101,7 +102,7 @@ test('POST /pairings validates input', async () => {
   assert.equal(res.body.code, 'invalid_ozkie_version');
 });
 
-test('POST /pairings registers a direct lock and is idempotent for the same app', async () => {
+test('POST /pairings registers a direct lock and is idempotent for the same app (keeps the label)', async () => {
   let { res } = await step('pairings-L1', () =>
     call('POST', '/pairings', { app_id: APP_A.hex, device_id: L1, label: 'Front door' })
   );
@@ -114,6 +115,9 @@ test('POST /pairings registers a direct lock and is idempotent for the same app'
     call('POST', '/pairings', { app_id: APP_A.hex, device_id: L1 })
   ));
   assert.equal(res.status, 200);
+  // S1e-3 regression: a label-less re-register keeps the owner's label.
+  const [row] = await fx.query('SELECT label FROM locks WHERE id = ?', [L1]);
+  assert.equal(row.label, 'Front door');
 });
 
 test('POST /pairings refuses a second app on a live device_id', async () => {
@@ -147,12 +151,14 @@ test('MQTT enroll of a paired lock -> enrollment_ack; unknown -> nack', async ()
   assert.ok(ack, 'enrollment_ack published on the lock command topic');
   assert.equal(ack.payload.op, 'enrollment_ack');
   assert.equal(ack.payload.app_id, APP_A.hex);
-  // Recorded, not endorsed: the label-less re-register above wrote the
-  // 'New Doorlock' default over 'Front door' (registerPairing's
-  // `label || 'New Doorlock'` defeats its own COALESCE), so enroll then
-  // names the lock from its MAC. Today's behaviour; flagged for S1.
-  assert.equal(ack.payload.label, 'Doorlock 00:01');
+  // S1e-3: the label-less re-register above kept 'Front door', so enroll
+  // uses it (it fell back to 'Doorlock 00:01', from the MAC, before the fix).
+  assert.equal(ack.payload.label, 'Front door');
   assert.match(ack.payload.broker_secret, /^ozl_[0-9a-f]{32}$/);
+  // S1e-2: the DB keeps only the hash of what the ack carried.
+  const [lockRow] = await fx.query('SELECT broker_secret FROM locks WHERE id = ?', [L1]);
+  assert.match(lockRow.broker_secret, /^PBKDF2\$sha512\$100000\$/);
+  assert.ok(verifyBrokerSecret(ack.payload.broker_secret, lockRow.broker_secret));
 
   ({ pubs } = await step('enroll-unknown', async () => {
     await fx.pub(T('enroll', 's0-ghost'), { device_id: 's0-ghost', mac: 'AA:BB:CC:00:00:99' });
@@ -217,6 +223,11 @@ test('bridge online -> utc push + one-time broker credentials', async () => {
   });
   const ops = pubs.filter((m) => m.topic === TB('command', B1)).map((m) => m.payload.op || 'utc');
   assert.deepEqual(ops.sort(), ['broker_credentials', 'utc']);
+  // S1e-1: the bridge gets the plaintext once; the DB keeps only the hash.
+  const creds = pubs.find((m) => m.payload.op === 'broker_credentials').payload;
+  const [row] = await fx.query('SELECT broker_secret FROM bridges WHERE id = ?', [B1]);
+  assert.match(row.broker_secret, /^PBKDF2\$sha512\$100000\$/);
+  assert.ok(verifyBrokerSecret(creds.broker_secret, row.broker_secret));
 
   ({ pubs } = await step('bridge-B1-online-again', async () => {
     await fx.pub(TB('presence', B1), { state: 'online' });

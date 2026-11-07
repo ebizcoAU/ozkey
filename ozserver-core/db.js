@@ -14,6 +14,87 @@ const pool = lazy(() => ctx.pool);
 const mysql = lazy(() => ctx.mysql);
 const logEvent = (...args) => ctx.logEvent(...args);
 const hashBrokerSecret = (...args) => require('./util').hashBrokerSecret(...args);
+const isHashedBrokerSecret = (...args) => require('./util').isHashedBrokerSecret(...args);
+const brokerSecretColumn = () => require('./util').BROKER_SECRET_COLUMN;
+
+/** Widen `table`.broker_secret for the hashed form and hash any plaintext
+ *  rows in place (ozkey-50 §8.2). Idempotent: hashed rows (PBKDF2$ or the
+ *  older scrypt$) are left alone, since they can't be re-hashed. */
+async function hashPlaintextBrokerSecrets(table) {
+  await pool.query(`ALTER TABLE ${table} MODIFY COLUMN broker_secret ${brokerSecretColumn()}`);
+  const [rows] = await pool.query(`SELECT id, broker_secret FROM ${table} WHERE broker_secret IS NOT NULL`);
+  const plain = rows.filter((r) => !isHashedBrokerSecret(r.broker_secret));
+  for (const row of plain) {
+    await pool.query(`UPDATE ${table} SET broker_secret = ? WHERE id = ?`, [await hashBrokerSecret(row.broker_secret), row.id]);
+  }
+  if (plain.length) logEvent('info', `hashed ${plain.length} plaintext ${table}.broker_secret row(s)`);
+}
+
+const S1E4_FLAG = 's1e4_utc_datetimes';
+
+/** S1e-4 one-time migration (PM-approved purge, not a shift). Every DATETIME
+ *  written before S1e-4 is naive time in no single zone. JS Dates went in as
+ *  Node-local (lab: AEDT +11). NOW() went in as whatever MySQL's global zone
+ *  was at the time (lab convention +07). The pool now reads them as UTC.
+ *  Rather than shift them, drop what that misreading would break. All of it is
+ *  short-lived routing state:
+ *   - pending_queue: delete every queued unlock/assisted-unlock (60 s
+ *     windows). Delete any other queued row only once it is expired WHATEVER
+ *     zone wrote it: expires_at < UTC_TIMESTAMP() - 12 h. That is keep-biased
+ *     on purpose: dropping a still-live revoke-key would leave a revoked key
+ *     on the lock, while keeping a stale one only means a late delivery or an
+ *     expiry drop at wake. So live revoke-key, bond-verb, factory-reset and
+ *     no-expiry grant-key rows are KEPT.
+ *   - enroll_tokens: delete every unused one, and used ones past the same
+ *     12 h margin.
+ *   - presence: NULL locks.last_seen_at/presence_at/last_mech_at,
+ *     lock_bridges.last_confirmed_reachable_at and bridges_presence.presence_at.
+ *     The next heartbeat/presence message refills them in UTC.
+ *  UTC_TIMESTAMP() does not depend on the session zone, so the rule needs no
+ *  guess about the old one. Guarded by a schema_flags row, so it runs once
+ *  per DB, in one transaction with that row. On a fresh DB it finds nothing
+ *  and just sets the flag. */
+const PRE_UTC_MARGIN = 'UTC_TIMESTAMP() - INTERVAL 12 HOUR';
+
+async function purgePreUtcDatetimes() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS schema_flags (
+      name VARCHAR(64) PRIMARY KEY,
+      applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB`);
+  const [done] = await pool.query('SELECT 1 FROM schema_flags WHERE name = ?', [S1E4_FLAG]);
+  if (done.length) return;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const n = async (sql) => (await conn.query(sql))[0].affectedRows;
+    const counts = {
+      queue: await n(`DELETE FROM pending_queue WHERE status = 'queued'
+                        AND (action_type IN ('unlock', 'assisted-unlock')
+                             OR (expires_at IS NOT NULL AND expires_at < ${PRE_UTC_MARGIN}))`),
+      tokens: await n(`DELETE FROM enroll_tokens WHERE used_at IS NULL OR expires_at < ${PRE_UTC_MARGIN}`),
+      locks: await n(`UPDATE locks SET last_seen_at = NULL, presence_at = NULL, last_mech_at = NULL
+                        WHERE last_seen_at IS NOT NULL OR presence_at IS NOT NULL OR last_mech_at IS NOT NULL`),
+      lockBridges: await n(`UPDATE lock_bridges SET last_confirmed_reachable_at = NULL
+                              WHERE last_confirmed_reachable_at IS NOT NULL`),
+      bridges: await n('UPDATE bridges_presence SET presence_at = NULL WHERE presence_at IS NOT NULL'),
+    };
+    await conn.query('INSERT INTO schema_flags (name) VALUES (?)', [S1E4_FLAG]);
+    await conn.commit();
+    logEvent(
+      'info',
+      `S1e-4 UTC migration: deleted ${counts.queue} queue row(s), ${counts.tokens} enroll token(s); ` +
+        `cleared presence on ${counts.locks} lock(s), ${counts.lockBridges} lock_bridges row(s), ` +
+        `${counts.bridges} bridge(s)`
+    );
+  } catch (err) {
+    await conn.rollback().catch(() => {});
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
 
 async function initDatabase() {
   const admin = await mysql.createConnection({
@@ -28,7 +109,15 @@ async function initDatabase() {
   );
   await admin.end();
 
-  ctx.pool = mysql.createPool(CONFIG.DB);
+  // S1e-4: one zone for both clocks. JS Dates bound as params and NOW() in SQL
+  // write the same naive DATETIME columns; they agree only if Node and MySQL
+  // share a zone. Pin both to UTC so the host TZ (and DST) no longer matters.
+  ctx.pool = mysql.createPool({ ...CONFIG.DB, timezone: 'Z' });
+  ctx.pool.on('connection', (conn) => {
+    conn.query("SET time_zone = '+00:00'", (err) => {
+      if (err) logEvent('error', `SET time_zone failed: ${err.message}`);
+    });
+  });
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS owners (
@@ -560,16 +649,12 @@ async function initDatabase() {
   // S−1 / S1c: a profile that hashes lock broker secrets (ozpms) needs the
   // wider column, and any plaintext rows from before get hashed. Both steps
   // are idempotent. A profile that doesn't (ozlock today) is left as it was.
-  if (CONFIG.HASH_LOCK_BROKER_SECRETS) {
-    await pool.query('ALTER TABLE locks MODIFY COLUMN broker_secret VARCHAR(128)');
-    const [plainSecrets] = await pool.query(
-      "SELECT id, broker_secret FROM locks WHERE broker_secret IS NOT NULL AND broker_secret NOT LIKE 'scrypt$%'"
-    );
-    for (const row of plainSecrets) {
-      await pool.query('UPDATE locks SET broker_secret = ? WHERE id = ?', [hashBrokerSecret(row.broker_secret), row.id]);
-    }
-    if (plainSecrets.length) logEvent('info', `S−1: hashed ${plainSecrets.length} plaintext broker_secret row(s)`);
-  }
+  if (CONFIG.HASH_LOCK_BROKER_SECRETS) await hashPlaintextBrokerSecrets('locks');
+  // S1e-1: bridge broker secrets are hashed in every profile. Nothing reads
+  // them back after the one-time broker_credentials push.
+  await hashPlaintextBrokerSecrets('bridges');
+
+  await purgePreUtcDatetimes();
 
   // Seed the single lab owner + site (ozkey-05 lab simplification).
   const [[{ ownerCnt }]] = await pool.query('SELECT COUNT(*) AS ownerCnt FROM owners');

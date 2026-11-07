@@ -121,8 +121,9 @@ const CONFIG = {
   topicCommand: (site, deviceId) => `ozkie/${site}/locks/${deviceId}/command`,
   topicBridgeCommand: (site, bridgeId) => `ozkie/${site}/bridges/${bridgeId}/command`,
   topicTime: (site) => `ozkie/${site}/time`,
-  BRIDGE_RESET_TIMEOUT_MS: 5000,
-  LOCK_RESET_TIMEOUT_MS: 5000,
+  // Overridable for the regression suite (S1d); unset = 5 s.
+  BRIDGE_RESET_TIMEOUT_MS: Number(process.env.OZPMS_BRIDGE_RESET_TIMEOUT_MS) || 5000,
+  LOCK_RESET_TIMEOUT_MS: Number(process.env.OZPMS_LOCK_RESET_TIMEOUT_MS) || 5000,
   UTC_PUSH_REFRESH_MS: 10 * 60 * 1000,
   AUDIT_LOG_RETENTION_MS: 90 * 24 * 3600 * 1000,
   AUDIT_LOG_PURGE_INTERVAL_MS: 24 * 3600 * 1000,
