@@ -412,8 +412,12 @@ def interop(exe):
     def start():
         p = subprocess.Popen([exe, '--state', state, '--device-id', dev, '--ble', str(ble),
                               '--relay', str(rel)], stdout=subprocess.PIPE, text=True)
-        p.stdout.readline(); key = p.stdout.readline().split()[-1]
-        return p, bytes.fromhex(key)
+        banner, keyline = p.stdout.readline(), p.stdout.readline()
+        if not keyline.startswith('lock key '):
+            p.wait()
+            raise RuntimeError(f'ozhostlock did not start (exit {p.returncode}): '
+                               f'ports {ble}/{rel} in use?')
+        return p, bytes.fromhex(keyline.split()[-1])
     def chk(name, cond):
         nonlocal fails
         fails += 0 if cond else 1
