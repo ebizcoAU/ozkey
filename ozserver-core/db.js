@@ -646,6 +646,15 @@ async function initDatabase() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB`);
 
+  // C0a: console actions are audited with the staff member as `actor`
+  // (app_id stays the app's). In every profile, so core queries can rely on it.
+  const [[{ hasActor }]] = await pool.query(
+    `SELECT COUNT(*) AS hasActor FROM information_schema.columns
+      WHERE table_schema = ? AND table_name = 'audit_log' AND column_name = 'actor'`,
+    [CONFIG.DB.database]
+  );
+  if (!hasActor) await pool.query('ALTER TABLE audit_log ADD COLUMN actor VARCHAR(120) NULL AFTER app_id');
+
   // S−1 / S1c: a profile that hashes lock broker secrets (ozpms) needs the
   // wider column, and any plaintext rows from before get hashed. Both steps
   // are idempotent. A profile that doesn't (ozlock today) is left as it was.

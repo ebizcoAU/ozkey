@@ -101,7 +101,7 @@ const path = require('path');
 const jwt = require('jsonwebtoken'); // ozkey-24: app broker-auth JWT issuance
 // S0b (ozkey-50 §7): the lock side lives in ozserver-core now; this file is
 // the ozlock profile (pairing, apps/auth, grants HTTP layer, Nexus, routes).
-const { createCore, util: coreUtil } = require('../../ozserver-core');
+const { createCore, util: coreUtil, consolePolicy } = require('../../ozserver-core');
 const {
   detectLanIp,
   SECRET_MIN_PROD_LEN,
@@ -126,6 +126,10 @@ const SECRETS = {
   PROVISION_WIFI_SSID: resolveSecret(['PROVISION_WIFI_SSID'], { required: 'always' }),
   PROVISION_WIFI_PASSWORD: resolveSecret(['PROVISION_WIFI_PASSWORD'], { required: 'always' }),
 };
+// C0a: the operator console. OZLOCK_CONSOLE_TOTP_KEY (64 hex) and
+// OZLOCK_PUBLIC_URL (https://, or http with OZ_LAB_INSECURE=1 outside
+// production) are required; boot refuses without them (enforceSecrets).
+const CONSOLE_CONFIG = consolePolicy.resolveConsoleConfig('OZLOCK');
 
 /* ---------------------------------------------------------------------------
  * Configuration
@@ -454,6 +458,25 @@ let pool = null;
  * REST API
  * ------------------------------------------------------------------------- */
 const app = express();
+// Behind the reverse proxy (dashboards proposal §5) exactly one hop is
+// trusted, so req.ip is the client and not the proxy. Off unless set.
+if (process.env.OZLOCK_TRUST_PROXY === '1') app.set('trust proxy', 1);
+app.disable('x-powered-by');
+
+/* -- C0a: operator console (/console/v1) ------------------------------------
+ * Mounted BEFORE cors(): the console is same-origin only and must never
+ * answer a cross-origin read. OZLOCK roles are fixed (PM Q3, 2026-11-05):
+ * our staff only; lock owners stay in BANOI.
+ */
+const OZLOCK_CONSOLE_ROLES = {
+  admin: ['*'],
+  operator: ['fleet.read', 'fleet.act'],
+  viewer: ['fleet.read'],
+};
+const consoleRouter = express.Router();
+consoleRouter.use(express.json({ limit: '16kb' }));
+app.use('/console/v1', consoleRouter);
+
 app.use(cors());
 app.use(express.json());
 
@@ -491,6 +514,15 @@ api.get('/health', (req, res) => {
  * the core refuses to mount without one.
  */
 const ozlockOpenAccess = (_req, _res, next) => next();
+if (CONSOLE_CONFIG.totpKey && CONSOLE_CONFIG.publicUrl) {
+  core.mountConsole(consoleRouter, {
+    product: 'ozlock',
+    issuer: 'OZLOCK',
+    roles: OZLOCK_CONSOLE_ROLES,
+    config: CONSOLE_CONFIG,
+  });
+} // else enforceSecrets() refuses to boot before anything listens.
+
 core.mountLockApi(api, {
   auth: ozlockOpenAccess,
   onLockRemoved: (lock) => {
@@ -686,6 +718,7 @@ async function boot() {
   for (;;) {
     try {
       await initDatabase();
+      await core.initConsoleDatabase();
       pool = core.pool;
       break;
     } catch (err) {
@@ -728,7 +761,28 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
-if (require.main === module) {
+/** `node server.js console:create-admin <email> [display name]`: the only way
+ *  to create the first console admin (no default credentials). It prints a
+ *  one-time enrolment link that expires in 30 min, and refuses once an
+ *  active admin exists. It needs the DB but not MQTT or HTTP. */
+async function cliCreateAdmin(email, displayName) {
+  enforceSecrets();
+  try {
+    await initDatabase();
+    await core.initConsoleDatabase();
+    const link = await core.createAdminInvite(email, displayName);
+    console.log(`CONSOLE ADMIN INVITE ${link}`);
+    await core.pool.end();
+    process.exit(0);
+  } catch (err) {
+    logEvent('error', `console:create-admin: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+if (require.main === module && process.argv[2] === 'console:create-admin') {
+  cliCreateAdmin(process.argv[3], process.argv.slice(4).join(' '));
+} else if (require.main === module) {
   boot();
 } else {
   module.exports = {

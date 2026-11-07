@@ -23,6 +23,8 @@ const registry = require('./registry');
 const transport = require('./transport');
 const db = require('./db');
 const api = require('./api');
+const consoleAuth = require('./console');
+const consolePolicy = require('./console/policy');
 
 /**
  * @param {object} deps
@@ -63,6 +65,7 @@ function createCore({ CONFIG, logEvent, mysql, mqtt }) {
     ...transport,
     ...db,
     ...api,
+    ...consoleAuth,
     /** The mysql2 pool, once initDatabase() has created it. */
     get pool() {
       return ctx.pool;
@@ -70,4 +73,4 @@ function createCore({ CONFIG, logEvent, mysql, mqtt }) {
   };
 }
 
-module.exports = { createCore, util };
+module.exports = { createCore, util, consolePolicy };
