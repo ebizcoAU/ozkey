@@ -118,7 +118,10 @@ function mask(value, key) {
   if (value === null || value === undefined) return value;
   if (VOLATILE_KEYS.has(key)) return MASK;
   if (key === 'broker_tcp_port' && value === harnessBrokerPort) return BROKER_PORT_TOKEN;
-  if (key === 'msg_id' && typeof value === 'string') return value.replace(/^(ozl-\d+-)\d+$/, '$1<ms>');
+  if (key === 'msg_id' && typeof value === 'string') {
+    // Live-only remote unlock ids are ozl-u<random hex>-<ms> (no queue row).
+    return value.replace(/^(ozl-\d+-)\d+$/, '$1<ms>').replace(/^ozl-u[0-9a-f]+-\d+$/, 'ozl-u<id>-<ms>');
+  }
   if (Array.isArray(value)) return value.map((v) => mask(v, key));
   if (typeof value === 'object') {
     const out = {};
@@ -127,7 +130,7 @@ function mask(value, key) {
   }
   if (typeof value === 'string') {
     // utc=<n> inside log text, and msg ids embedded in strings
-    return value.replace(/ozl-(\d+)-\d{10,}/g, 'ozl-$1-<ms>');
+    return value.replace(/ozl-(\d+)-\d{10,}/g, 'ozl-$1-<ms>').replace(/ozl-u[0-9a-f]+-\d{10,}/g, 'ozl-u<id>-<ms>');
   }
   return value;
 }

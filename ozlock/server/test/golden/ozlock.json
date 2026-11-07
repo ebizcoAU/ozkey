@@ -1206,13 +1206,14 @@
           "delivery": "delivered",
           "device_id": "s0-bridged-02",
           "envelope_hex": "c0ffee01",
-          "expires_at": "<masked>",
           "mode": "remote",
+          "msg_id": "ozl-u<id>-<ms>",
           "ok": true,
-          "queue_id": 1,
+          "refusal_watch_s": 1,
           "requires_touch": false,
+          "result": "sent_unconfirmed",
           "transport_ok": true,
-          "window_s": 60
+          "window_s": null
         },
         "status": 200
       }
@@ -1221,7 +1222,7 @@
       {
         "payload": {
           "envelope_hex": "c0ffee01",
-          "msg_id": "ozl-1-<ms>",
+          "msg_id": "ozl-u<id>-<ms>",
           "target": "s0-bridged-02"
         },
         "retain": false,
@@ -1334,7 +1335,7 @@
           "envelope_hex": "beef0001",
           "grant_id": 1,
           "ok": true,
-          "queue_id": 2,
+          "queue_id": 1,
           "sync_status": "pending"
         },
         "status": 200
@@ -1344,7 +1345,7 @@
       {
         "payload": {
           "envelope_hex": "beef0001",
-          "msg_id": "ozl-2-<ms>",
+          "msg_id": "ozl-1-<ms>",
           "target": "s0-bridged-02"
         },
         "retain": false,
@@ -1431,7 +1432,7 @@
               "action": "unlock",
               "app_id": "015acabd3be4dc7903b21d6300c3e8213785df1352785ccea9caf42661db7351",
               "created_at": "<masked>",
-              "detail": "remote unlock",
+              "detail": "remote unlock: sent_unconfirmed",
               "device_id": "s0-bridged-02",
               "id": 6,
               "site_id": "lab"
@@ -1496,7 +1497,7 @@
           "expires_at": "<masked>",
           "grant_id": 1,
           "ok": true,
-          "queue_id": 3,
+          "queue_id": 2,
           "sync_status": "revoking"
         },
         "status": 200
@@ -1506,7 +1507,7 @@
       {
         "payload": {
           "envelope_hex": "dead0001",
-          "msg_id": "ozl-3-<ms>",
+          "msg_id": "ozl-2-<ms>",
           "target": "s0-bridged-02"
         },
         "retain": false,
@@ -1531,7 +1532,7 @@
           "expires_at": "<masked>",
           "grant_id": 9999,
           "ok": true,
-          "queue_id": 4,
+          "queue_id": 3,
           "sync_status": "revoking"
         },
         "status": 200
@@ -1541,7 +1542,7 @@
       {
         "payload": {
           "envelope_hex": "dead0002",
-          "msg_id": "ozl-4-<ms>",
+          "msg_id": "ozl-3-<ms>",
           "target": "s0-bridged-02"
         },
         "retain": false,
@@ -1610,7 +1611,7 @@
           "envelope_hex": "110aa",
           "expires_at": "<masked>",
           "ok": true,
-          "queue_id": 5,
+          "queue_id": 4,
           "transport_ok": true
         },
         "status": 200
@@ -1620,7 +1621,7 @@
       {
         "payload": {
           "envelope_hex": "110aa",
-          "msg_id": "ozl-5-<ms>",
+          "msg_id": "ozl-4-<ms>",
           "target": "s0-bridged-02"
         },
         "retain": false,
@@ -1645,7 +1646,7 @@
           "envelope_hex": "130aa",
           "expires_at": "<masked>",
           "ok": true,
-          "queue_id": 6,
+          "queue_id": 5,
           "transport_ok": true
         },
         "status": 200
@@ -1655,7 +1656,7 @@
       {
         "payload": {
           "envelope_hex": "130aa",
-          "msg_id": "ozl-6-<ms>",
+          "msg_id": "ozl-5-<ms>",
           "target": "s0-bridged-02"
         },
         "retain": false,
@@ -1680,7 +1681,7 @@
           "envelope_hex": "80aa",
           "expires_at": "<masked>",
           "ok": true,
-          "queue_id": 7,
+          "queue_id": 6,
           "transport_ok": true
         },
         "status": 200
@@ -1690,7 +1691,7 @@
       {
         "payload": {
           "envelope_hex": "80aa",
-          "msg_id": "ozl-7-<ms>",
+          "msg_id": "ozl-6-<ms>",
           "target": "s0-bridged-02"
         },
         "retain": false,
@@ -1756,7 +1757,7 @@
           "envelope_hex": "11aa",
           "expires_at": "<masked>",
           "ok": true,
-          "queue_id": 8,
+          "queue_id": 7,
           "transport_ok": true
         },
         "status": 200
@@ -1770,7 +1771,7 @@
           "envelope_hex": "11aa",
           "grant_id": null,
           "issued_at": "<masked>",
-          "msg_id": "ozl-8-<ms>",
+          "msg_id": "ozl-7-<ms>",
           "source": "ozlockserv"
         },
         "retain": false,
@@ -1839,7 +1840,7 @@
               "envelope_hex": "11aa",
               "expires_at": "<masked>",
               "grant_id": null,
-              "id": 8,
+              "id": 7,
               "msg_type": "sealed_envelope",
               "payload_hex": null,
               "site_id": "lab",
@@ -1852,7 +1853,7 @@
               "envelope_hex": "80aa",
               "expires_at": "<masked>",
               "grant_id": null,
-              "id": 7,
+              "id": 6,
               "msg_type": "sealed_envelope",
               "payload_hex": null,
               "site_id": "lab",
@@ -1865,7 +1866,7 @@
               "envelope_hex": "130aa",
               "expires_at": "<masked>",
               "grant_id": null,
-              "id": 6,
+              "id": 5,
               "msg_type": "sealed_envelope",
               "payload_hex": null,
               "site_id": "lab",
@@ -1878,7 +1879,7 @@
               "envelope_hex": "110aa",
               "expires_at": "<masked>",
               "grant_id": null,
-              "id": 5,
+              "id": 4,
               "msg_type": "sealed_envelope",
               "payload_hex": null,
               "site_id": "lab",
@@ -1891,7 +1892,7 @@
               "envelope_hex": "dead0002",
               "expires_at": "<masked>",
               "grant_id": 9999,
-              "id": 4,
+              "id": 3,
               "msg_type": "sealed_envelope",
               "payload_hex": null,
               "site_id": "lab",
@@ -1904,7 +1905,7 @@
               "envelope_hex": "dead0001",
               "expires_at": "<masked>",
               "grant_id": 1,
-              "id": 3,
+              "id": 2,
               "msg_type": "sealed_envelope",
               "payload_hex": null,
               "site_id": "lab",
@@ -1917,19 +1918,6 @@
               "envelope_hex": "beef0001",
               "expires_at": null,
               "grant_id": 1,
-              "id": 2,
-              "msg_type": "sealed_envelope",
-              "payload_hex": null,
-              "site_id": "lab",
-              "status": "sent"
-            },
-            {
-              "action_type": "unlock",
-              "created_at": "<masked>",
-              "device_id": "s0-bridged-02",
-              "envelope_hex": "c0ffee01",
-              "expires_at": "<masked>",
-              "grant_id": null,
               "id": 1,
               "msg_type": "sealed_envelope",
               "payload_hex": null,
@@ -2469,7 +2457,7 @@
       {
         "payload": {
           "envelope_hex": "reset01",
-          "msg_id": "ozl-9-<ms>",
+          "msg_id": "ozl-8-<ms>",
           "target": "s0-bridged-02"
         },
         "retain": false,

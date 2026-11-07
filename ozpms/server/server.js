@@ -136,6 +136,10 @@ const CONFIG = {
   // The operator's own data: never let a deploy drop grants columns.
   DROP_PLAINTEXT_GRANT_COLUMNS: false,
   ENFORCE_CAPS: process.env.OZPMS_ENFORCE_CAPS !== '0',
+  // Live-only remote unlock (PM nexus-6e 2026-11-07): how long the single
+  // publish waits for a v1 refusal code on the uplink before answering
+  // 'sent_unconfirmed'. 10 s by default; tests shorten it.
+  UNLOCK_REFUSAL_WATCH_MS: Number(process.env.OZPMS_UNLOCK_WATCH_MS) || 10_000,
   HASH_LOCK_BROKER_SECRETS: true, // S−1, kept from the July fork
   PROVISION_WIFI_SSID: SECRETS.PROVISION_WIFI_SSID,
   PROVISION_WIFI_PASSWORD: SECRETS.PROVISION_WIFI_PASSWORD,
