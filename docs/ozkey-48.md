@@ -595,6 +595,14 @@ stays up 2 minutes clears it too, but never while in SAFE mode. While SAFE:
   A client that gets 36 surfaces "lock in SAFE mode" and does not retry in a loop. It clears the flag
   on a non-36 sealed response from the lock. Bridge presence is not a clear signal, because a bridge
   reconnects within the same boot.
+- **Bench recipe: forcing SAFE mode.** This is the app team's acceptance step 1 (ozkey-67's
+  XF draft, 2026-11-07). 🟡 **NOT BUILT.** No shell command or hook forces a watchdog reset today.
+  - Host proof: `test_ak1037_wdt aowdt` and `test_ak1037_gatt safe` preset the count and boot the
+    third reset.
+  - On the kit, once a forcing hook is ruled on: trigger a watchdog reset 3 times in a row with no
+    power-on reset in between. The `oz.start` log then shows `wdt: reset WATCHDOG, watchdog resets
+    in a row 3: SAFE MODE …`.
+  - To leave SAFE mode: take the batteries out and put them back (power-on reset).
 - **No plaintext SAFE flag** in presence or advertising (PM nexus-6e, 2026-11-07): it would tell anyone
   who reads it that this door can't lock. For now the owner app is the signal (36, event type 4). The
   server and console signal waits for the v2 server-side OSCORE client.
