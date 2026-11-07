@@ -20,9 +20,9 @@
 > A `relay` characteristic (§2, §2.3), a closed type byte on MQTT (§2.4.1), topics and
 > correlation (§2.4.2), one relay EDHOC per lock (§2.4.3), timers and retries side by side (§2.4.4),
 > failover hand-off (§2.4.5), MQTT buffer sizing (§2.4.6).
-> F-AK-WDT-2 (2026-11-07, firmware ozkey-d7, PENDING PM review; rev number left to the PM):
-> SAFE mode after a watchdog reset loop (§6.1), result 36 `SAFE_MODE` (App. A), event type 4
-> `safe mode` (§5.1).
+> Rev 7 (2026-11-07, PM nexus-6e accepted, F-AK-WDT-2): SAFE mode after a watchdog reset loop
+> (§6.1): unlock never refused, LOCK refused, the rest owner only. Result 36 `SAFE_MODE` (App. A),
+> event type 4 `safe mode` (§5.1). Servers get 5.03 `SAFE_MODE`: surface it, never retry-loop.
 
 ## 0. What changes from v1, in one table
 
@@ -588,7 +588,8 @@ stays up 2 minutes clears it too, but never while in SAFE mode. While SAFE:
   SAFE belongs to the boot, not the bond table.
 - **One `safe mode` event** (§5.1 type 4) is logged when SAFE starts, `{1: resets in a row}`. The owner
   sees it on `events`. Service-bond `events` aren't built yet (§5.1), so a server learns of SAFE mode
-  from 5.03 `SAFE_MODE` on its next `cred` request.
+  from 5.03 `SAFE_MODE` on its next `cred` request. The server shows "lock in SAFE mode" to the owner
+  and the console, and must not retry in a loop (PM, 2026-11-07).
 
 **No server ever holds bond #0** (ozkey-50 §3, server review). The servers hold only `service`,
 `issuer` and the ozpms custodian, whose limits the lock enforces (ozkey-51). Server-side remote unlock
