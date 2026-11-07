@@ -169,6 +169,7 @@ class Fixture {
   /** `env`: extra server env for this file's instance (e.g. short timers). */
   constructor({ env = {} } = {}) {
     this.extraEnv = env;
+    this.extraArgs = []; // S1e-KEYGUARD: argv after server.js for the next (re)start
     if (!P) throw new Error('testkit: configure(profile) first');
     this.tmp = fs.mkdtempSync(path.join(os.tmpdir(), `s0-${P.name}-`));
     this.dbName = `${P.dbPrefix}_${process.pid}`;
@@ -292,7 +293,7 @@ class Fixture {
   async startServer() {
     const logFrom = this.log().length;
     const out = fs.openSync(this.serverLog, 'a');
-    this.server = spawn(process.execPath, ['server.js'], {
+    this.server = spawn(process.execPath, ['server.js', ...this.extraArgs], {
       cwd: P.serverDir,
       stdio: ['ignore', out, out],
       env: this.serverEnv(),
@@ -317,16 +318,53 @@ class Fixture {
     }
   }
 
+  /** S1e-KEYGUARD: stop the running server, then boot one that is expected to
+   *  EXIT (a refused start) against the same DB and broker. Resolves with its
+   *  exit code and what it printed; rejects if it is still up after timeoutMs.
+   *  The fixture has no running server afterwards: call restartServer(). */
+  async bootExpectingExit(args = [], { timeoutMs = 60000 } = {}) {
+    await this.stopServer();
+    const logFrom = this.log().length;
+    const out = fs.openSync(this.serverLog, 'a');
+    const child = spawn(process.execPath, ['server.js', ...args], {
+      cwd: P.serverDir,
+      stdio: ['ignore', out, out],
+      env: this.serverEnv(),
+    });
+    this.procs.push(child);
+    const code = await Promise.race([
+      new Promise((r) => child.once('exit', (c) => r(c))),
+      sleep(timeoutMs).then(() => 'timeout'),
+    ]);
+    fs.closeSync(out);
+    const printed = this.log().slice(logFrom);
+    if (code === 'timeout') {
+      child.kill('SIGKILL');
+      throw new Error(
+        `server did not exit within ${timeoutMs} ms (loadavg ${os.loadavg().map((l) => l.toFixed(1)).join('/')})\n${printed}`
+      );
+    }
+    this.procs = this.procs.filter((p) => p !== child);
+    return { code, out: printed };
+  }
+
+  /** Stop only the server (no-op if it already exited or none is running). */
+  async stopServer() {
+    const old = this.server;
+    if (!old) return;
+    if (old.exitCode === null && old.signalCode === null) {
+      old.kill('SIGTERM');
+      await Promise.race([new Promise((r) => old.once('exit', r)), sleep(3000)]);
+      if (old.exitCode === null && old.signalCode === null) old.kill('SIGKILL');
+    }
+    this.procs = this.procs.filter((p) => p !== old);
+    this.server = null;
+  }
+
   /** S1e-1: stop and re-spawn only the server; broker and DB stay. This is
    *  how a boot migration is tested against rows seeded by query(). */
   async restartServer() {
-    const old = this.server;
-    if (old.exitCode === null) {
-      old.kill('SIGTERM');
-      await Promise.race([new Promise((r) => old.once('exit', r)), sleep(3000)]);
-      if (old.exitCode === null) old.kill('SIGKILL');
-    }
-    this.procs = this.procs.filter((p) => p !== old);
+    await this.stopServer();
     await this.startServer();
   }
 

@@ -413,27 +413,94 @@ function x25519PublicKeyFromHex(hex) {
 // — same "lab shortcut, loudly flagged" posture as JWT_SIGNING_SECRET
 // above; production should manage this via a real secrets store, not a
 // plaintext file beside the code.
-const SERVER_ECDH_KEY_PATH = path.join(__dirname, '.server_ecdh_key.json');
-let serverEcdhKeyPair = null; // set by loadOrCreateServerEcdhKeyPair() at boot
+// OZLOCK_SERVER_ECDH_KEY_PATH overrides the location (the regression suite
+// points it at each fixture's temp dir instead of writing beside the code).
+const SERVER_ECDH_KEY_PATH =
+  process.env.OZLOCK_SERVER_ECDH_KEY_PATH || path.join(__dirname, '.server_ecdh_key.json');
+const NEW_IDENTITY_FLAG = '--new-identity';
+let serverEcdhKeyPair = null; // set by resolveServerEcdhIdentity() at boot
 
-function loadOrCreateServerEcdhKeyPair() {
-  if (fs.existsSync(SERVER_ECDH_KEY_PATH)) {
-    const { x, d } = JSON.parse(fs.readFileSync(SERVER_ECDH_KEY_PATH, 'utf8'));
-    return {
-      privateKey: crypto.createPrivateKey({ key: { kty: 'OKP', crv: 'X25519', x, d }, format: 'jwk' }),
-      publicKeyHex: Buffer.from(x, 'base64url').toString('hex'),
-    };
-  }
+function loadServerEcdhKeyPair() {
+  if (!fs.existsSync(SERVER_ECDH_KEY_PATH)) return null;
+  const { x, d } = JSON.parse(fs.readFileSync(SERVER_ECDH_KEY_PATH, 'utf8'));
+  return {
+    privateKey: crypto.createPrivateKey({ key: { kty: 'OKP', crv: 'X25519', x, d }, format: 'jwk' }),
+    publicKeyHex: Buffer.from(x, 'base64url').toString('hex'),
+  };
+}
+
+function createServerEcdhKeyPair() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
   const pubJwk = publicKey.export({ format: 'jwk' });
   const privJwk = privateKey.export({ format: 'jwk' });
-  fs.writeFileSync(
-    SERVER_ECDH_KEY_PATH,
-    JSON.stringify({ x: pubJwk.x, d: privJwk.d }),
-    { mode: 0o600 }
-  );
-  logEvent('info', `ozkey-24: generated a new server ECDH identity -> ${SERVER_ECDH_KEY_PATH}`);
+  // 'wx': never overwrite. A key that appeared since the check is kept.
+  fs.writeFileSync(SERVER_ECDH_KEY_PATH, JSON.stringify({ x: pubJwk.x, d: privJwk.d }), { mode: 0o600, flag: 'wx' });
   return { privateKey, publicKeyHex: Buffer.from(pubJwk.x, 'base64url').toString('hex') };
+}
+
+/** S1e-KEYGUARD (PM nexus-9e, 2026-11-05): a missing key file must never
+ *  silently mint a new identity. The S1e-4 lab boot ran from a worktree with
+ *  no key file and came up as a different server for 43 s; any app that had
+ *  called in then would have failed its proof with no hint why.
+ *  - key file present: use it. NEW_IDENTITY_FLAG with it present is refused,
+ *    so nobody believes they rotated a key that was in fact kept.
+ *  - missing, DB fresh (no owners, no locks before this boot's schema init):
+ *    first boot, create one.
+ *  - missing, DB has owners or locks: refuse, unless NEW_IDENTITY_FLAG says a
+ *    new identity is wanted on purpose (every paired app must then re-pair).
+ *  Returns the key pair, or a { refuse } message for boot() to exit on. */
+/** Owners and locks as they were BEFORE this boot's initDatabase(), which
+ *  seeds a lab owner into an empty DB. Counting after it would make every DB
+ *  look in use, and a genuine first boot would be refused. A DB or table that
+ *  doesn't exist yet counts as 0. */
+async function probeDbUseBeforeInit() {
+  const conn = await mysql.createConnection({ host: CONFIG.DB.host, user: CONFIG.DB.user, password: CONFIG.DB.password });
+  try {
+    const [tables] = await conn.query(
+      "SELECT table_name AS t FROM information_schema.tables WHERE table_schema = ? AND table_name IN ('owners', 'locks')",
+      [CONFIG.DB.database]
+    );
+    const has = new Set(tables.map((r) => r.t));
+    const count = async (t) =>
+      has.has(t) ? Number((await conn.query(`SELECT COUNT(*) AS n FROM \`${CONFIG.DB.database}\`.${t}`))[0][0].n) : 0;
+    return { owners: await count('owners'), locks: await count('locks') };
+  } finally {
+    await conn.end();
+  }
+}
+
+async function resolveServerEcdhIdentity({ owners, locks }, argv) {
+  const wantNew = argv.includes(NEW_IDENTITY_FLAG);
+  const existing = loadServerEcdhKeyPair();
+  if (existing) {
+    if (!wantNew) return { keyPair: existing };
+    return {
+      refuse:
+        `${NEW_IDENTITY_FLAG} given but ${SERVER_ECDH_KEY_PATH} exists. The flag only allows creating a ` +
+        'missing key; it never replaces one. To rotate, move the old key away deliberately, then boot with the flag.',
+    };
+  }
+  const inUse = owners > 0 || locks > 0;
+  if (inUse && !wantNew) {
+    return {
+      refuse:
+        `server ECDH identity missing: ${SERVER_ECDH_KEY_PATH} not found, but this DB already has ` +
+        `${owners} owner(s) and ${locks} lock(s). Paired apps prove themselves against that key, so a new ` +
+        'one would lock them all out. Restore the key file (0600, beside server.js on the box that ran this ' +
+        `DB), or boot with ${NEW_IDENTITY_FLAG} to create a new identity on purpose (every app must re-pair).`,
+    };
+  }
+  const keyPair = createServerEcdhKeyPair();
+  if (inUse) {
+    logEvent(
+      'warn',
+      `ozkey-24: ${NEW_IDENTITY_FLAG}: created a NEW server ECDH identity for a DB with ${owners} owner(s) ` +
+        `and ${locks} lock(s) -> ${SERVER_ECDH_KEY_PATH}. Every paired app must re-pair.`
+    );
+  } else {
+    logEvent('info', `ozkey-24: fresh DB, generated the server ECDH identity -> ${SERVER_ECDH_KEY_PATH}`);
+  }
+  return { keyPair };
 }
 
 // ozkey-24 §3.2: single-use, short-lived challenge nonces. In-memory by
@@ -711,12 +778,11 @@ async function boot() {
     SECRETS.JWT_SIGNING_SECRET ? [] : ['OZLOCK_JWT_SECRET unset, using the lab-only JWT secret (refused in production)']
   );
 
-  serverEcdhKeyPair = loadOrCreateServerEcdhKeyPair();
-  logEvent('info', `ozkey-24: server ECDH identity ${serverEcdhKeyPair.publicKeyHex.slice(0, 12)}…`);
-
   let attempts = 0;
+  let dbUseBeforeInit = null;
   for (;;) {
     try {
+      dbUseBeforeInit = await probeDbUseBeforeInit();
       await initDatabase();
       await core.initConsoleDatabase();
       pool = core.pool;
@@ -727,6 +793,16 @@ async function boot() {
       await new Promise((r) => setTimeout(r, 5000));
     }
   }
+
+  // S1e-KEYGUARD: "is this a fresh lab?" is a DB question, answered from the
+  // pre-init probe. Still before MQTT and HTTP, so a refused boot served nothing.
+  const identity = await resolveServerEcdhIdentity(dbUseBeforeInit, process.argv.slice(2));
+  if (identity.refuse) {
+    logEvent('error', `S1e-KEYGUARD: refusing to start. ${identity.refuse}`);
+    process.exit(1);
+  }
+  serverEcdhKeyPair = identity.keyPair;
+  logEvent('info', `ozkey-24: server ECDH identity ${serverEcdhKeyPair.publicKeyHex.slice(0, 12)}…`);
 
   initMqtt();
 
@@ -768,7 +844,18 @@ process.on('uncaughtException', (err) => {
 async function cliCreateAdmin(email, displayName) {
   enforceSecrets();
   try {
+    // S1e-KEYGUARD: the CLI touches the DB like a boot does (initDatabase seeds
+    // the lab owner into an empty DB), so it settles the identity by the same
+    // rule. On a fresh DB it creates the key; without that, "create the admin,
+    // then start the server" would leave an in-use DB with no key, and the
+    // first boot would be refused. On an in-use DB with no key it never
+    // creates one: it warns, and the admin is still created (it needs no key).
+    const dbUse = await probeDbUseBeforeInit();
     await initDatabase();
+    const identity = await resolveServerEcdhIdentity(dbUse, []);
+    if (identity.refuse) {
+      logEvent('warn', `S1e-KEYGUARD: the server will refuse to start until this is fixed. ${identity.refuse}`);
+    }
     await core.initConsoleDatabase();
     const link = await core.createAdminInvite(email, displayName);
     console.log(`CONSOLE ADMIN INVITE ${link}`);

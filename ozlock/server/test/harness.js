@@ -26,6 +26,9 @@ harness.configure({
     OZLOCK_CONSOLE_TOTP_KEY: S0_CONSOLE_TOTP_KEY,
     OZLOCK_PUBLIC_URL: `http://127.0.0.1:${fx.httpPort}`,
     OZ_LAB_INSECURE: '1',
+    // S1e-KEYGUARD: each fixture gets its own server identity file, so a run
+    // never writes beside the code or reuses another run's key.
+    OZLOCK_SERVER_ECDH_KEY_PATH: path.join(fx.tmp, 'server_ecdh_key.json'),
   }),
 });
 
