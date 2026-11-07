@@ -355,6 +355,15 @@ static void key_in(oz_lock *L, char key, int connected)
     }
 }
 
+#ifdef OZ_DEBUG_HOOKS
+/* oz.wdthang (debug builds only, PM GO 2026-11-07): the OZKIE thread keeps
+ * running but stops checking in, as a stuck handler would. The main loop then
+ * stops feeding and the watchdog resets the lock: the bench recipe for SAFE
+ * mode (ozkey-48 §6.1). Never in a release build. */
+static volatile int dbg_hang;
+void oz_gatt_ak1037_debug_hang(void) { dbg_hang = 1; }
+#endif
+
 static void ozkie_thread(void *param)
 {
     oz_lock *L = param;
@@ -367,6 +376,9 @@ static void ozkie_thread(void *param)
     int wdt_id = oz_ak1037_wdt_add(OZ_GATT_WDT_MS);
     refresh_info(L);
     for (;;) {
+#ifdef OZ_DEBUG_HOOKS
+        if (!dbg_hang)
+#endif
         oz_ak1037_wdt_checkin(wdt_id);
         /* 10 ms while the motor moves (oz_motor_step's cadence), else 100. */
         rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE ? 100 : 10;

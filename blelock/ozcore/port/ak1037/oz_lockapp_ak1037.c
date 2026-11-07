@@ -160,6 +160,24 @@ static void oz_state_cmd(char argc, char **argv)
     printf("oz.state: %s, last move %s\r\n", s < 3 ? lock_name[s] : "?", m < 4 ? move_name[m] : "?");
 }
 
+#ifdef OZ_DEBUG_HOOKS
+/* Debug builds only (OZ_DEBUG_HOOKS, never in a release config): force a
+ * watchdog reset. Three in a row with no power-on reset boot SAFE mode
+ * (ozkey-48 §6.1 bench recipe). */
+static void oz_wdthang_cmd(char argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    if (!running) {
+        printf("oz.wdthang: oz.start first\r\n");
+        return;
+    }
+    printf("oz.wdthang: OZKIE thread stops checking in; watchdog reset in about 15 s\r\n");
+    oz_gatt_ak1037_debug_hang();
+}
+AK_MSH_CMD_EXPORT(oz_wdthang_cmd, oz.wdthang, DEBUG BUILD ONLY: force a watchdog reset);
+#endif
+
 AK_MSH_CMD_EXPORT(oz_start_cmd, oz.start, start the OZKIE lock with log-only hardware);
 AK_MSH_CMD_EXPORT(oz_touch_cmd, oz.touch, someone is at the door: open the advertising window);
 AK_MSH_CMD_EXPORT(oz_code_cmd, oz.code, the owner typed this pairing code on the keypad);

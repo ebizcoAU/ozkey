@@ -62,5 +62,9 @@ void oz_gatt_ak1037_pair_prompt(int on);
  * move (oz_motor.h). The thread steps the motor and reports each finished
  * move to oz_lock_actuated(). */
 void oz_gatt_ak1037_actuate(int unlock);
+#ifdef OZ_DEBUG_HOOKS
+/* Debug builds only: the OZKIE thread stops checking in (oz.wdthang). */
+void oz_gatt_ak1037_debug_hang(void);
+#endif
 
 #endif

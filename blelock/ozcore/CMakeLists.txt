@@ -195,6 +195,24 @@ target_link_libraries(test_ak1037_gatt ozport_ak1037_host)
 target_compile_options(test_ak1037_gatt PRIVATE -Wall -Wextra -Werror)
 add_test(NAME ak1037_gatt COMMAND test_ak1037_gatt)
 add_test(NAME ak1037_gatt_safe COMMAND test_ak1037_gatt safe)
+# oz.wdthang (PM GO 2026-11-07): a debug-only hook. No build here or in
+# port/ak1037/Makefile defines OZ_DEBUG_HOOKS except the debug test below.
+add_test(NAME ak1037_nohooks COMMAND test_ak1037_gatt nohooks)
+add_test(NAME ak1037_release_bin_no_wdthang
+         COMMAND sh -c "! LC_ALL=C grep -a -q 'oz\\.wdthang' \"$1\" && ! LC_ALL=C grep -a -q 'oz\\.wdthang' \"$2\""
+                 sh $<TARGET_FILE:test_ak1037_gatt> $<TARGET_FILE:test_ak1037_selftest>)
+# The chip's build (port/ak1037/Makefile, what VictorPC links) never sets it.
+add_test(NAME ak1037_makefile_no_debug_hooks
+         COMMAND sh -c "! grep -q OZ_DEBUG_HOOKS \"$1\"" sh ${CMAKE_CURRENT_SOURCE_DIR}/port/ak1037/Makefile)
+add_executable(test_ak1037_gatt_debug tests/test_ak1037_gatt.c port/ak1037/oz_lockapp_ak1037.c
+               port/ak1037/oz_gatt_ak1037.c)
+target_link_libraries(test_ak1037_gatt_debug ozport_ak1037_host)
+target_compile_options(test_ak1037_gatt_debug PRIVATE -Wall -Wextra -Werror)
+target_compile_definitions(test_ak1037_gatt_debug PRIVATE OZ_DEBUG_HOOKS=1)
+add_test(NAME ak1037_wdthang COMMAND test_ak1037_gatt_debug wdthang)
+# Positive control for the scan above: it finds the name where the hook is built in.
+add_test(NAME ak1037_debug_bin_has_wdthang
+         COMMAND sh -c "LC_ALL=C grep -a -q 'oz\\.wdthang' \"$1\"" sh $<TARGET_FILE:test_ak1037_gatt_debug>)
 # P5-D: optimised builds hold the measured host stack peaks to the threads'
 # budgets (unoptimised frames are far bigger than the target's -Os ones).
 target_compile_definitions(test_ak1037_gatt PRIVATE $<$<CONFIG:Release>:OZ_STACK_TRIPWIRE>)
