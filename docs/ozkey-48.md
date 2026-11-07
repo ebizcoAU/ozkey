@@ -22,7 +22,7 @@
 > failover hand-off (§2.4.5), MQTT buffer sizing (§2.4.6).
 > Rev 7 (2026-11-07, PM nexus-6e accepted, F-AK-WDT-2): SAFE mode after a watchdog reset loop
 > (§6.1): unlock never refused, LOCK refused, the rest owner only. Result 36 `SAFE_MODE` (App. A),
-> event type 4 `safe mode` (§5.1). Servers get 5.03 `SAFE_MODE`: surface it, never retry-loop.
+> event type 4 `safe mode` (§5.1). 36 is sealed: only OSCORE context holders see it (§6.1).
 
 ## 0. What changes from v1, in one table
 
@@ -587,9 +587,14 @@ stays up 2 minutes clears it too, but never while in SAFE mode. While SAFE:
   every verb, including `events` and `dev/reset`. A factory reset does not leave SAFE mode, because
   SAFE belongs to the boot, not the bond table.
 - **One `safe mode` event** (§5.1 type 4) is logged when SAFE starts, `{1: resets in a row}`. The owner
-  sees it on `events`. Service-bond `events` aren't built yet (§5.1), so a server learns of SAFE mode
-  from 5.03 `SAFE_MODE` on its next `cred` request. The server shows "lock in SAFE mode" to the owner
-  and the console, and must not retry in a loop (PM, 2026-11-07).
+  sees it on `events`.
+- **Who can see SAFE mode.** 5.03 / 36 sits *inside* OSCORE. The outer code is 2.04 (2.05 for Observe),
+  so the bridge relay, the broker and ozlock never see it (ozkey-67, 2026-11-07). Only the holder of the
+  OSCORE context sees it: the owner app for its own requests, the service-bond client (ozpms /
+  ozlodge, not built yet) for `cred` requests, and the bridge for its own `bridge`-bond requests.
+  A client that gets 36 surfaces "lock in SAFE mode" and does not retry in a loop. It clears the flag
+  on a non-36 sealed response from the lock. Bridge presence is not a clear signal, because a bridge
+  reconnects within the same boot. 🟡 How ozlock and consoles learn of SAFE mode is OPEN (PM).
 
 **No server ever holds bond #0** (ozkey-50 §3, server review). The servers hold only `service`,
 `issuer` and the ozpms custodian, whose limits the lock enforces (ozkey-51). Server-side remote unlock
