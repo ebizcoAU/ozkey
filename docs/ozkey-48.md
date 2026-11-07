@@ -594,7 +594,10 @@ stays up 2 minutes clears it too, but never while in SAFE mode. While SAFE:
   ozlodge, not built yet) for `cred` requests, and the bridge for its own `bridge`-bond requests.
   A client that gets 36 surfaces "lock in SAFE mode" and does not retry in a loop. It clears the flag
   on a non-36 sealed response from the lock. Bridge presence is not a clear signal, because a bridge
-  reconnects within the same boot. 🟡 How ozlock and consoles learn of SAFE mode is OPEN (PM).
+  reconnects within the same boot.
+- **No plaintext SAFE flag** in presence or advertising (PM nexus-6e, 2026-11-07): it would tell anyone
+  who reads it that this door can't lock. For now the owner app is the signal (36, event type 4). The
+  server and console signal waits for the v2 server-side OSCORE client.
 
 **No server ever holds bond #0** (ozkey-50 §3, server review). The servers hold only `service`,
 `issuer` and the ozpms custodian, whose limits the lock enforces (ozkey-51). Server-side remote unlock
