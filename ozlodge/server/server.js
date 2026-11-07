@@ -155,7 +155,10 @@ const CONFIG = {
     connectionLimit: 10,
     queueLimit: 0,
   },
-  MQTT_URL: 'mqtt://10.1.1.20:1883',
+  // OZLODGE-BROKER-ENV-1 (2026-11-05): from env. The default is the lab
+  // broker ozlock and the bridges use; the old hard-coded 10.1.1.20 had been
+  // dead since the broker moved, so ozlodge silently ran with no MQTT.
+  MQTT_URL: process.env.OZLODGE_MQTT_URL || 'mqtt://10.1.1.42:1883',
   // This deployment's site (tenant) prefix on the device-scoped topic root.
   // Distinct from ozlockserv's 'lab' — multiple servers share the broker and
   // each must own its own site (ozkey-07 §10 / ozkey-04 §9).
@@ -1954,7 +1957,15 @@ async function boot() {
     );
   });
 
-  startMdns();
+  // OZLODGE-BROKER-ENV-1: a test-only opt-out. A spawned test server must never
+  // advertise the lab's service name on the LAN (a lock browsing _ozkey._tcp
+  // could take its test broker). Only the exact value 0 disables it; unset or
+  // anything else advertises, as before.
+  if (process.env.OZLODGE_MDNS === '0') {
+    logEvent('info', 'mDNS advertising disabled (OZLODGE_MDNS=0, test only)');
+  } else {
+    startMdns();
+  }
 }
 
 /**
