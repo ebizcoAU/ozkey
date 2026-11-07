@@ -58,6 +58,7 @@ enum {
     OZ_R_MEMBER_EXPIRED = 27, OZ_R_INVITE_BOUND_ELSEWHERE = 28, OZ_R_PAIR_FAILED = 29,
     OZ_R_PAIR_LOCKED_OUT = 30, OZ_R_NOT_FOUND = 31, OZ_R_REVOKE_DENIED = 32,
     OZ_R_TIME_REJECTED = 33, OZ_R_BATTERY_LOW = 34, OZ_R_PIN_TOO_SHORT = 35,
+    OZ_R_SAFE_MODE = 36,
 };
 
 /* Matter DoorLock vocabulary (🟡 values to be checked against Matter 1.x, ozkey-48 §5). */
@@ -167,6 +168,7 @@ typedef struct oz_lock {
     uint8_t        relay_used[OZ_LOCK_MAX_BONDS];
     oz_lock_hooks  hooks;
     const char    *fw;
+    uint8_t        safe;           /* SAFE mode this boot (F-AK-WDT-2), RAM only */
 } oz_lock;
 
 /* Load state from kv, or mint a new identity (factory-fresh, unclaimed). */
@@ -237,6 +239,20 @@ uint64_t oz_lock_card_lockout_ms(const oz_lock *L);
  * OZ_LOCKSTATE_NOT_FULLY_LOCKED. An unconfirmed move (no sensor) reports the
  * direction it drove. The actuate hook alone sets the commanded state. */
 void oz_lock_actuated(oz_lock *L, int unlock, int result);
+
+/* SAFE mode (F-AK-WDT-2, ozkey-48 §6.1): the port's boot guard saw
+ * OZ_BOOTGUARD_LIMIT watchdog resets in a row. For the rest of this boot:
+ *   - unlocking still works for everyone who may unlock (app, PIN, card):
+ *     never lock anyone out;
+ *   - LOCK is refused for everyone: 5.03 SAFE_MODE, the state reads
+ *     "not fully locked", the motor is not driven;
+ *   - every other request is owner (admin) only; anyone else gets 5.03
+ *     SAFE_MODE;
+ *   - one `safe mode` event {1: watchdog resets in a row, 2: 0}.
+ * Call after oz_lock_init; repeat calls change nothing. A factory reset keeps
+ * it; only a power-on reset (the port's boot guard) clears it. */
+void oz_lock_set_safe(oz_lock *L, uint32_t resets);
+int  oz_lock_safe(const oz_lock *L);
 
 /* Battery readings from the port (oz_power.h): at rest, and the lowest one
  * while the motor drove. A level change raises a `battery` event. At

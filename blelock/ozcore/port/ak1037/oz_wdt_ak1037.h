@@ -38,5 +38,7 @@ int  oz_ak1037_wdt_add(uint32_t period_ms);
 void oz_ak1037_wdt_checkin(int id);
 void oz_ak1037_wdt_service(void);
 int  oz_ak1037_wdt_safe(void);
+/* Watchdog resets in a row as counted at boot (the SAFE mode event's data). */
+uint32_t oz_ak1037_wdt_resets(void);
 
 #endif
