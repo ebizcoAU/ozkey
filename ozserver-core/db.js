@@ -491,6 +491,26 @@ async function initDatabase() {
       first_seen_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB`);
 
+  // ozkey-56 §5 (F1-BRIDGE-BOND-1, agreed 2026-11-06): the bridge's OZKIE
+  // X25519 key, pinned on first sight from its presence (TOFU; the BLE info
+  // value stays authoritative), and the app's advisory record of a bridge
+  // bond on a lock. Additive, nullable, no backfill.
+  for (const [table, column, ddl] of [
+    ['bridges', 'ozkie_pub', 'CHAR(64) NULL'],
+    ['bridges', 'ozkie_pub_at', 'DATETIME NULL'],
+    ['bridges', 'ozkie_pub_conflict', 'CHAR(64) NULL'],
+    ['lock_bridges', 'bond_pub_fp', 'CHAR(32) NULL'],
+    ['lock_bridges', 'bond_slot', 'TINYINT UNSIGNED NULL'],
+    ['lock_bridges', 'bonded_at', 'DATETIME NULL'],
+  ]) {
+    const [[{ n }]] = await pool.query(
+      `SELECT COUNT(*) AS n FROM information_schema.columns
+        WHERE table_schema = ? AND table_name = ? AND column_name = ?`,
+      [CONFIG.DB.database, table, column]
+    );
+    if (!n) await pool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  }
+
   // ozkey-23 §10.1a/10.2a, XF-96 §4/§6: BANOI has the same gap bridges had —
   // ftpos confirmed the app connects with client-id only, no username/
   // password, because no server-side mint exists for it either.

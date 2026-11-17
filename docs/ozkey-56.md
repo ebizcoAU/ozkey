@@ -1,6 +1,6 @@
 # ozkey-56: ozlock relay for OZKIE v2 locks (AK1037). Design note
 
-Status: DRAFT rev 1, 2026-11-18, ozkey-srv (server lane). For PM nexus-46 and fw ozkey-c4.
+Status: DRAFT rev 1a, 2026-11-18 (§5 as built), ozkey-srv (server lane). For PM nexus-46 and fw ozkey-c4.
 Ticket: OZKIE-V2-SERVER-1, sections A + C of
 `nexus-lab-backups/ozkey_notes/2026-11-07_OZKIE-V2-SERVER-1_acceptance.md`.
 Spec: ozkey-48 rev 7, §2.3-§2.4 (the relay wire), §4.2 (Echo), §7 (server duties).
@@ -119,6 +119,13 @@ only" on the DELETE route; `dev/reset` is something the app sends through the re
 - `PUT|DELETE /locks/:lock_id/bridges/:bridge_id/bond` takes `{app_id, bond_pub_fp, slot}`. It sets
   `lock_bridges.bond_pub_fp`, `bond_slot` and `bonded_at` (an advisory claim from the app). Refusals: 409
   `bridge_bonds_full` (max 2 per lock) and 409 `pub_mismatch` (the fingerprint doesn't match the pinned pub).
+- As built (rev 1a, 2026-11-18): 403 `owner_only`, 404 `bridge_not_paired`, 200 `{recorded,
+  pub_verified}` (false when the bridge never presented a key). `pub_mismatch` is still recorded
+  (`recorded: true`), as the XF draft says ("recorded with a warning"). DELETE is idempotent
+  (`cleared: true|false`). A key conflict writes one `bridge_key_conflict` audit row.
+- Fix found on the way: `POST /pairings` never wrote `lock_bridges`. A lock paired with a bridge
+  there and moved later lost that bridge from its failover candidates, and a bond on it had
+  nowhere to go. The pairing now inserts the current bridge's row at priority 0.
 - The console shows a bridge that isn't enrolled, or a bond held by a decommissioned bridge. That waits for the C0b console work and is
   not in this branch.
 
