@@ -2144,14 +2144,15 @@
       },
       "response": {
         "body": {
-          "code": "ozkie_v2_relay_not_built",
-          "detail": "This lock speaks OZKIE v2 (EDHOC + OSCORE). The server cannot relay v2 messages yet, and a v1 envelope would mean nothing to it. Use a direct BLE session at the door.",
+          "code": "ozkie_v2_use_relay",
+          "detail": "This lock speaks OZKIE v2 (EDHOC + OSCORE). This route carries v1 envelopes only. Send the OSCORE request through POST /locks/:id/ozkie instead.",
           "device_id": "s0-bridged-02",
-          "error": "ozkie_v2_relay_not_built",
+          "error": "ozkie_v2_use_relay",
           "ok": false,
-          "ref": "ozkey-48 §7"
+          "ref": "ozkey-56 §4",
+          "relay": "/locks/s0-bridged-02/ozkie"
         },
-        "status": 501
+        "status": 409
       }
     },
     "mqtt": [],
@@ -2169,14 +2170,15 @@
       },
       "response": {
         "body": {
-          "code": "ozkie_v2_relay_not_built",
-          "detail": "This lock speaks OZKIE v2 (EDHOC + OSCORE). The server cannot relay v2 messages yet, and a v1 envelope would mean nothing to it. Use a direct BLE session at the door.",
+          "code": "ozkie_v2_use_relay",
+          "detail": "This lock speaks OZKIE v2 (EDHOC + OSCORE). This route carries v1 envelopes only. Send the OSCORE request through POST /locks/:id/ozkie instead.",
           "device_id": "s0-bridged-02",
-          "error": "ozkie_v2_relay_not_built",
+          "error": "ozkie_v2_use_relay",
           "ok": false,
-          "ref": "ozkey-48 §7"
+          "ref": "ozkey-56 §4",
+          "relay": "/locks/s0-bridged-02/ozkie"
         },
-        "status": 501
+        "status": 409
       }
     },
     "mqtt": [],
@@ -2194,14 +2196,15 @@
       },
       "response": {
         "body": {
-          "code": "ozkie_v2_relay_not_built",
-          "detail": "This lock speaks OZKIE v2 (EDHOC + OSCORE). The server cannot relay v2 messages yet, and a v1 envelope would mean nothing to it. Use a direct BLE session at the door.",
+          "code": "ozkie_v2_use_relay",
+          "detail": "This lock speaks OZKIE v2 (EDHOC + OSCORE). This route carries v1 envelopes only. Send the OSCORE request through POST /locks/:id/ozkie instead.",
           "device_id": "s0-bridged-02",
-          "error": "ozkie_v2_relay_not_built",
+          "error": "ozkie_v2_use_relay",
           "ok": false,
-          "ref": "ozkey-48 §7"
+          "ref": "ozkey-56 §4",
+          "relay": "/locks/s0-bridged-02/ozkie"
         },
-        "status": 501
+        "status": 409
       }
     },
     "mqtt": [],
@@ -2219,14 +2222,15 @@
       },
       "response": {
         "body": {
-          "code": "ozkie_v2_relay_not_built",
-          "detail": "This lock speaks OZKIE v2 (EDHOC + OSCORE). The server cannot relay v2 messages yet, and a v1 envelope would mean nothing to it. Use a direct BLE session at the door.",
+          "code": "ozkie_v2_use_relay",
+          "detail": "This lock speaks OZKIE v2 (EDHOC + OSCORE). This route carries v1 envelopes only. Send the OSCORE request through POST /locks/:id/ozkie instead.",
           "device_id": "s0-bridged-02",
-          "error": "ozkie_v2_relay_not_built",
+          "error": "ozkie_v2_use_relay",
           "ok": false,
-          "ref": "ozkey-48 §7"
+          "ref": "ozkey-56 §4",
+          "relay": "/locks/s0-bridged-02/ozkie"
         },
-        "status": 501
+        "status": 409
       }
     },
     "mqtt": [],

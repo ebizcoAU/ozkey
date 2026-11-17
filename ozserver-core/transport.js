@@ -15,6 +15,7 @@ const mqtt = lazy(() => ctx.mqtt);
 const logEvent = (...args) => ctx.logEvent(...args);
 
 // From other core modules.
+const handleOzkieUplink = (...args) => require('./ozkie').handleOzkieUplink(...args);
 const handleUplinkReset = (...args) => require('./relay').handleUplinkReset(...args);
 const handleUplinkCaps = (...args) => require('./relay').handleUplinkCaps(...args);
 const logUplinkMetadata = (...args) => require('./relay').logUplinkMetadata(...args);
@@ -46,6 +47,17 @@ function mqttPublish(topic, payload, opts = {}) {
     qos: 1,
     retain: !!opts.retain,
   });
+  return true;
+}
+
+/** OZKIE v2 relay (ozkey-48 §2.4.2): a binary frame, QoS 0, never retained.
+ *  Separate from mqttPublish(), which would JSON-encode a Buffer. */
+function mqttPublishRaw(topic, buf) {
+  if (!mqttClient || !mqttClient.connected) {
+    logEvent('warn', `MQTT offline — dropped OZKIE frame to ${topic}`);
+    return false;
+  }
+  mqttClient.publish(topic, buf, { qos: 0, retain: false });
   return true;
 }
 
@@ -149,6 +161,8 @@ function initMqtt() {
         CONFIG.SUB_PRESENCE_BRIDGES_LEGACY,
         CONFIG.SUB_BRIDGE_SCAN_RESULT,
         CONFIG.SUB_PEER_STATUS,
+        // ozkey-56: the OZKIE v2 relay uplink, for a profile that relays v2.
+        ...(CONFIG.SUB_OZKIE_UPLINK ? [CONFIG.SUB_OZKIE_UPLINK] : []),
         // S1c: only a profile that keeps door events sets these (ozpms).
         ...(CONFIG.SUB_DOOR_LOG ? [CONFIG.SUB_DOOR_LOG, CONFIG.SUB_DOOR_LOG_LEGACY].filter(Boolean) : []),
       ],
@@ -231,6 +245,15 @@ function initMqtt() {
   mqttClient.on('offline', () => logEvent('warn', 'MQTT broker offline'));
 
   mqttClient.on('message', async (topic, payloadBuf) => {
+    // ozkey-56: OZKIE v2 relay uplink. Binary, so it's matched before the
+    // utf8 decode below and handed over untouched.
+    if (CONFIG.SUB_OZKIE_UPLINK) {
+      const oz = topic.match(/^ozkie\/([^/]+)\/locks\/([^/]+)\/ozkie\/([^/]+)$/);
+      if (oz) {
+        if (oz[1] === CONFIG.SITE_ID) handleOzkieUplink(oz[2], oz[3], payloadBuf);
+        return;
+      }
+    }
     const payload = payloadBuf.toString('utf8').trim();
     try {
       // S16: accept either the new `ozkie/` root or legacy `ozkey/` during
@@ -468,6 +491,7 @@ function isMqttConnected() {
 
 module.exports = {
   mqttPublish,
+  mqttPublishRaw,
   publishRetainedTime,
   logMemberRelay,
   initMqtt,

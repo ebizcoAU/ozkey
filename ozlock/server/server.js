@@ -273,6 +273,9 @@ const CONFIG = {
   // Same "bridge reporting on itself/its own observation" shape as
   // scan_result, one more thing a bridge publishes unprompted.
   SUB_PEER_STATUS: 'ozkie/lab/bridges/+/peer_status',
+  // ozkey-56: the OZKIE v2 relay uplink (ozkey-48 §2.4.2). The trailing
+  // segment is the relaying bridge. Binary payloads; ozserver-core/ozkie.js.
+  SUB_OZKIE_UPLINK: 'ozkie/lab/locks/+/ozkie/+',
   topicCommand: (site, deviceId) => `ozkie/${site}/locks/${deviceId}/command`,
   // A bridged lock has no MQTT client of its own — the bridge is its gateway
   // and subscribes to its OWN topic, then demuxes onto its BLE link by
@@ -307,6 +310,11 @@ const CONFIG = {
   // publish waits for a v1 refusal code on the uplink before answering
   // 'sent_unconfirmed'. 10 s by default; tests shorten it.
   UNLOCK_REFUSAL_WATCH_MS: Number(process.env.OZLOCK_UNLOCK_WATCH_MS) || 10_000,
+  // ozkey-56 / ozkey-48 §2.4.4: the relay's waits. Request answer 10 s, EDHOC
+  // lease 35 s (outlasts the lock's 30 s), message_3 refusal window 2 s.
+  OZKIE_WAIT_MS: Number(process.env.OZLOCK_OZKIE_WAIT_MS) || 10_000,
+  OZKIE_EDHOC_LEASE_MS: Number(process.env.OZLOCK_OZKIE_EDHOC_LEASE_MS) || 35_000,
+  OZKIE_M3_WAIT_MS: Number(process.env.OZLOCK_OZKIE_M3_WAIT_MS) || 2_000,
   PROVISION_WIFI_SSID: SECRETS.PROVISION_WIFI_SSID,
   PROVISION_WIFI_PASSWORD: SECRETS.PROVISION_WIFI_PASSWORD,
   // S1e-2 (ozkey-50 §8.2): lock broker_secret stored hashed, as in ozpms.

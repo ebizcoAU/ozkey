@@ -20,6 +20,10 @@ const logEvent = (...args) => ctx.logEvent(...args);
 const makeSecret = (...args) => require('./util').makeSecret(...args);
 const recordAudit = (...args) => require('./audit').recordAudit(...args);
 const refuseIfOzkieV2 = (...args) => require('./relay').refuseIfOzkieV2(...args);
+const relayFrame = (...args) => require('./ozkie').relayFrame(...args);
+const abortPinned = (...args) => require('./ozkie').abortPinned(...args);
+const refuseFrame = (...args) => require('./ozkie').refuseFrame(...args);
+const isMqttConnected = (...args) => require('./transport').isMqttConnected(...args);
 const flushQueueForDevice = (...args) => require('./queue').flushQueueForDevice(...args);
 const publishUnlockNow = (...args) => require('./queue').publishUnlockNow(...args);
 const eventsAtRisk = (...args) => require('./registry').eventsAtRisk(...args);
@@ -525,6 +529,7 @@ api.patch('/locks/:id', async (req, res) => {
         .json({ ok: false, code: 'lock_not_found', error: `Lock ${req.params.id} not found` });
     logEvent('info', `Lock ${req.params.id} settings updated (${sets.join(', ')})`);
     if (bridgeIdChanged) {
+      abortPinned(req.params.id, newBridgeId); // ozkey-56 §3.4
       logEvent(
         'pair',
         newBridgeId
@@ -713,7 +718,7 @@ api.delete('/locks/:id', async (req, res) => {
         // bytes — and `dev/reset` over a relay is owner-only actuation with an
         // Echo round trip (§4.2), not built yet. Remove the record only and
         // report the reset as not attempted; the owner resets at the door.
-        logEvent('warn', `Factory reset NOT sent for lock ${id} — OZKIE v2 relay not built yet (ozkey-48 §7)`);
+        logEvent('warn', `Factory reset NOT sent for lock ${id} — OZKIE v2: the owner sends dev/reset through /locks/:id/ozkie (ozkey-56 §4)`);
       } else if (envelope_hex) {
         // XF-91 §5 — sealed unpair, required for a Thread lock: bridge32 has
         // no `locks/+/command` subscription at all, so the plain path below
@@ -989,6 +994,74 @@ api.get('/locks/:id/grants', async (req, res) => {
 // longer window would make an UNATTENDED open more likely, not less.
 const ASSISTED_UNLOCK_MS = 60_000;
 
+
+/* -- OZKIE v2 relay (ozkey-56; ozkey-48 rev 7 §2.4) -------------------------
+ * One frame in, the lock's answer out, in the same HTTP response. Transit-only:
+ * nothing here writes a table (ozkie.js may add one content-free audit row per
+ * completed handshake). Checks run in ozkey-56 §3.1 order; every refusal is
+ * immediate, nothing is queued, retried or re-sent.
+ */
+api.post('/locks/:id/ozkie', async (req, res) => {
+  if (!guardDb(res)) return;
+  const deviceId = String(req.params.id).slice(0, 64);
+  const { app_id, frame_b64 } = req.body || {};
+  const send = (r) => res.status(r.status).json(r.body);
+  try {
+    // 1. the frame
+    let frame = null;
+    if (typeof frame_b64 === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(frame_b64)) {
+      frame = Buffer.from(frame_b64, 'base64');
+    }
+    if (!frame || frame.length < 2 || frame.length > 1025 || (frame[0] !== 0 && frame[0] !== 1)) {
+      return send(refuseFrame(frame));
+    }
+    // 2. the lock, and that it speaks v2
+    const [[lock]] = await pool.query('SELECT app_id, bridge_id, ozkie_version FROM locks WHERE id = ?', [deviceId]);
+    if (!lock) return res.status(404).json({ ok: false, code: 'lock_not_found', error: `Lock ${deviceId} not found` });
+    if (lock.ozkie_version !== OZKIE_V2) {
+      return res.status(409).json({
+        ok: false,
+        code: 'not_ozkie_v2',
+        error: 'not_ozkie_v2',
+        detail: 'This lock speaks OZKIE v1. Use the v1 routes.',
+      });
+    }
+    // 3. owner only (UX, as for v1 unlock: the lock enforces roles; a member
+    //    never has a relay context, ozkey-48 §4.1)
+    const callerAppId = app_id ? String(app_id).trim().toLowerCase() : null;
+    if (!callerAppId || callerAppId !== String(lock.app_id || '').toLowerCase()) {
+      return res.status(403).json({
+        ok: false,
+        code: 'relay_owner_only',
+        error: 'relay_owner_only',
+        detail: 'Only the lock owner reaches this lock remotely. Members use Bluetooth at the door.',
+      });
+    }
+    // 4. the bridge, online
+    if (!lock.bridge_id) {
+      return res.status(503).json({ ok: false, code: 'bridge_offline', error: 'bridge_offline', detail: 'The lock has no bridge.' });
+    }
+    const [[bp]] = await pool.query('SELECT presence FROM bridges_presence WHERE bridge_id = ?', [lock.bridge_id]);
+    if (!bp || bp.presence !== 'online') {
+      return res.status(503).json({
+        ok: false,
+        code: 'bridge_offline',
+        error: 'bridge_offline',
+        detail: `Bridge ${lock.bridge_id} is not online. Nothing was sent or queued.`,
+        bridge_id: lock.bridge_id,
+      });
+    }
+    // 5. the broker
+    if (!isMqttConnected()) {
+      return res.status(503).json({ ok: false, code: 'mqtt_down', error: 'mqtt_down', detail: 'Nothing was sent.' });
+    }
+    // 6.-8. token, lease, topic: in relayFrame
+    send(await relayFrame({ siteId: CONFIG.SITE_ID, lockId: deviceId, bridgeId: lock.bridge_id, appId: callerAppId, frame }));
+  } catch (err) {
+    logEvent('error', `OZKIE relay for ${deviceId} failed: ${err.message}`);
+    res.status(500).json({ ok: false, code: 'internal', error: 'internal' });
+  }
+});
 
 api.post('/locks/:id/unlock', async (req, res) => {
   if (!guardDb(res)) return;

@@ -36,27 +36,28 @@ const lastGrantSentByDevice = new Map(); // deviceId -> { grantId, queueId }
 const unlockWatches = new Map();
 
 /* -- OZKIE v2 gate (ozkey-48, operator-approved 2026-10-18) -------------------
- * Every relay route below carries v1 sealed envelopes. A v2 (AK1037) lock
- * speaks EDHOC + OSCORE instead, and its relay path (pass OSCORE bytes
- * through, route `4.01 + Echo` back to the sender, ozkey-48 §7) is not built
- * yet — no v2 lock or simulator exists to build it against. Until it is,
- * refuse cleanly instead of queueing bytes the lock cannot read.
+ * Every relay route below carries v1 sealed envelopes, which mean nothing to a
+ * v2 (AK1037) lock: it speaks EDHOC + OSCORE. Since ozkey-56 a v2 lock is
+ * reached through POST /locks/:id/ozkie (ozkie.js), where the app sends the
+ * OSCORE request itself (grant = `cred`, unlock = `lock/unlock` with Echo).
+ * These v1 routes refuse a v2 lock and name that endpoint.
  */
 const OZKIE_V2 = 2;
 
 /** Sends the refusal and returns true when `lock` is OZKIE v2; false otherwise. */
 function refuseIfOzkieV2(res, lock, deviceId, verb) {
   if (!lock || lock.ozkie_version !== OZKIE_V2) return false;
-  logEvent('warn', `${verb} refused for ${deviceId} — OZKIE v2 relay not built yet (ozkey-48 §7)`);
-  res.status(501).json({
+  logEvent('warn', `${verb} refused for ${deviceId} — v1 route, OZKIE v2 lock (use /locks/:id/ozkie, ozkey-56)`);
+  res.status(409).json({
     ok: false,
-    code: 'ozkie_v2_relay_not_built',
-    error: 'ozkie_v2_relay_not_built',
+    code: 'ozkie_v2_use_relay',
+    error: 'ozkie_v2_use_relay',
     detail:
-      'This lock speaks OZKIE v2 (EDHOC + OSCORE). The server cannot relay v2 messages yet, ' +
-      'and a v1 envelope would mean nothing to it. Use a direct BLE session at the door.',
+      'This lock speaks OZKIE v2 (EDHOC + OSCORE). This route carries v1 envelopes only. ' +
+      'Send the OSCORE request through POST /locks/:id/ozkie instead.',
     device_id: deviceId,
-    ref: 'ozkey-48 §7',
+    relay: `/locks/${deviceId}/ozkie`,
+    ref: 'ozkey-56 §4',
   });
   return true;
 }
