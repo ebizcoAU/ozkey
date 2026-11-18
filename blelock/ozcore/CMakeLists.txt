@@ -215,7 +215,7 @@ add_test(NAME ak1037_gatt_zeroaddr COMMAND test_ak1037_gatt zeroaddr)
 # port/ak1037/Makefile defines OZ_DEBUG_HOOKS except the debug test below.
 add_test(NAME ak1037_nohooks COMMAND test_ak1037_gatt nohooks)
 add_test(NAME ak1037_release_bin_no_wdthang
-         COMMAND sh -c "! LC_ALL=C grep -a -q 'oz\\.wdthang' \"$1\" && ! LC_ALL=C grep -a -q 'oz\\.wdthang' \"$2\""
+         COMMAND sh -c "! LC_ALL=C grep -a -q -e 'oz\\.wdthang' -e 'oz\\.wipe' \"$1\" && ! LC_ALL=C grep -a -q -e 'oz\\.wdthang' -e 'oz\\.wipe' \"$2\""
                  sh $<TARGET_FILE:test_ak1037_gatt> $<TARGET_FILE:test_ak1037_selftest>)
 # The burn tool refuses a partition without a file ("Partition name and BIN file
 # name are different", 2026-11-18): every partition gets a download line, in order.
@@ -231,9 +231,10 @@ target_link_libraries(test_ak1037_gatt_debug ozport_ak1037_host)
 target_compile_options(test_ak1037_gatt_debug PRIVATE -Wall -Wextra -Werror)
 target_compile_definitions(test_ak1037_gatt_debug PRIVATE OZ_DEBUG_HOOKS=1)
 add_test(NAME ak1037_wdthang COMMAND test_ak1037_gatt_debug wdthang)
+add_test(NAME ak1037_wipe COMMAND test_ak1037_gatt_debug wipe)
 # Positive control for the scan above: it finds the name where the hook is built in.
 add_test(NAME ak1037_debug_bin_has_wdthang
-         COMMAND sh -c "LC_ALL=C grep -a -q 'oz\\.wdthang' \"$1\"" sh $<TARGET_FILE:test_ak1037_gatt_debug>)
+         COMMAND sh -c "LC_ALL=C grep -a -q 'oz\\.wdthang' \"$1\" && LC_ALL=C grep -a -q 'oz\\.wipe' \"$1\"" sh $<TARGET_FILE:test_ak1037_gatt_debug>)
 # P5-D: optimised builds hold the measured host stack peaks to the threads'
 # budgets (unoptimised frames are far bigger than the target's -Os ones).
 target_compile_definitions(test_ak1037_gatt PRIVATE $<$<CONFIG:Release>:OZ_STACK_TRIPWIRE>)

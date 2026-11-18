@@ -49,4 +49,15 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "link failed: $LASTEXITCODE" }
     "roots: $($roots.Count)"
     & "${Tc}size" "build/$Name.elf"
+    # OZ-WIPE-1 guard (PM nexus-46): debug-only shell hooks never in a release
+    # image. Only an image named *_dbg (built with EXTRA=-DOZ_DEBUG_HOOKS=1)
+    # may contain them; any other link fails here.
+    $raw = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes("$app\build\$Name.elf"))
+    $hooks = @('oz.wipe', 'oz.wdthang') | Where-Object { $raw.Contains($_) }
+    if ($Name -notlike '*_dbg') {
+        if ($hooks) { throw "release image $Name contains debug hooks: $($hooks -join ', ')" }
+        "debug hooks: none (release image)"
+    } else {
+        "debug hooks: $($hooks -join ', ') (DEBUG image, bench only)"
+    }
 } finally { Pop-Location }

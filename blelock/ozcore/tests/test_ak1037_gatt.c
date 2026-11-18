@@ -750,12 +750,56 @@ static const char *hook_name(void)
 }
 
 /* Release and every default build: the shell has no such command. */
+/* "oz.wipe", built at run time for the same reason as hook_name(). */
+static const char *wipe_name(void)
+{
+    static char n[16];
+    static volatile const char rev[] = "epiw.zo";
+    size_t len = sizeof rev - 1;
+    for (size_t i = 0; i < len; i++)
+        n[i] = rev[len - 1 - i];
+    n[len] = 0;
+    return n;
+}
+
 static void no_hooks(void)
 {
     expect_int("no debug hook in the shell", mock_msh_run(hook_name()), -1);
+    expect_int("no wipe in the shell", mock_msh_run(wipe_name()), -1);
 }
 
 #ifdef OZ_DEBUG_HOOKS
+/* OZ-WIPE-1 (PM GO 2026-11-18): debug builds only, serial shell only. Erases
+ * the lock's kv (identity, bonds) BEFORE oz.start, so the next oz.start is a
+ * fresh UNCLAIMED lock; refused while the lock runs (no race with its writes). */
+static void wipe(void)
+{
+    char cmd[32];
+    uint8_t v = 7, got[4];
+    size_t gl = 0;
+    mock_flash_blank();
+    expect_int("wipe: a key before oz.start", oz_port_kv_set("wt", &v, 1), OZ_OK);
+    capture_start();
+    expect_int("wipe: the command exists", mock_msh_run(wipe_name()), 0);
+    capture_end();
+    expect_int("wipe: without CONFIRM it only explains", count("usage:"), 1);
+    expect_int("…and erases nothing", oz_port_kv_get("wt", got, sizeof got, &gl), OZ_OK);
+    snprintf(cmd, sizeof cmd, "%s CONFIRM", wipe_name());
+    capture_start();
+    expect_int("wipe CONFIRM runs", mock_msh_run(cmd), 0);
+    capture_end();
+    expect_int("…says it erased", count("erased"), 1);
+    expect_int("…the key is gone", oz_port_kv_get("wt", got, sizeof got, &gl), OZ_E_NOT_FOUND);
+    keep_flash = 1;
+    boot();                             /* oz.start after the wipe: "unclaimed" is checked there */
+    claim();
+    capture_start();
+    expect_int("wipe while running: runs", mock_msh_run(cmd), 0);
+    capture_end();
+    expect_int("…refused while the lock runs", count("refused"), 1);
+    expect_int("…still claimed", read_info() > 0 && lock_claimed == 1, 1);
+}
+
 /* Debug build: the command stops the OZKIE thread's check-ins, so the main
  * loop stops feeding and the watchdog would reset the lock. */
 static void wdthang(void)
@@ -822,6 +866,14 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "nohooks")) {
         no_hooks();
         return report("ak1037_gatt_nohooks");
+    }
+    if (argc > 1 && !strcmp(argv[1], "wipe")) {
+#ifdef OZ_DEBUG_HOOKS
+        wipe();
+#else
+        expect_int("built with OZ_DEBUG_HOOKS", 0, 1);
+#endif
+        return report("ak1037_gatt_wipe");
     }
     if (argc > 1 && !strcmp(argv[1], "wdthang")) {
 #ifdef OZ_DEBUG_HOOKS
