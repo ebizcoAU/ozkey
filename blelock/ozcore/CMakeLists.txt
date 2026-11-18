@@ -8,6 +8,14 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+# NANO-PRINTF-1: the AK1037's newlib-nano snprintf has no %lld/%zu/%jd. Every
+# host build gets the same limits (tests/nano_printf.h), so they fail here first.
+option(OZ_NANO_PRINTF "host snprintf behaves like the chip's newlib-nano" ON)
+if(OZ_NANO_PRINTF)
+    add_compile_options(-include ${CMAKE_CURRENT_SOURCE_DIR}/tests/nano_printf.h)
+    add_library(oznano STATIC tests/nano_printf.c)
+endif()
+
 add_library(ozcore STATIC
     src/oz_cbor.c
     src/oz_edhoc.c
@@ -29,6 +37,9 @@ add_library(ozcore STATIC
     src/sha256_sw.c
     src/aes128_sw.c)
 target_include_directories(ozcore PUBLIC include)
+if(OZ_NANO_PRINTF)
+    target_link_libraries(ozcore PUBLIC oznano)
+endif()
 target_compile_options(ozcore PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror)
 
 # Monocypher 4.0.2 (BSD-2 / CC0), X25519 until Anyka exposes the PKE curve API.
@@ -205,6 +216,11 @@ add_test(NAME ak1037_nohooks COMMAND test_ak1037_gatt nohooks)
 add_test(NAME ak1037_release_bin_no_wdthang
          COMMAND sh -c "! LC_ALL=C grep -a -q 'oz\\.wdthang' \"$1\" && ! LC_ALL=C grep -a -q 'oz\\.wdthang' \"$2\""
                  sh $<TARGET_FILE:test_ak1037_gatt> $<TARGET_FILE:test_ak1037_selftest>)
+# The burn tool refuses a partition without a file ("Partition name and BIN file
+# name are different", 2026-11-18): every partition gets a download line, in order.
+add_test(NAME ak1037_burn_config_partitions_have_bins
+         COMMAND sh -c "p=$(sed -n 's/^[[:space:]]*partition[0-9][0-9]* = \\([A-Z]*\\),.*/\\1/p' \"$1\" | tr '\\n' ' '); d=$(sed -n 's/^download_to_nand[0-9][0-9]* = [^,]*,[^,]*,[^,]*, \\([A-Z]*\\),.*/\\1/p' \"$1\" | tr '\\n' ' '); echo \"partitions: $p\"; echo \"downloads:  $d\"; [ -n \"$p\" ] && [ \"$p\" = \"$d\" ]"
+                 sh ${CMAKE_CURRENT_SOURCE_DIR}/port/ak1037/burn/config_ozkie.txt)
 # The chip's build (port/ak1037/Makefile, what VictorPC links) never sets it.
 add_test(NAME ak1037_makefile_no_debug_hooks
          COMMAND sh -c "! grep -q OZ_DEBUG_HOOKS \"$1\"" sh ${CMAKE_CURRENT_SOURCE_DIR}/port/ak1037/Makefile)

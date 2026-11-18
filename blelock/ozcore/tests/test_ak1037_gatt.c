@@ -816,7 +816,7 @@ int main(int argc, char **argv)
      * to the thread's budget as a tripwire. It covers only the paths run
      * here; the RV32 worst case is the static report (ozkey-49 P5-D). */
     size_t peak = mock_stack_peak("ozkie");
-    printf("ozkie thread stack peak (host): %zu of %u B\n", peak, (unsigned)OZ_GATT_THREAD_STACK);
+    printf("ozkie thread stack peak (host): %u of %u B\n", (unsigned)peak, (unsigned)OZ_GATT_THREAD_STACK);
 #ifdef OZ_STACK_TRIPWIRE
     expect_int("OZKIE stack measured", peak > 0, 1);
     expect_int("OZKIE stack within its budget", peak <= OZ_GATT_THREAD_STACK, 1);

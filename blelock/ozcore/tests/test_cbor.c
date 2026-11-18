@@ -9,7 +9,8 @@ static void enc_int(int64_t v, const char *want)
     oz_cbor_w_init(&w, b, sizeof b);
     oz_cbor_put_int(&w, v);
     char name[48];
-    snprintf(name, sizeof name, "int %lld", (long long)v);
+    char d[21];
+    snprintf(name, sizeof name, "int %s", oz_i64(d, v));
     expect(name, b, w.len, want);
 
     oz_cbor_r r;

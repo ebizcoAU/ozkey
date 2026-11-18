@@ -480,7 +480,8 @@ static void credentials(void)
     oz_oscore_xchg hx;
     size_t hl = make_req(&owner, OZ_COAP_POST, "cred", add, al, NULL, held, sizeof held, &hx);
     char path[16];
-    snprintf(path, sizeof path, "cred/%lld", (long long)id);
+    char d[21];
+    snprintf(path, sizeof path, "cred/%s", oz_i64(d, id));
     bl = body_epoch(b, sizeof b, 0);
     expect_int("delete PIN", call(&owner, &ble, OZ_COAP_DELETE, path, b, bl), OZ_R_CRED_OK);
     expect_int("deleted PIN refused", oz_lock_keypad_pin(&L, "135790"), 0);
@@ -561,6 +562,7 @@ static void keypad_limit(void)
     expect_int("5th miss", oz_lock_keypad_pin(&L, "0001"), OZ_PIN_WRONG);
     uint64_t left = oz_lock_keypad_lockout_ms(&L);
     expect_int("5 misses: 60 s lockout", left > 59000 && left <= 60000, 1);
+    if (!(left > 59000 && left <= 60000)) { char d[21]; printf("  lockout left %s ms\n", oz_i64(d, (long long)left)); }
     expect_int("locked out: the right PIN is not checked", oz_lock_keypad_pin(&L, "482613"), OZ_PIN_LOCKED_OUT);
     expect_int("…and the door stayed shut", unlocks - before, 3);
 
@@ -633,6 +635,7 @@ static void cards(void)
     expect_int("5th miss: too long", oz_lock_card(&L, b, OZ_LOCK_CRED_SECRET + 1), OZ_CARD_WRONG);
     uint64_t left = oz_lock_card_lockout_ms(&L);
     expect_int("5 misses: 60 s lockout", left > 59000 && left <= 60000, 1);
+    if (!(left > 59000 && left <= 60000)) { char d[21]; printf("  lockout left %s ms\n", oz_i64(d, (long long)left)); }
     expect_int("…raised a card lockout event", L.events.next_seq - ev0, 1);
     oz_event ev;
     uint32_t cur = ev0;
@@ -1371,8 +1374,8 @@ static void run_suite(size_t mtu)
     events();
     pair_lockout();
     if (mtu)
-        printf("lock over GATT, MTU %zu: %ld frames in, %ld out, %d new failures\n",
-               mtu, frames_in, frames_out, failures - before);
+        printf("lock over GATT, MTU %u: %ld frames in, %ld out, %d new failures\n",
+               (unsigned)mtu, frames_in, frames_out, failures - before);
     frames_in = frames_out = 0;
 }
 

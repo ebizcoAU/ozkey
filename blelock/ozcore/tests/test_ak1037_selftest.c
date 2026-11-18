@@ -67,7 +67,7 @@ int main(int argc, char **argv)
     /* P5-D: every suite's deepest path on the self-test thread, host frames
      * (see test_ak1037_gatt). The image gives it 16 KB. */
     size_t peak = mock_stack_peak("oztest");
-    printf("oztest thread stack peak (host): %zu of 16384 B\n", peak);
+    printf("oztest thread stack peak (host): %u of 16384 B\n", (unsigned)peak);
 #ifdef OZ_STACK_TRIPWIRE
     expect_int("self-test stack measured", peak > 0, 1);
     expect_int("self-test stack within 16 KB", peak <= 16384, 1);

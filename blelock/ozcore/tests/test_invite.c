@@ -53,7 +53,7 @@ int main(void)
     expect_int("to cbor", oz_invite_to_cbor(&inv, cb, sizeof cb, &cl), 0);
     expect_int("from cbor", oz_invite_from_cbor(&back, cb, cl), 0);
     expect_int("round trip verifies", oz_invite_verify(&back, secret), 0);
-    printf("v2 invite as CBOR: %zu bytes\n", cl);
+    printf("v2 invite as CBOR: %u bytes\n", (unsigned)cl);
 
     /* v3: bound to one app key and naming the issuing bond. */
     uint8_t guest_pub[32];
@@ -71,7 +71,7 @@ int main(void)
     oz_invite_to_cbor(&inv, cb, sizeof cb, &cl);
     expect_int("v3 from cbor", oz_invite_from_cbor(&back, cb, cl), 0);
     expect_int("v3 round trip verifies", oz_invite_verify(&back, secret), 0);
-    printf("v3 invite as CBOR: %zu bytes; MAC ", cl);
+    printf("v3 invite as CBOR: %u bytes; MAC ", (unsigned)cl);
     for (int i = 0; i < 32; i++) printf("%02x", inv.mac[i]);
     printf("  (vector for ftpos)\n");
 
