@@ -518,6 +518,8 @@ static void motor_moves(void)
     capture_end();
     expect_int("unlock answered", response(out, ol, &x, &result) == OZ_COAP_CHANGED && result == OZ_R_UNLOCK_OK, 1);
     expect_int("driving to unlock", count("motor: to unlock"), 1);
+    const char *ua = strstr(out_buf, "motor: to unlock @");
+    unsigned long ta_unlock = ua ? strtoul(ua + strlen("motor: to unlock @"), NULL, 10) : 0;
     expect_int("not done at 300 ms", count("motor: unlock unconfirmed"), 0);
 
     capture_start();
@@ -526,6 +528,15 @@ static void motor_moves(void)
     expect_int("done after the drive time", count("motor: unlock unconfirmed"), 1);
     expect_int("then brake", count("motor: brake"), 1);
     expect_int("drive ran ~400 ms", (long long)(mock_ms - t0) >= OZ_MOTOR_DRIVE_MS - 300, 1);
+    /* BENCH-1: each motor line carries the lock's own ms tick ("@<ms> ms"),
+     * so the drive time is measurable from the serial log, not a host clock. */
+    {
+        const char *b = strstr(out_buf, "motor: brake @");
+        unsigned long tb = b ? strtoul(b + strlen("motor: brake @"), NULL, 10) : 0;
+        expect_int("motor lines carry the tick", ta_unlock > 0 && b != NULL, 1);
+        expect_int("drive time from the log = drive_ms (one 10 ms step of slack)",
+                   tb >= ta_unlock + OZ_MOTOR_DRIVE_MS && tb <= ta_unlock + OZ_MOTOR_DRIVE_MS + 10, 1);
+    }
     /* Roy (Anyka): A high B low turns it, both high brake, both low stop. */
     const char *s1 = strstr(mock_motor_states, "10 ");
     const char *s2 = s1 ? strstr(s1, "11 ") : NULL;
