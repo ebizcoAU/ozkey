@@ -24,7 +24,9 @@
 /* Event types. The ozkey-48 §5.1 list (access, alarm, duress, battery,
  * doorbell, bolt) takes the next values as each is built. */
 enum { OZ_EV_GAP = 0, OZ_EV_KEYPAD_LOCKOUT = 1, OZ_EV_CARD_LOCKOUT = 2, OZ_EV_BATTERY = 3,
-       OZ_EV_SAFE_MODE = 4 };
+       OZ_EV_SAFE_MODE = 4,
+       /* The door's own inputs (LOCK-IO-1): */
+       OZ_EV_TAMPER = 5, OZ_EV_EXIT_BUTTON = 6, OZ_EV_DOOR_LEFT_OPEN = 7 };
 
 #define OZ_EV_NO_ACTOR 0xff     /* not done by a bond (keypad, sensors) */
 

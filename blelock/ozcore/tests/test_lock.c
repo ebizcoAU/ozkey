@@ -1224,6 +1224,7 @@ static void events(void)
     expect_int("next lockout", notification(&owner, &ble, &wb, &ev), 1);
     expect_int("…seq s0+1, level 2, 120 s", ev.seq == s0 + 1 && ev.d1 == 2 && ev.d2 == 120, 1);
 
+
     /* Admin only for now: the service bond gets FORBIDDEN, not a stream. */
     oz_link_open(&relay, 1);
     handshake(&service, &relay, NULL, 0, NULL);
@@ -1289,6 +1290,30 @@ static void events(void)
     boot_lock();
     expect_int("after a reboot: past every seq used", (long long)(L.events.next_seq - before) > 0, 1);
     expect_int("…ring empty", L.events.count, 0);
+
+    /* LOCK-IO-1, PM safe-exit rule: with the keypad locked out, the inside
+     * exit button still unlocks. Each input is in the event ring. */
+    {
+        oz_event le;
+        uint32_t cur;
+        raise_lockout();
+        expect_int("keypad locked out now", oz_lock_keypad_lockout_ms(&L) > 0, 1);
+        int u0 = unlocks, l0 = locks;
+        oz_lock_exit_button(&L);
+        expect_int("exit button unlocks during a keypad lockout (PM)", unlocks - u0, 1);
+        cur = L.events.next_seq - 1;
+        expect_int("…recorded as the exit button, no actor", oz_events_next(&L.events, &cur, &le) == 1
+                   && le.type == OZ_EV_EXIT_BUTTON && le.actor == OZ_EV_NO_ACTOR, 1);
+        oz_lock_door_event(&L, OZ_EV_TAMPER, 0);
+        cur = L.events.next_seq - 1;
+        expect_int("tamper recorded", oz_events_next(&L.events, &cur, &le) == 1 && le.type == OZ_EV_TAMPER, 1);
+        oz_lock_door_event(&L, OZ_EV_DOOR_LEFT_OPEN, 30);
+        cur = L.events.next_seq - 1;
+        expect_int("door left open recorded, 30 s", oz_events_next(&L.events, &cur, &le) == 1
+                   && le.type == OZ_EV_DOOR_LEFT_OPEN && le.b == 30, 1);
+        oz_lock_auto_relock(&L);
+        expect_int("auto-relock locks", locks - l0, 1);
+    }
 
     /* A factory reset forgets the numbering. */
     oz_link_open(&ble, 0);

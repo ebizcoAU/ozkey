@@ -28,6 +28,7 @@ add_library(ozcore STATIC
     src/oz_adv.c
     src/oz_limit.c
     src/oz_keypad.c
+    src/oz_doorio.c
     src/oz_motor.c
     src/oz_events.c
     src/oz_card.c
@@ -136,6 +137,9 @@ target_link_libraries(ozhostlock ozport_host)
 add_executable(test_keypad tests/test_keypad.c)
 target_link_libraries(test_keypad ozport_host)
 add_test(NAME keypad COMMAND test_keypad)
+add_executable(test_doorio tests/test_doorio.c)
+target_link_libraries(test_doorio ozport_host)
+add_test(NAME doorio COMMAND test_doorio)
 
 add_executable(test_motor tests/test_motor.c)
 target_link_libraries(test_motor ozport_host)
