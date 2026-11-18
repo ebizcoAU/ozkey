@@ -53,7 +53,8 @@ static const T_BT_ATTREC gatt_table[] = {
 /* ── BLE context → OZKIE thread ──────────────────────────────────────────── */
 
 enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, EV_KEY, EV_CARD, EV_PAD };
-static char pad_char(int pad);          /* touch pad number -> key (TOUCH-KEYPAD-1) */
+static char pad_char(int pad);          /* touch pad bit -> key (TOUCH-MAP-1) */
+#define OZ_BL_FLASH_MS 300u         /* backlight flash per press (TOUCH-LED-1) */
 
 #define FRAME_MAX (BLE_MTU_MAX_SIZE - 3)
 typedef struct {
@@ -385,6 +386,8 @@ static void ozkie_thread(void *param)
     uint32_t squat_drops = 0;
     int applied = -1, failed = 0;
     int wdt_id = oz_ak1037_wdt_add(OZ_GATT_WDT_MS);
+    int bl_on = 0;                  /* the press flash (TOUCH-LED-1) */
+    uint32_t bl_off_at = 0;
     refresh_info(L);
     for (;;) {
 #ifdef OZ_DEBUG_HOOKS
@@ -431,6 +434,9 @@ static void ozkie_thread(void *param)
                 break;
             case EV_PAD: {
                 char c = pad_char((int)m.h.arg);
+                oz_ak1037_backlight(1);         /* the operator sees every press */
+                bl_off_at = now_ms() + OZ_BL_FLASH_MS;
+                bl_on = 1;
                 oz_port_log("touch: pad %d -> %c", (int)m.h.arg, c ? c : '-');
                 if (c)
                     key_in(L, c, connected);
@@ -460,6 +466,10 @@ static void ozkie_thread(void *param)
         battery_rest(L);
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
             oz_port_log("keypad: entry timed out");
+        if (bl_on && (int32_t)(now_ms() - bl_off_at) >= 0) {
+            oz_ak1037_backlight(0);
+            bl_on = 0;
+        }
 
         /* Claiming the lock or a window closing changes the mode too, so it is
          * recomputed every pass, not only on events. A failed apply is retried
@@ -491,13 +501,17 @@ int oz_gatt_ak1037_pair_code(uint32_t code)
 #define OZ_TK_SEN     60
 #define OZ_TK_WK_SEN  50
 
-/* Pad number -> key, by the EVB's layout: rows 1 2 3 / 4 5 6 / 7 8 9 / * 0 #,
- * then mute, bell, lock (not keys). UNVERIFIED order: every press logs its pad
- * number ("touch: pad N -> c") so the first chip run confirms or corrects it. */
+/* Pad -> key (TOUCH-MAP-1, measured on the EVB 2026-11-18): the SDK reports a
+ * one-bit mask per pad, from bit 14 = "1" down: keys 1-9 = bits 14..6, '*' bit
+ * 5, '0' bit 4, '#' bit 3; mute (2), bell (1) and lock (0) are not keys yet.
+ * Anything not a single known bit (two pads at once) is ignored, but logged. */
 static char pad_char(int pad)
 {
-    static const char map[] = "\0" "123456789*0#";
-    return (pad > 0 && pad < (int)(sizeof map - 1)) ? map[pad] : 0;
+    static const char by_bit[15] = { 0, 0, 0, '#', '0', '*', '9', '8', '7', '6', '5', '4', '3', '2', '1' };
+    for (int b = 0; b < 15; b++)
+        if (pad == (1 << b))
+            return by_bit[b];
+    return 0;
 }
 
 /* From the SDK's touch scan (may be interrupt context): post only. */
@@ -520,6 +534,7 @@ static void touch_start(void)
         oz_port_log("touch: driver registration failed; keypad via the shell only");
         return;
     }
+    oz_ak1037_backlight_init();         /* off, before any press can light it */
     (void)tk.init(&p, OZ_TK_KEYMARK);
     oz_port_log("touch: 15 pads on");
 }

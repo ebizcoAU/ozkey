@@ -38,4 +38,8 @@ void oz_ak1037_clock_advance(uint64_t ms);
 void oz_ak1037_motor_pins_init(void);
 void oz_ak1037_motor_pins(int a, int b);
 
+/* The keypad backlight (TOUCH-LED-1): all 15 key LEDs on or off. */
+void oz_ak1037_backlight_init(void);
+void oz_ak1037_backlight(int on);
+
 #endif
