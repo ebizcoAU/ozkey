@@ -68,6 +68,8 @@ void oz_gatt_ak1037_actuate(int unlock);
 #ifdef OZ_DEBUG_HOOKS
 /* Debug builds only: the OZKIE thread stops checking in (oz.wdthang). */
 void oz_gatt_ak1037_debug_hang(void);
+/* Debug builds only: erase the lock's kv from its own thread, then reset. */
+void oz_gatt_ak1037_debug_wipe_reset(void);
 #endif
 
 #endif

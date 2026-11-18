@@ -219,8 +219,9 @@ static void oz_wipe_cmd(char argc, char **argv)
         printf("usage: oz.wipe CONFIRM   (DEBUG BUILD ONLY: erases identity and bonds; before oz.start)\r\n");
         return;
     }
-    if (running) {
-        printf("oz.wipe: refused while the lock runs; reset (SW13), then oz.wipe CONFIRM before oz.start\r\n");
+    if (running) {                      /* AUTOSTART-1: the lock runs from power-on */
+        printf("oz.wipe: the lock runs: erasing from its thread, then restarting\r\n");
+        oz_gatt_ak1037_debug_wipe_reset();
         return;
     }
     if (oz_ak1037_kv_claim(OZ_AK1037_KV_LOCK) != OZ_OK) {
@@ -242,3 +243,22 @@ AK_MSH_CMD_EXPORT(oz_code_cmd, oz.code, the owner typed this pairing code on the
 AK_MSH_CMD_EXPORT(oz_key_cmd, oz.key, keys pressed on the keypad);
 AK_MSH_CMD_EXPORT(oz_card_cmd, oz.card, a card at the reader: its UID in hex);
 AK_MSH_CMD_EXPORT(oz_state_cmd, oz.state, lock state and the last motor move);
+
+/* AUTOSTART-1: the lock starts itself OZ_AUTOSTART_MS after boot (a product
+ * can't wait for a serial command; the operator took a waiting board for a
+ * dead one). A failed start (the BLE address not ready) retries each second,
+ * a few times. The main loop calls this with the ms tick; a typed oz.start
+ * before or after is harmless. */
+#define OZ_AUTOSTART_MS    3000u
+#define OZ_AUTOSTART_TRIES 5
+void oz_ak1037_app_poll(uint32_t now_ms)
+{
+    static uint32_t next = OZ_AUTOSTART_MS;
+    static int tries;
+    if (running || tries >= OZ_AUTOSTART_TRIES || now_ms < next)
+        return;
+    tries++;
+    printf("oz.start: automatic start\r\n");
+    if (oz_lockapp_ak1037_start() != OZ_OK)
+        next = now_ms + 1000u;
+}

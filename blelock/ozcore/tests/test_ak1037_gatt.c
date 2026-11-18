@@ -915,6 +915,38 @@ static const char *wipe_name(void)
     return n;
 }
 
+/* AUTOSTART-1: a lock starts itself at power-on (the operator took a board
+ * waiting for oz.start for a dead one). oz_ak1037_app_poll() runs from the
+ * main loop with the ms tick; the lock starts once, OZ_AUTOSTART_MS in. */
+void oz_ak1037_app_poll(uint32_t now_ms);
+static void autostart(void)
+{
+    mock_flash_blank();
+    mock_on_notify = on_notify;
+    capture_start();
+    oz_ak1037_app_poll(1000);
+    oz_ak1037_app_poll(2999);
+    capture_end();
+    expect_int("not before 3 s", mock_ble_inits == 0 && count("automatic start") == 0, 1);
+    capture_start();
+    oz_ak1037_app_poll(3000);
+    capture_end();
+    expect_int("at 3 s: started by itself", count("oz.start: automatic start") == 1 && mock_ble_inits == 1, 1);
+    expect_int("…an UNCLAIMED lock", count("UNCLAIMED"), 1);
+    if (mock_ble_inits != 1)
+        return;                         /* no thread to wait for */
+    mock_wait_parked();
+    capture_start();
+    oz_ak1037_app_poll(4000);
+    oz_ak1037_app_poll(100000);
+    capture_end();
+    expect_int("once only", count("automatic start") == 0 && mock_ble_inits == 1, 1);
+    capture_start();
+    (void)mock_msh_run("oz.start");
+    capture_end();
+    expect_int("a typed oz.start is harmless", count("already running"), 1);
+}
+
 static void no_hooks(void)
 {
     expect_int("no debug hook in the shell", mock_msh_run(hook_name()), -1);
@@ -947,11 +979,17 @@ static void wipe(void)
     keep_flash = 1;
     boot();                             /* oz.start after the wipe: "unclaimed" is checked there */
     claim();
+    /* AUTOSTART-1: the lock now runs from power-on, so the bench wipe works
+     * while it runs: the OZKIE thread (the only kv writer) erases, then the
+     * chip resets, so nothing races and RAM never outlives the kv. */
+    expect_int("a key again", oz_port_kv_set("wt", &v, 1), OZ_OK);
     capture_start();
     expect_int("wipe while running: runs", mock_msh_run(cmd), 0);
+    mock_pass();
     capture_end();
-    expect_int("…refused while the lock runs", count("refused"), 1);
-    expect_int("…still claimed", read_info() > 0 && lock_claimed == 1, 1);
+    expect_int("…erased by the lock thread", oz_port_kv_get("wt", got, sizeof got, &gl), OZ_E_NOT_FOUND);
+    expect_int("…then the chip resets", mock_chip_resets, 1);
+    expect_int("…and says so", count("oz.wipe: identity and bonds erased; restarting"), 1);
 }
 
 /* Debug build: the command stops the OZKIE thread's check-ins, so the main
@@ -1212,6 +1250,10 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "nohooks")) {
         no_hooks();
         return report("ak1037_gatt_nohooks");
+    }
+    if (argc > 1 && !strcmp(argv[1], "autostart")) {
+        autostart();
+        return report("ak1037_gatt_autostart");
     }
     if (argc > 1 && !strcmp(argv[1], "led")) {
 #ifdef OZ_DEBUG_HOOKS

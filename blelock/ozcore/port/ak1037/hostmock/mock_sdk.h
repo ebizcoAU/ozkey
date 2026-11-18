@@ -125,4 +125,6 @@ void mock_rfid_card(const uint8_t *uid, int len);
 extern int      mock_dac_on, mock_dac_plays, mock_dac_bad, mock_dac_pa_missing;
 extern uint32_t mock_dac_rate, mock_dac_len;
 
+extern int mock_chip_resets;            /* hal_clock_chip_reset() calls */
+
 #endif

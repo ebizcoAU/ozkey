@@ -7,4 +7,5 @@ typedef enum {
     HAL_RESET_NONE = 0xff
 } T_eRST_STATUS;
 T_eRST_STATUS hal_clock_get_reset_status(void);
+void hal_clock_chip_reset(void);         /* AUTOSTART-1 */
 #endif

@@ -24,6 +24,8 @@
 #include "hal_touch.h"
 #include "hal_rfid.h"
 #include "hal_sys.h"
+#include "hal_sysclock.h"
+#include "oz_kv_lfs.h"
 
 #include "oz_port.h"
 #include "oz_adv.h"
@@ -426,6 +428,12 @@ static void key_in(oz_lock *L, char key, int connected)
  * mode (ozkey-48 §6.1). Never in a release build. */
 static volatile int dbg_hang;
 void oz_gatt_ak1037_debug_hang(void) { dbg_hang = 1; }
+
+/* oz.wipe while the lock runs (AUTOSTART-1): the OZKIE thread, the only kv
+ * writer, erases between two passes, then the chip resets, so RAM state never
+ * outlives the kv it came from. Debug builds only. */
+static volatile int dbg_wipe;
+void oz_gatt_ak1037_debug_wipe_reset(void) { dbg_wipe = 1; }
 #endif
 
 static void ozkie_thread(void *param)
@@ -445,6 +453,15 @@ static void ozkie_thread(void *param)
     refresh_info(L);
     for (;;) {
 #ifdef OZ_DEBUG_HOOKS
+        if (dbg_wipe) {
+            dbg_wipe = 0;
+            if (oz_kv_lfs_namespace("oz") == OZ_OK && oz_kv_lfs_wipe() == OZ_OK) {
+                oz_port_log("oz.wipe: identity and bonds erased; restarting");
+                hal_clock_chip_reset();
+            } else {
+                oz_port_log("oz.wipe: FAILED (kv); nothing reset");
+            }
+        }
         if (!dbg_hang)
 #endif
         oz_ak1037_wdt_checkin(wdt_id);
