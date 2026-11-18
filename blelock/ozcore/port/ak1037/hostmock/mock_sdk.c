@@ -13,6 +13,7 @@
 #include "hal_saradc.h"
 #include "hal_gpio.h"
 #include "dev_tk.h"
+#include "hal_rfid.h"
 #include "hal_touch.h"
 #include "hal_sys.h"
 #include "hal_sfc_norflash.h"
@@ -738,4 +739,31 @@ void mock_tk_press(int key)
         tk_cb(TOUCH_KEY_PRESS, key);
         tk_cb(TOUCH_KEY_RELEASE, key);
     }
+}
+
+/* ── RFID reader (RFID-READER-1) ─────────────────────────────────────────── */
+int      mock_rfid_inited, mock_rfid_reads;
+uint32_t mock_rfid_cost_ms;             /* how long one read blocks */
+static uint8_t rfid_uid[16];
+static int     rfid_len;
+
+int32_t hal_rfid_init(void) { mock_rfid_inited++; return 1; }
+void    hal_rfid_destroy(void) { }
+
+int32_t hal_rfid_read_card(EN_RFID_CARD_TYPE t, uint8_t *data)
+{
+    mock_rfid_reads++;
+    mock_ms += mock_rfid_cost_ms;
+    if (t != CARD_TYPE_A || rfid_len == 0)
+        return 0;
+    memcpy(data, rfid_uid, (size_t)rfid_len);
+    data[rfid_len] = 0;                 /* as the SDK: a NUL after the UID */
+    return rfid_len;
+}
+
+void mock_rfid_card(const uint8_t *uid, int len)
+{
+    rfid_len = uid ? len : 0;
+    if (uid)
+        memcpy(rfid_uid, uid, (size_t)len);
 }

@@ -22,6 +22,7 @@
 #include "com_ble.h"
 #include "dev_tk.h"
 #include "hal_touch.h"
+#include "hal_rfid.h"
 #include "hal_sys.h"
 
 #include "oz_port.h"
@@ -55,6 +56,7 @@ static const T_BT_ATTREC gatt_table[] = {
 
 enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, EV_KEY, EV_CARD, EV_PAD };
 static char pad_char(int pad);          /* touch pad bit -> key (TOUCH-MAP-1) */
+static void rfid_poll(oz_lock *L);      /* the on-chip RFID reader (RFID-READER-1) */
 #define OZ_BL_FLASH_MS 300u         /* backlight flash per press (TOUCH-LED-1) */
 
 #define FRAME_MAX (BLE_MTU_MAX_SIZE - 3)
@@ -471,6 +473,8 @@ static void ozkie_thread(void *param)
             (void)com_ble_disconnect(0);
         }
         motor_step(L);
+        if (motor.phase == OZ_MOTOR_IDLE)
+            rfid_poll(L);
         battery_rest(L);
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
             oz_port_log("keypad: entry timed out");
@@ -550,6 +554,57 @@ static void touch_start(void)
     oz_port_log("touch: 15 pads on");
 }
 
+/* ── On-chip RFID reader (RFID-READER-1) ─────────────────────────────────── */
+
+/* hal_rfid_read_card() runs one read on the antenna and blocks while it does,
+ * so it is polled from the lock thread every OZ_RFID_POLL_MS, never while the
+ * motor moves. The card path (oz_card_seen) makes a card held on the antenna
+ * one check. The slowest poll so far is logged (from 20 ms), as the chip's
+ * read time is not documented. */
+#define OZ_RFID_POLL_MS  250u
+#define OZ_RFID_SLOW_MS  20u
+static uint32_t rfid_next, rfid_slowest;
+static uint8_t  rfid_last[OZ_CARD_ID_MAX];
+static size_t   rfid_last_len;
+
+static void rfid_poll(oz_lock *L)
+{
+    uint8_t id[32];
+    uint32_t t0 = now_ms();
+    if ((int32_t)(t0 - rfid_next) < 0)
+        return;
+    int32_t n = hal_rfid_read_card(CARD_TYPE_A, id);
+    uint32_t dt = now_ms() - t0;
+    rfid_next = now_ms() + OZ_RFID_POLL_MS;
+    if (dt >= OZ_RFID_SLOW_MS && dt > rfid_slowest) {
+        rfid_slowest = dt;
+        oz_port_log("rfid: slowest poll %lu ms", (unsigned long)dt);
+    }
+    if (n <= 0 || n > (int32_t)OZ_CARD_ID_MAX) {
+        rfid_last_len = 0;              /* the antenna is free again */
+        return;
+    }
+    if ((size_t)n != rfid_last_len || memcmp(id, rfid_last, (size_t)n) != 0) {
+        char hex[2 * OZ_CARD_ID_MAX + 1];
+        for (int32_t i = 0; i < n; i++) {
+            static const char h[] = "0123456789abcdef";
+            hex[2 * i] = h[id[i] >> 4];
+            hex[2 * i + 1] = h[id[i] & 15];
+        }
+        hex[2 * n] = 0;
+        oz_port_log("rfid: card %s", hex);
+        memcpy(rfid_last, id, (size_t)n);
+        rfid_last_len = (size_t)n;
+    }
+    card_in(L, id, (size_t)n);
+}
+
+static void rfid_start(void)
+{
+    (void)hal_rfid_init();
+    oz_port_log("rfid: reader on");
+}
+
 int oz_gatt_ak1037_key(char key)
 {
     post(EV_KEY, (uint32_t)(uint8_t)key);
@@ -607,6 +662,7 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
     oz_motor_init(&motor, NULL);
     oz_card_init(&card);
     touch_start();
+    rfid_start();
     if (rt_thread_init(&thread, "ozkie", ozkie_thread, L, thread_stack, sizeof thread_stack,
                        thread_priority, 10) != RT_EOK)
         return OZ_E_HW;
