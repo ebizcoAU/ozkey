@@ -220,7 +220,7 @@ add_test(NAME ak1037_gatt_autostart COMMAND test_ak1037_gatt autostart)
 # port/ak1037/Makefile defines OZ_DEBUG_HOOKS except the debug test below.
 add_test(NAME ak1037_nohooks COMMAND test_ak1037_gatt nohooks)
 add_test(NAME ak1037_release_bin_no_wdthang
-         COMMAND sh -c "! LC_ALL=C grep -a -q -e 'oz\\.wdthang' -e 'oz\\.wipe' -e 'oz\\.led' \"$1\" && ! LC_ALL=C grep -a -q -e 'oz\\.wdthang' -e 'oz\\.wipe' -e 'oz\\.led' \"$2\""
+         COMMAND sh -c "! LC_ALL=C grep -a -q -e 'oz\\.wdthang' -e 'oz\\.wipe' -e 'oz\\.led' -e 'oz\\.batt' -e 'sense OFF' \"$1\" && ! LC_ALL=C grep -a -q -e 'oz\\.wdthang' -e 'oz\\.wipe' -e 'oz\\.led' -e 'oz\\.batt' -e 'sense OFF' \"$2\""
                  sh $<TARGET_FILE:test_ak1037_gatt> $<TARGET_FILE:test_ak1037_selftest>)
 # The burn tool refuses a partition without a file ("Partition name and BIN file
 # name are different", 2026-11-18): every partition gets a download line, in order.
@@ -231,13 +231,14 @@ add_test(NAME ak1037_burn_config_partitions_have_bins
 add_test(NAME ak1037_makefile_no_debug_hooks
          COMMAND sh -c "! grep -q OZ_DEBUG_HOOKS \"$1\"" sh ${CMAKE_CURRENT_SOURCE_DIR}/port/ak1037/Makefile)
 add_executable(test_ak1037_gatt_debug tests/test_ak1037_gatt.c port/ak1037/oz_lockapp_ak1037.c
-               port/ak1037/oz_gatt_ak1037.c)
+               port/ak1037/oz_gatt_ak1037.c port/ak1037/oz_port_ak1037.c)   # all debug, as on the chip
 target_link_libraries(test_ak1037_gatt_debug ozport_ak1037_host)
 target_compile_options(test_ak1037_gatt_debug PRIVATE -Wall -Wextra -Werror)
 target_compile_definitions(test_ak1037_gatt_debug PRIVATE OZ_DEBUG_HOOKS=1)
 add_test(NAME ak1037_wdthang COMMAND test_ak1037_gatt_debug wdthang)
 add_test(NAME ak1037_wipe COMMAND test_ak1037_gatt_debug wipe)
 add_test(NAME ak1037_led COMMAND test_ak1037_gatt_debug led)
+add_test(NAME ak1037_batt_bench COMMAND test_ak1037_gatt_debug batt)
 # Positive control for the scan above: it finds the name where the hook is built in.
 add_test(NAME ak1037_debug_bin_has_wdthang
          COMMAND sh -c "LC_ALL=C grep -a -q 'oz\\.wdthang' \"$1\" && LC_ALL=C grep -a -q 'oz\\.wipe' \"$1\"" sh $<TARGET_FILE:test_ak1037_gatt_debug>)

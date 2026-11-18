@@ -1700,6 +1700,7 @@ void oz_lock_actuated(oz_lock *L, int unlock, int result)
     if (result == OZ_MOVE_JAMMED) {
         L->lock_state = OZ_LOCKSTATE_NOT_FULLY_LOCKED;
         oz_port_log("lock: motor jammed while %s", unlock ? "unlocking" : "locking");
+        event_add(L, OZ_EV_JAMMED, OZ_EV_NO_ACTOR, unlock ? 1u : 0u, 0);   /* BATT-SENSE-1 */
     } else if (result == OZ_MOVE_OK || result == OZ_MOVE_UNCONFIRMED) {
         L->lock_state = unlock ? OZ_LOCKSTATE_UNLOCKED : OZ_LOCKSTATE_LOCKED;
     }

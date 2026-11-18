@@ -1,6 +1,7 @@
 /* Lock engine end to end: a simulated app (EDHOC initiator + OSCORE client)
  * against oz_lock, in process. Each block names the ozkey-48 rule it checks. */
 #include "oz_lock.h"
+#include "oz_motor.h"
 #include "oz_cbor.h"
 #include "oz_port_host.h"
 #include "oz_test.h"
@@ -1313,6 +1314,24 @@ static void events(void)
                    && le.type == OZ_EV_DOOR_LEFT_OPEN && le.b == 30, 1);
         oz_lock_auto_relock(&L);
         expect_int("auto-relock locks", locks - l0, 1);
+
+        /* BATT-SENSE-1, PM rulings: at CRITICAL the app's LOCK is refused, but
+         * the auto-relock is exempt (security first: an unlocked door is the
+         * worse failure; the motor's 1.5 s cap bounds a stall) and the exit
+         * unlock is always allowed (safe exit beats motor protection). */
+        oz_lock_power_rest(&L, 3000);
+        expect_int("battery CRITICAL now", L.power.level, OZ_BATT_CRITICAL);
+        l0 = locks; u0 = unlocks;
+        oz_lock_auto_relock(&L);
+        expect_int("auto-relock still locks at CRITICAL (PM)", locks - l0, 1);
+        oz_lock_exit_button(&L);
+        expect_int("exit still unlocks at CRITICAL (PM)", unlocks - u0, 1);
+        /* A stalled move: JAMMED, recorded for the owner's app. */
+        oz_lock_actuated(&L, 0, OZ_MOVE_JAMMED);
+        cur = L.events.next_seq - 1;
+        expect_int("a jam is recorded (locking)", oz_events_next(&L.events, &cur, &le) == 1
+                   && le.type == OZ_EV_JAMMED && le.a == 0, 1);
+        oz_lock_power_rest(&L, 6000);
     }
 
     /* A factory reset forgets the numbering. */

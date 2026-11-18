@@ -59,4 +59,11 @@ void oz_ak1037_backlight(int state);
  * or -1 for a bad index (LED-MAP-1). */
 int  oz_ak1037_backlight_pin(int i, int state);
 
+/* Battery sensing (BATT-SENSE-1): 0 on the bench build only; the raw ADC and
+ * its pin voltage, for measuring the divider (oz.batt). */
+int      oz_ak1037_battery_sensing(void);
+void     oz_ak1037_battery_note(void);
+int      oz_ak1037_battery_raw(void);
+uint16_t oz_ak1037_battery_pin_mv(int raw);
+
 #endif

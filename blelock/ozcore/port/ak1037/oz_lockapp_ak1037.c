@@ -92,6 +92,7 @@ int oz_lockapp_ak1037_start(void)
         printf("oz.start: GATT start failed; reboot\r\n");
         return OZ_E_HW;
     }
+    oz_ak1037_battery_note();
     printf("oz.start: %s %s\r\n", id, oz_lock_claimed(&lock) ? "claimed" : "UNCLAIMED");
     return OZ_OK;
 }
@@ -207,6 +208,18 @@ static void oz_led_cmd(char argc, char **argv)
     printf("oz.led: pin %d = GPIO%d %s\r\n", i, g, argv[2]);
 }
 AK_MSH_CMD_EXPORT(oz_led_cmd, oz.led, DEBUG BUILD ONLY: drive one J7 backlight pin);
+
+/* BATT-SENSE-1 (debug builds only): the raw ADC on the battery channel and
+ * the pin voltage it means, to measure the divider with a multimeter. */
+static void oz_batt_cmd(char argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    int raw = oz_ak1037_battery_raw();
+    printf("oz.batt: raw %d, pin %u mV (sense %s)\r\n", raw, (unsigned)oz_ak1037_battery_pin_mv(raw),
+           oz_ak1037_battery_sensing() ? "on" : "OFF");
+}
+AK_MSH_CMD_EXPORT(oz_batt_cmd, oz.batt, DEBUG BUILD ONLY: raw battery ADC);
 
 /* OZ-WIPE-1 (debug builds only, PM GO 2026-11-18): erase the lock's kv, its
  * identity and bonds, so the next oz.start is a fresh UNCLAIMED lock (bench:
