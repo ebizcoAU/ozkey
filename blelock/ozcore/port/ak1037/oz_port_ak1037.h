@@ -55,5 +55,8 @@ int  oz_ak1037_beep_start(void);
 void oz_ak1037_beep_stop(void);
 void oz_ak1037_backlight_init(void);
 void oz_ak1037_backlight(int state);
+/* One pin (0..7) only, for mapping keys to pins on the bench: the GPIO number,
+ * or -1 for a bad index (LED-MAP-1). */
+int  oz_ak1037_backlight_pin(int i, int state);
 
 #endif

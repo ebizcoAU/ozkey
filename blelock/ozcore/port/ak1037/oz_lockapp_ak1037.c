@@ -189,6 +189,25 @@ static void oz_wdthang_cmd(char argc, char **argv)
 }
 AK_MSH_CMD_EXPORT(oz_wdthang_cmd, oz.wdthang, DEBUG BUILD ONLY: force a watchdog reset);
 
+/* LED-MAP-1 (debug builds only): drive one J7 backlight pin high, low or
+ * release it, so the bench learns which key each pin and level lights (each
+ * pin drives a pair of key LEDs). For lighting only the pressed key. */
+static void oz_led_cmd(char argc, char **argv)
+{
+    int st = -1;
+    int i = argc >= 3 ? atoi(argv[1]) : -1;
+    if (argc >= 3)
+        st = !strcmp(argv[2], "h") ? OZ_BL_HIGH : !strcmp(argv[2], "l") ? OZ_BL_LOW
+           : !strcmp(argv[2], "off") ? OZ_BL_OFF : -1;
+    int g = (st < 0) ? -1 : oz_ak1037_backlight_pin(i, st);
+    if (g < 0) {
+        printf("usage: oz.led <0-7> <h|l|off>   (DEBUG BUILD ONLY: one J7 backlight pin)\r\n");
+        return;
+    }
+    printf("oz.led: pin %d = GPIO%d %s\r\n", i, g, argv[2]);
+}
+AK_MSH_CMD_EXPORT(oz_led_cmd, oz.led, DEBUG BUILD ONLY: drive one J7 backlight pin);
+
 /* OZ-WIPE-1 (debug builds only, PM GO 2026-11-18): erase the lock's kv, its
  * identity and bonds, so the next oz.start is a fresh UNCLAIMED lock (bench:
  * a claimed lock back to the start of blerun without a reburn). Serial shell

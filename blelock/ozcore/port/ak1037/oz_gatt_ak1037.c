@@ -518,9 +518,9 @@ static void ozkie_thread(void *param)
                 tones(2, 80);
             }
             if (d & OZ_DIO_DOOR_OPENED)
-                oz_port_log("door: opened");
+                oz_port_log("door: opened @%lu ms", (unsigned long)now_ms());
             if (d & OZ_DIO_DOOR_CLOSED)
-                oz_port_log("door: closed");
+                oz_port_log("door: closed @%lu ms", (unsigned long)now_ms());
             if (d & OZ_DIO_RELOCK)
                 oz_lock_auto_relock(L);
             if (d & OZ_DIO_TAMPER) {

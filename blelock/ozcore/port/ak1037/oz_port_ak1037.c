@@ -450,6 +450,22 @@ void oz_ak1037_backlight(int state)
     }
 }
 
+/* One J7 pin (0..7 = GPIO22, 24-29, 34): released, high or low (LED-MAP-1). */
+int oz_ak1037_backlight_pin(int i, int state)
+{
+    if (i < 0 || i >= 8)
+        return -1;
+    (void)hal_gpio_init(bl_pin[i]);
+    if (state == OZ_BL_OFF) {
+        (void)hal_gpio_set_dir(bl_pin[i], GPIO_DIR_INPUT);
+    } else {
+        (void)hal_gpio_output_value(bl_pin[i], (uint8_t)(state == OZ_BL_HIGH));
+        (void)hal_gpio_set_dir(bl_pin[i], GPIO_DIR_OUTPUT);
+        (void)hal_gpio_output_value(bl_pin[i], (uint8_t)(state == OZ_BL_HIGH));
+    }
+    return (int)bl_pin[i];
+}
+
 void oz_ak1037_backlight_init(void)
 {
     for (int i = 0; i < 8; i++)
@@ -470,6 +486,16 @@ void oz_ak1037_backlight_init(void)
 static int16_t beep_pcm[OZ_BEEP_SAMPLES] __attribute__((aligned(4)));
 static int beep_ready, beep_open;
 
+/* hal_dac.c calls this on every DAC open/close, and logs "pa ctrl callback is
+ * empty!" without one. The amplifier is on for the whole run (above), so the
+ * callback only says yes: no switching, no 60 ms wait per beep (LOCK-IO-2). */
+extern void dac_set_pa_ctrl(T_BOOL (*callback)(T_BOOL enable));
+static T_BOOL pa_keep_on(T_BOOL enable)
+{
+    (void)enable;
+    return AK_TRUE;
+}
+
 void oz_ak1037_speaker_init(void)
 {
     static const int16_t sine8[8] = { 0, 4243, 6000, 4243, 0, -4243, -6000, -4243 };
@@ -479,6 +505,7 @@ void oz_ak1037_speaker_init(void)
     (void)hal_gpio_output_value(GPIOAO5, 1);
     (void)hal_gpio_set_dir(GPIOAO5, GPIO_DIR_OUTPUT);
     (void)hal_gpio_output_value(GPIOAO5, 1);
+    dac_set_pa_ctrl(pa_keep_on);
     beep_ready = 1;
 }
 
