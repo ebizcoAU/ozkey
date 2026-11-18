@@ -26,6 +26,9 @@
 #include "oz_lock.h"
 #include "oz_gatt_ak1037.h"
 #include "oz_port_ak1037.h"
+#ifdef OZ_DEBUG_HOOKS
+#include "oz_kv_lfs.h"
+#endif
 
 #ifndef OZ_START_PRIORITY
 #define OZ_START_PRIORITY (RT_THREAD_PRIORITY_MAX / 2)
@@ -185,6 +188,33 @@ static void oz_wdthang_cmd(char argc, char **argv)
     oz_gatt_ak1037_debug_hang();
 }
 AK_MSH_CMD_EXPORT(oz_wdthang_cmd, oz.wdthang, DEBUG BUILD ONLY: force a watchdog reset);
+
+/* OZ-WIPE-1 (debug builds only, PM GO 2026-11-18): erase the lock's kv, its
+ * identity and bonds, so the next oz.start is a fresh UNCLAIMED lock (bench:
+ * a claimed lock back to the start of blerun without a reburn). Serial shell
+ * only: no BLE path reaches the shell. Only before oz.start, so it never races
+ * the running lock's own kv writes: reset (SW13), oz.wipe CONFIRM, oz.start. */
+static void oz_wipe_cmd(char argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "CONFIRM")) {
+        printf("usage: oz.wipe CONFIRM   (DEBUG BUILD ONLY: erases identity and bonds; before oz.start)\r\n");
+        return;
+    }
+    if (running) {
+        printf("oz.wipe: refused while the lock runs; reset (SW13), then oz.wipe CONFIRM before oz.start\r\n");
+        return;
+    }
+    if (oz_ak1037_kv_claim(OZ_AK1037_KV_LOCK) != OZ_OK) {
+        printf("oz.wipe: refused: reboot after oz.selftest\r\n");
+        return;
+    }
+    if (oz_ak1037_kv_mount() != OZ_OK || oz_kv_lfs_namespace("oz") != OZ_OK || oz_kv_lfs_wipe() != OZ_OK) {
+        printf("oz.wipe: FAILED (kv)\r\n");
+        return;
+    }
+    printf("oz.wipe: identity and bonds erased; oz.start gives a fresh UNCLAIMED lock\r\n");
+}
+AK_MSH_CMD_EXPORT(oz_wipe_cmd, oz.wipe, DEBUG BUILD ONLY: erase identity and bonds before oz.start);
 #endif
 
 AK_MSH_CMD_EXPORT(oz_start_cmd, oz.start, start the OZKIE lock with log-only hardware);

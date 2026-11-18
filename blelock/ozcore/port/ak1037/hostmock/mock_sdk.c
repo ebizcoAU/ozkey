@@ -509,8 +509,25 @@ T_eBLE_RESULT com_ble_set_gatt_service(T_BT_ATTREC *table, uint32_t len, uint8_t
     return eBLE_RESULT_SUCCESS;
 }
 
+/* As the SDK checks it (ble_gatt.c, ble_gatt_usersrv_is_att_idx_valid): idx
+ * counts the notify-capable characteristics of the registered table, from 0.
+ * On the chip a wrong idx prints "send_att_rec_id overflow N" and returns
+ * PARAM_ERR (NOTIFY-IDX-1, 2026-11-18: we passed 4, our one notify char is 0). */
+int mock_notify_bad_idx;
+
 T_eBLE_RESULT com_ble_server_notify_ext(T_pVOID link, uint8_t *buf, uint16_t len, uint16_t idx)
 {
+    uint16_t n = 0;
+    int found = 0;
+    for (uint32_t i = 0; mock_gatt_table && i < mock_gatt_len; i++)
+        if (mock_gatt_table[i].type == arCharacteristic && (mock_gatt_table[i].state & arNotify)) {
+            if (n == idx) { found = 1; break; }
+            n++;
+        }
+    if (!found) {
+        mock_notify_bad_idx++;
+        return eBLE_RESULT_PARAM_ERR;
+    }
     return mock_on_notify(link, buf, len, idx);
 }
 
