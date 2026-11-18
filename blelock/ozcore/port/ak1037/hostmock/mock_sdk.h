@@ -113,4 +113,10 @@ extern uint32_t mock_tk_keymark;
 extern int16_t  mock_tk_sen0, mock_tk_sen_wk;
 void mock_tk_press(int key);
 
+/* RFID reader (RFID-READER-1): a card on the antenna (NULL: none), and what
+ * the port did with the reader. */
+extern int      mock_rfid_inited, mock_rfid_reads;
+extern uint32_t mock_rfid_cost_ms;
+void mock_rfid_card(const uint8_t *uid, int len);
+
 #endif

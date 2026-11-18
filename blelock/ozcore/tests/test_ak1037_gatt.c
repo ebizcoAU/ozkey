@@ -939,6 +939,42 @@ static void zero_addr(void)
            "6f7a6b2d" "6163626565363361636162 38");     /* ozk-acbee63acab8 */
 }
 
+/* RFID-READER-1: the SDK's on-chip reader feeds the card path. Polled every
+ * 250 ms from the lock thread (not while the motor moves); a card held on the
+ * antenna is one check; a slow poll is logged with its time. */
+static void rfid_reader(void)
+{
+    static const uint8_t uid[4] = { 0xde, 0xad, 0xbe, 0xef };
+    mock_ms += 31u * 60u * 1000u;       /* past any card lockout from above */
+    expect_int("reader started once", mock_rfid_inited, 1);
+    mock_pass();
+    int r0 = mock_rfid_reads;
+    uint32_t t0 = mock_ms;
+    while (mock_ms - t0 < 1000)
+        mock_pass();
+    int polls = mock_rfid_reads - r0;
+    expect_int("polled about every 250 ms (3-5 in 1 s)", polls >= 3 && polls <= 5, 1);
+
+    capture_start();
+    mock_rfid_card(uid, 4);
+    t0 = mock_ms;
+    while (mock_ms - t0 < 2000)
+        mock_pass();                    /* held 2 s on the antenna */
+    mock_rfid_card(NULL, 0);
+    capture_end();
+    expect_int("a card held 2 s: one check", count("card: wrong") + count("card: locked out"), 1);
+    expect_int("…logged with its id", count("rfid: card deadbeef"), 1);
+
+    capture_start();
+    mock_rfid_cost_ms = 30;
+    t0 = mock_ms;
+    while (mock_ms - t0 < 600)
+        mock_pass();
+    mock_rfid_cost_ms = 0;
+    capture_end();
+    expect_int("a 30 ms poll is logged once (new maximum)", count("rfid: slowest poll 30 ms"), 1);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "zeroaddr")) {
@@ -982,6 +1018,7 @@ int main(int argc, char **argv)
     battery_reads();
     junk_and_limits();
     disconnect_and_adv();
+    rfid_reader();
     expect_int("every notify went to a notify characteristic (SDK index check)", mock_notify_bad_idx, 0);
     expect_int("flash stayed in OZKV", mock_flash_out_of_part, 0);
     expect_int("NOR rule kept", mock_nor_violations, 0);
