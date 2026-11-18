@@ -73,6 +73,7 @@ function freePort() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const BIND_RETRIES = 5; // OZPMS-PORT-RACE-1
 
 /** Same KEY=VALUE format server.js reads; only used for the DB password. */
 function readDotEnv(file) {
@@ -191,16 +192,25 @@ class Fixture {
     if (!this.dbPassword) throw new Error(`${envName('DB_PASSWORD')} not set (env or ${P.serverDir}/.env)`);
 
     // Broker
-    this.mqttPort = await freePort();
-    harnessBrokerPort = this.mqttPort;
-    const conf = path.join(this.tmp, 'mosquitto.conf');
-    fs.writeFileSync(conf, `listener ${this.mqttPort} 127.0.0.1\nallow_anonymous true\npersistence false\n`);
+    // OZPMS-PORT-RACE-1: the same pick-then-bind race as the server's port.
+    // A mosquitto that lost the race exits at once; a connect could then
+    // reach whoever took the port, so require OUR broker to still be alive.
     const bin = MOSQUITTO_CANDIDATES.find((p) => fs.existsSync(p));
     if (!bin) throw new Error('mosquitto not found; set OZ_TEST_MOSQUITTO');
-    this.broker = spawn(bin, ['-c', conf], { stdio: 'ignore' });
-    this.procs.push(this.broker);
+    const conf = path.join(this.tmp, 'mosquitto.conf');
+    for (let attempt = 1; ; attempt++) {
+      this.mqttPort = await freePort();
+      fs.writeFileSync(conf, `listener ${this.mqttPort} 127.0.0.1\nallow_anonymous true\npersistence false\n`);
+      this.broker = spawn(bin, ['-c', conf], { stdio: 'ignore' });
+      this.procs.push(this.broker);
+      await waitFor(() => this.broker.exitCode !== null || this.canConnect(this.mqttPort), { what: 'mosquitto' });
+      await sleep(100);
+      if (this.broker.exitCode === null && this.broker.signalCode === null) break;
+      if (attempt >= BIND_RETRIES) throw new Error(`mosquitto could not bind after ${BIND_RETRIES} ports`);
+      process.stderr.write(`[testkit] broker port ${this.mqttPort} taken, retrying\n`);
+    }
+    harnessBrokerPort = this.mqttPort;
     this.mqttUrl = `mqtt://127.0.0.1:${this.mqttPort}`;
-    await waitFor(() => this.canConnect(this.mqttPort), { what: 'mosquitto' });
 
     // Stub Nexus
     this.nexus = http.createServer((req, res) => {
@@ -294,6 +304,24 @@ class Fixture {
 
   /** Spawn the profile's server.js against this fixture's broker and DB. */
   async startServer() {
+    // OZPMS-PORT-RACE-1 (PM nexus-46, 2026-11-18): freePort() closes its probe
+    // before the server binds, so under a concurrent gate another process can
+    // take the port in between, and the whole suite went red on EADDRINUSE.
+    // Retry on a fresh port; nothing else is retried, so a real boot failure
+    // still fails.
+    for (let attempt = 1; ; attempt++) {
+      const r = await this.startServerOnce();
+      if (r !== 'EADDRINUSE') return;
+      if (attempt >= BIND_RETRIES) throw new Error(`server could not bind after ${BIND_RETRIES} ports (EADDRINUSE)`);
+      const was = this.httpPort;
+      this.httpPort = await freePort();
+      this.base = `http://127.0.0.1:${this.httpPort}${P.basePath}`;
+      process.stderr.write(`[testkit] HTTP port ${was} taken (EADDRINUSE), retrying on ${this.httpPort}\n`);
+    }
+  }
+
+  /** One spawn. Resolves undefined when listening, 'EADDRINUSE' when the port was taken. */
+  async startServerOnce() {
     const logFrom = this.log().length;
     const out = fs.openSync(this.serverLog, 'a');
     this.server = spawn(process.execPath, ['server.js', ...this.extraArgs], {
@@ -303,8 +331,9 @@ class Fixture {
     });
     this.procs.push(this.server);
     const t0 = Date.now();
+    const booted = () => this.log().slice(logFrom);
     try {
-      await waitFor(() => /HTTP directory listening/.test(this.log().slice(logFrom)), {
+      await waitFor(() => /HTTP directory listening|EADDRINUSE/.test(booted()), {
         timeoutMs: 60000, // matches refuse.test.js; slow spawns under load (S1e-3 repro #3)
         what: 'server listening',
       });
@@ -313,12 +342,15 @@ class Fixture {
       // say whether the child is alive, how loaded the box is, and what it
       // printed, so a slow spawn and a broken boot read differently.
       const s = this.server;
-      const tail = this.log().slice(logFrom).split('\n').slice(-40).join('\n');
+      const tail = booted().split('\n').slice(-40).join('\n');
       err.message +=
         ` after ${Date.now() - t0} ms; server pid ${s.pid} exitCode=${s.exitCode} signal=${s.signalCode};` +
         ` loadavg ${os.loadavg().map((l) => l.toFixed(1)).join('/')}\n--- server log tail ---\n${tail || '(empty)'}`;
       throw err;
     }
+    if (/HTTP directory listening/.test(booted())) return undefined;
+    await this.stopServer();
+    return 'EADDRINUSE';
   }
 
   /** S1e-KEYGUARD: stop the running server, then boot one that is expected to

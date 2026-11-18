@@ -16,6 +16,7 @@ const pool = lazy(() => ctx.pool);
 const logEvent = (...args) => ctx.logEvent(...args);
 
 // From other core modules.
+const abortPinned = (...args) => require('./ozkie').abortPinned(...args);
 const normalizeMac = (...args) => require('./util').normalizeMac(...args);
 const makeSecret = (...args) => require('./util').makeSecret(...args);
 const hashBrokerSecret = (...args) => require('./util').hashBrokerSecret(...args);
@@ -300,6 +301,7 @@ async function handleLockPresence(deviceId, payload) {
           'UPDATE locks SET bridge_id = ?, mcu_link_up = NULL, mcu_last_frame_s = NULL WHERE id = ?',
           [obj.via, deviceId]
         );
+        abortPinned(deviceId, obj.via); // ozkey-56 §3.4
         await pool.query('UPDATE lock_bridges SET priority = priority + 1 WHERE lock_id = ? AND bridge_id != ?', [
           deviceId,
           obj.via,
@@ -512,6 +514,7 @@ async function runBridgeFailoverSweep() {
        WHERE id = ?`,
       [next.bridge_id, lock.id]
     );
+    abortPinned(lock.id, next.bridge_id); // ozkey-56 §3.4
     // Same demote-then-promote shape PATCH /locks/:id already uses (XF-138
     // P5) — without this, the old bridge is left stuck at priority 0
     // alongside the new one (found live on real hardware, XF-144
@@ -736,6 +739,31 @@ function handleBridgePresence(bridgeId, payload) {
   return next;
 }
 
+/** ozkey-56 §5: first value wins. A different value later is a CONFLICT: the
+ *  pinned key stays, GET /bridges/:id serves null with reason "conflict", and
+ *  only an admin re-pins (re-key confirmation, PM ruling pending). A pin-only
+ *  `bridges` row is safe: getOrMintBridgeCredentials() keys off broker_secret. */
+async function pinBridgePub(bridgeId, pub) {
+  await pool.query('INSERT IGNORE INTO bridges (id) VALUES (?)', [bridgeId]);
+  const [r] = await pool.query(
+    'UPDATE bridges SET ozkie_pub = ?, ozkie_pub_at = NOW() WHERE id = ? AND ozkie_pub IS NULL',
+    [pub, bridgeId]
+  );
+  if (r.affectedRows) {
+    logEvent('key', `Bridge ${bridgeId} OZKIE key pinned (${pub.slice(0, 12)}…, TOFU)`);
+    return;
+  }
+  const [[row]] = await pool.query('SELECT ozkie_pub, ozkie_pub_conflict FROM bridges WHERE id = ?', [bridgeId]);
+  if (!row || row.ozkie_pub === pub || row.ozkie_pub_conflict === pub) return;
+  await pool.query('UPDATE bridges SET ozkie_pub_conflict = ? WHERE id = ?', [pub, bridgeId]);
+  logEvent(
+    'warn',
+    `Bridge ${bridgeId} presents a DIFFERENT OZKIE key (${pub.slice(0, 12)}…, pinned ${row.ozkie_pub.slice(0, 12)}…): ` +
+      'conflict, served null until an admin re-key'
+  );
+  await recordAudit(null, null, 'bridge_key_conflict', `bridge ${bridgeId}: presented ${pub.slice(0, 16)}…, pinned ${row.ozkie_pub.slice(0, 16)}…`);
+}
+
 async function handleBridgePresenceImpl(bridgeId, payload) {
   let obj;
   try {
@@ -751,6 +779,10 @@ async function handleBridgePresenceImpl(bridgeId, payload) {
     [bridgeId, state]
   );
   logEvent('info', `Presence: bridge ${bridgeId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}`);
+  // ozkey-56 §5: pin the bridge's OZKIE key on first sight (TOFU).
+  if (typeof obj.ozkie_pub === 'string' && /^[0-9a-fA-F]{64}$/.test(obj.ozkie_pub)) {
+    await pinBridgePub(bridgeId, obj.ozkie_pub.toLowerCase());
+  }
 
   // ozkey-P2: resolve any REST call currently waiting on this bridge's reset
   // outcome. `reason==='factory_reset'` is the one positive signal that

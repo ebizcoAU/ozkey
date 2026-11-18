@@ -608,15 +608,16 @@ test('bridge-reported ozkie_version 2 switches the v2 gates on', async () => {
   ({ res } = await step('unlock-L2-v2-owner', () =>
     call('POST', `/locks/${L2}/unlock`, { envelope_hex: 'aa', app_id: APP_A.hex })
   ));
-  assert.equal(res.status, 501);
-  assert.equal(res.body.code, 'ozkie_v2_relay_not_built');
+  assert.equal(res.status, 409);
+  assert.equal(res.body.code, 'ozkie_v2_use_relay');
   for (const [name, method, p] of [
     ['grant-L2-v2', 'POST', `/locks/${L2}/grants`],
     ['settings-L2-v2', 'POST', `/locks/${L2}/settings`],
     ['revoke-L2-v2', 'DELETE', `/locks/${L2}/grants/1`],
   ]) {
     ({ res } = await step(name, () => call(method, p, { type: 'pin', envelope_hex: 'aa' })));
-    assert.equal(res.status, 501, name);
+    assert.equal(res.status, 409, name);
+    assert.equal(res.body.code, 'ozkie_v2_use_relay', name);
   }
 
   await step('presence-L2-v1', async () => {

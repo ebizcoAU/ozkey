@@ -36,7 +36,7 @@ const deps = { logEvent: () => {}, mysql: {}, mqtt: {} };
 function fakeRouter() {
   const calls = [];
   const r = { calls };
-  for (const m of ['get', 'post', 'patch', 'delete']) r[m] = (path, ...h) => calls.push({ m, path, h });
+  for (const m of ['get', 'post', 'put', 'patch', 'delete']) r[m] = (path, ...h) => calls.push({ m, path, h });
   return r;
 }
 

@@ -18,6 +18,7 @@ const { ctx } = require('./ctx');
 const util = require('./util');
 const audit = require('./audit');
 const relay = require('./relay');
+const ozkie = require('./ozkie');
 const queue = require('./queue');
 const registry = require('./registry');
 const transport = require('./transport');
@@ -61,6 +62,7 @@ function createCore({ CONFIG, logEvent, mysql, mqtt }) {
   return {
     ...audit,
     ...relay,
+    ...ozkie,
     ...queue,
     ...registry,
     ...transport,
