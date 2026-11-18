@@ -44,15 +44,22 @@ static const T_BT_ATTREC gatt_table[] = {
     { arCharacteristic, arLongUUID | arWrite | arNotify, OZ_BLE_UUID_OZKIE },
     { arChrValue, 0, AK_NULL },
     { arChrClientConfiguration, 0, AK_NULL },
+    /* RELAY-AK-1: `relay` (ozkey-48 rev 6 §2.3), the bridge's link. */
+    { arCharacteristic, arLongUUID | arWrite | arNotify, OZ_BLE_UUID_RELAY },
+    { arChrValue, 0, AK_NULL },
+    { arChrClientConfiguration, 0, AK_NULL },
 };
 #define TABLE_LEN      (sizeof gatt_table / sizeof gatt_table[0])
 #define REC_INFO       ((const void *)&gatt_table[2])
 #define REC_OZKIE      ((const void *)&gatt_table[4])
+#define REC_RELAY      ((const void *)&gatt_table[7])
 /* The SDK counts only the notify-capable characteristics, from 0
  * (ble_gatt.c ble_gatt_usersrv_is_att_idx_valid); OZKIE is the only one. 4 was
  * a guess: on the chip every notify failed "send_att_rec_id overflow 4"
  * (NOTIFY-IDX-1, 2026-11-18). */
 #define NOTIFY_REC_IDX 0
+#define NOTIFY_RELAY_IDX 1              /* the second notify characteristic (RELAY-AK-1) */
+enum { CH_OZKIE = 0, CH_RELAY = 1 };
 
 /* ── BLE context → OZKIE thread ──────────────────────────────────────────── */
 
@@ -101,12 +108,12 @@ static void post(uint8_t ev, uint32_t arg)
 
 /* A written frame, from the BLE stack's callback only (one at a time there),
  * so one static buffer keeps the 0.5 KB off the stack's own thread. */
-static void post_frame(const void *data, uint16_t len)
+static void post_frame(const void *data, uint16_t len, uint32_t chr)
 {
     static msg_t m;
     m.h.ev = EV_FRAME;
     m.h.len = len;
-    m.h.arg = 0;
+    m.h.arg = chr;                      /* CH_OZKIE or CH_RELAY */
     memcpy(m.data, data, len);
     if (rt_mq_send(&mq, &m, offsetof(msg_t, data) + len) != RT_EOK)
         oz_port_log("gatt: queue full, frame dropped");
@@ -137,11 +144,11 @@ static void on_write(void *handle, T_BT_ATTRECV_CB *info, uint32_t info_len)
 {
     (void)handle;
     (void)info_len;
-    if (!info || info->p_att_rec != REC_OZKIE)
+    if (!info || (info->p_att_rec != REC_OZKIE && info->p_att_rec != REC_RELAY))
         return;
     if (info->buf_size == 0 || info->buf_size > FRAME_MAX)
         return;                         /* the reassembler would refuse it anyway */
-    post_frame(info->p_buf, info->buf_size);
+    post_frame(info->p_buf, info->buf_size, info->p_att_rec == REC_RELAY ? CH_RELAY : CH_OZKIE);
 }
 
 /* `info` is read from the BLE context, so it serves a snapshot the OZKIE
@@ -193,6 +200,13 @@ static struct rt_thread thread;
 static uint8_t thread_stack[OZ_GATT_THREAD_STACK] __attribute__((aligned(8)));
 static oz_link link;
 static oz_ble session;
+/* RELAY-AK-1: ONE relay link. The SDK keeps one connection (uMaxInitLinks 1),
+ * so its owner is that connection, once it may own it (oz_lock_relay_may_own:
+ * an authenticated bridge, or the owner while no bridge is enrolled). */
+static oz_link relay_link;
+static oz_ble relay_ble;
+static int relay_owned;
+static uint32_t relay_unauth;
 static oz_adv adv;
 static oz_keypad keypad;
 static oz_motor motor;
@@ -237,15 +251,17 @@ static int adv_apply(const oz_lock *L, oz_adv_mode mode)
     return 0;
 }
 
+/* ctx: NULL for `ozkie`, &relay_idx for `relay`. */
+static const uint16_t ozkie_idx = NOTIFY_REC_IDX, relay_idx = NOTIFY_RELAY_IDX;
 static int notify(void *ctx, const uint8_t *frame, size_t len)
 {
-    (void)ctx;
+    const uint16_t idx = ctx ? *(const uint16_t *)ctx : ozkie_idx;
     void *h = conn;
     if (!h)
         return OZ_E_HW;
     /* The stack's send ring can fill on a burst of fragments: wait it out. */
     for (int tries = 0; tries < 50; tries++) {
-        T_eBLE_RESULT r = com_ble_server_notify_ext(h, (uint8_t *)frame, (uint16_t)len, NOTIFY_REC_IDX);
+        T_eBLE_RESULT r = com_ble_server_notify_ext(h, (uint8_t *)frame, (uint16_t)len, idx);
         if (r == eBLE_RESULT_SUCCESS)
             return OZ_OK;
         if (r != eBLE_RESULT_BUFFER_FULL)
@@ -447,10 +463,29 @@ static void ozkie_thread(void *param)
                 break;
             case EV_MTU:
                 oz_ble_set_mtu(&session, m.h.arg);
+                if (relay_owned)
+                    oz_ble_set_mtu(&relay_ble, m.h.arg);
                 break;
             case EV_FRAME:
-                if (connected)
+                if (!connected)
+                    break;
+                if (m.h.arg == CH_RELAY) {
+                    if (!relay_owned && !oz_lock_relay_may_own(L, &link)) {
+                        if (++relay_unauth == 1 || relay_unauth % 100 == 0)
+                            oz_port_log("gatt: relay write from an unauthenticated connection dropped (%lu)",
+                                        (unsigned long)relay_unauth);
+                        break;
+                    }
+                    if (!relay_owned) {
+                        relay_owned = 1;
+                        oz_ble_connect_as(&relay_ble, 1);
+                        oz_ble_set_mtu(&relay_ble, session.mtu);
+                        oz_port_log("gatt: relay owned");
+                    }
+                    (void)oz_ble_rx(&relay_ble, m.data, m.h.len);
+                } else {
                     (void)oz_ble_rx(&session, m.data, m.h.len);
+                }
                 refresh_info(L);        /* a claim changes the state field */
                 break;
             case EV_PAIR_CODE:
@@ -459,6 +494,11 @@ static void ozkie_thread(void *param)
                 refresh_info(L);
                 break;
             case EV_DISCONNECT:
+                if (relay_owned) {
+                    oz_ble_disconnect(&relay_ble);  /* half-done EDHOC goes; contexts stay in L */
+                    relay_owned = 0;
+                    oz_port_log("gatt: relay released (disconnect)");
+                }
                 if (connected) {
                     oz_ble_disconnect(&session);
                     oz_adv_link(&adv, 0);
@@ -490,11 +530,20 @@ static void ozkie_thread(void *param)
         }
         if (connected)
             (void)oz_ble_tick(&session);
+        if (relay_owned)
+            (void)oz_ble_tick(&relay_ble);
+        /* Taken under the rev 6 rule (the owner, no bridge yet): given back as
+         * soon as its owner may no longer hold it (a bridge was enrolled). */
+        if (relay_owned && !oz_lock_relay_may_own(L, &link)) {
+            oz_ble_disconnect(&relay_ble);
+            relay_owned = 0;
+            oz_port_log("gatt: relay released: its owner is not an authenticated bridge");
+        }
         /* App-slot squat timeout (F1-BRIDGE-BOND-1 (B), ozkey-48 rev 7 §2.3): the
          * one connection here IS the app slot. 🟡 com_ble_disconnect(0) — link
          * index 0 for the single peripheral link — is unverified until the kit. */
         if (connected && !kicked &&
-            oz_lock_link_squatting(L, &link, 0, (uint32_t)(now_ms() - connected_at))) {
+            oz_lock_link_squatting(L, &link, relay_owned, (uint32_t)(now_ms() - connected_at))) {
             kicked = 1;
             ++squat_drops;
             oz_port_log("gatt: connection dropped: no authenticated session in %u s (%lu so far)",
@@ -749,6 +798,7 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
     if (oz_ak1037_wdt_safe())
         oz_lock_set_safe(L, oz_ak1037_wdt_resets());   /* F-AK-WDT-2: refusals + the event */
     oz_ble_init(&session, L, &link, notify, NULL);
+    oz_ble_init(&relay_ble, L, &relay_link, notify, (void *)&relay_idx);
     oz_adv_init(&adv, OZ_GATT_ADV_ALWAYS, now_ms());
     oz_keypad_init(&keypad);
     oz_motor_init(&motor, NULL);
