@@ -194,3 +194,20 @@ test('topic over 200 B refused', async () => {
   assert.equal(r.status, 500);
   assert.equal(r.body.code, 'topic_too_long');
 });
+
+test('A-1: malformed / stray uplinks are dropped AND counted by reason; nothing is published', async () => {
+  const before = oz.ozkieCounters();
+  const sentBefore = sent.length;
+  const d = (k) => (oz.ozkieCounters()[k] || 0) - (before[k] || 0);
+  oz.handleOzkieUplink(L, B, Buffer.from([1]));                         // empty (< 2 B)
+  oz.handleOzkieUplink(L, B, Buffer.alloc(1300, 1));                    // over 1,230 B
+  oz.handleOzkieUplink(L, B, Buffer.from([7, 0x40, 0x01, 0, 0]));       // unknown type
+  oz.handleOzkieUplink(L, B, coap(tok(77), 0x44));                      // no exchange waiting
+  oz.handleOzkieUplink(L, B, Buffer.from([0, 0x01]));                   // EDHOC, no lease
+  assert.equal(d('uplink_empty'), 1);
+  assert.equal(d('uplink_too_large'), 1);
+  assert.equal(d('uplink_bad_type'), 1);
+  assert.equal(d('uplink_unmatched'), 1);
+  assert.equal(d('uplink_no_lease'), 1);
+  assert.equal(sent.length, sentBefore, 'a dropped uplink is never answered, retried or forwarded');
+});
