@@ -5,7 +5,7 @@ project name = AnyMicro1037
 device channel = 4
 
 ###COM
-com baud rate = 6000000
+com baud rate = 115200
 com save flag = 0
 
 Product_UPD_Flag = 1
@@ -52,15 +52,16 @@ partition count = 7
 	partition4 = ROMFS, 1, 0, 0, 210
 	partition5 = UDATA, 1, 0, 0, 100
 	partition6 = OZKV, 1, 0, 0, 64
-	partition7 = FPDAT, 1, 0, 0, 564
+	partition7 = FPDAT, 1, 0, 0, 628
 
-download_to_nand count = 6
+download_to_nand count = 7
 download_to_nand1 = 1, ..\..\app_ota\bin\app_ota.bin, 0x0, OTA, 0, 0
 download_to_nand2 = 1, ..\..\app_mcu\bin\ozkie_app.bin, 0x0, PROG, 0, 0
 download_to_nand3 = 1, ..\..\app_mcu\bin\lowpower.bin, 0x0, LP, 0, 0
 download_to_nand4 = 1, ..\..\app_mcu\bin\romfs.bin, 0x0, ROMFS, 0, 0
 download_to_nand5 = 1, ..\..\app_mcu\bin\lfs.bin, 0x0, UDATA, 0, 0
 download_to_nand6 = 1, ..\..\app_mcu\bin\ozkv_blank.bin, 0x0, OZKV, 0, 0
+download_to_nand7 = 1, ..\..\app_mcu\bin\fpdat.bin, 0x0, FPDAT, 0, 0
 
 download_to_spi_img count = 0
 

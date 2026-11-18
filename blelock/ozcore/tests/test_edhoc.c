@@ -252,8 +252,8 @@ static void test_x25519_roundtrip(void)
     expect_int("x25519: I accepts", oz_edhoc_i_msg2(&I, m2, m2l, er, sizeof er, &erl), 0);
     expect_int("x25519: msg3", oz_edhoc_i_msg3(&I, ead3, ead3_len, m3, sizeof m3, &m3l), 0);
     expect_int("x25519: R accepts", oz_edhoc_r_msg3(&R, m3, m3l, er, sizeof er, &erl), 0);
-    printf("x25519 handshake sizes: msg1 %zu, msg2 %zu, msg3 %zu (kccs + %zu-byte EAD_3)\n",
-           m1l, m2l, m3l, ead3_len);
+    printf("x25519 handshake sizes: msg1 %u, msg2 %u, msg3 %u (kccs + %u-byte EAD_3)\n",
+           (unsigned)m1l, (unsigned)m2l, (unsigned)m3l, (unsigned)ead3_len);
 
     expect_int("x25519: R learnt the app key", memcmp(R.peer.pub, app_p.pub, 32), 0);
     expect_int("x25519: EAD_3 delivered", (long long)R.ead_len, (long long)ead3_len);
