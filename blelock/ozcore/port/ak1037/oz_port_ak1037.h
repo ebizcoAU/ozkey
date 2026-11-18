@@ -33,4 +33,9 @@ uint16_t oz_ak1037_battery_mv(void);
  * that ran the self-test, so the lock never runs on a moved clock. */
 void oz_ak1037_clock_advance(uint64_t ms);
 
+/* The motor board's two inputs (MOTOR-GPIO-1): set both LOW as outputs (call
+ * at boot), and drive them: (1,0) / (0,1) turn, (1,1) brake, (0,0) stop. */
+void oz_ak1037_motor_pins_init(void);
+void oz_ak1037_motor_pins(int a, int b);
+
 #endif

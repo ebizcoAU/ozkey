@@ -39,6 +39,10 @@ enum { OZ_MOTOR_IDLE = 0, OZ_MOTOR_DRIVING, OZ_MOTOR_BRAKING, OZ_MOTOR_RESTING }
 #define OZ_MOTOR_TIMEOUT_MS 1500u
 #define OZ_MOTOR_BRAKE_MS   50u
 #define OZ_MOTOR_REST_MS    300u
+/* The hard limit (MOTOR-GPIO-1, PM nexus-46): no move keeps the motor
+ * powered longer than this, whatever the config says; past it the move ends
+ * OZ_MOVE_JAMMED and the motor brakes. The one place this number lives. */
+#define OZ_MOTOR_MAX_DRIVE_MS 1500u
 
 typedef struct {
     uint16_t drive_ms;      /* no sensor: how long one move runs */

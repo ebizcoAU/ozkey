@@ -223,8 +223,33 @@ static void lock_state(void)
     expect_int("unknown result: state kept", L.lock_state, OZ_LOCKSTATE_UNLOCKED);
 }
 
+/* MOTOR-GPIO-1 (PM nexus-46): whatever a config says, no move keeps the motor
+ * powered longer than OZ_MOTOR_MAX_DRIVE_MS: a stuck motor never stays on. */
+static void hard_limit(void)
+{
+    static const oz_motor_cfg LONG_NOSENSE = { 5000, 5000, OZ_MOTOR_BRAKE_MS, OZ_MOTOR_REST_MS, 0 };
+    static const oz_motor_cfg LONG_SENSED  = { 5000, 5000, OZ_MOTOR_BRAKE_MS, OZ_MOTOR_REST_MS, 1 };
+    const oz_motor_cfg *cfgs[2] = { &LONG_NOSENSE, &LONG_SENSED };
+    for (int i = 0; i < 2; i++) {
+        oz_motor m;
+        bolt_sim b = { 50, 1000000, -1, 0, i, 0, 0, 0 };   /* never arrives */
+        log_t lg;
+        memset(&lg, 0, sizeof lg);
+        uint32_t now = 1000;
+        oz_motor_init(&m, cfgs[i]);
+        oz_motor_command(&m, 1, now);
+        run(&m, &b, &now, 6000, &lg);
+        expect_int(i ? "hard limit (sensor): one move" : "hard limit: one move", lg.n, 1);
+        expect_int(i ? "hard limit (sensor): ends JAMMED" : "hard limit: ends JAMMED", lg.result[0], OZ_MOVE_JAMMED);
+        expect_int(i ? "hard limit (sensor): power off by the limit" : "hard limit: power off by the limit",
+                   (long long)b.driven_ms, OZ_MOTOR_MAX_DRIVE_MS);
+        expect_int("…drive only while DRIVING", lg.out_bad, 0);
+    }
+}
+
 int main(void)
 {
+    hard_limit();
     no_sensor();
     sensor();
     busy();

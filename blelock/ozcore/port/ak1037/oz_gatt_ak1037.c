@@ -256,11 +256,15 @@ void oz_gatt_ak1037_actuate(int unlock)
     oz_motor_command(&motor, unlock, now_ms());
 }
 
-/* The motor driver: log-only until OZ-7 gives the driver IC, its pins and a
- * bolt sensor. Nothing is sensed, so every move ends OZ_MOVE_UNCONFIRMED. */
+/* The motor driver (MOTOR-GPIO-1): the kit's motor board on GPIO17/18. There
+ * is no bolt sensor yet, so every move ends OZ_MOVE_UNCONFIRMED; oz_motor caps
+ * every drive at OZ_MOTOR_MAX_DRIVE_MS. Which way is "unlock" on a real lock
+ * body is a wiring question: swap motor_A/B if it turns the wrong way. */
 static void motor_drive(uint8_t out)
 {
     static const char *const name[] = { "off", "to unlock", "to lock", "brake" };
+    static const uint8_t ab[4][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
+    oz_ak1037_motor_pins(ab[out & 3][0], ab[out & 3][1]);
     oz_port_log("motor: %s", name[out & 3]);
 }
 
@@ -488,6 +492,7 @@ int oz_gatt_ak1037_radio_up(void)
     static int up;
     if (up)
         return OZ_OK;
+    oz_ak1037_motor_pins_init();        /* main_ozkie did it at boot; again is harmless */
     if (rt_mq_init(&mq, "ozkie", mq_pool, SLOT_SIZE, sizeof mq_pool, RT_IPC_FLAG_FIFO) != RT_EOK)
         return OZ_E_HW;
     T_BLE_INIT_PARAM init;

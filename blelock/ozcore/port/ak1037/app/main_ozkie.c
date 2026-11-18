@@ -20,6 +20,7 @@
  * include path only, so declared here as the SDK names are below. */
 extern int  oz_ak1037_wdt_boot(void);
 extern void oz_ak1037_wdt_service(void);
+extern void oz_ak1037_motor_pins_init(void);   /* MOTOR-GPIO-1, oz_port_ak1037.h */
 
 extern void hal_set_total_callback(void (*fun)(void));
 extern void msh_process();
@@ -35,6 +36,7 @@ static void ble_freq_intr(void) { ble_freq_adj_mk = 1; }
 static void app_main_thread_entry(void *parameter)
 {
     (void)parameter;
+    oz_ak1037_motor_pins_init();    /* motor board inputs LOW before anything else */
     printf("ozkie: main thread\r\n");
 #if (SUPP_BLE_FREQ_ADJ == 1)
     /* Factory crystal trim, as the SDK app does it. */

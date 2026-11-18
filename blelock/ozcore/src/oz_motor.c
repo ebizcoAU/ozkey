@@ -52,6 +52,8 @@ int oz_motor_step(oz_motor *m, uint32_t now_ms, uint8_t bolt, int stall, int *un
             return finish(m, now_ms, OZ_MOVE_OK, unlock);
         if (stall)
             return finish(m, now_ms, OZ_MOVE_JAMMED, unlock);
+        if (t >= OZ_MOTOR_MAX_DRIVE_MS)     /* the hard limit, whatever the config */
+            return finish(m, now_ms, OZ_MOVE_JAMMED, unlock);
         if (m->cfg.has_sensor && t >= m->cfg.timeout_ms)
             return finish(m, now_ms, OZ_MOVE_JAMMED, unlock);
         if (!m->cfg.has_sensor && t >= m->cfg.drive_ms)
