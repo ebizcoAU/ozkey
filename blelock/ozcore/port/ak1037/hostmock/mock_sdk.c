@@ -11,6 +11,7 @@
 #include "hal_ske.h"
 #include "hal_trng.h"
 #include "hal_saradc.h"
+#include "hal_gpio.h"
 #include "hal_sys.h"
 #include "hal_sfc_norflash.h"
 #include "hal_partition.h"
@@ -469,6 +470,7 @@ uint32_t mock_gatt_len;
 uint16_t mock_mtu_requested;
 uint8_t mock_dev_addr[6] = { 0xb8, 0xca, 0x3a, 0xe6, 0xbe, 0xac };
 int mock_no_dev_addr;
+int mock_ble_up, mock_dev_addr_stays_zero;
 
 int mock_adv_enabled;
 uint8_t mock_adv_type;
@@ -494,6 +496,7 @@ T_eBLE_RESULT com_ble_init(T_BLE_INIT_PARAM *p)
     if (mock_ble_init_fail)
         return eBLE_RESULT_INIT_ERR;
     mock_ble = *p;
+    mock_ble_up = 1;
     return eBLE_RESULT_SUCCESS;
 }
 
@@ -551,7 +554,16 @@ uint8_t com_ble_set_mtu_size(T_pVOID handle, uint16_t mtu)
     return 0;
 }
 
-uint8_t *com_ble_get_dev_addr(void) { return mock_no_dev_addr ? NULL : mock_dev_addr; }
+/* As on the chip (2026-11-18): all zeros until com_ble_init has run, because
+ * the stack derives the address during its own init. mock_dev_addr_stays_zero:
+ * a stack that never sets it. */
+uint8_t *com_ble_get_dev_addr(void)
+{
+    static uint8_t zero[6];
+    if (mock_no_dev_addr)
+        return NULL;
+    return (mock_ble_up && !mock_dev_addr_stays_zero) ? mock_dev_addr : zero;
+}
 
 void mock_ble_event(void *link, T_eBT_MSG msg, int32_t param1)
 {
@@ -635,3 +647,34 @@ void hal_wdt_feed(void) { if (mock_wdt_enabled) mock_wdt_feeds++; }
 void hal_wdt_stop(void) { mock_wdt_enabled = 0; }
 T_eRST_STATUS hal_clock_get_reset_status(void) { return (T_eRST_STATUS)mock_reset_status; }
 int32_t hal_lpc_get_boot_state(void) { return mock_boot_state; }
+
+/* ── GPIO (MOTOR-GPIO-1) ─────────────────────────────────────────────────── */
+int  mock_gpio_level[GPIO_MOCK_N];
+int  mock_gpio_dir[GPIO_MOCK_N] = { [0 ... GPIO_MOCK_N - 1] = -1 };   /* -1: never set */
+int  mock_gpio_pulldown[GPIO_MOCK_N];
+char mock_motor_states[512];            /* "AB" after each change of 17/18, space-separated */
+
+static void motor_state_note(void)
+{
+    char st[4] = { (char)('0' + mock_gpio_level[17]), (char)('0' + mock_gpio_level[18]), ' ', 0 };
+    size_t n = strlen(mock_motor_states);
+    if (n >= 3 && !memcmp(mock_motor_states + n - 3, st, 2))
+        return;
+    if (n + 3 < sizeof mock_motor_states)
+        memcpy(mock_motor_states + n, st, 4);
+}
+
+int32_t hal_gpio_init(T_eGPIO g) { return (g >= 0 && g < GPIO_MOCK_N) ? 0 : -1; }
+int32_t hal_gpio_set_dir(T_eGPIO g, T_eGPIO_DIR d) { mock_gpio_dir[g] = (int)d; return 0; }
+int32_t hal_gpio_set_pull(T_eGPIO g, T_eGPIO_PULL p, uint8_t en)
+{
+    mock_gpio_pulldown[g] = (p == GPIO_PULL_DOWN && en);
+    return 0;
+}
+int32_t hal_gpio_output_value(T_eGPIO g, uint8_t v)
+{
+    mock_gpio_level[g] = v != 0;
+    if ((g == 17 || g == 18) && mock_gpio_dir[g] == GPIO_DIR_OUTPUT)
+        motor_state_note();
+    return 0;
+}

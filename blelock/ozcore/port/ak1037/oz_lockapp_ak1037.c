@@ -16,6 +16,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "rtthread.h"
 #include "com_msh.h"
@@ -64,10 +65,18 @@ int oz_lockapp_ak1037_start(void)
         return OZ_E_ARG;
     }
     /* ozk- + the BLE address, most significant byte first. UNVERIFIED: the
-     * byte order com_ble_get_dev_addr() returns, against what a phone scans. */
+     * byte order com_ble_get_dev_addr() returns, against what a phone scans.
+     * The stack sets the address in its own init, so bring it up first: read
+     * before that, it is all zeros, and every unit was ozk-000000000000
+     * (LOCK-ID-1, first chip run). A zero address is never an ID. */
+    if (oz_gatt_ak1037_radio_up() != OZ_OK) {
+        printf("oz.start: BLE init failed; reboot\r\n");
+        return OZ_E_HW;
+    }
     const uint8_t *a = com_ble_get_dev_addr();
-    if (!a) {
-        printf("oz.start: no BLE address\r\n");
+    static const uint8_t zero[6];
+    if (!a || !memcmp(a, zero, sizeof zero)) {
+        printf("oz.start: no BLE address yet; try again\r\n");
         return OZ_E_HW;
     }
     snprintf(id, sizeof id, "ozk-%02x%02x%02x%02x%02x%02x", a[5], a[4], a[3], a[2], a[1], a[0]);

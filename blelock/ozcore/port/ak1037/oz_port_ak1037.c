@@ -28,6 +28,7 @@
 #include "hal_ske.h"
 #include "hal_trng.h"
 #include "hal_saradc.h"
+#include "hal_gpio.h"
 #include "hal_sys.h"
 #include "hal_sfc_norflash.h"
 #include "hal_partition.h"
@@ -395,6 +396,35 @@ uint16_t oz_ak1037_battery_mv(void)
         return 0;                       /* 0xffff: the SDK's error */
     uint32_t mv = (uint32_t)raw * OZ_BATT_VREF_MV * OZ_BATT_DIV / 4095u;
     return mv > UINT16_MAX ? UINT16_MAX : (uint16_t)mv;
+}
+
+/* ── Motor driver pins (MOTOR-GPIO-1) ───────────────────────────────────── */
+
+/* The kit's motor board (Roy, Anyka, 2026-11-18): A high + B low turns one way,
+ * A low + B high the other, both high brakes, both low stops (lowest current).
+ * No PWM. Pins are ours to choose: J8 GPIO17 / GPIO18 (PM nexus-46). */
+#define OZ_MOTOR_A_GPIO GPIO17
+#define OZ_MOTOR_B_GPIO GPIO18
+
+void oz_ak1037_motor_pins(int a, int b)
+{
+    (void)hal_gpio_output_value(OZ_MOTOR_A_GPIO, (uint8_t)(a != 0));
+    (void)hal_gpio_output_value(OZ_MOTOR_B_GPIO, (uint8_t)(b != 0));
+}
+
+/* Both LOW, as outputs with pull-downs: called first thing at boot, before
+ * anything else can move the motor. The level is set before the direction so
+ * the pin never drives high on the way. */
+void oz_ak1037_motor_pins_init(void)
+{
+    static const T_eGPIO pin[2] = { OZ_MOTOR_A_GPIO, OZ_MOTOR_B_GPIO };
+    for (int i = 0; i < 2; i++) {
+        (void)hal_gpio_init(pin[i]);
+        (void)hal_gpio_set_pull(pin[i], GPIO_PULL_DOWN, 1);
+        (void)hal_gpio_output_value(pin[i], 0);
+        (void)hal_gpio_set_dir(pin[i], GPIO_DIR_OUTPUT);
+        (void)hal_gpio_output_value(pin[i], 0);
+    }
 }
 
 /* ── Log ─────────────────────────────────────────────────────────────────── */
