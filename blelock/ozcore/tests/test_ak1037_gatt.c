@@ -947,11 +947,48 @@ static void autostart(void)
     expect_int("a typed oz.start is harmless", count("already running"), 1);
 }
 
+static const char *batt_name(void)
+{
+    static char n[16];
+    static volatile const char rev[] = "ttab.zo";
+    size_t len = sizeof rev - 1;
+    for (size_t i = 0; i < len; i++)
+        n[i] = rev[len - 1 - i];
+    n[len] = 0;
+    return n;
+}
+
+#ifdef OZ_DEBUG_HOOKS
+/* BATT-SENSE-1: the bench (debug) build has battery sensing OFF: the EVB's
+ * vol_check is not wired, and a floating ADC read as "CRITICAL, 0%", which
+ * refused app LOCK moves. oz.batt prints the raw ADC to measure the divider. */
+
+static void batt_bench(void)
+{
+    capture_start();
+    boot();
+    capture_end();
+    expect_int("boot says sensing is off (bench build)", count("battery: sense OFF"), 1);
+    capture_start();
+    mock_adc_raw = 12;                  /* a floating pin */
+    mock_ms += 10u * 60u * 1000u;
+    passes(3);
+    capture_end();
+    expect_int("no CRITICAL from an unwired pin", count("lock: battery CRITICAL"), 0);
+    capture_start();
+    mock_adc_raw = 2047;
+    expect_int("oz.batt exists", mock_msh_run(batt_name()), 0);
+    capture_end();
+    expect_int("…prints the raw reading", count("oz.batt: raw 2047"), 1);
+}
+#endif
+
 static void no_hooks(void)
 {
     expect_int("no debug hook in the shell", mock_msh_run(hook_name()), -1);
     expect_int("no wipe in the shell", mock_msh_run(wipe_name()), -1);
     expect_int("no led map in the shell", mock_msh_run(led_name()), -1);
+    expect_int("no battery probe in the shell", mock_msh_run(batt_name()), -1);
 }
 
 #ifdef OZ_DEBUG_HOOKS
@@ -1254,6 +1291,14 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "autostart")) {
         autostart();
         return report("ak1037_gatt_autostart");
+    }
+    if (argc > 1 && !strcmp(argv[1], "batt")) {
+#ifdef OZ_DEBUG_HOOKS
+        batt_bench();
+#else
+        expect_int("built with OZ_DEBUG_HOOKS", 0, 1);
+#endif
+        return report("ak1037_gatt_batt");
     }
     if (argc > 1 && !strcmp(argv[1], "led")) {
 #ifdef OZ_DEBUG_HOOKS

@@ -385,7 +385,32 @@ uint64_t oz_port_monotonic_ms(void)
 #define OZ_BATT_VREF_MV 2400u           /* full scale; UNVERIFIED (BGR × 2?) */
 #endif
 
-uint16_t oz_ak1037_battery_mv(void)
+/* BATT-SENSE-1 (PM): sensing may be OFF only on the bench (the debug image,
+ * on an EVB whose vol_check is not wired: a floating ADC read "CRITICAL, 0%"
+ * and refused app LOCK moves). Off = no reading, so the level stays as it is.
+ * A release image never runs blind to a dying pack: link_app_mcu.ps1 fails a
+ * release image that holds the "sense OFF" text. */
+#ifndef OZ_BATT_SENSE
+#ifdef OZ_DEBUG_HOOKS
+#define OZ_BATT_SENSE 0
+#else
+#define OZ_BATT_SENSE 1
+#endif
+#endif
+
+int oz_ak1037_battery_sensing(void) { return OZ_BATT_SENSE; }
+
+/* Said once at start; the text exists only in an image built with sensing off
+ * (the release link check looks for it). */
+void oz_ak1037_battery_note(void)
+{
+#if !OZ_BATT_SENSE
+    oz_port_log("battery: sense OFF (bench build): no readings, nothing refused for the battery");
+#endif
+}
+
+/* The raw 12-bit reading, or -1: for oz.batt (measuring the divider). */
+int oz_ak1037_battery_raw(void)
 {
     static int ready;
     if (!ready) {
@@ -393,8 +418,21 @@ uint16_t oz_ak1037_battery_mv(void)
         ready = 1;
     }
     int raw = hal_saradc_get_data(OZ_BATT_AIN);
-    if (raw < 0 || raw > 4095)
-        return 0;                       /* 0xffff: the SDK's error */
+    return (raw < 0 || raw > 4095) ? -1 : raw;  /* 0xffff: the SDK's error */
+}
+
+uint16_t oz_ak1037_battery_pin_mv(int raw)
+{
+    return raw < 0 ? 0 : (uint16_t)((uint32_t)raw * OZ_BATT_VREF_MV / 4095u);
+}
+
+uint16_t oz_ak1037_battery_mv(void)
+{
+    if (!OZ_BATT_SENSE)
+        return 0;                       /* bench: no reading */
+    int raw = oz_ak1037_battery_raw();
+    if (raw < 0)
+        return 0;
     uint32_t mv = (uint32_t)raw * OZ_BATT_VREF_MV * OZ_BATT_DIV / 4095u;
     return mv > UINT16_MAX ? UINT16_MAX : (uint16_t)mv;
 }
