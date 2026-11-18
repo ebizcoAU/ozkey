@@ -835,6 +835,45 @@ static const char *hook_name(void)
 
 /* Release and every default build: the shell has no such command. */
 /* "oz.wipe", built at run time for the same reason as hook_name(). */
+/* "oz.led", built backwards so this file's release binary never holds it. */
+static const char *led_name(void)
+{
+    static char n[16];
+    static volatile const char rev[] = "del.zo";
+    size_t len = sizeof rev - 1;
+    for (size_t i = 0; i < len; i++)
+        n[i] = rev[len - 1 - i];
+    n[len] = 0;
+    return n;
+}
+
+#ifdef OZ_DEBUG_HOOKS
+/* LED-MAP-1 (bench): one J7 pin at a time, high / low / released, so the
+ * operator can tell which key lights (each pin drives a pair of key LEDs). */
+static void led_map(void)
+{
+    char cmd[32];
+    capture_start();
+    expect_int("led: the command exists", mock_msh_run(led_name()), 0);
+    capture_end();
+    expect_int("…without arguments it explains", count("usage:"), 1);
+    snprintf(cmd, sizeof cmd, "%s 3 h", led_name());
+    (void)mock_msh_run(cmd);
+    expect_int("pin 3 (GPIO26) driven high", mock_gpio_dir[26] == GPIO_DIR_OUTPUT && mock_gpio_level[26] == 1, 1);
+    snprintf(cmd, sizeof cmd, "%s 3 l", led_name());
+    (void)mock_msh_run(cmd);
+    expect_int("…low", mock_gpio_dir[26] == GPIO_DIR_OUTPUT && mock_gpio_level[26] == 0, 1);
+    snprintf(cmd, sizeof cmd, "%s 3 off", led_name());
+    (void)mock_msh_run(cmd);
+    expect_int("…released", mock_gpio_dir[26], GPIO_DIR_INPUT);
+    capture_start();
+    snprintf(cmd, sizeof cmd, "%s 8 h", led_name());
+    (void)mock_msh_run(cmd);
+    capture_end();
+    expect_int("pin 8 refused", count("usage:"), 1);
+}
+#endif
+
 static const char *wipe_name(void)
 {
     static char n[16];
@@ -850,6 +889,7 @@ static void no_hooks(void)
 {
     expect_int("no debug hook in the shell", mock_msh_run(hook_name()), -1);
     expect_int("no wipe in the shell", mock_msh_run(wipe_name()), -1);
+    expect_int("no led map in the shell", mock_msh_run(led_name()), -1);
 }
 
 #ifdef OZ_DEBUG_HOOKS
@@ -980,6 +1020,7 @@ static void beeps(void)
         mock_pass();
     expect_int("a card read: a tone, then the wrong pattern (3 tones)", mock_dac_plays - p0, 4);
     expect_int("every DAC call was one the SDK accepts", mock_dac_bad, 0);
+    expect_int("amplifier callback registered (no 'pa ctrl callback is empty!')", mock_dac_pa_missing, 0);
 }
 
 /* LOCK-IO-1: the bench's three momentary switches, active LOW with pull-ups:
@@ -1020,6 +1061,7 @@ static void door_io(void)
     idle(4000);
     capture_end();
     expect_int("door opened and closed", count("door: opened") == 1 && count("door: closed") == 1, 1);
+    expect_int("…with the lock's ms tick", count("door: opened @") == 1 && count("door: closed @") == 1, 1);
     expect_int("…no relock within 4 s of closing", count("lock: auto-relock"), 0);
     capture_start();
     idle(2500);
@@ -1091,6 +1133,14 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "nohooks")) {
         no_hooks();
         return report("ak1037_gatt_nohooks");
+    }
+    if (argc > 1 && !strcmp(argv[1], "led")) {
+#ifdef OZ_DEBUG_HOOKS
+        led_map();
+#else
+        expect_int("built with OZ_DEBUG_HOOKS", 0, 1);
+#endif
+        return report("ak1037_gatt_led");
     }
     if (argc > 1 && !strcmp(argv[1], "wipe")) {
 #ifdef OZ_DEBUG_HOOKS

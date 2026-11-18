@@ -8,4 +8,6 @@ T_BOOL  hal_dac_deinit(void);
 int32_t hal_dac_open(void);
 int32_t hal_dac_close(void);
 int32_t hal_dac_trans_single(void *buf, uint32_t len);
+/* Not in the SDK header: sample_audio.c declares it extern itself. */
+void    dac_set_pa_ctrl(T_BOOL (*callback)(T_BOOL enable));
 #endif

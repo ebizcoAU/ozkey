@@ -775,7 +775,12 @@ void mock_rfid_card(const uint8_t *uid, int len)
 }
 
 /* ── Audio DAC (BEEP-1) ──────────────────────────────────────────────────── */
-int      mock_dac_on, mock_dac_plays, mock_dac_bad;
+int      mock_dac_on, mock_dac_plays, mock_dac_bad, mock_dac_pa_missing;
+static T_BOOL (*dac_pa)(T_BOOL);
+/* As hal_dac.c: analog open/close call the amplifier callback, or log
+ * "pa ctrl callback is empty!" when none was registered. */
+void dac_set_pa_ctrl(T_BOOL (*cb)(T_BOOL)) { if (cb) dac_pa = cb; else mock_dac_pa_missing++; }
+static void dac_pa_call(T_BOOL on) { if (dac_pa) (void)dac_pa(on); else mock_dac_pa_missing++; }
 uint32_t mock_dac_rate, mock_dac_len;
 
 T_BOOL hal_dac_init(uint32_t rate, uint8_t bits, uint8_t gain)
@@ -783,6 +788,7 @@ T_BOOL hal_dac_init(uint32_t rate, uint8_t bits, uint8_t gain)
     if (mock_dac_on || rate < 8000 || rate > 48000 || bits != 16 || gain < 1 || gain > 6)
         mock_dac_bad++;
     mock_dac_rate = rate;
+    dac_pa_call(1);
     return 1;
 }
 int32_t hal_dac_open(void) { mock_dac_on = 1; return 1; }
@@ -794,5 +800,5 @@ int32_t hal_dac_trans_single(void *buf, uint32_t len)
     mock_dac_len = len;
     return 1;
 }
-int32_t hal_dac_close(void) { mock_dac_on = 0; return 1; }
+int32_t hal_dac_close(void) { mock_dac_on = 0; dac_pa_call(0); return 1; }
 T_BOOL  hal_dac_deinit(void) { return 1; }
