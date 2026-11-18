@@ -14,6 +14,7 @@
 #include "hal_gpio.h"
 #include "dev_tk.h"
 #include "hal_rfid.h"
+#include "hal_dac.h"
 #include "hal_touch.h"
 #include "hal_sys.h"
 #include "hal_sfc_norflash.h"
@@ -767,3 +768,26 @@ void mock_rfid_card(const uint8_t *uid, int len)
     if (uid)
         memcpy(rfid_uid, uid, (size_t)len);
 }
+
+/* ── Audio DAC (BEEP-1) ──────────────────────────────────────────────────── */
+int      mock_dac_on, mock_dac_plays, mock_dac_bad;
+uint32_t mock_dac_rate, mock_dac_len;
+
+T_BOOL hal_dac_init(uint32_t rate, uint8_t bits, uint8_t gain)
+{
+    if (mock_dac_on || rate < 8000 || rate > 48000 || bits != 16 || gain < 1 || gain > 6)
+        mock_dac_bad++;
+    mock_dac_rate = rate;
+    return 1;
+}
+int32_t hal_dac_open(void) { mock_dac_on = 1; return 1; }
+int32_t hal_dac_trans_single(void *buf, uint32_t len)
+{
+    if (!mock_dac_on || ((uintptr_t)buf & 3) || len == 0)
+        mock_dac_bad++;                 /* as the SDK: open first, 4-byte aligned */
+    mock_dac_plays++;
+    mock_dac_len = len;
+    return 1;
+}
+int32_t hal_dac_close(void) { mock_dac_on = 0; return 1; }
+T_BOOL  hal_dac_deinit(void) { return 1; }

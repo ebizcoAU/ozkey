@@ -101,7 +101,7 @@ int mock_msh_run(const char *line);
 
 /* GPIO (MOTOR-GPIO-1): levels, direction (-1 never set), pull-downs, and the
  * motor pins' state "AB" (A = GPIO17, B = GPIO18) after each write that changed it. */
-extern int  mock_gpio_level[64], mock_gpio_dir[64], mock_gpio_pulldown[64];
+extern int  mock_gpio_level[0x110], mock_gpio_dir[0x110], mock_gpio_pulldown[0x110];   /* GPIO_MOCK_N */
 extern char mock_motor_states[512];
 
 extern int mock_notify_bad_idx;        /* notifies refused: idx not a notify characteristic */
@@ -118,5 +118,10 @@ void mock_tk_press(int key);
 extern int      mock_rfid_inited, mock_rfid_reads;
 extern uint32_t mock_rfid_cost_ms;
 void mock_rfid_card(const uint8_t *uid, int len);
+
+/* Audio DAC (BEEP-1): open/close state, tones sent, last length and rate,
+ * and calls the SDK would refuse (not open, unaligned, bad parameters). */
+extern int      mock_dac_on, mock_dac_plays, mock_dac_bad;
+extern uint32_t mock_dac_rate, mock_dac_len;
 
 #endif

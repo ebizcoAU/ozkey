@@ -41,6 +41,13 @@ void oz_ak1037_motor_pins(int a, int b);
 /* The keypad backlight (TOUCH-LED-1, BACKLIGHT-2): pins released (all dark),
  * or driven high / low (each lights one LED of every pair). */
 enum { OZ_BL_OFF = 0, OZ_BL_HIGH, OZ_BL_LOW };
+
+/* The key beep (BEEP-1): amplifier on once; a beep starts (1, or 0 if one is
+ * playing or the DAC refused) and the caller stops it after OZ_BEEP_MS. */
+#define OZ_BEEP_MS 80u
+void oz_ak1037_speaker_init(void);
+int  oz_ak1037_beep_start(void);
+void oz_ak1037_beep_stop(void);
 void oz_ak1037_backlight_init(void);
 void oz_ak1037_backlight(int state);
 

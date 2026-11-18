@@ -3,7 +3,8 @@
 #define HAL_GPIO_H_MOCK
 #include <stdint.h>
 typedef enum { GPIO17 = 17, GPIO18 = 18, GPIO22 = 22, GPIO24 = 24, GPIO25 = 25, GPIO26 = 26, GPIO27 = 27,
-               GPIO28 = 28, GPIO29 = 29, GPIO30 = 30, GPIO34 = 34, GPIO_MOCK_N = 64 } T_eGPIO;
+               GPIO28 = 28, GPIO29 = 29, GPIO30 = 30, GPIO34 = 34, GPIOAO5 = 0x105,
+               GPIO_MOCK_N = 0x110 } T_eGPIO;
 typedef enum { GPIO_DIR_OUTPUT, GPIO_DIR_INPUT, GPIO_DIR_HEIGHT_Z } T_eGPIO_DIR;
 typedef enum { GPIO_PULL_UP = 0, GPIO_PULL_DOWN } T_eGPIO_PULL;
 int32_t hal_gpio_init(T_eGPIO gpio);
