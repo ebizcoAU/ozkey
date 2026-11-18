@@ -21,6 +21,11 @@
 extern int  oz_ak1037_wdt_boot(void);
 extern void oz_ak1037_wdt_service(void);
 extern void oz_ak1037_motor_pins_init(void);   /* MOTOR-GPIO-1, oz_port_ak1037.h */
+extern unsigned int get_ms_tick_func(void);
+
+/* AUTOSTART-1: the lock image's oz_lockapp_ak1037.c starts the lock from
+ * here; the self-test image has nothing to start. */
+__attribute__((weak)) void oz_ak1037_app_poll(uint32_t now_ms) { (void)now_ms; }
 
 extern void hal_set_total_callback(void (*fun)(void));
 extern void msh_process();
@@ -65,6 +70,7 @@ static void app_main_thread_entry(void *parameter)
         }
 #endif
         oz_ak1037_wdt_service();    /* feeds only while every task checks in */
+        oz_ak1037_app_poll((uint32_t)get_ms_tick_func());
         osDelay(1);
     }
 }

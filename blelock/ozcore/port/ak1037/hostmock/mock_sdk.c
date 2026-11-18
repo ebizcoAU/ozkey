@@ -802,3 +802,7 @@ int32_t hal_dac_trans_single(void *buf, uint32_t len)
 }
 int32_t hal_dac_close(void) { mock_dac_on = 0; dac_pa_call(0); return 1; }
 T_BOOL  hal_dac_deinit(void) { return 1; }
+
+/* ── Chip reset (AUTOSTART-1: the bench wipe while running) ──────────────── */
+int mock_chip_resets;
+void hal_clock_chip_reset(void) { mock_chip_resets++; }
