@@ -1,0 +1,17 @@
+HEAD 6d2af01064101b4ccdb2d6be3ecfba9a5865eb81 diff e3b0c44298fc1c14
+quiet1 ozserver-core # pass 28 # fail 0  start 6.03 peak 6.03
+quiet1 ozpms/server # pass 33 # fail 0  start 5.86 peak 5.86
+quiet1 ozlock/server # pass 108 # fail 0  start 4.65 peak 4.86
+quiet2 ozserver-core # pass 28 # fail 0  start 4.19 peak 4.19
+quiet2 ozpms/server # pass 33 # fail 0  start 4.02 peak 6.04
+quiet2 ozlock/server # pass 108 # fail 0  start 5.04 peak 5.04
+quiet3 ozserver-core # pass 28 # fail 0  start 3.87 peak 3.87
+quiet3 ozpms/server # pass 33 # fail 0  start 4.20 peak 4.83
+quiet3 ozlock/server # pass 108 # fail 0  start 4.71 peak 6.43
+conc1 ozlock # pass 108 # fail 0  start 3.56 peak 4.15 | ozpms # pass 33 # fail 0  start 3.56 peak 3.81
+conc2 ozlock # pass 108 # fail 0  start 3.58 peak 12.11 | ozpms # pass 33 # fail 0  start 3.58 peak 4.18
+conc3 ozlock # pass 108 # fail 0  start 3.97 peak 5.50 | ozpms # pass 33 # fail 0  start 3.97 peak 3.97
+HEAD 6d2af01064101b4ccdb2d6be3ecfba9a5865eb81 diff e3b0c44298fc1c14
+ozlodge1 rc=0 # pass 6 # fail 0 
+ozlodge2 rc=0 # pass 6 # fail 0 
+ozlodge3 rc=0 # pass 6 # fail 0 
