@@ -429,28 +429,31 @@ void oz_ak1037_motor_pins_init(void)
 
 /* ── Keypad backlight (TOUCH-LED-1) ─────────────────────────────────────── */
 
-/* The EVB's 15 key LEDs through jumper header J7: GPIO22 (LED15) and GPIO24-29,
- * GPIO34 (LED pairs 13/14 … 1/2). Each LED sits between VDD33_IO and the pin
- * through 470 R (schematic page 5), so LOW lights it. UNVERIFIED on hardware:
- * if they come out inverted, flip OZ_BL_ON_LEVEL. J7's jumpers must be fitted. */
-#define OZ_BL_ON_LEVEL 0
+/* The EVB's 15 key LEDs through jumper header J7: GPIO22 and GPIO24-29,
+ * GPIO34. BACKLIGHT-2 (chip run 2026-11-19): each pin drives a PAIR of LEDs,
+ * one lit by HIGH and one by LOW: all pins high lit 2 4 7 9 * and the bottom
+ * corners. So "off" is released (input: neither LED of a pair), and the lock
+ * thread toggles high/low every 10 ms during a flash so both halves light. */
 static const T_eGPIO bl_pin[8] = { GPIO22, GPIO24, GPIO25, GPIO26, GPIO27, GPIO28, GPIO29, GPIO34 };
 
-void oz_ak1037_backlight(int on)
+void oz_ak1037_backlight(int state)
 {
-    uint8_t v = (uint8_t)(on ? OZ_BL_ON_LEVEL : !OZ_BL_ON_LEVEL);
-    for (int i = 0; i < 8; i++)
-        (void)hal_gpio_output_value(bl_pin[i], v);
+    for (int i = 0; i < 8; i++) {
+        if (state == OZ_BL_OFF) {
+            (void)hal_gpio_set_dir(bl_pin[i], GPIO_DIR_INPUT);
+        } else {
+            (void)hal_gpio_output_value(bl_pin[i], (uint8_t)(state == OZ_BL_HIGH));
+            (void)hal_gpio_set_dir(bl_pin[i], GPIO_DIR_OUTPUT);
+            (void)hal_gpio_output_value(bl_pin[i], (uint8_t)(state == OZ_BL_HIGH));
+        }
+    }
 }
 
 void oz_ak1037_backlight_init(void)
 {
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 8; i++)
         (void)hal_gpio_init(bl_pin[i]);
-        (void)hal_gpio_output_value(bl_pin[i], (uint8_t)!OZ_BL_ON_LEVEL);
-        (void)hal_gpio_set_dir(bl_pin[i], GPIO_DIR_OUTPUT);
-        (void)hal_gpio_output_value(bl_pin[i], (uint8_t)!OZ_BL_ON_LEVEL);
-    }
+    oz_ak1037_backlight(OZ_BL_OFF);
 }
 
 /* ── Log ─────────────────────────────────────────────────────────────────── */
