@@ -104,7 +104,8 @@ class FakeSerial:
                 hit = [p for t, p in self.g.side if t == 0x81]
                 if hit:
                     self.g.side[:] = [x for x in self.g.side if x[0] != 0x81]
-                    self.out += b'[OZ] keypad: ' + (b'open' if hit[0] == b'\x01' else b'wrong') + b'\n'
+                    # The AK1037 lock image logs "[oz] keypad: …" (the C6 sketch "[OZ]"); BENCH-1.
+                    self.out += b'[oz] keypad: ' + (b'open' if hit[0] == b'\x01' else b'wrong') + b'\n'
                     return
                 time.sleep(0.02)
     def read(self, n):

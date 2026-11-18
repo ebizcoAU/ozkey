@@ -166,7 +166,8 @@ class BleLockLink:
         elif typ == 0x80:
             self._shell(f'oz.code {int.from_bytes(p, "big")}')
         elif typ == 0x81:
-            m = self._shell(f'oz.key {p.decode()}#', r'\[OZ\] keypad: (open|wrong|locked out)')
+            # "[OZ]" on the C6 sketch, "[oz]" on the AK1037 lock image (BENCH-1).
+            m = self._shell(f'oz.key {p.decode()}#', r'\[(?:OZ|oz)\] keypad: (open|wrong|locked out)')
             self.q.put((0x81, bytes([1 if m and m.group(1) == 'open' else 0])))
         elif typ == 0x82:
             self._read_info(); self.q.put((0x82, self._last_info))

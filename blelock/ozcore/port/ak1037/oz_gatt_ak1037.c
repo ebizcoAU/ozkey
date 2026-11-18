@@ -267,7 +267,9 @@ static void motor_drive(uint8_t out)
     static const char *const name[] = { "off", "to unlock", "to lock", "brake" };
     static const uint8_t ab[4][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
     oz_ak1037_motor_pins(ab[out & 3][0], ab[out & 3][1]);
-    oz_port_log("motor: %s", name[out & 3]);
+    /* The lock's own ms tick, so the bench can measure a move from the
+     * serial log (BENCH-1: a relayed log arrives in bursts). */
+    oz_port_log("motor: %s @%lu ms", name[out & 3], (unsigned long)now_ms());
 }
 
 /* The battery (P5-F): a reading at rest every OZ_GATT_BATT_MS, and the lowest
