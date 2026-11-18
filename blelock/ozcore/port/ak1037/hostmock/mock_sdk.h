@@ -106,4 +106,11 @@ extern char mock_motor_states[512];
 
 extern int mock_notify_bad_idx;        /* notifies refused: idx not a notify characteristic */
 
+/* On-chip touch keys (TOUCH-KEYPAD-1): what the port registered, and a pad
+ * press as the SDK reports it (press, then release, with the pad number). */
+extern int      mock_tk_registered;
+extern uint32_t mock_tk_keymark;
+extern int16_t  mock_tk_sen0, mock_tk_sen_wk;
+void mock_tk_press(int key);
+
 #endif

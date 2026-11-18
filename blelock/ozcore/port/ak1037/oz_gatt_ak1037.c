@@ -20,6 +20,8 @@
 #include "rtthread.h"
 #include "rthw.h"
 #include "com_ble.h"
+#include "dev_tk.h"
+#include "hal_touch.h"
 
 #include "oz_port.h"
 #include "oz_adv.h"
@@ -50,7 +52,8 @@ static const T_BT_ATTREC gatt_table[] = {
 
 /* ── BLE context → OZKIE thread ──────────────────────────────────────────── */
 
-enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, EV_KEY, EV_CARD };
+enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, EV_KEY, EV_CARD, EV_PAD };
+static char pad_char(int pad);          /* touch pad number -> key (TOUCH-KEYPAD-1) */
 
 #define FRAME_MAX (BLE_MTU_MAX_SIZE - 3)
 typedef struct {
@@ -426,6 +429,13 @@ static void ozkie_thread(void *param)
             case EV_KEY:
                 key_in(L, (char)m.h.arg, connected);
                 break;
+            case EV_PAD: {
+                char c = pad_char((int)m.h.arg);
+                oz_port_log("touch: pad %d -> %c", (int)m.h.arg, c ? c : '-');
+                if (c)
+                    key_in(L, c, connected);
+                break;
+            }
             case EV_CARD:
                 card_in(L, m.data, m.h.len);
                 break;
@@ -471,6 +481,47 @@ int oz_gatt_ak1037_pair_code(uint32_t code)
 {
     post(EV_PAIR_CODE, code);
     return OZ_OK;
+}
+
+/* ── On-chip touch pads (TOUCH-KEYPAD-1) ────────────────────────────────── */
+
+/* The EVB's 15 pads, as the SDK sample sets them for EVB_MBD_AK1037D V103
+ * (board_mcu_anyka.h: TOUCH_SEN 60, TOUCH_WK_SEN 50, key mark 0x7fff). */
+#define OZ_TK_KEYMARK 0x7fffu
+#define OZ_TK_SEN     60
+#define OZ_TK_WK_SEN  50
+
+/* Pad number -> key, by the EVB's layout: rows 1 2 3 / 4 5 6 / 7 8 9 / * 0 #,
+ * then mute, bell, lock (not keys). UNVERIFIED order: every press logs its pad
+ * number ("touch: pad N -> c") so the first chip run confirms or corrects it. */
+static char pad_char(int pad)
+{
+    static const char map[] = "\0" "123456789*0#";
+    return (pad > 0 && pad < (int)(sizeof map - 1)) ? map[pad] : 0;
+}
+
+/* From the SDK's touch scan (may be interrupt context): post only. */
+static void on_pad(int fun, int pad)
+{
+    if (fun == TOUCH_KEY_PRESS)
+        post(EV_PAD, (uint32_t)pad);
+}
+
+static void touch_start(void)
+{
+    static tk_dev_opt_t tk;
+    tk_dev_param_t p;
+    memset(&p, 0, sizeof p);
+    for (int i = 0; i < 15; i++)
+        p.sen[i] = OZ_TK_SEN;
+    p.sen_wk = OZ_TK_WK_SEN;
+    p.callback = on_pad;
+    if (dev_tk_register_inner(&tk) == AK_FALSE || !tk.init) {
+        oz_port_log("touch: driver registration failed; keypad via the shell only");
+        return;
+    }
+    (void)tk.init(&p, OZ_TK_KEYMARK);
+    oz_port_log("touch: 15 pads on");
 }
 
 int oz_gatt_ak1037_key(char key)
@@ -529,6 +580,7 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
     oz_keypad_init(&keypad);
     oz_motor_init(&motor, NULL);
     oz_card_init(&card);
+    touch_start();
     if (rt_thread_init(&thread, "ozkie", ozkie_thread, L, thread_stack, sizeof thread_stack,
                        thread_priority, 10) != RT_EOK)
         return OZ_E_HW;

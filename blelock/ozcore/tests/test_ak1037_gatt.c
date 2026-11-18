@@ -249,6 +249,11 @@ static void boot(void)
     expect_int("motor pins are outputs", mock_gpio_dir[17] == 0 && mock_gpio_dir[18] == 0, 1);
     expect_int("motor pins low", mock_gpio_level[17] == 0 && mock_gpio_level[18] == 0, 1);
     expect_int("motor pins pulled down", mock_gpio_pulldown[17] && mock_gpio_pulldown[18], 1);
+    /* TOUCH-KEYPAD-1: the EVB's 15 on-chip touch pads, as the SDK sample sets
+     * them for EVB V103 (keymark 0x7fff, sensitivity 60, wake 50). */
+    expect_int("touch pads registered once", mock_tk_registered, 1);
+    expect_int("all 15 pads enabled", (long long)mock_tk_keymark, 0x7fff);
+    expect_int("pad sensitivity as the SDK's EVB V103", mock_tk_sen0 == 60 && mock_tk_sen_wk == 50, 1);
     expect("service UUID", mock_gatt_table[0].p_data, 16, "010000000000" "4b434f4c" "01" "00324b5a4f");
     expect("ozkie UUID", mock_gatt_table[3].p_data, 16, "010000000000" "4b434f4c" "03" "00324b5a4f");
     mock_wait_parked();
@@ -374,6 +379,25 @@ static void keys(const char *k)
     mock_msh_run(cmd);
     for (size_t i = 0; i < strlen(k); i++)
         mock_pass();
+}
+
+static void touch_pads(void)
+{
+    /* Pads to keys: 1-9 -> '1'-'9', 10 '*', 11 '0', 12 '#' (EVB rows 1 2 3 /
+     * 4 5 6 / 7 8 9 / * 0 #); every press logs its pad number, so the chip run
+     * confirms the order. "123456#" is one keypad entry (wrong on a fresh lock). */
+    {
+        static const int pads[] = { 1, 2, 3, 4, 5, 6, 12 };
+        capture_start();
+        for (size_t i = 0; i < sizeof pads / sizeof pads[0]; i++) {
+            mock_tk_press(pads[i]);
+            mock_pass();
+        }
+        capture_end();
+        expect_int("each pad press logged with its number", count("touch: pad "), 7);
+        expect_int("pad 12 is '#'", count("touch: pad 12 -> #"), 1);
+        expect_int("the pads reached the keypad (an entry, checked: wrong)", count("keypad: wrong"), 1);
+    }
 }
 
 static void keypad_lockout(void)
@@ -903,6 +927,7 @@ int main(int argc, char **argv)
         return report("ak1037_gatt_safe");
     }
     boot();
+    touch_pads();
     claim();
     keypad_lockout();
     cards_at_reader();

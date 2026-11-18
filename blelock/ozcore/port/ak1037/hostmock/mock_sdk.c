@@ -12,6 +12,8 @@
 #include "hal_trng.h"
 #include "hal_saradc.h"
 #include "hal_gpio.h"
+#include "dev_tk.h"
+#include "hal_touch.h"
 #include "hal_sys.h"
 #include "hal_sfc_norflash.h"
 #include "hal_partition.h"
@@ -694,4 +696,35 @@ int32_t hal_gpio_output_value(T_eGPIO g, uint8_t v)
     if ((g == 17 || g == 18) && mock_gpio_dir[g] == GPIO_DIR_OUTPUT)
         motor_state_note();
     return 0;
+}
+
+/* ── On-chip touch keys (TOUCH-KEYPAD-1) ─────────────────────────────────── */
+int      mock_tk_registered;
+uint32_t mock_tk_keymark;
+int16_t  mock_tk_sen0, mock_tk_sen_wk;
+static void (*tk_cb)(int fun, int key);
+
+static int32_t mock_tk_init(tk_dev_param_t *p, uint32_t keymark)
+{
+    mock_tk_keymark = keymark;
+    mock_tk_sen0 = p->sen[0];
+    mock_tk_sen_wk = p->sen_wk;
+    tk_cb = p->callback;
+    return 0;
+}
+
+int dev_tk_register_inner(tk_dev_opt_t *opt)
+{
+    memset(opt, 0, sizeof *opt);
+    opt->init = mock_tk_init;
+    mock_tk_registered++;
+    return AK_TRUE;
+}
+
+void mock_tk_press(int key)
+{
+    if (tk_cb) {
+        tk_cb(TOUCH_KEY_PRESS, key);
+        tk_cb(TOUCH_KEY_RELEASE, key);
+    }
 }
