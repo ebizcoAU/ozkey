@@ -8,6 +8,25 @@
 
 /* ── the lock and its hardware hooks ────────────────────────────────────── */
 
+/* A lockout's time left, read right after the miss that set it (NANO-PRINTF-1
+ * follow-up). On the host the clock only moves when the test moves it, so it
+ * must be within 1 s of full. On the chip real time passes too: the miss writes
+ * the limit record to SPI flash. Up to 5 s is allowed there, and any value
+ * outside the host's 1 s window is printed so the real cost is on record. */
+static void expect_left(const char *name, uint64_t left, uint64_t full)
+{
+#ifdef OZ_SELFTEST_TARGET
+    const uint64_t slack = 5000;
+#else
+    const uint64_t slack = 1000;
+#endif
+    expect_int(name, left > full - slack && left <= full, 1);
+    if (!(left > full - 1000 && left <= full)) {
+        char a[21], b[21];
+        printf("  %s: %s ms left of %s\n", name, oz_i64(a, (long long)left), oz_i64(b, (long long)full));
+    }
+}
+
 static oz_lock L;
 static int unlocks, locks, prompt_on;
 static void hw_actuate(void *app, int unlock) { (void)app; if (unlock) unlocks++; else locks++; }
@@ -561,15 +580,14 @@ static void keypad_limit(void)
     expect_int("no lockout after 4 misses", oz_lock_keypad_lockout_ms(&L) == 0, 1);
     expect_int("5th miss", oz_lock_keypad_pin(&L, "0001"), OZ_PIN_WRONG);
     uint64_t left = oz_lock_keypad_lockout_ms(&L);
-    expect_int("5 misses: 60 s lockout", left > 59000 && left <= 60000, 1);
-    if (!(left > 59000 && left <= 60000)) { char d[21]; printf("  lockout left %s ms\n", oz_i64(d, (long long)left)); }
+    expect_left("5 misses: 60 s lockout", left, 60000);
     expect_int("locked out: the right PIN is not checked", oz_lock_keypad_pin(&L, "482613"), OZ_PIN_LOCKED_OUT);
     expect_int("…and the door stayed shut", unlocks - before, 3);
 
     /* A reboot (battery pulled) restores the lockout from kv. */
     boot_lock();
     left = oz_lock_keypad_lockout_ms(&L);
-    expect_int("lockout survives a reboot", left > 59000 && left <= 60000, 1);
+    expect_left("lockout survives a reboot", left, 60000);
     expect_int("still not checked after the reboot", oz_lock_keypad_pin(&L, "482613"), OZ_PIN_LOCKED_OUT);
 
     /* An owner unlock from the app clears it. */
@@ -584,7 +602,7 @@ static void keypad_limit(void)
     oz_port_kv_set("pl", (const uint8_t *)"\x07", 1);
     boot_lock();
     left = oz_lock_keypad_lockout_ms(&L);
-    expect_int("bad record: locked out 30 min", left > 1799000 && left <= 1800000, 1);
+    expect_left("bad record: locked out 30 min", left, 1800000);
     expect_int("bad record: nothing checked", oz_lock_keypad_pin(&L, "482613"), OZ_PIN_LOCKED_OUT);
     oz_link_open(&ble, 0);
     handshake(&owner, &ble, NULL, 0, NULL);
@@ -634,8 +652,7 @@ static void cards(void)
     uint32_t ev0 = L.events.next_seq;
     expect_int("5th miss: too long", oz_lock_card(&L, b, OZ_LOCK_CRED_SECRET + 1), OZ_CARD_WRONG);
     uint64_t left = oz_lock_card_lockout_ms(&L);
-    expect_int("5 misses: 60 s lockout", left > 59000 && left <= 60000, 1);
-    if (!(left > 59000 && left <= 60000)) { char d[21]; printf("  lockout left %s ms\n", oz_i64(d, (long long)left)); }
+    expect_left("5 misses: 60 s lockout", left, 60000);
     expect_int("…raised a card lockout event", L.events.next_seq - ev0, 1);
     oz_event ev;
     uint32_t cur = ev0;
@@ -649,7 +666,7 @@ static void cards(void)
     /* A reboot keeps it; an owner unlock clears it. */
     boot_lock();
     left = oz_lock_card_lockout_ms(&L);
-    expect_int("lockout survives a reboot", left > 59000 && left <= 60000, 1);
+    expect_left("lockout survives a reboot", left, 60000);
     oz_link_open(&ble, 0);
     handshake(&owner, &ble, NULL, 0, NULL);
     expect_int("owner unlocks from the app", call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0),
@@ -663,7 +680,7 @@ static void cards(void)
     oz_host_advance_ms(oz_lock_card_lockout_ms(&L) + 1);
     (void)oz_lock_card(&L, OTHER, sizeof OTHER);
     left = oz_lock_card_lockout_ms(&L);
-    expect_int("next miss: 120 s", left > 119000 && left <= 120000, 1);
+    expect_left("next miss: 120 s", left, 120000);
     oz_host_advance_ms(left + 1);
     expect_int("a right card resets it", oz_lock_card(&L, UID, sizeof UID), OZ_CARD_OPEN);
     expect_int("…to 5 free misses", L.card_limit.level == 0 && L.card_limit.misses == 0, 1);
@@ -672,7 +689,7 @@ static void cards(void)
     oz_port_kv_set("rl", (const uint8_t *)"\x07", 1);
     boot_lock();
     left = oz_lock_card_lockout_ms(&L);
-    expect_int("bad card record: 30 min", left > 1799000 && left <= 1800000, 1);
+    expect_left("bad card record: 30 min", left, 1800000);
     oz_link_open(&ble, 0);
     handshake(&owner, &ble, NULL, 0, NULL);
     call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0);
