@@ -99,4 +99,9 @@ extern int mock_boot_state;             /* hal_lpc_get_boot_state(), 0 = cold bo
 /* Run "cmd arg ..." as MSH would. Returns -1 if no such command. */
 int mock_msh_run(const char *line);
 
+/* GPIO (MOTOR-GPIO-1): levels, direction (-1 never set), pull-downs, and the
+ * motor pins' state "AB" (A = GPIO17, B = GPIO18) after each write that changed it. */
+extern int  mock_gpio_level[64], mock_gpio_dir[64], mock_gpio_pulldown[64];
+extern char mock_motor_states[512];
+
 #endif

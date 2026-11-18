@@ -244,6 +244,11 @@ static void boot(void)
     expect_int("stack's own advertising off", mock_ble.adv_def_on, 0);
     expect_int("callbacks set", mock_ble.recv_cb && mock_ble.read_cb && mock_ble.evt_handle_cb, 1);
     expect_int("GATT table rows", mock_gatt_len, 6);
+    /* MOTOR-GPIO-1: motor_A = GPIO17, motor_B = GPIO18, driven LOW (stop,
+     * lowest current) with pull-downs before anything can move. */
+    expect_int("motor pins are outputs", mock_gpio_dir[17] == 0 && mock_gpio_dir[18] == 0, 1);
+    expect_int("motor pins low", mock_gpio_level[17] == 0 && mock_gpio_level[18] == 0, 1);
+    expect_int("motor pins pulled down", mock_gpio_pulldown[17] && mock_gpio_pulldown[18], 1);
     expect("service UUID", mock_gatt_table[0].p_data, 16, "010000000000" "4b434f4c" "01" "00324b5a4f");
     expect("ozkie UUID", mock_gatt_table[3].p_data, 16, "010000000000" "4b434f4c" "03" "00324b5a4f");
     mock_wait_parked();
@@ -504,6 +509,7 @@ static void motor_moves(void)
     int result;
 
     passes(200);                        /* earlier moves finish */
+    mock_motor_states[0] = 0;
     capture_start();
     size_t n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
     size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
@@ -520,6 +526,14 @@ static void motor_moves(void)
     expect_int("done after the drive time", count("motor: unlock unconfirmed"), 1);
     expect_int("then brake", count("motor: brake"), 1);
     expect_int("drive ran ~400 ms", (long long)(mock_ms - t0) >= OZ_MOTOR_DRIVE_MS - 300, 1);
+    /* Roy (Anyka): A high B low turns it, both high brake, both low stop. */
+    const char *s1 = strstr(mock_motor_states, "10 ");
+    const char *s2 = s1 ? strstr(s1, "11 ") : NULL;
+    const char *s3 = s2 ? strstr(s2, "00 ") : NULL;
+    expect_int("pins: unlock drive (A=1 B=0), then brake (1 1), then stop (0 0)", s3 != NULL, 1);
+    const char *rev = strstr(mock_motor_states, "01 ");
+    expect_int("pins: never the lock direction during an unlock", s2 && (!rev || rev > s2), 1);
+    expect_int("pins: stopped after the move", mock_gpio_level[17] == 0 && mock_gpio_level[18] == 0, 1);
 
     /* Lock during the rest, then unlock: the latest wins, the lock never runs. */
     capture_start();
