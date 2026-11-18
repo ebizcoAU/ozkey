@@ -684,6 +684,8 @@ int32_t hal_lpc_get_boot_state(void) { return mock_boot_state; }
 int  mock_gpio_level[GPIO_MOCK_N];
 int  mock_gpio_dir[GPIO_MOCK_N] = { [0 ... GPIO_MOCK_N - 1] = -1 };   /* -1: never set */
 int  mock_gpio_pulldown[GPIO_MOCK_N];
+int  mock_gpio_pullup[GPIO_MOCK_N];
+int  mock_gpio_in[GPIO_MOCK_N] = { [0 ... GPIO_MOCK_N - 1] = 1 };   /* pin level read: pulled up */
 char mock_motor_states[512];            /* "AB" after each change of 17/18, space-separated */
 
 static void motor_state_note(void)
@@ -701,6 +703,7 @@ int32_t hal_gpio_set_dir(T_eGPIO g, T_eGPIO_DIR d) { mock_gpio_dir[g] = (int)d; 
 int32_t hal_gpio_set_pull(T_eGPIO g, T_eGPIO_PULL p, uint8_t en)
 {
     mock_gpio_pulldown[g] = (p == GPIO_PULL_DOWN && en);
+    mock_gpio_pullup[g] = (p == GPIO_PULL_UP && en);
     return 0;
 }
 int32_t hal_gpio_output_value(T_eGPIO g, uint8_t v)
@@ -710,6 +713,8 @@ int32_t hal_gpio_output_value(T_eGPIO g, uint8_t v)
         motor_state_note();
     return 0;
 }
+
+int32_t hal_gpio_input_value(T_eGPIO g) { return mock_gpio_in[g]; }
 
 /* ── On-chip touch keys (TOUCH-KEYPAD-1) ─────────────────────────────────── */
 int      mock_tk_registered;

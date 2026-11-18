@@ -502,6 +502,29 @@ void oz_ak1037_beep_stop(void)
     beep_open = 0;
 }
 
+/* ── Door switches (LOCK-IO-1) ──────────────────────────────────────────── */
+
+/* The bench's three momentary switches on J8, each to GND with a 10 k pull-up
+ * to 3.3 V (and the pin's own pull-up): pressed = LOW. Pins free in the SDK's
+ * EVB V103 configuration: GPIO30 tamper, GPIO31 door, AO_GPIO9 exit (an
+ * always-on pin, so it can wake the chip later). */
+static const T_eGPIO sw_pin[OZ_DIO_SW_N] = { GPIO30, GPIO31, GPIOAO9 };
+
+void oz_ak1037_switches_init(void)
+{
+    for (int i = 0; i < OZ_DIO_SW_N; i++) {
+        (void)hal_gpio_init(sw_pin[i]);
+        (void)hal_gpio_set_dir(sw_pin[i], GPIO_DIR_INPUT);
+        (void)hal_gpio_set_pull(sw_pin[i], GPIO_PULL_UP, 1);
+    }
+}
+
+void oz_ak1037_switches(uint8_t pressed[OZ_DIO_SW_N])
+{
+    for (int i = 0; i < OZ_DIO_SW_N; i++)
+        pressed[i] = (uint8_t)(hal_gpio_input_value(sw_pin[i]) == 0);
+}
+
 /* ── Log ─────────────────────────────────────────────────────────────────── */
 
 void oz_port_log(const char *fmt, ...)

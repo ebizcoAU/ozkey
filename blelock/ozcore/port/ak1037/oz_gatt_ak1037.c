@@ -31,6 +31,8 @@
 #include "oz_keypad.h"
 #include "oz_motor.h"
 #include "oz_card.h"
+#include "oz_doorio.h"
+#include "oz_events.h"
 #include "oz_gatt_ak1037.h"
 #include "oz_port_ak1037.h"
 #include "oz_wdt_ak1037.h"
@@ -57,6 +59,18 @@ static const T_BT_ATTREC gatt_table[] = {
 enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, EV_KEY, EV_CARD, EV_PAD };
 static char pad_char(int pad);          /* touch pad bit -> key (TOUCH-MAP-1) */
 static int rfid_poll(oz_lock *L);       /* the on-chip RFID reader (RFID-READER-1): 1 = a new card */
+static void tones(int n, uint32_t gap_ms);  /* queue n beeps (LOCK-IO-1 patterns) */
+
+/* The door's own inputs (LOCK-IO-1). Policy numbers: OZ_DOORIO_BENCH, one place. */
+static const oz_doorio_cfg doorio_cfg = OZ_DOORIO_BENCH;
+static oz_doorio dio;
+
+/* Beep patterns (LOCK-IO-1): each beep is OZ_BEEP_MS; the queue holds start
+ * times. 1 = a key or a card read, 2 = open, 3 quick = wrong, 5 = door left
+ * open, back to back = the tamper alarm. */
+#define OZ_TONE_Q 8
+static uint32_t tone_q[OZ_TONE_Q];
+static int tone_n;
 #define OZ_BL_FLASH_MS 300u         /* backlight flash per press (TOUCH-LED-1) */
 
 #define FRAME_MAX (BLE_MTU_MAX_SIZE - 3)
@@ -269,6 +283,10 @@ void oz_gatt_ak1037_actuate(int unlock)
         safe_refused = 1;
         return;
     }
+    if (unlock)
+        oz_doorio_unlocked(&dio, now_ms());     /* starts the auto-relock clock */
+    else
+        oz_doorio_locked(&dio);
     oz_motor_command(&motor, unlock, now_ms());
 }
 
@@ -337,13 +355,17 @@ static void card_in(oz_lock *L, const uint8_t *id, size_t len)
     if (!oz_card_seen(&card, id, len, now_ms()))
         return;                         /* the same card, still on the reader */
     int r = oz_lock_card(L, id, len);
-    if (r == OZ_CARD_OPEN)
+    if (r == OZ_CARD_OPEN) {
         oz_port_log("card: open");
-    else if (r == OZ_CARD_LOCKED_OUT)
+        tones(2, 80);
+    } else if (r == OZ_CARD_LOCKED_OUT) {
         oz_port_log("card: locked out, %u s left, not checked",
                     (unsigned)((oz_lock_card_lockout_ms(L) + 999u) / 1000u));
-    else
+        tones(3, 40);
+    } else {
         oz_port_log("card: wrong");
+        tones(3, 40);
+    }
 }
 
 static void key_in(oz_lock *L, char key, int connected)
@@ -353,13 +375,17 @@ static void key_in(oz_lock *L, char key, int connected)
     case OZ_KP_PIN: {
         int r = oz_lock_keypad_pin(L, keypad.entry);
         oz_keypad_done(&keypad);
-        if (r == OZ_PIN_OPEN)
+        if (r == OZ_PIN_OPEN) {
             oz_port_log("keypad: open");
-        else if (r == OZ_PIN_LOCKED_OUT)
+            tones(2, 80);
+        } else if (r == OZ_PIN_LOCKED_OUT) {
             oz_port_log("keypad: locked out, %u s left, not checked",
                         (unsigned)((oz_lock_keypad_lockout_ms(L) + 999u) / 1000u));
-        else
+            tones(3, 40);
+        } else {
             oz_port_log("keypad: wrong");
+            tones(3, 40);
+        }
         break;
     }
     case OZ_KP_PAIR_CODE:
@@ -408,7 +434,7 @@ static void ozkie_thread(void *param)
         oz_ak1037_wdt_checkin(wdt_id);
         /* 10 ms while the motor moves (oz_motor_step's cadence) or the
          * backlight flashes (its toggle), else 100. */
-        rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE && !bl_on && !beeping ? 100 : 10;  /* 10 ms: motor, flash or beep */
+        rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE && !bl_on && !beeping && !tone_n ? 100 : 10;  /* 10 ms: motor, flash or beep */
         if (rt_mq_recv(&mq, &m, sizeof m, ms_ticks((uint32_t)wait)) == RT_EOK) {
             switch (m.h.ev) {
             case EV_CONNECT:
@@ -449,10 +475,7 @@ static void ozkie_thread(void *param)
                 char c = pad_char((int)m.h.arg);
                 bl_off_at = now_ms() + OZ_BL_FLASH_MS;  /* the operator sees every press */
                 bl_on = 1;
-                if (oz_ak1037_beep_start()) {   /* …and hears it (BEEP-1) */
-                    beep_off_at = now_ms() + OZ_BEEP_MS;
-                    beeping = 1;
-                }
+                tones(1, 0);                    /* …and hears it (BEEP-1) */
                 oz_port_log("touch: pad %d -> %c", (int)m.h.arg, c ? c : '-');
                 if (c)
                     key_in(L, c, connected);
@@ -483,14 +506,47 @@ static void ozkie_thread(void *param)
             bl_off_at = now_ms() + OZ_BL_FLASH_MS;  /* a new card: flash + beep */
             if (!bl_on)
                 bl_on = 1;
-            if (oz_ak1037_beep_start()) {
-                beep_off_at = now_ms() + OZ_BEEP_MS;
-                beeping = 1;
+            tones(1, 0);
+        }
+        /* LOCK-IO-1: the door switches. The exit button unlocks ALWAYS (PM). */
+        {
+            uint8_t pr[OZ_DIO_SW_N];
+            oz_ak1037_switches(pr);
+            int d = oz_doorio_step(&dio, pr, now_ms());
+            if (d & OZ_DIO_EXIT_UNLOCK) {
+                oz_lock_exit_button(L);
+                tones(2, 80);
             }
+            if (d & OZ_DIO_DOOR_OPENED)
+                oz_port_log("door: opened");
+            if (d & OZ_DIO_DOOR_CLOSED)
+                oz_port_log("door: closed");
+            if (d & OZ_DIO_RELOCK)
+                oz_lock_auto_relock(L);
+            if (d & OZ_DIO_TAMPER) {
+                oz_lock_door_event(L, OZ_EV_TAMPER, 0);
+                bl_off_at = now_ms() + doorio_cfg.alarm_ms;
+                bl_on = 1;
+            }
+            if (d & OZ_DIO_ALARM_END)
+                oz_port_log("lock: tamper alarm over");
+            if (d & OZ_DIO_LEFT_OPEN) {
+                oz_lock_door_event(L, OZ_EV_DOOR_LEFT_OPEN, doorio_cfg.left_open_ms / 1000u);
+                tones(5, 120);
+            }
+            if (oz_doorio_alarm(&dio) && tone_n == 0 && !beeping)
+                tones(1, 0);                /* the alarm: beeps back to back */
         }
         if (beeping && (int32_t)(now_ms() - beep_off_at) >= 0) {
             oz_ak1037_beep_stop();
             beeping = 0;
+        }
+        if (!beeping && tone_n && (int32_t)(now_ms() - tone_q[0]) >= 0) {
+            if (oz_ak1037_beep_start()) {
+                beep_off_at = now_ms() + OZ_BEEP_MS;
+                beeping = 1;
+            }
+            memmove(tone_q, tone_q + 1, (size_t)(--tone_n) * sizeof tone_q[0]);
         }
         battery_rest(L);
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
@@ -630,6 +686,17 @@ static void rfid_start(void)
     oz_port_log("rfid: reader on");
 }
 
+static void tones(int n, uint32_t gap_ms)
+{
+    uint32_t t = now_ms();
+    if (tone_n && (int32_t)(tone_q[tone_n - 1] + OZ_BEEP_MS + gap_ms - t) > 0)
+        t = tone_q[tone_n - 1] + OZ_BEEP_MS + gap_ms;
+    for (int i = 0; i < n && tone_n < OZ_TONE_Q; i++) {
+        tone_q[tone_n++] = t;
+        t += OZ_BEEP_MS + gap_ms;
+    }
+}
+
 int oz_gatt_ak1037_key(char key)
 {
     post(EV_KEY, (uint32_t)(uint8_t)key);
@@ -687,6 +754,8 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
     oz_motor_init(&motor, NULL);
     oz_card_init(&card);
     oz_ak1037_speaker_init();
+    oz_ak1037_switches_init();
+    oz_doorio_init(&dio, &doorio_cfg);
     touch_start();
     rfid_start();
     if (rt_thread_init(&thread, "ozkie", ozkie_thread, L, thread_stack, sizeof thread_stack,

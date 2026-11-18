@@ -102,6 +102,7 @@ int mock_msh_run(const char *line);
 /* GPIO (MOTOR-GPIO-1): levels, direction (-1 never set), pull-downs, and the
  * motor pins' state "AB" (A = GPIO17, B = GPIO18) after each write that changed it. */
 extern int  mock_gpio_level[0x110], mock_gpio_dir[0x110], mock_gpio_pulldown[0x110];   /* GPIO_MOCK_N */
+extern int  mock_gpio_pullup[0x110], mock_gpio_in[0x110];   /* in: the level a read returns (1 = released) */
 extern char mock_motor_states[512];
 
 extern int mock_notify_bad_idx;        /* notifies refused: idx not a notify characteristic */

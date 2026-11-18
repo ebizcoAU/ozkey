@@ -240,6 +240,15 @@ uint64_t oz_lock_card_lockout_ms(const oz_lock *L);
  * direction it drove. The actuate hook alone sets the commanded state. */
 void oz_lock_actuated(oz_lock *L, int unlock, int result);
 
+/* The door's own inputs (LOCK-IO-1, oz_doorio decides when):
+ * - the inside exit button: unlock, ALWAYS (no lockout, tamper or safe-mode
+ *   check: PM safe-exit rule), recorded as OZ_EV_EXIT_BUTTON;
+ * - an auto-relock (the door closed, or an unlock nobody used);
+ * - OZ_EV_TAMPER / OZ_EV_DOOR_LEFT_OPEN, recorded for the owner's app. */
+void oz_lock_exit_button(oz_lock *L);
+void oz_lock_auto_relock(oz_lock *L);
+void oz_lock_door_event(oz_lock *L, uint8_t type, uint32_t secs);
+
 /* SAFE mode (F-AK-WDT-2, ozkey-48 §6.1): the port's boot guard saw
  * OZ_BOOTGUARD_LIMIT watchdog resets in a row. For the rest of this boot:
  *   - unlocking still works for everyone who may unlock (app, PIN, card):

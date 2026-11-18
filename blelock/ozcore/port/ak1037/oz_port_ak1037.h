@@ -46,6 +46,11 @@ enum { OZ_BL_OFF = 0, OZ_BL_HIGH, OZ_BL_LOW };
  * playing or the DAC refused) and the caller stops it after OZ_BEEP_MS. */
 #define OZ_BEEP_MS 80u
 void oz_ak1037_speaker_init(void);
+
+/* The door switches (LOCK-IO-1): tamper, door, exit; 1 = pressed. */
+#include "oz_doorio.h"
+void oz_ak1037_switches_init(void);
+void oz_ak1037_switches(uint8_t pressed[OZ_DIO_SW_N]);
 int  oz_ak1037_beep_start(void);
 void oz_ak1037_beep_stop(void);
 void oz_ak1037_backlight_init(void);

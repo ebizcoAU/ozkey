@@ -1826,3 +1826,31 @@ void oz_lock_power_load(oz_lock *L, uint16_t min_mv)
     if (oz_power_load(&L->power, min_mv))
         power_changed(L);
 }
+
+/* ── The door's own inputs (LOCK-IO-1) ─────────────────────────────────── */
+
+/* PM safe-exit rule: no lockout, tamper or safe-mode check here, ever. */
+void oz_lock_exit_button(oz_lock *L)
+{
+    if (L->hooks.actuate)
+        L->hooks.actuate(L->hooks.app, 1);
+    L->lock_state = OZ_LOCKSTATE_UNLOCKED;
+    oz_port_log("lock: exit button");
+    event_add(L, OZ_EV_EXIT_BUTTON, OZ_EV_NO_ACTOR, 0, 0);
+}
+
+void oz_lock_auto_relock(oz_lock *L)
+{
+    if (L->hooks.actuate)
+        L->hooks.actuate(L->hooks.app, 0);
+    L->lock_state = OZ_LOCKSTATE_LOCKED;
+    oz_port_log("lock: auto-relock");
+}
+
+void oz_lock_door_event(oz_lock *L, uint8_t type, uint32_t secs)
+{
+    if (type != OZ_EV_TAMPER && type != OZ_EV_DOOR_LEFT_OPEN)
+        return;
+    oz_port_log("lock: %s", type == OZ_EV_TAMPER ? "TAMPER" : "door left open");
+    event_add(L, type, OZ_EV_NO_ACTOR, 0, secs);
+}

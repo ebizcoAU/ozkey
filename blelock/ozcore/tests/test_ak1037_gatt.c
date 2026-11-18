@@ -686,6 +686,7 @@ static void battery_reads(void)
     capture_end();
     expect_int("new batteries: ok", count("lock: battery ok"), 1);
     capture_start();
+    mock_gpio_in[GPIO31] = 0;           /* LOCK-IO-1: door held open, so no auto-relock moves the motor here */
     mock_adc_raw = RAW(3900);           /* what it reads while the motor pulls */
     n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
     (void)exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
@@ -698,6 +699,7 @@ static void battery_reads(void)
     expect_int("the unlock ran", count("motor: unlock unconfirmed"), 1);
     expect_int("the sag made it critical", count("lock: battery CRITICAL"), 1);
     expect_int("recovered at rest: still critical", count("lock: battery ok"), 0);
+    mock_gpio_in[GPIO31] = 1;
 
     /* An ADC error is no reading: still critical, nothing reported. */
     capture_start();
@@ -973,11 +975,77 @@ static void beeps(void)
     }
     expect_int("a card read flashes the backlight", lit, 1);
     mock_rfid_card(NULL, 0);
-    expect_int("a card read plays one tone", mock_dac_plays - p0, 1);
     t0 = mock_ms;
     while (mock_ms - t0 < 1000)
         mock_pass();
+    expect_int("a card read: a tone, then the wrong pattern (3 tones)", mock_dac_plays - p0, 4);
     expect_int("every DAC call was one the SDK accepts", mock_dac_bad, 0);
+}
+
+/* LOCK-IO-1: the bench's three momentary switches, active LOW with pull-ups:
+ * GPIO30 tamper, GPIO31 door (pressed = open on the bench), AOGPIO9 exit. */
+static void hold(int pin, uint32_t ms)
+{
+    mock_gpio_in[pin] = 0;
+    uint32_t t0 = mock_ms;
+    while (mock_ms - t0 < ms)
+        mock_pass();
+    mock_gpio_in[pin] = 1;
+}
+
+static void idle(uint32_t ms)
+{
+    uint32_t t0 = mock_ms;
+    while (mock_ms - t0 < ms)
+        mock_pass();
+}
+
+static void door_io(void)
+{
+    int in = 1;
+    static const int pins[3] = { GPIO30, GPIO31, GPIOAO9 };
+    for (int i = 0; i < 3; i++)
+        in &= mock_gpio_dir[pins[i]] == GPIO_DIR_INPUT && mock_gpio_pullup[pins[i]];
+    expect_int("switch pins are inputs with pull-ups", in, 1);
+    idle(2000);
+
+    capture_start();
+    hold(GPIOAO9, 300);                 /* exit */
+    idle(1500);
+    capture_end();
+    expect_int("exit button: unlock", count("lock: exit button") == 1 && count("motor: to unlock @") == 1, 1);
+
+    capture_start();
+    hold(GPIO31, 1000);                 /* the door opens, then closes */
+    idle(4000);
+    capture_end();
+    expect_int("door opened and closed", count("door: opened") == 1 && count("door: closed") == 1, 1);
+    expect_int("…no relock within 4 s of closing", count("lock: auto-relock"), 0);
+    capture_start();
+    idle(2500);
+    capture_end();
+    expect_int("…auto-relock 5 s after closing", count("lock: auto-relock") == 1 && count("motor: to lock @") == 1, 1);
+
+    capture_start();
+    int p0 = mock_dac_plays;
+    hold(GPIO30, 300);                  /* tamper */
+    idle(3000);
+    capture_end();
+    expect_int("tamper: recorded", count("lock: TAMPER"), 1);
+    expect_int("…the alarm sounds (many tones in 3 s)", mock_dac_plays - p0 >= 8, 1);
+    capture_start();
+    hold(GPIOAO9, 300);                 /* PM: exit during the alarm */
+    idle(1500);
+    capture_end();
+    expect_int("exit during the tamper alarm unlocks (PM)", count("lock: exit button") == 1 && count("motor: to unlock @") == 1, 1);
+    idle(20000);                        /* alarm over, relocked (unopened) */
+
+    capture_start();
+    hold(GPIO31, 31000);                /* the door left open */
+    capture_end();
+    expect_int("door left open 30 s: warned", count("lock: door left open"), 1);
+    expect_int("…and never relocked while open (PM)", count("lock: auto-relock"), 0);
+    idle(20000);
 }
 
 static void rfid_reader(void)
@@ -1059,6 +1127,7 @@ int main(int argc, char **argv)
     disconnect_and_adv();
     rfid_reader();
     beeps();
+    door_io();
     expect_int("every notify went to a notify characteristic (SDK index check)", mock_notify_bad_idx, 0);
     expect_int("flash stayed in OZKV", mock_flash_out_of_part, 0);
     expect_int("NOR rule kept", mock_nor_violations, 0);
