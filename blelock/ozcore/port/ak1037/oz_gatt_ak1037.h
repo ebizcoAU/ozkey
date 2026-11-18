@@ -36,6 +36,9 @@
 /* Bring up BLE (server role), register the service, start the OZKIE thread.
  * L must already be initialised with oz_lock_init(). Returns OZ_OK or OZ_E_HW. */
 int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority);
+/* Brings the BLE stack up (once) without the lock, so the device address can
+ * be read; oz_gatt_ak1037_start calls it too. */
+int oz_gatt_ak1037_radio_up(void);
 
 /* From the keypad, RFID or fingerprint thread: someone is at the door. Opens
  * (or re-arms) the 60 s advertising window. */

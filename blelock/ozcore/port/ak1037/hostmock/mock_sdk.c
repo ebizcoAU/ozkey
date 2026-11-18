@@ -469,6 +469,7 @@ uint32_t mock_gatt_len;
 uint16_t mock_mtu_requested;
 uint8_t mock_dev_addr[6] = { 0xb8, 0xca, 0x3a, 0xe6, 0xbe, 0xac };
 int mock_no_dev_addr;
+int mock_ble_up, mock_dev_addr_stays_zero;
 
 int mock_adv_enabled;
 uint8_t mock_adv_type;
@@ -494,6 +495,7 @@ T_eBLE_RESULT com_ble_init(T_BLE_INIT_PARAM *p)
     if (mock_ble_init_fail)
         return eBLE_RESULT_INIT_ERR;
     mock_ble = *p;
+    mock_ble_up = 1;
     return eBLE_RESULT_SUCCESS;
 }
 
@@ -551,7 +553,16 @@ uint8_t com_ble_set_mtu_size(T_pVOID handle, uint16_t mtu)
     return 0;
 }
 
-uint8_t *com_ble_get_dev_addr(void) { return mock_no_dev_addr ? NULL : mock_dev_addr; }
+/* As on the chip (2026-11-18): all zeros until com_ble_init has run, because
+ * the stack derives the address during its own init. mock_dev_addr_stays_zero:
+ * a stack that never sets it. */
+uint8_t *com_ble_get_dev_addr(void)
+{
+    static uint8_t zero[6];
+    if (mock_no_dev_addr)
+        return NULL;
+    return (mock_ble_up && !mock_dev_addr_stays_zero) ? mock_dev_addr : zero;
+}
 
 void mock_ble_event(void *link, T_eBT_MSG msg, int32_t param1)
 {

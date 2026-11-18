@@ -69,6 +69,8 @@ extern uint32_t mock_gatt_len;
 extern uint16_t mock_mtu_requested;
 extern uint8_t mock_dev_addr[6];
 extern int mock_no_dev_addr;
+extern int mock_ble_up;                /* com_ble_init has succeeded */
+extern int mock_dev_addr_stays_zero;    /* the stack never sets the address */
 
 extern int mock_adv_enabled;            /* last com_ble_set_adv_enable */
 extern uint8_t mock_adv_type;

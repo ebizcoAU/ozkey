@@ -777,8 +777,34 @@ static void wdthang(void)
 }
 #endif
 
+/* LOCK-ID-1 (chip, 2026-11-18): oz.start read the BLE address before the
+ * stack had set it and named the lock ozk-000000000000, which every unit
+ * would share. An all-zero address is never an ID: no lock, no advertising,
+ * and oz.start works once the address is there. */
+static void zero_addr(void)
+{
+    mock_flash_blank();
+    mock_ms = 5000;
+    mock_on_notify = on_notify;
+    mock_dev_addr_stays_zero = 1;
+    expect_int("zero address: oz.start runs", mock_msh_run("oz.start"), 0);
+    expect_int("zero address: the stack is up", mock_ble_inits, 1);
+    expect_int("zero address: nothing advertised", mock_adv_applies, 0);
+    mock_dev_addr_stays_zero = 0;
+    expect_int("address set: oz.start again", mock_msh_run("oz.start"), 0);
+    expect_int("address set: still one BLE init", mock_ble_inits, 1);
+    mock_wait_parked();
+    expect_int("address set: info read", read_info() > 0, 1);
+    expect("address set: device id from the BLE address", (const uint8_t *)lock_id, strlen(lock_id),
+           "6f7a6b2d" "6163626565363361636162 38");     /* ozk-acbee63acab8 */
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "zeroaddr")) {
+        zero_addr();
+        return report("ak1037_gatt_zeroaddr");
+    }
     if (argc > 1 && !strcmp(argv[1], "nohooks")) {
         no_hooks();
         return report("ak1037_gatt_nohooks");

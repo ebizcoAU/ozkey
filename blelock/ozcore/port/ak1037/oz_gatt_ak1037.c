@@ -479,18 +479,17 @@ int oz_gatt_ak1037_touch(void)
     return OZ_OK;
 }
 
-int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
+/* The BLE stack, without the lock: the stack sets the device address during
+ * its own init, so the lock's ID can only be read after this (LOCK-ID-1).
+ * Its own advertising stays off, so nothing can connect before the OZKIE
+ * thread runs; events in between wait in the queue. Runs once. */
+int oz_gatt_ak1037_radio_up(void)
 {
+    static int up;
+    if (up)
+        return OZ_OK;
     if (rt_mq_init(&mq, "ozkie", mq_pool, SLOT_SIZE, sizeof mq_pool, RT_IPC_FLAG_FIFO) != RT_EOK)
         return OZ_E_HW;
-    if (oz_ak1037_wdt_safe())
-        oz_lock_set_safe(L, oz_ak1037_wdt_resets());   /* F-AK-WDT-2: refusals + the event */
-    oz_ble_init(&session, L, &link, notify, NULL);
-    oz_adv_init(&adv, OZ_GATT_ADV_ALWAYS, now_ms());
-    oz_keypad_init(&keypad);
-    oz_motor_init(&motor, NULL);
-    oz_card_init(&card);
-
     T_BLE_INIT_PARAM init;
     memset(&init, 0, sizeof init);
     init.role_type = eBLE_ROLE_SERVER;
@@ -506,6 +505,21 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
         oz_port_log("gatt: service registration failed");
         return OZ_E_HW;
     }
+    up = 1;
+    return OZ_OK;
+}
+
+int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
+{
+    if (oz_gatt_ak1037_radio_up() != OZ_OK)
+        return OZ_E_HW;
+    if (oz_ak1037_wdt_safe())
+        oz_lock_set_safe(L, oz_ak1037_wdt_resets());   /* F-AK-WDT-2: refusals + the event */
+    oz_ble_init(&session, L, &link, notify, NULL);
+    oz_adv_init(&adv, OZ_GATT_ADV_ALWAYS, now_ms());
+    oz_keypad_init(&keypad);
+    oz_motor_init(&motor, NULL);
+    oz_card_init(&card);
     if (rt_thread_init(&thread, "ozkie", ozkie_thread, L, thread_stack, sizeof thread_stack,
                        thread_priority, 10) != RT_EOK)
         return OZ_E_HW;
