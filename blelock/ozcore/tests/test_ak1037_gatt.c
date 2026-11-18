@@ -392,11 +392,13 @@ static void touch_pads(void)
         static const int pads[] = { 1 << 14, 1 << 13, 1 << 12, 1 << 11, 1 << 10, 1 << 9, 1 << 3 };
         capture_start();
         for (size_t i = 0; i < sizeof pads / sizeof pads[0]; i++) {
+            mock_ms += 2000;            /* a person: ~2 s between keys (TICK-RATE-1) */
             mock_tk_press(pads[i]);
             mock_pass();
         }
         capture_end();
         expect_int("each pad press logged with its number", count("touch: pad "), 7);
+        expect_int("2 s between keys does not drop the entry (10 s idle)", count("keypad: entry timed out"), 0);
         expect_int("bit 3 (8) is '#'", count("touch: pad 8 -> #"), 1);
         expect_int("bit 14 (16384) is '1'", count("touch: pad 16384 -> 1"), 1);
         expect_int("the pads reached the keypad (an entry, checked: wrong)", count("keypad: wrong"), 1);

@@ -19,7 +19,7 @@
 #include "com_ble.h"
 
 /* ── time, interrupts ──────────────────────────────────────────────────── */
-extern uint32_t mock_ms;                /* get_ms_tick_func(); ticks are mock_ms / 10 */
+extern uint32_t mock_ms;                /* get_ms_tick_func(); one OS tick = 1 ms, as on the chip */
 extern long mock_irq_violations;        /* SKE driver called with interrupts on */
 
 /* ── SKE ───────────────────────────────────────────────────────────────── */
