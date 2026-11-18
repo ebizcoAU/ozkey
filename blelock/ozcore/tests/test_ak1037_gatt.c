@@ -37,6 +37,12 @@
 /* gatt_table rows (oz_gatt_ak1037.c) */
 #define REC_INFO  (&mock_gatt_table[2])
 #define REC_OZKIE (&mock_gatt_table[4])
+#define REC_RELAY (&mock_gatt_table[7])   /* RELAY-AK-1 */
+
+/* Which characteristic the client writes, and the notify index the lock must
+ * answer on: ozkie = 0, relay = 1 (the SDK counts notify chars from 0). */
+static const void *cur_rec;              /* NULL = REC_OZKIE */
+static uint16_t cur_idx = 0;
 
 /* ── the phone's GATT client ───────────────────────────────────────────── */
 
@@ -56,7 +62,7 @@ static T_eBLE_RESULT on_notify(void *link, const uint8_t *f, uint16_t n, uint16_
     if (notify_fail)
         return eBLE_RESULT_SEND_ERR;
     notifies++;
-    if (link != LINK || idx != 0 || n > mtu - 3   /* idx: the SDK counts notify chars from 0 */ || oz_reasm_feed(&got, f, n, &d))
+    if (link != LINK || idx != cur_idx || n > mtu - 3   /* idx: the SDK counts notify chars from 0 */ || oz_reasm_feed(&got, f, n, &d))
         got_bad++;
     else
         got_done |= d;
@@ -76,7 +82,7 @@ static size_t exchange(uint8_t type, const uint8_t *msg, size_t len, uint8_t *ou
         uint8_t f[520];
         size_t n;
         oz_frag(type, msg, len, mtu, i, f, sizeof f, &n);
-        mock_ble_write(LINK, REC_OZKIE, f, (uint16_t)n);
+        mock_ble_write(LINK, cur_rec ? cur_rec : REC_OZKIE, f, (uint16_t)n);
         mock_pass();
     }
     if (!got_done || got.len > cap)
@@ -177,6 +183,26 @@ static int handshake(void)
     return 0;
 }
 
+/* The Echo of the last 4.01 (OSCORE B.1.2: the relay link asks for one before
+ * its first request), sent by the next request_echo(). */
+static uint8_t last_echo[8];
+static int has_echo;
+
+static size_t request_echo(uint8_t method, const char *path, const uint8_t *echo,
+                           uint8_t *out, size_t cap, oz_oscore_xchg *x)
+{
+    oz_coap_msg m;
+    oz_coap_init(&m, OZ_COAP_CON, method, ++mid);
+    m.tkl = 1;
+    m.token[0] = (uint8_t)mid;
+    oz_coap_set_path(&m, path);
+    if (echo)
+        oz_coap_add_opt(&m, OZ_COAP_OPT_ECHO, echo, 8);
+    size_t n = 0;
+    oz_oscore_protect_req(&osc, &m, out, cap, &n, x);
+    return n;
+}
+
 static size_t request(uint8_t method, const char *path, uint8_t *out, size_t cap, oz_oscore_xchg *x)
 {
     oz_coap_msg m;
@@ -199,6 +225,10 @@ static int response(const uint8_t *in, size_t n, oz_oscore_xchg *x, int *result)
     *result = -1;
     if (!n || oz_oscore_verify_resp(&osc, x, in, n, pt, sizeof pt, &resp, &piv))
         return -1;
+    const oz_coap_opt *eo = oz_coap_find(&resp, OZ_COAP_OPT_ECHO);
+    has_echo = eo && eo->len == 8;
+    if (has_echo)
+        memcpy(last_echo, eo->val, 8);
     if (resp.payload_len) {
         oz_cbor_r r;
         oz_cbor_r_init(&r, resp.payload, resp.payload_len);
@@ -244,7 +274,7 @@ static void boot(void)
     expect_int("server role", mock_ble.role_type, eBLE_ROLE_SERVER);
     expect_int("stack's own advertising off", mock_ble.adv_def_on, 0);
     expect_int("callbacks set", mock_ble.recv_cb && mock_ble.read_cb && mock_ble.evt_handle_cb, 1);
-    expect_int("GATT table rows", mock_gatt_len, 6);
+    expect_int("GATT table rows", mock_gatt_len, 9);   /* + relay (RELAY-AK-1) */
     /* MOTOR-GPIO-1: motor_A = GPIO17, motor_B = GPIO18, driven LOW (stop,
      * lowest current) with pull-downs before anything can move. */
     expect_int("motor pins are outputs", mock_gpio_dir[17] == 0 && mock_gpio_dir[18] == 0, 1);
@@ -1090,6 +1120,55 @@ static void door_io(void)
     idle(20000);
 }
 
+/* RELAY-AK-1: the `relay` characteristic (ozkey-48 rev 6 §2.3), so a bridge
+ * (or, while none is enrolled, the owner) can reach the lock through it. The
+ * AK1037 SDK keeps ONE connection, so the relay owner is that connection. */
+static void relay_link(void)
+{
+    uint8_t out[600], req[300];
+    oz_oscore_xchg x;
+    int result;
+
+    mock_ble_event(LINK, eBT_MSG_LE_CONNECTION_SUCC, 0);
+    mock_pass();
+    mock_ble_event(LINK, eBT_MSG_LE_MTU_EXCHANGED, 247);
+    mock_pass();
+    mtu = 247;
+
+    /* No bridge enrolled: the rev 6 rule lets the connection take `relay`
+     * (oz_lock_relay_may_own; once a bridge is enrolled only it may, which
+     * test_lock covers). The owner talks to the lock through it. */
+    cur_rec = REC_OZKIE;
+    cur_idx = 0;
+    expect_int("owner session on ozkie", handshake(), 0);
+    capture_start();
+    cur_rec = REC_RELAY;
+    cur_idx = 1;
+    expect_int("EDHOC on the relay link, answered on notify index 1", handshake(), 0);
+    size_t n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
+    size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    /* The relay link's first request: 4.01 + Echo, and nothing done (B.1.2). */
+    expect_int("first relay request: 4.01 + Echo", response(out, ol, &x, &result) == OZ_COAP_UNAUTHORIZED && has_echo, 1);
+    n = request_echo(OZ_COAP_POST, "lock/unlock", last_echo, req, sizeof req, &x);
+    ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+    expect_int("unlock through the relay, with the Echo", response(out, ol, &x, &result) == OZ_COAP_CHANGED && result == OZ_R_UNLOCK_OK, 1);
+    idle(1500);
+    capture_end();
+    expect_int("…the relay owned once", count("gatt: relay owned"), 1);
+    expect_int("…the motor turned", count("motor: to unlock @"), 1);
+    expect_int("every notify on a notify characteristic", mock_notify_bad_idx, 0);
+
+    capture_start();
+    mock_ble_event(LINK, eBT_MSG_LE_LINK_DISCONNECTED, 0);
+    mock_pass();
+    capture_end();
+    expect_int("disconnect releases the relay", count("gatt: relay released"), 1);
+    cur_rec = REC_OZKIE;
+    cur_idx = 0;
+    mtu = 23;
+    idle(20000);                        /* the auto-relock after the unlock */
+}
+
 static void rfid_reader(void)
 {
     static const uint8_t uid[4] = { 0xde, 0xad, 0xbe, 0xef };
@@ -1178,6 +1257,7 @@ int main(int argc, char **argv)
     rfid_reader();
     beeps();
     door_io();
+    relay_link();
     expect_int("every notify went to a notify characteristic (SDK index check)", mock_notify_bad_idx, 0);
     expect_int("flash stayed in OZKV", mock_flash_out_of_part, 0);
     expect_int("NOR rule kept", mock_nor_violations, 0);
