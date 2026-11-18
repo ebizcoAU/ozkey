@@ -56,7 +56,7 @@ static const T_BT_ATTREC gatt_table[] = {
 
 enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, EV_KEY, EV_CARD, EV_PAD };
 static char pad_char(int pad);          /* touch pad bit -> key (TOUCH-MAP-1) */
-static void rfid_poll(oz_lock *L);      /* the on-chip RFID reader (RFID-READER-1) */
+static int rfid_poll(oz_lock *L);       /* the on-chip RFID reader (RFID-READER-1): 1 = a new card */
 #define OZ_BL_FLASH_MS 300u         /* backlight flash per press (TOUCH-LED-1) */
 
 #define FRAME_MAX (BLE_MTU_MAX_SIZE - 3)
@@ -397,6 +397,8 @@ static void ozkie_thread(void *param)
     int applied = -1, failed = 0;
     int wdt_id = oz_ak1037_wdt_add(OZ_GATT_WDT_MS);
     int bl_on = 0;                  /* the press flash (TOUCH-LED-1) */
+    int beeping = 0;                /* the key beep (BEEP-1) */
+    uint32_t beep_off_at = 0;
     uint32_t bl_off_at = 0;
     refresh_info(L);
     for (;;) {
@@ -406,7 +408,7 @@ static void ozkie_thread(void *param)
         oz_ak1037_wdt_checkin(wdt_id);
         /* 10 ms while the motor moves (oz_motor_step's cadence) or the
          * backlight flashes (its toggle), else 100. */
-        rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE && !bl_on ? 100 : 10;  /* 10 ms: motor or flash */
+        rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE && !bl_on && !beeping ? 100 : 10;  /* 10 ms: motor, flash or beep */
         if (rt_mq_recv(&mq, &m, sizeof m, ms_ticks((uint32_t)wait)) == RT_EOK) {
             switch (m.h.ev) {
             case EV_CONNECT:
@@ -447,6 +449,10 @@ static void ozkie_thread(void *param)
                 char c = pad_char((int)m.h.arg);
                 bl_off_at = now_ms() + OZ_BL_FLASH_MS;  /* the operator sees every press */
                 bl_on = 1;
+                if (oz_ak1037_beep_start()) {   /* …and hears it (BEEP-1) */
+                    beep_off_at = now_ms() + OZ_BEEP_MS;
+                    beeping = 1;
+                }
                 oz_port_log("touch: pad %d -> %c", (int)m.h.arg, c ? c : '-');
                 if (c)
                     key_in(L, c, connected);
@@ -473,8 +479,19 @@ static void ozkie_thread(void *param)
             (void)com_ble_disconnect(0);
         }
         motor_step(L);
-        if (motor.phase == OZ_MOTOR_IDLE)
-            rfid_poll(L);
+        if (motor.phase == OZ_MOTOR_IDLE && rfid_poll(L)) {
+            bl_off_at = now_ms() + OZ_BL_FLASH_MS;  /* a new card: flash + beep */
+            if (!bl_on)
+                bl_on = 1;
+            if (oz_ak1037_beep_start()) {
+                beep_off_at = now_ms() + OZ_BEEP_MS;
+                beeping = 1;
+            }
+        }
+        if (beeping && (int32_t)(now_ms() - beep_off_at) >= 0) {
+            oz_ak1037_beep_stop();
+            beeping = 0;
+        }
         battery_rest(L);
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
             oz_port_log("keypad: entry timed out");
@@ -567,12 +584,12 @@ static uint32_t rfid_next, rfid_slowest;
 static uint8_t  rfid_last[OZ_CARD_ID_MAX];
 static size_t   rfid_last_len;
 
-static void rfid_poll(oz_lock *L)
+static int rfid_poll(oz_lock *L)
 {
     uint8_t id[32];
     uint32_t t0 = now_ms();
     if ((int32_t)(t0 - rfid_next) < 0)
-        return;
+        return 0;
     int32_t n = hal_rfid_read_card(CARD_TYPE_A, id);
     uint32_t dt = now_ms() - t0;
     rfid_next = now_ms() + OZ_RFID_POLL_MS;
@@ -582,8 +599,9 @@ static void rfid_poll(oz_lock *L)
     }
     if (n <= 0 || n > (int32_t)OZ_CARD_ID_MAX) {
         rfid_last_len = 0;              /* the antenna is free again */
-        return;
+        return 0;
     }
+    int fresh = 0;
     if ((size_t)n != rfid_last_len || memcmp(id, rfid_last, (size_t)n) != 0) {
         char hex[2 * OZ_CARD_ID_MAX + 1];
         for (int32_t i = 0; i < n; i++) {
@@ -592,11 +610,18 @@ static void rfid_poll(oz_lock *L)
             hex[2 * i + 1] = h[id[i] & 15];
         }
         hex[2 * n] = 0;
-        oz_port_log("rfid: card %s", hex);
+#ifdef OZ_DEBUG_HOOKS
+        oz_port_log("rfid: card %s", hex);          /* the full id: bench image only */
+#else
+        (void)hex;
+        oz_port_log("rfid: card read (%d bytes)", (int)n);  /* release: no id in the log (PM) */
+#endif
+        fresh = 1;
         memcpy(rfid_last, id, (size_t)n);
         rfid_last_len = (size_t)n;
     }
     card_in(L, id, (size_t)n);
+    return fresh;
 }
 
 static void rfid_start(void)
@@ -661,6 +686,7 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
     oz_keypad_init(&keypad);
     oz_motor_init(&motor, NULL);
     oz_card_init(&card);
+    oz_ak1037_speaker_init();
     touch_start();
     rfid_start();
     if (rt_thread_init(&thread, "ozkie", ozkie_thread, L, thread_stack, sizeof thread_stack,

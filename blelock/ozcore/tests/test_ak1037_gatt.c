@@ -942,6 +942,44 @@ static void zero_addr(void)
 /* RFID-READER-1: the SDK's on-chip reader feeds the card path. Polled every
  * 250 ms from the lock thread (not while the motor moves); a card held on the
  * antenna is one check; a slow poll is logged with its time. */
+/* BEEP-1 (operator): every key press and every card read beeps (an 80 ms,
+ * 2 kHz tone on the speaker DAC, amplifier GPIOAO5 on) and flashes the
+ * backlight; the DAC is closed again by itself. */
+static void beeps(void)
+{
+    static const uint8_t uid[4] = { 0x01, 0x02, 0x03, 0x04 };
+    uint32_t t0 = mock_ms;
+    while (mock_ms - t0 < 1000)
+        mock_pass();
+    expect_int("speaker amplifier on (GPIOAO5 high)", mock_gpio_dir[GPIOAO5] == GPIO_DIR_OUTPUT && mock_gpio_level[GPIOAO5] == 1, 1);
+    expect_int("DAC closed at rest", mock_dac_on, 0);
+    int p0 = mock_dac_plays;
+    mock_tk_press(1 << 14);
+    mock_pass();
+    expect_int("a key press plays one tone", mock_dac_plays - p0, 1);
+    expect_int("…80 ms at 16 kHz, 16-bit (2560 bytes)", mock_dac_rate == 16000 && mock_dac_len == 2560, 1);
+    t0 = mock_ms;
+    while (mock_ms - t0 < 300)
+        mock_pass();
+    expect_int("…and the DAC is closed again by itself", mock_dac_on, 0);
+
+    p0 = mock_dac_plays;
+    mock_rfid_card(uid, 4);
+    int lit = 0;
+    t0 = mock_ms;
+    while (mock_ms - t0 < 300) {
+        mock_pass();
+        lit |= mock_gpio_dir[22] == GPIO_DIR_OUTPUT;
+    }
+    expect_int("a card read flashes the backlight", lit, 1);
+    mock_rfid_card(NULL, 0);
+    expect_int("a card read plays one tone", mock_dac_plays - p0, 1);
+    t0 = mock_ms;
+    while (mock_ms - t0 < 1000)
+        mock_pass();
+    expect_int("every DAC call was one the SDK accepts", mock_dac_bad, 0);
+}
+
 static void rfid_reader(void)
 {
     static const uint8_t uid[4] = { 0xde, 0xad, 0xbe, 0xef };
@@ -963,7 +1001,8 @@ static void rfid_reader(void)
     mock_rfid_card(NULL, 0);
     capture_end();
     expect_int("a card held 2 s: one check", count("card: wrong") + count("card: locked out"), 1);
-    expect_int("…logged with its id", count("rfid: card deadbeef"), 1);
+    expect_int("…logged without its id (release log, PM)", count("rfid: card read (4 bytes)"), 1);
+    expect_int("…the full id is not in the log", count("deadbeef"), 0);
 
     capture_start();
     mock_rfid_cost_ms = 30;
@@ -1019,6 +1058,7 @@ int main(int argc, char **argv)
     junk_and_limits();
     disconnect_and_adv();
     rfid_reader();
+    beeps();
     expect_int("every notify went to a notify characteristic (SDK index check)", mock_notify_bad_idx, 0);
     expect_int("flash stayed in OZKV", mock_flash_out_of_part, 0);
     expect_int("NOR rule kept", mock_nor_violations, 0);

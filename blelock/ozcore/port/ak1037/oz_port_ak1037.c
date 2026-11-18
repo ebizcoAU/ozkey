@@ -29,6 +29,7 @@
 #include "hal_trng.h"
 #include "hal_saradc.h"
 #include "hal_gpio.h"
+#include "hal_dac.h"
 #include "hal_sys.h"
 #include "hal_sfc_norflash.h"
 #include "hal_partition.h"
@@ -454,6 +455,51 @@ void oz_ak1037_backlight_init(void)
     for (int i = 0; i < 8; i++)
         (void)hal_gpio_init(bl_pin[i]);
     oz_ak1037_backlight(OZ_BL_OFF);
+}
+
+/* ── Key beep (BEEP-1) ──────────────────────────────────────────────────── */
+
+/* The EVB speaker: the audio DAC into the speaker amplifier, whose enable is
+ * GPIOAO5, active high (SDK board_mcu_anyka.h, EVB_MBD_AK1037D V103). The
+ * amplifier needs ~60 ms to come up (sample_audio.c), so it is switched on once
+ * at start (bench; battery cost is a production item). A beep is 80 ms of a
+ * 2 kHz sine at 16 kHz, 16-bit, gain 3 (the SDK sample's settings), sent in one
+ * DMA transfer from RAM; the lock thread closes the DAC when it is over. */
+#define OZ_BEEP_RATE    16000u
+#define OZ_BEEP_SAMPLES 1280u           /* 80 ms */
+static int16_t beep_pcm[OZ_BEEP_SAMPLES] __attribute__((aligned(4)));
+static int beep_ready, beep_open;
+
+void oz_ak1037_speaker_init(void)
+{
+    static const int16_t sine8[8] = { 0, 4243, 6000, 4243, 0, -4243, -6000, -4243 };
+    for (unsigned i = 0; i < OZ_BEEP_SAMPLES; i++)
+        beep_pcm[i] = sine8[i & 7];     /* 16 kHz / 8 = 2 kHz */
+    (void)hal_gpio_init(GPIOAO5);
+    (void)hal_gpio_output_value(GPIOAO5, 1);
+    (void)hal_gpio_set_dir(GPIOAO5, GPIO_DIR_OUTPUT);
+    (void)hal_gpio_output_value(GPIOAO5, 1);
+    beep_ready = 1;
+}
+
+int oz_ak1037_beep_start(void)
+{
+    if (!beep_ready || beep_open)
+        return 0;                       /* a beep is already playing */
+    if (!hal_dac_init(OZ_BEEP_RATE, 16, 3) || hal_dac_open() != AK_TRUE)
+        return 0;
+    beep_open = 1;
+    (void)hal_dac_trans_single(beep_pcm, sizeof beep_pcm);
+    return 1;
+}
+
+void oz_ak1037_beep_stop(void)
+{
+    if (!beep_open)
+        return;
+    (void)hal_dac_close();
+    (void)hal_dac_deinit();
+    beep_open = 0;
 }
 
 /* ── Log ─────────────────────────────────────────────────────────────────── */
