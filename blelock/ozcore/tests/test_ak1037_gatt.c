@@ -383,11 +383,13 @@ static void keys(const char *k)
 
 static void touch_pads(void)
 {
-    /* Pads to keys: 1-9 -> '1'-'9', 10 '*', 11 '0', 12 '#' (EVB rows 1 2 3 /
-     * 4 5 6 / 7 8 9 / * 0 #); every press logs its pad number, so the chip run
-     * confirms the order. "123456#" is one keypad entry (wrong on a fresh lock). */
+    /* Pads to keys (TOUCH-MAP-1, measured on the EVB 2026-11-18): the SDK
+     * reports a one-bit mask per pad, from bit 14 = "1" down: 1 2 3 4 5 6 7 8 9
+     * = bits 14..6, '*' 5, '0' 4, '#' 3, then mute 2, bell 1, lock 0 (not keys).
+     * Every press logs its value. "123456#" is one keypad entry (wrong on a
+     * fresh lock). */
     {
-        static const int pads[] = { 1, 2, 3, 4, 5, 6, 12 };
+        static const int pads[] = { 1 << 14, 1 << 13, 1 << 12, 1 << 11, 1 << 10, 1 << 9, 1 << 3 };
         capture_start();
         for (size_t i = 0; i < sizeof pads / sizeof pads[0]; i++) {
             mock_tk_press(pads[i]);
@@ -395,8 +397,35 @@ static void touch_pads(void)
         }
         capture_end();
         expect_int("each pad press logged with its number", count("touch: pad "), 7);
-        expect_int("pad 12 is '#'", count("touch: pad 12 -> #"), 1);
+        expect_int("bit 3 (8) is '#'", count("touch: pad 8 -> #"), 1);
+        expect_int("bit 14 (16384) is '1'", count("touch: pad 16384 -> 1"), 1);
         expect_int("the pads reached the keypad (an entry, checked: wrong)", count("keypad: wrong"), 1);
+    }
+    /* TOUCH-LED-1 (operator): every pad press flashes the keypad backlight
+     * (J7: GPIO22, 24-29, 34; LEDs to VDD33_IO, so LOW lights them). */
+    {
+        static const int bl[] = { 22, 24, 25, 26, 27, 28, 29, 34 };
+        int out = 1, dark = 1;
+        for (int i = 0; i < 6; i++)
+            mock_pass();                /* the presses above: let their flash end */
+        for (size_t i = 0; i < sizeof bl / sizeof bl[0]; i++) {
+            out &= mock_gpio_dir[bl[i]] == 0;
+            dark &= mock_gpio_level[bl[i]] == 1;
+        }
+        expect_int("backlight pins are outputs", out, 1);
+        expect_int("backlight off at rest (high)", dark, 1);
+        mock_tk_press(1 << 14);
+        mock_pass();
+        int lit = 1;
+        for (size_t i = 0; i < sizeof bl / sizeof bl[0]; i++)
+            lit &= mock_gpio_level[bl[i]] == 0;
+        expect_int("a press lights the backlight", lit, 1);
+        for (int i = 0; i < 6; i++)
+            mock_pass();                /* ~600 ms with no press */
+        dark = 1;
+        for (size_t i = 0; i < sizeof bl / sizeof bl[0]; i++)
+            dark &= mock_gpio_level[bl[i]] == 1;
+        expect_int("…and it goes off again by itself", dark, 1);
     }
 }
 
