@@ -25,11 +25,20 @@ static size_t cat_hex(char *buf, size_t pos, size_t cap, const uint8_t *b, size_
     return pos;
 }
 
+/* Decimal by hand, not snprintf("%lld"): the AK1037's newlib-nano has no "ll"
+ * and printed the letter "d", so the chip signed different text (NANO-PRINTF-1). */
 static size_t cat_int(char *buf, size_t pos, size_t cap, int64_t v)
 {
-    char t[24];
-    int n = snprintf(t, sizeof t, "%lld", (long long)v);
-    return n > 0 ? cat(buf, pos, cap, t, (size_t)n) : cap + 1;
+    char t[21];
+    size_t n = sizeof t;
+    uint64_t u = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    do {
+        t[--n] = (char)('0' + (int)(u % 10));
+        u /= 10;
+    } while (u);
+    if (v < 0)
+        t[--n] = '-';
+    return cat(buf, pos, cap, t + n, sizeof t - n);
 }
 
 int oz_invite_compute_mac(const oz_invite *inv, const uint8_t secret[32], uint8_t mac[32])
