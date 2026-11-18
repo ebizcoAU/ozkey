@@ -22,6 +22,7 @@
 #include "com_ble.h"
 #include "dev_tk.h"
 #include "hal_touch.h"
+#include "hal_sys.h"
 
 #include "oz_port.h"
 #include "oz_adv.h"
@@ -181,7 +182,14 @@ static oz_keypad keypad;
 static oz_motor motor;
 static oz_card card;
 
-static uint32_t now_ms(void) { return (uint32_t)rt_tick_get() * (1000u / RT_TICK_PER_SECOND); }
+/* TICK-RATE-1: the OS tick is 1 kHz on this SDK (board.c: hal_timer_init(
+ * TIMER_CORE_ID, 1000, rt_tick_increase); measured 999 ticks/s on the EVB),
+ * but rtconfig.h says RT_TICK_PER_SECOND 100, so rt_tick_from_millisecond()
+ * and rt_thread_mdelay() wait a tenth of what they are asked. Time comes from
+ * the SDK's ms counter, and waits are converted at the real rate. */
+#define OZ_AK1037_TICK_HZ 1000u
+static uint32_t now_ms(void) { return (uint32_t)get_ms_tick_func(); }
+static rt_int32_t ms_ticks(uint32_t ms) { return (rt_int32_t)((ms * OZ_AK1037_TICK_HZ + 999u) / 1000u); }
 
 /* Stop, set type and both payloads, start. The type can only change while
  * stopped (HCI), and the controller has already stopped a connectable
@@ -226,7 +234,7 @@ static int notify(void *ctx, const uint8_t *frame, size_t len)
             return OZ_OK;
         if (r != eBLE_RESULT_BUFFER_FULL)
             return OZ_E_HW;
-        rt_thread_mdelay(5);
+        rt_thread_delay((rt_tick_t)ms_ticks(5));
     }
     return OZ_E_HW;
 }
@@ -396,7 +404,7 @@ static void ozkie_thread(void *param)
         oz_ak1037_wdt_checkin(wdt_id);
         /* 10 ms while the motor moves (oz_motor_step's cadence), else 100. */
         rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE ? 100 : 10;
-        if (rt_mq_recv(&mq, &m, sizeof m, (rt_int32_t)rt_tick_from_millisecond(wait)) == RT_EOK) {
+        if (rt_mq_recv(&mq, &m, sizeof m, ms_ticks((uint32_t)wait)) == RT_EOK) {
             switch (m.h.ev) {
             case EV_CONNECT:
                 oz_ble_connect(&session);

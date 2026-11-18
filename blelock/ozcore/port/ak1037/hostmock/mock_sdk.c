@@ -27,7 +27,11 @@ long mock_irq_violations;
 static int irq_depth;
 
 unsigned int get_ms_tick_func(void) { return mock_ms; }
-rt_tick_t rt_tick_get(void) { return mock_ms / (1000u / RT_TICK_PER_SECOND); }
+/* TICK-RATE-1: the chip's OS tick is 1 kHz (SDK board.c: hal_timer_init(
+ * TIMER_CORE_ID, 1000, rt_tick_increase); measured 999 ticks/s on the EVB),
+ * although rtconfig.h says RT_TICK_PER_SECOND 100. The mock does the same:
+ * one tick = 1 ms, while the header (and rt_tick_from_millisecond) say 100. */
+rt_tick_t rt_tick_get(void) { return mock_ms; }
 
 /* RT-Thread 3.1's rounding: up to the next tick. */
 rt_tick_t rt_tick_from_millisecond(rt_int32_t ms)
@@ -37,10 +41,17 @@ rt_tick_t rt_tick_from_millisecond(rt_int32_t ms)
     return (rt_tick_t)(RT_TICK_PER_SECOND * (ms / 1000) + (RT_TICK_PER_SECOND * (ms % 1000) + 999) / 1000);
 }
 
+/* As RT-Thread: rt_thread_delay(rt_tick_from_millisecond(ms)), so a delay is
+ * a tenth of what was asked on this chip (see rt_tick_get). */
+rt_err_t rt_thread_delay(rt_tick_t ticks)
+{
+    mock_ms += (uint32_t)ticks;
+    return RT_EOK;
+}
+
 rt_err_t rt_thread_mdelay(rt_int32_t ms)
 {
-    mock_ms += (uint32_t)ms;
-    return RT_EOK;
+    return rt_thread_delay(rt_tick_from_millisecond(ms));
 }
 
 rt_base_t rt_hw_interrupt_disable(void) { return irq_depth++; }
@@ -412,7 +423,7 @@ rt_err_t rt_mq_recv(rt_mq_t mq, void *buffer, rt_size_t size, rt_int32_t timeout
         fprintf(stderr, "rt_mq_recv: would block forever\n");
         abort();
     } else {
-        mock_ms += (uint32_t)timeout * (1000u / RT_TICK_PER_SECOND);
+        mock_ms += (uint32_t)timeout;           /* 1 tick = 1 ms (rt_tick_get) */
         rc = -RT_ETIMEOUT;
     }
     pthread_mutex_unlock(&big);

@@ -59,6 +59,7 @@ rt_err_t  rt_thread_init(struct rt_thread *thread, const char *name, void (*entr
                          rt_uint8_t priority, rt_uint32_t tick);
 rt_err_t  rt_thread_startup(rt_thread_t thread);
 rt_err_t  rt_thread_mdelay(rt_int32_t ms);
+rt_err_t  rt_thread_delay(rt_tick_t ticks);
 rt_tick_t rt_tick_get(void);
 rt_tick_t rt_tick_from_millisecond(rt_int32_t ms);
 
