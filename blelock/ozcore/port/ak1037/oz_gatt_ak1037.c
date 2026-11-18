@@ -5,8 +5,6 @@
  * reads, notify through com_ble_server_notify_ext().
  *
  * UNVERIFIED until the dev kit (P4):
- *   - NOTIFY_REC_IDX: what att_rec_idx counts is undocumented (the DFU sample
- *     passes 0). Anyka question 5, ozkey-49.
  *   - A long info read (over MTU − 1) would need read-blob offsets; info is
  *     well under 23 bytes of overhead, so a single read is assumed.
  *   - Whether the stack restarts advertising by itself after a disconnect.
@@ -44,7 +42,11 @@ static const T_BT_ATTREC gatt_table[] = {
 #define TABLE_LEN      (sizeof gatt_table / sizeof gatt_table[0])
 #define REC_INFO       ((const void *)&gatt_table[2])
 #define REC_OZKIE      ((const void *)&gatt_table[4])
-#define NOTIFY_REC_IDX 4                /* UNVERIFIED, see above */
+/* The SDK counts only the notify-capable characteristics, from 0
+ * (ble_gatt.c ble_gatt_usersrv_is_att_idx_valid); OZKIE is the only one. 4 was
+ * a guess: on the chip every notify failed "send_att_rec_id overflow 4"
+ * (NOTIFY-IDX-1, 2026-11-18). */
+#define NOTIFY_REC_IDX 0
 
 /* ── BLE context → OZKIE thread ──────────────────────────────────────────── */
 

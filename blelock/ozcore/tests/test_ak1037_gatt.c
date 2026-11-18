@@ -55,7 +55,7 @@ static T_eBLE_RESULT on_notify(void *link, const uint8_t *f, uint16_t n, uint16_
     if (notify_fail)
         return eBLE_RESULT_SEND_ERR;
     notifies++;
-    if (link != LINK || idx != 4 || n > mtu - 3 || oz_reasm_feed(&got, f, n, &d))
+    if (link != LINK || idx != 0 || n > mtu - 3   /* idx: the SDK counts notify chars from 0 */ || oz_reasm_feed(&got, f, n, &d))
         got_bad++;
     else
         got_done |= d;
@@ -847,6 +847,7 @@ int main(int argc, char **argv)
     battery_reads();
     junk_and_limits();
     disconnect_and_adv();
+    expect_int("every notify went to a notify characteristic (SDK index check)", mock_notify_bad_idx, 0);
     expect_int("flash stayed in OZKV", mock_flash_out_of_part, 0);
     expect_int("NOR rule kept", mock_nor_violations, 0);
     expect_int("SKE only with interrupts off", mock_irq_violations, 0);

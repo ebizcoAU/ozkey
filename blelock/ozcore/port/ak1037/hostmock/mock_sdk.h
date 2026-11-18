@@ -104,4 +104,6 @@ int mock_msh_run(const char *line);
 extern int  mock_gpio_level[64], mock_gpio_dir[64], mock_gpio_pulldown[64];
 extern char mock_motor_states[512];
 
+extern int mock_notify_bad_idx;        /* notifies refused: idx not a notify characteristic */
+
 #endif
