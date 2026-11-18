@@ -27,6 +27,7 @@
 #include "oz_gatt_ak1037.h"
 #include "oz_motor.h"
 #include "mock_sdk.h"
+#include "hal_gpio.h"
 #include "hal_sysclock.h"
 #include "oz_wdt.h"
 #include "oz_wdt_ak1037.h"
@@ -404,30 +405,45 @@ static void touch_pads(void)
         expect_int("the pads reached the keypad (an entry, checked: wrong)", count("keypad: wrong"), 1);
     }
     /* TOUCH-LED-1 (operator): every pad press flashes the keypad backlight
-     * (J7: GPIO22, 24-29, 34; LEDs to VDD33_IO, so LOW lights them). */
+     * (J7: GPIO22, 24-29, 34). BACKLIGHT-2, from the chip run: each pin drives a
+     * PAIR of key LEDs, one lit by HIGH and one by LOW (driving all pins high lit
+     * 2 4 7 9 * and the bottom corners). So at rest the pins are released
+     * (inputs: all dark), and a flash toggles them every 10 ms (both halves lit). */
     {
         static const int bl[] = { 22, 24, 25, 26, 27, 28, 29, 34 };
-        int out = 1, dark = 1;
-        for (int i = 0; i < 6; i++)
+        const size_t n = sizeof bl / sizeof bl[0];
+        uint32_t t0 = mock_ms;
+        while (mock_ms - t0 < 1000)
             mock_pass();                /* the presses above: let their flash end */
-        for (size_t i = 0; i < sizeof bl / sizeof bl[0]; i++) {
-            out &= mock_gpio_dir[bl[i]] == 0;
-            dark &= mock_gpio_level[bl[i]] == 1;
-        }
-        expect_int("backlight pins are outputs", out, 1);
-        expect_int("backlight off at rest (high)", dark, 1);
+        int rel = 1;
+        for (size_t i = 0; i < n; i++)
+            rel &= mock_gpio_dir[bl[i]] == GPIO_DIR_INPUT;
+        expect_int("backlight pins released at rest (all keys dark)", rel, 1);
         mock_tk_press(1 << 14);
-        mock_pass();
-        int lit = 1;
-        for (size_t i = 0; i < sizeof bl / sizeof bl[0]; i++)
-            lit &= mock_gpio_level[bl[i]] == 0;
-        expect_int("a press lights the backlight", lit, 1);
-        for (int i = 0; i < 6; i++)
-            mock_pass();                /* ~600 ms with no press */
-        dark = 1;
-        for (size_t i = 0; i < sizeof bl / sizeof bl[0]; i++)
-            dark &= mock_gpio_level[bl[i]] == 1;
-        expect_int("…and it goes off again by itself", dark, 1);
+        mock_pass();                    /* takes the press */
+        uint32_t f0 = mock_ms;
+        int hi[8] = { 0 }, lo[8] = { 0 }, out = 1;
+        for (int k = 0; k < 4; k++) {
+            mock_pass();
+            for (size_t i = 0; i < n; i++) {
+                out &= mock_gpio_dir[bl[i]] == GPIO_DIR_OUTPUT;
+                hi[i] |= mock_gpio_level[bl[i]] == 1;
+                lo[i] |= mock_gpio_level[bl[i]] == 0;
+            }
+        }
+        int both = 1;
+        for (size_t i = 0; i < n; i++)
+            both &= hi[i] && lo[i];
+        expect_int("a press drives the backlight pins", out, 1);
+        expect_int("…toggling high and low (both LEDs of each pair light)", both, 1);
+        expect_int("…every 10 ms (4 toggles inside the 300 ms flash)", mock_ms - f0 <= 40, 1);
+        t0 = mock_ms;
+        while (mock_ms - t0 < 600)
+            mock_pass();
+        rel = 1;
+        for (size_t i = 0; i < n; i++)
+            rel &= mock_gpio_dir[bl[i]] == GPIO_DIR_INPUT;
+        expect_int("…and the pins are released again by themselves", rel, 1);
     }
 }
 

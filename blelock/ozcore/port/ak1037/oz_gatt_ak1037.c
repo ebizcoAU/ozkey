@@ -402,8 +402,9 @@ static void ozkie_thread(void *param)
         if (!dbg_hang)
 #endif
         oz_ak1037_wdt_checkin(wdt_id);
-        /* 10 ms while the motor moves (oz_motor_step's cadence), else 100. */
-        rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE ? 100 : 10;
+        /* 10 ms while the motor moves (oz_motor_step's cadence) or the
+         * backlight flashes (its toggle), else 100. */
+        rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE && !bl_on ? 100 : 10;  /* 10 ms: motor or flash */
         if (rt_mq_recv(&mq, &m, sizeof m, ms_ticks((uint32_t)wait)) == RT_EOK) {
             switch (m.h.ev) {
             case EV_CONNECT:
@@ -442,8 +443,7 @@ static void ozkie_thread(void *param)
                 break;
             case EV_PAD: {
                 char c = pad_char((int)m.h.arg);
-                oz_ak1037_backlight(1);         /* the operator sees every press */
-                bl_off_at = now_ms() + OZ_BL_FLASH_MS;
+                bl_off_at = now_ms() + OZ_BL_FLASH_MS;  /* the operator sees every press */
                 bl_on = 1;
                 oz_port_log("touch: pad %d -> %c", (int)m.h.arg, c ? c : '-');
                 if (c)
@@ -475,8 +475,11 @@ static void ozkie_thread(void *param)
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
             oz_port_log("keypad: entry timed out");
         if (bl_on && (int32_t)(now_ms() - bl_off_at) >= 0) {
-            oz_ak1037_backlight(0);
+            oz_ak1037_backlight(OZ_BL_OFF);
             bl_on = 0;
+        } else if (bl_on) {
+            bl_on = bl_on == 1 ? 2 : 1;     /* toggle: both LEDs of each pair */
+            oz_ak1037_backlight(bl_on == 1 ? OZ_BL_HIGH : OZ_BL_LOW);
         }
 
         /* Claiming the lock or a window closing changes the mode too, so it is
