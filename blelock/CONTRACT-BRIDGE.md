@@ -275,10 +275,11 @@ Joint text: ozkey-fw (bridge) + ozkey-srv (ozlock); PM rulings of 2026-11-20. **
     will not verify these signatures): the bridge needs Monocypher's optional `crypto_ed25519_*`
     (`monocypher-ed25519.c`), which `blelock/ozcore/third_party/monocypher` does not ship today.
 - Publish: **QoS 1, never retained.** A bridge refuses a frame that arrives with the retain flag (reason `parse`).
-- Size: the whole MQTT packet must stay ≤ 256 B (PubSubClient). Packet = 1 (header) + 2 (remaining length)
-  + 2 + topic + 2 (packet id, QoS 1) + 64 (sig) + body, so **topic + body ≤ 185 B**: `body` ≤ 137 B with a topic
-  of 48 B. Rule for both sides: `body` ≤ **130 B**, topic ≤ 48 B. ozlock refuses to publish a longer one
-  (it is a server bug, never truncated).
+- Size: bridgeBLE raises PubSubClient's buffer to 2048 B (`setBufferSize(2048)`, for OZKIE v2 relay packets);
+  its 256 B default does NOT apply to bridgeBLE. Packet = 1 (header) + 2 (remaining length) + 2 + topic + 2
+  (packet id, QoS 1) + 64 (sig) + body. Rule for both sides: `body` ≤ **512 B**, topic ≤ 200 B (packet ≤ 783 B,
+  well inside 2048). The bridge refuses a longer body (reason `parse`); ozlock refuses to publish one (a server
+  bug, never truncated). Today's largest op body is well under 130 B.
 - Encoding: deterministic CBOR (shortest-form integers and lengths, definite lengths, map keys in bytewise order).
   The bridge verifies the received bytes as they are; the rule exists so both encoders agree with the shared test
   vectors (`blelock/ozcore/tests/vectors/bridge_cmd_v1.*`, generated from ozcore's CBOR writer).
