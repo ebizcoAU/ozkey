@@ -596,11 +596,24 @@ static void card_reads(const char *hex, int reads, uint32_t every_ms)
 
 static void cards_at_reader(void)
 {
+    /* KV-LAT-1: the beep starts BEFORE the limit record is written (a write
+     * can take ~530 ms on the chip), and the write is done on the same pass,
+     * before anything else is read: the power-cut window stays one write. */
+    idle(1000);                         /* quiet: an earlier right PIN's reset is flushed at idle */
+    long p0 = mock_flash_progs;
+    mock_progs_at_dac_open = -1;
     mock_ms += 2000;
     capture_start();
-    card_reads("04a1b2c3d4e5f6", 20, 100);      /* held 2 s on the reader */
+    mock_msh_run("oz.card 04a1b2c3d4e5f6");
+    mock_pass();
     capture_end();
-    expect_int("a card held 2 s: one check", count("card: wrong"), 1);
+    expect_int("a wrong card", count("card: wrong"), 1);
+    expect_int("kvlat: its first tone started before any flash write", mock_progs_at_dac_open, p0);
+    expect_int("kvlat: …and the count was written on the same pass", mock_flash_progs > p0, 1);
+    capture_start();
+    card_reads("04a1b2c3d4e5f6", 19, 100);      /* still held: 2 s on the reader in all */
+    capture_end();
+    expect_int("a card held 2 s: one check", count("card: wrong"), 0);
 
     capture_start();
     mock_ms += 2000;

@@ -81,6 +81,25 @@ static oz_doorio dio;
 #define OZ_TONE_Q 8
 static uint32_t tone_q[OZ_TONE_Q];
 static int tone_n;
+static uint32_t now_ms(void);
+static int beeping;                     /* the key beep (BEEP-1), on the OZKIE thread only */
+static uint32_t beep_off_at;
+
+/* Start the next queued tone if it is due and none plays. Called by the loop,
+ * and at once after a wrong card/PIN so the beep comes before the kv write
+ * (KV-LAT-1). */
+static void tone_kick(void)
+{
+    if (beeping || !tone_n || (int32_t)(now_ms() - tone_q[0]) < 0)
+        return;
+    if (oz_ak1037_beep_start()) {
+        beep_off_at = now_ms() + OZ_BEEP_MS;
+        beeping = 1;
+    } else {
+        oz_port_log("beep: start failed (DAC refused), %u more queued", (unsigned)(tone_n - 1));
+    }
+    memmove(tone_q, tone_q + 1, (size_t)(--tone_n) * sizeof tone_q[0]);
+}
 #define OZ_BL_FLASH_MS 300u         /* backlight flash per press (TOUCH-LED-1) */
 
 #define FRAME_MAX (BLE_MTU_MAX_SIZE - 3)
@@ -384,6 +403,8 @@ static void card_in(oz_lock *L, const uint8_t *id, size_t len)
     } else {
         oz_port_log("card: wrong");
         tones(3, 40);
+        tone_kick();                    /* KV-LAT-1: the beep first, */
+        oz_lock_flush(L);               /* then the count, before anything else is read */
     }
 }
 
@@ -404,6 +425,8 @@ static void key_in(oz_lock *L, char key, int connected)
         } else {
             oz_port_log("keypad: wrong");
             tones(3, 40);
+            tone_kick();                /* KV-LAT-1: the beep first, */
+            oz_lock_flush(L);           /* then the count, before the next key is taken */
         }
         break;
     }
@@ -482,8 +505,6 @@ static void ozkie_thread(void *param)
     int applied = -1, failed = 0;
     int wdt_id = oz_ak1037_wdt_add(OZ_GATT_WDT_MS);
     int bl_on = 0;                  /* 0 dark; 1/2 all keys, toggling (card, alarm); 3 one key (PER-KEY-BL-1) */
-    int beeping = 0;                /* the key beep (BEEP-1) */
-    uint32_t beep_off_at = 0;
     uint32_t bl_off_at = 0;
     refresh_info(L);
     for (;;) {
@@ -655,15 +676,11 @@ static void ozkie_thread(void *param)
             oz_ak1037_beep_stop();
             beeping = 0;
         }
-        if (!beeping && tone_n && (int32_t)(now_ms() - tone_q[0]) >= 0) {
-            if (oz_ak1037_beep_start()) {
-                beep_off_at = now_ms() + OZ_BEEP_MS;
-                beeping = 1;
-            } else {
-                oz_port_log("beep: start failed (DAC refused), %u more queued", (unsigned)(tone_n - 1));
-            }
-            memmove(tone_q, tone_q + 1, (size_t)(--tone_n) * sizeof tone_q[0]);
-        }
+        tone_kick();
+        /* KV-LAT-1: a right credential's limit reset is written when nothing
+         * moves or beeps (losing it to a power cut fails safe). */
+        if (motor.phase == OZ_MOTOR_IDLE && !beeping && !tone_n)
+            oz_lock_flush(L);
         battery_rest(L);
         if (oz_keypad_tick(&keypad, now_ms()) == OZ_KP_CLEARED)
             oz_port_log("keypad: entry timed out");

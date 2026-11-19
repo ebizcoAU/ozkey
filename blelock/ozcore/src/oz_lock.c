@@ -1655,16 +1655,49 @@ int oz_lock_tick(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, size_t
 
 /* ── keypad PIN at the door ─────────────────────────────────────────────── */
 
-static void save_limit(const oz_limit *l, const char *key)
+static int save_limit(const oz_limit *l, const char *key)
 {
     uint8_t b[OZ_LIMIT_SAVED_LEN];
     oz_limit_save(l, oz_port_monotonic_ms(), b);
-    if (oz_port_kv_set(key, b, sizeof b))
+    int rc = oz_port_kv_set(key, b, sizeof b);
+    if (rc)
         oz_port_log("lock: limit %s not saved", key);
+    return rc;
 }
 
-static void save_pin_limit(oz_lock *L) { save_limit(&L->pin_limit, "pl"); }
-static void save_card_limit(oz_lock *L) { save_limit(&L->card_limit, "rl"); }
+/* KV-LAT-1: a record that failed to save stays dirty, so the next flush (or
+ * the next attempt's gate) tries again. */
+#define DIRTY_PIN_LIMIT  0x01u
+#define DIRTY_CARD_LIMIT 0x02u
+static void save_pin_limit(oz_lock *L)
+{
+    if (!save_limit(&L->pin_limit, "pl"))
+        L->dirty &= (uint8_t)~DIRTY_PIN_LIMIT;
+}
+static void save_card_limit(oz_lock *L)
+{
+    if (!save_limit(&L->card_limit, "rl"))
+        L->dirty &= (uint8_t)~DIRTY_CARD_LIMIT;
+}
+
+/* Mark a limit record changed: written now, or (deferral on) by the port's
+ * oz_lock_flush() right after its feedback starts. */
+static void limit_changed(oz_lock *L, uint8_t bit)
+{
+    L->dirty |= bit;
+    if (!L->defer_saves)
+        oz_lock_flush(L);
+}
+
+void oz_lock_defer_saves(oz_lock *L, int on) { L->defer_saves = (uint8_t)(on != 0); }
+
+void oz_lock_flush(oz_lock *L)
+{
+    if (L->dirty & DIRTY_PIN_LIMIT)
+        save_pin_limit(L);
+    if (L->dirty & DIRTY_CARD_LIMIT)
+        save_card_limit(L);
+}
 
 uint64_t oz_lock_keypad_lockout_ms(const oz_lock *L)
 {
@@ -1717,6 +1750,7 @@ static int cred_live(const oz_cred *c, int64_t now)
 
 int oz_lock_keypad_pin(oz_lock *L, const char *digits)
 {
+    oz_lock_flush(L);                   /* KV-LAT-1: the last attempt's count is durable first */
     uint64_t mono = oz_port_monotonic_ms();
     if (oz_limit_locked(&L->pin_limit, mono))
         return OZ_PIN_LOCKED_OUT;
@@ -1741,17 +1775,18 @@ int oz_lock_keypad_pin(oz_lock *L, const char *digits)
             continue;
         if (c->uses > 0) {
             c->uses--;
-            save_creds(L);
+            save_creds(L);              /* before the door opens: a lost write would be a free use */
         }
-        if (oz_limit_success(&L->pin_limit))
-            save_pin_limit(L);
+        int reset = oz_limit_success(&L->pin_limit);
         if (L->hooks.actuate)
             L->hooks.actuate(L->hooks.app, 1);
         L->lock_state = OZ_LOCKSTATE_UNLOCKED;
+        if (reset)
+            limit_changed(L, DIRTY_PIN_LIMIT);  /* after: a lost reset fails safe (KV-LAT-1) */
         return OZ_PIN_OPEN;
     }
     uint32_t ms = oz_limit_miss(&L->pin_limit, mono);
-    save_pin_limit(L);
+    limit_changed(L, DIRTY_PIN_LIMIT);
     if (ms) {
         oz_port_log("lock: keypad locked out for %u s", (unsigned)(ms / 1000u));
         event_add(L, OZ_EV_KEYPAD_LOCKOUT, OZ_EV_NO_ACTOR, L->pin_limit.level, ms / 1000u);
@@ -1768,6 +1803,7 @@ uint64_t oz_lock_card_lockout_ms(const oz_lock *L)
 
 int oz_lock_card(oz_lock *L, const uint8_t *id, size_t len)
 {
+    oz_lock_flush(L);                   /* KV-LAT-1: the last attempt's count is durable first */
     uint64_t mono = oz_port_monotonic_ms();
     if (oz_limit_locked(&L->card_limit, mono))
         return OZ_CARD_LOCKED_OUT;
@@ -1788,17 +1824,18 @@ int oz_lock_card(oz_lock *L, const uint8_t *id, size_t len)
             continue;
         if (c->uses > 0) {
             c->uses--;
-            save_creds(L);
+            save_creds(L);              /* before the door opens: a lost write would be a free use */
         }
-        if (oz_limit_success(&L->card_limit))
-            save_card_limit(L);
+        int reset = oz_limit_success(&L->card_limit);
         if (L->hooks.actuate)
             L->hooks.actuate(L->hooks.app, 1);
         L->lock_state = OZ_LOCKSTATE_UNLOCKED;
+        if (reset)
+            limit_changed(L, DIRTY_CARD_LIMIT); /* after: a lost reset fails safe (KV-LAT-1) */
         return OZ_CARD_OPEN;
     }
     uint32_t ms = oz_limit_miss(&L->card_limit, mono);
-    save_card_limit(L);
+    limit_changed(L, DIRTY_CARD_LIMIT);
     if (ms) {
         oz_port_log("lock: card reader locked out for %u s", (unsigned)(ms / 1000u));
         event_add(L, OZ_EV_CARD_LOCKOUT, OZ_EV_NO_ACTOR, L->card_limit.level, ms / 1000u);

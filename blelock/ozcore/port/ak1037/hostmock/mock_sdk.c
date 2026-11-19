@@ -805,10 +805,13 @@ void mock_dac_timing_reset(void)
     mock_dac_shortest_gap_ms = 0xffffffffu;
     dac_closed_once = 0;
 }
+long mock_progs_at_dac_open = -1;       /* KV-LAT-1: flash writes done at the first tone after a test sets -1 */
 int32_t hal_dac_open(void)
 {
     if (mock_dac_open_fail)
         return 0;
+    if (mock_progs_at_dac_open < 0)     /* the FIRST tone since the test reset it */
+        mock_progs_at_dac_open = mock_flash_progs;
     mock_dac_on = 1;
     return 1;
 }

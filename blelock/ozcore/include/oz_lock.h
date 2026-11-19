@@ -169,6 +169,8 @@ typedef struct oz_lock {
     oz_lock_hooks  hooks;
     const char    *fw;
     uint8_t        safe;           /* SAFE mode this boot (F-AK-WDT-2), RAM only */
+    uint8_t        defer_saves;    /* KV-LAT-1: limit writes wait for oz_lock_flush() */
+    uint8_t        dirty;          /* KV-LAT-1: limit records not yet written */
 } oz_lock;
 
 /* Load state from kv, or mint a new identity (factory-fresh, unclaimed). */
@@ -233,6 +235,19 @@ uint64_t oz_lock_keypad_lockout_ms(const oz_lock *L);
 enum { OZ_CARD_WRONG = 0, OZ_CARD_OPEN = 1, OZ_CARD_LOCKED_OUT = 2 };
 int  oz_lock_card(oz_lock *L, const uint8_t *id, size_t len);
 uint64_t oz_lock_card_lockout_ms(const oz_lock *L);
+
+/* KV-LAT-1 (PM nexus-1b, 2026-11-19): a kv write can take ~530 ms on the
+ * AK1037's NOR (littlefs compaction), so a port may defer the wrong-guess
+ * limit writes past its feedback. With deferral on, oz_lock_card() and
+ * oz_lock_keypad_pin() update the counters in RAM (enforced at once) and mark
+ * them dirty; the port MUST call oz_lock_flush() as soon as its feedback has
+ * started, so the power-cut window stays the write time. Every entry point
+ * flushes first, so a second attempt is never checked before the first one's
+ * count is durable. A success's reset is written after the actuate hook (losing
+ * it fails safe); a limited-use credential's use is still written before it.
+ * Off (the default): every change is written at once, as before. */
+void oz_lock_defer_saves(oz_lock *L, int on);
+void oz_lock_flush(oz_lock *L);
 
 /* The port's motor finished a move (oz_motor.h OZ_MOVE_*): the lock state
  * follows what the move did. A jam leaves the bolt somewhere in between:
