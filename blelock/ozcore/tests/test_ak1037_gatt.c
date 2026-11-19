@@ -728,7 +728,10 @@ static void battery_reads(void)
     size_t n = request(OZ_COAP_POST, "lock/lock", req, sizeof req, &x);
     size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
     capture_end();
-    expect_int("ADC on the placeholder channel", mock_adc_channel, 1 << 1);
+    /* BATT-AIN-1 (Anyka motor driver schematic V1.0, 2026-11-19): VOL_DET =
+     * VIN x 1M/(2M+1M), wired to J8 row 2 right = GPIO39 = AIN5 (GPIO14/AIN1
+     * is not on J8). */
+    expect_int("ADC on AIN5 (GPIO39, J8 row 2 right)", mock_adc_channel, 1 << 5);
     expect_int("rest reading: critical", count("lock: battery CRITICAL"), 1);
     expect_int("lock refused", response(out, ol, &x, &result) == OZ_COAP_SERVICE_UNAVAILABLE &&
                result == OZ_R_BATTERY_LOW, 1);
@@ -1006,6 +1009,8 @@ static void batt_bench(void)
     expect_int("oz.batt exists", mock_msh_run(batt_name()), 0);
     capture_end();
     expect_int("…prints the raw reading", count("oz.batt: raw 2047"), 1);
+    expect_int("…on AIN5", mock_adc_channel, 1 << 5);
+    expect_int("…says the full scale is not calibrated", count("full scale UNCALIBRATED"), 1);
 }
 #endif
 

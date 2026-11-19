@@ -373,16 +373,19 @@ uint64_t oz_port_monotonic_ms(void)
 
 /* ── Battery (P5-F) ──────────────────────────────────────────────────────── */
 
-/* Placeholders until OZ-7 5a gives the board: which AIN sees the pack, the
- * divider in front of it, and the reference the ADC runs on. */
+/* BATT-AIN-1, from Anyka's motor driver schematic V1.0 (2026-11-19): the
+ * board's VOL_DET (H1 pin 4) = VIN x 1M / (2M + 1M). On the EVB it is wired
+ * to J8 row 2 right = GPIO39 = AIN5 (the old placeholder AIN1 = GPIO14 is not
+ * on J8: readings from it were a floating pin). The ADC full scale is still
+ * UNCALIBRATED: one multimeter reading of the pack sets OZ_BATT_VREF_MV. */
 #ifndef OZ_BATT_AIN
-#define OZ_BATT_AIN     SARADC_SEL_AIN1
+#define OZ_BATT_AIN     SARADC_SEL_AIN5
 #endif
 #ifndef OZ_BATT_DIV
-#define OZ_BATT_DIV     3u              /* 6 V pack → 2 V at the pin */
+#define OZ_BATT_DIV     3u              /* 2M over 1M: 6 V pack → 2 V at the pin */
 #endif
 #ifndef OZ_BATT_VREF_MV
-#define OZ_BATT_VREF_MV 2400u           /* full scale; UNVERIFIED (BGR × 2?) */
+#define OZ_BATT_VREF_MV 2400u           /* full scale; UNCALIBRATED (BGR × 2?) */
 #endif
 
 /* BATT-SENSE-1 (PM): sensing may be OFF only on the bench (the debug image,
@@ -426,6 +429,12 @@ uint16_t oz_ak1037_battery_pin_mv(int raw)
     return raw < 0 ? 0 : (uint16_t)((uint32_t)raw * OZ_BATT_VREF_MV / 4095u);
 }
 
+uint16_t oz_ak1037_battery_pack_mv(int raw)
+{
+    uint32_t mv = raw < 0 ? 0 : (uint32_t)raw * OZ_BATT_VREF_MV * OZ_BATT_DIV / 4095u;
+    return mv > UINT16_MAX ? UINT16_MAX : (uint16_t)mv;
+}
+
 uint16_t oz_ak1037_battery_mv(void)
 {
     if (!OZ_BATT_SENSE)
@@ -433,8 +442,7 @@ uint16_t oz_ak1037_battery_mv(void)
     int raw = oz_ak1037_battery_raw();
     if (raw < 0)
         return 0;
-    uint32_t mv = (uint32_t)raw * OZ_BATT_VREF_MV * OZ_BATT_DIV / 4095u;
-    return mv > UINT16_MAX ? UINT16_MAX : (uint16_t)mv;
+    return oz_ak1037_battery_pack_mv(raw);
 }
 
 /* ── Motor driver pins (MOTOR-GPIO-1) ───────────────────────────────────── */
