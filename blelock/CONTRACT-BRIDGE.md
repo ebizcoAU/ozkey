@@ -274,7 +274,7 @@ Joint text: ozkey-fw (bridge) + ozkey-srv (ozlock); PM rulings of 2026-11-20. **
     `crypto.sign(null, …)` produces. It is NOT Monocypher's default `crypto_eddsa_*` (that one uses BLAKE2b and
     will not verify these signatures): the bridge needs Monocypher's optional `crypto_ed25519_*`
     (`monocypher-ed25519.c`), which `blelock/ozcore/third_party/monocypher` does not ship today.
-- Publish: **QoS 1, never retained.** A bridge refuses a frame that arrives with the retain flag (reason `parse`).
+- Publish: **QoS 1, never retained.** A bridge refuses a retained frame where its MQTT client exposes the flag (reason `parse`); otherwise (PubSubClient on bridgeBLE) the counter rule covers it. ozlock watches `…/bridges/+/cmd` and alarms on, then clears, any retained frame.
 - Size: bridgeBLE raises PubSubClient's buffer to 2048 B (`setBufferSize(2048)`, for OZKIE v2 relay packets);
   its 256 B default does NOT apply to bridgeBLE. Packet = 1 (header) + 2 (remaining length) + 2 + topic + 2
   (packet id, QoS 1) + 64 (sig) + body. Rule for both sides: `body` ≤ **512 B**, topic ≤ 200 B (packet ≤ 783 B,
