@@ -36,7 +36,22 @@ $undef = (& "${TcW}nm" -u "$app\build\$name.elf" 2>$null | Measure-Object).Count
 "undefined symbols: $undef"; if ($undef -ne 0) { exit 1 }
 
 "== burn package"
+# mkimage.ps1 writes into the SDK's SHARED burn folder, the one the operator
+# burns the bench (_dbg) image from. Save those three files first and put them
+# back after, so a release build never changes what the next bench burn flashes
+# (found 2026-11-20). This release's files go to .\out\ in this tree.
+$shared = @("$app\bin\ozkie_app.bin", "$app\bin\ozkv_blank.bin", "$Sdk\tools\burntool\config_ozkie.txt")
+$keep = "$oz\bench-keep"; $outDir = "$oz\out"
+New-Item -ItemType Directory -Force $keep, $outDir | Out-Null
+foreach ($f in $shared) { if (Test-Path $f) { Copy-Item $f $keep -Force } }
 & powershell -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\mkimage.ps1" -Name $name -Sdk $Sdk -Tc $TcW 2>&1 | ForEach-Object { "$_" }
-$rc = $LASTEXITCODE; "mkimage rc=$rc"; if ($rc -ne 0) { exit 1 }
+$rc = $LASTEXITCODE; "mkimage rc=$rc"
+if ($rc -eq 0) { foreach ($f in $shared) { Copy-Item $f $outDir -Force } }
+foreach ($f in $shared) {
+    $k = Join-Path $keep (Split-Path $f -Leaf)
+    if (Test-Path $k) { Copy-Item $k $f -Force } else { Remove-Item $f -ErrorAction SilentlyContinue }
+}
+"bench burn folder restored: " + (($shared | ForEach-Object { (Get-FileHash $_ -ErrorAction SilentlyContinue).Hash.Substring(0,12) }) -join ' ')
+if ($rc -ne 0) { exit 1 }
 "relpkg.ps1 OK $name"
 exit 0

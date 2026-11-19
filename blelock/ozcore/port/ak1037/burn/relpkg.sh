@@ -56,15 +56,15 @@ ssh -o BatchMode=yes "$host" "cd /d $wr && (if exist rel-$sha7 rmdir /s /q rel-$
 rc=$?
 set -e
 grep -q "relpkg.ps1 OK" "$log" || fail "build host failed (rc=$rc), see the build.log"
-for f in app_mcu/bin/ozkie_app.bin app_mcu/bin/ozkv_blank.bin tools/burntool/config_ozkie.txt; do
-    scp -q -o BatchMode=yes "$host:$sdk/$f" "$out/" 2>>"$log" || fail "fetching $f failed"
+for f in ozkie_app.bin ozkv_blank.bin config_ozkie.txt; do      # from this tree's out\, not the shared burn folder
+    scp -q -o BatchMode=yes "$host:$wroot/rel-$sha7/out/$f" "$out/" 2>>"$log" || fail "fetching $f failed"
 done
 if ! python3 -I "$here/../../../tools/relcheck.py" "$out/ozkie_app.bin" "$sha7" >> "$log" 2>&1; then
     grep REFUSED "$log"; fail "relcheck rejected the image"
 fi
 {
     echo "version   $ver"
-    echo "variant   $variant ($(echo "$variant" | sed 's/fp0/no fingerprint/; s/fp1/fingerprint/'))"
+    echo "variant   $variant (SDK Makefile.nano_$variant)"
     echo "commit    $full$tag"
     echo "built     $(date '+%Y-%m-%d %H:%M:%S %Z') on $host, from a fresh rel-$sha7 tree"
     echo "image     RELEASE (no OZ_DEBUG_HOOKS); relcheck OK"
