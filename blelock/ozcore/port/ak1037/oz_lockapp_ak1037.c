@@ -33,7 +33,21 @@
 #ifndef OZ_START_PRIORITY
 #define OZ_START_PRIORITY (RT_THREAD_PRIORITY_MAX / 2)
 #endif
-#define OZ_LOCKAPP_FW "ozkie-ak1037-bringup"
+/* REL-VER-1: "ozkie-ak1037-<semver>+<git sha7>" in INFO and dev/info, so a
+ * test page can assert exactly which build runs (CN-LAB-1 T3). The build host
+ * writes port/ak1037/oz_build_sha.h (#define OZ_BUILD_SHA "abc1234", not in
+ * git) from the commit it builds; without it the image says "+nosha". */
+#if defined(__has_include)
+#if __has_include("oz_build_sha.h")
+#include "oz_build_sha.h"
+#endif
+#endif
+#ifndef OZ_BUILD_SHA
+#define OZ_BUILD_SHA "nosha"
+#endif
+#define OZ_LOCKAPP_SEMVER "0.1.0"
+#define OZ_LOCKAPP_FW "ozkie-ak1037-" OZ_LOCKAPP_SEMVER "+" OZ_BUILD_SHA
+#define OZ_LOCKAPP_MODEL "ak1037-evb"   /* the EVB_MBD_AK1037D bench board */
 
 static volatile int running;
 
@@ -55,7 +69,7 @@ static void log_prompt(void *app, int on)
 
 int oz_lockapp_ak1037_start(void)
 {
-    static const oz_lock_hooks hooks = { actuate, log_prompt, NULL };
+    static const oz_lock_hooks hooks = { actuate, log_prompt, NULL, OZ_LOCKAPP_MODEL };
     char id[4 + 12 + 1];
 
     if (running) {

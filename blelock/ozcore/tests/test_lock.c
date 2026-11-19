@@ -54,7 +54,7 @@ static void hw_actuate(void *app, int unlock)
     }
 }
 static void hw_prompt(void *app, int on) { (void)app; prompt_on = on; }
-static const oz_lock_hooks HOOKS = { hw_actuate, hw_prompt, NULL };
+static const oz_lock_hooks HOOKS = { hw_actuate, hw_prompt, NULL, "test-model" };
 
 static void boot_lock(void)
 {
@@ -317,6 +317,29 @@ static int call(app_t *a, oz_link *k, uint8_t method, const char *path, const ui
 }
 
 /* Response map value for key (uint), or −1. */
+/* The text value at key in a CBOR map, copied to out ("" if absent). */
+static const char *cbor_tstr_at(const uint8_t *b, size_t len, uint64_t key, char *out, size_t cap)
+{
+    oz_cbor_r r;
+    oz_cbor_r_init(&r, b, len);
+    out[0] = 0;
+    size_t pairs = oz_cbor_get_map(&r);
+    for (size_t i = 0; i < pairs && !r.err; i++) {
+        uint64_t k = oz_cbor_get_uint(&r);
+        size_t n;
+        if (k == key && oz_cbor_peek(&r) == OZ_CBOR_TSTR) {
+            const uint8_t *v = oz_cbor_get_tstr(&r, &n);
+            if (v && n < cap) {
+                memcpy(out, v, n);
+                out[n] = 0;
+            }
+            return out;
+        }
+        (void)oz_cbor_skip(&r, &n);
+    }
+    return out;
+}
+
 static int64_t resp_int(const app_t *a, uint64_t key)
 {
     oz_cbor_r r;
@@ -1503,6 +1526,22 @@ static void safe_mode(void)
     expect_int("…member, PIN and owner all actuated", unlocks - u0, 3);
     expect_int("owner lists bonds", call(&owner, &ble, OZ_COAP_GET, "bond", NULL, 0), OZ_R_OK);
     expect_int("owner reads info", call(&owner, &ble, OZ_COAP_GET, "dev/info", NULL, 0), OZ_R_OK);
+    {   /* REL-VER-1: the model is the port's, not a constant in the core */
+        char t[40];
+        uint8_t ib[160];
+        size_t il = 0;
+        expect_int("dev/info: fw is the init string",
+                   !strcmp(cbor_tstr_at(owner.resp.payload, owner.resp.payload_len, 1, t, sizeof t), "ozcore-p2"), 1);
+        expect_int("dev/info: model from the hooks",
+                   !strcmp(cbor_tstr_at(owner.resp.payload, owner.resp.payload_len, 2, t, sizeof t), "test-model"), 1);
+        expect_int("INFO builds", oz_lock_info(&L, ib, sizeof ib, &il), OZ_OK);
+        expect_int("INFO: model from the hooks", !strcmp(cbor_tstr_at(ib, il, 5, t, sizeof t), "test-model"), 1);
+        oz_lock M;
+        static const oz_lock_hooks nomodel = { hw_actuate, hw_prompt, NULL, NULL };
+        oz_lock_init(&M, "ozk-test0002", "x", &nomodel);
+        expect_int("INFO (no model) builds", oz_lock_info(&M, ib, sizeof ib, &il), OZ_OK);
+        expect_int("INFO: no model -> \"unknown\"", !strcmp(cbor_tstr_at(ib, il, 5, t, sizeof t), "unknown"), 1);
+    }
 
     /* The next boot is a fresh one: the port's boot guard decides again. */
     boot_lock();

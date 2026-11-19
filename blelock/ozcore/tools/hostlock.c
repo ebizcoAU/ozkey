@@ -116,7 +116,7 @@ int main(int argc, char **argv)
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     oz_host_kv_file(state);
-    oz_lock_hooks hooks = { hw_actuate, hw_prompt, NULL };
+    oz_lock_hooks hooks = { hw_actuate, hw_prompt, NULL, "hostlock" };
     if (oz_lock_init(&L, dev, "ozhostlock-p2", &hooks)) {
         fprintf(stderr, "init failed\n");
         return 1;

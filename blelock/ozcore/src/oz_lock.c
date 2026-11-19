@@ -349,6 +349,12 @@ int oz_lock_link_squatting(const oz_lock *L, const oz_link *s, int owns_relay, u
            !s->ctx_ready && !s->pairing;
 }
 
+/* REL-VER-1: the port names its hardware (oz_lock_hooks.model). */
+static const char *model_of(const oz_lock *L)
+{
+    return L->hooks.model ? L->hooks.model : "unknown";
+}
+
 int oz_lock_info(const oz_lock *L, uint8_t *out, size_t cap, size_t *out_len)
 {
     oz_cbor_w w;
@@ -358,7 +364,7 @@ int oz_lock_info(const oz_lock *L, uint8_t *out, size_t cap, size_t *out_len)
     oz_cbor_put_uint(&w, 2); oz_cbor_put_tstr(&w, L->fw, strlen(L->fw));
     oz_cbor_put_uint(&w, 3); oz_cbor_put_bstr(&w, L->pub, 32);
     oz_cbor_put_uint(&w, 4); oz_cbor_put_uint(&w, oz_lock_claimed(L) ? 1 : 0);
-    oz_cbor_put_uint(&w, 5); oz_cbor_put_tstr(&w, "ak1037-dev", 10);
+    oz_cbor_put_uint(&w, 5); oz_cbor_put_tstr(&w, model_of(L), strlen(model_of(L)));
     if (w.err)
         return w.err;
     *out_len = w.len;
@@ -846,7 +852,7 @@ static void v_info(req_ctx *q)
 {
     result(q, OZ_R_OK, 3);
     oz_cbor_put_uint(&q->w, 1); oz_cbor_put_tstr(&q->w, q->L->fw, strlen(q->L->fw));
-    oz_cbor_put_uint(&q->w, 2); oz_cbor_put_tstr(&q->w, "ak1037-dev", 10);
+    oz_cbor_put_uint(&q->w, 2); oz_cbor_put_tstr(&q->w, model_of(q->L), strlen(model_of(q->L)));
     oz_cbor_put_uint(&q->w, 3); oz_cbor_put_array(&q->w, 2);
     oz_cbor_put_uint(&q->w, OZ_CRED_PIN); oz_cbor_put_uint(&q->w, OZ_CRED_RFID);
 }

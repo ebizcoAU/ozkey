@@ -108,6 +108,9 @@ typedef struct {
     /* Ask the owner for the 6-digit pairing code on the keypad (on = 1), or stop. */
     void (*pair_prompt)(void *app, int on);
     void *app;
+    /* REL-VER-1: the hardware model reported in INFO and dev/info (key 5 / 2),
+     * e.g. "ak1037-evb"; NULL reports "unknown". Kept across a factory reset. */
+    const char *model;
 } oz_lock_hooks;
 
 typedef struct {
