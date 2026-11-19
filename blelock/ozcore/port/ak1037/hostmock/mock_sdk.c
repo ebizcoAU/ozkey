@@ -791,16 +791,48 @@ T_BOOL hal_dac_init(uint32_t rate, uint8_t bits, uint8_t gain)
     dac_pa_call(1);
     return 1;
 }
-int32_t hal_dac_open(void) { mock_dac_on = 1; return 1; }
+/* BEEP-RFID-1: each tone's time on (trans_single to close) and the silence
+ * before it, to catch tones run together; and an open the SDK refuses. */
+uint32_t mock_dac_longest_ms, mock_dac_shortest_gap_ms = 0xffffffffu;
+int      mock_dac_open_fail;
+static uint32_t dac_play_at, dac_close_at;
+static int dac_playing, dac_closed_once;
+void mock_dac_timing_reset(void)
+{
+    mock_dac_longest_ms = 0;
+    mock_dac_shortest_gap_ms = 0xffffffffu;
+    dac_closed_once = 0;
+}
+int32_t hal_dac_open(void)
+{
+    if (mock_dac_open_fail)
+        return 0;
+    mock_dac_on = 1;
+    return 1;
+}
 int32_t hal_dac_trans_single(void *buf, uint32_t len)
 {
     if (!mock_dac_on || ((uintptr_t)buf & 3) || len == 0)
         mock_dac_bad++;                 /* as the SDK: open first, 4-byte aligned */
     mock_dac_plays++;
     mock_dac_len = len;
+    if (dac_closed_once && mock_ms - dac_close_at < mock_dac_shortest_gap_ms)
+        mock_dac_shortest_gap_ms = mock_ms - dac_close_at;
+    dac_play_at = mock_ms;
+    dac_playing = 1;
     return 1;
 }
-int32_t hal_dac_close(void) { mock_dac_on = 0; dac_pa_call(0); return 1; }
+int32_t hal_dac_close(void)
+{
+    if (dac_playing && mock_ms - dac_play_at > mock_dac_longest_ms)
+        mock_dac_longest_ms = mock_ms - dac_play_at;
+    dac_playing = 0;
+    dac_close_at = mock_ms;
+    dac_closed_once = 1;
+    mock_dac_on = 0;
+    dac_pa_call(0);
+    return 1;
+}
 T_BOOL  hal_dac_deinit(void) { return 1; }
 
 /* ── Chip reset (AUTOSTART-1: the bench wipe while running) ──────────────── */

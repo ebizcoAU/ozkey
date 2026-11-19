@@ -446,7 +446,7 @@ static void ozkie_thread(void *param)
     uint32_t squat_drops = 0;
     int applied = -1, failed = 0;
     int wdt_id = oz_ak1037_wdt_add(OZ_GATT_WDT_MS);
-    int bl_on = 0;                  /* the press flash (TOUCH-LED-1) */
+    int bl_on = 0;                  /* 0 dark; 1/2 all keys, toggling (card, alarm); 3 one key (PER-KEY-BL-1) */
     int beeping = 0;                /* the key beep (BEEP-1) */
     uint32_t beep_off_at = 0;
     uint32_t bl_off_at = 0;
@@ -530,8 +530,12 @@ static void ozkie_thread(void *param)
                 break;
             case EV_PAD: {
                 char c = pad_char((int)m.h.arg);
-                bl_off_at = now_ms() + OZ_BL_FLASH_MS;  /* the operator sees every press */
-                bl_on = 1;
+                /* The operator sees every press: its own key only (PER-KEY-BL-1),
+                 * unless all keys are already flashing (a card, the tamper alarm). */
+                if (bl_on != 1 && bl_on != 2) {
+                    bl_on = oz_ak1037_backlight_pad((int)m.h.arg) ? 3 : 0;
+                    bl_off_at = now_ms() + OZ_BL_FLASH_MS;
+                }
                 tones(1, 0);                    /* …and hears it (BEEP-1) */
                 oz_port_log("touch: pad %d -> %c", (int)m.h.arg, c ? c : '-');
                 if (c)
@@ -568,10 +572,14 @@ static void ozkie_thread(void *param)
             (void)com_ble_disconnect(0);
         }
         motor_step(L);
-        if (motor.phase == OZ_MOTOR_IDLE && rfid_poll(L)) {
-            bl_off_at = now_ms() + OZ_BL_FLASH_MS;  /* a new card: flash + beep */
-            if (!bl_on)
-                bl_on = 1;
+        /* BEEP-RFID-1: a read blocks the thread (243 ms seen on the chip), so
+         * none while a tone plays or waits: it would hold the tone on and run
+         * the next ones into it. */
+        if (motor.phase == OZ_MOTOR_IDLE && !beeping && !tone_n && rfid_poll(L)) {
+            if (bl_on != 1 && bl_on != 2) {     /* a new card: all keys flash + a beep */
+                bl_on = 1;                      /* (an alarm flash already on keeps its end) */
+                bl_off_at = now_ms() + OZ_BL_FLASH_MS;
+            }
             tones(1, 0);
         }
         /* LOCK-IO-1: the door switches. The exit button unlocks ALWAYS (PM). */
@@ -611,6 +619,8 @@ static void ozkie_thread(void *param)
             if (oz_ak1037_beep_start()) {
                 beep_off_at = now_ms() + OZ_BEEP_MS;
                 beeping = 1;
+            } else {
+                oz_port_log("beep: start failed (DAC refused), %u more queued", (unsigned)(tone_n - 1));
             }
             memmove(tone_q, tone_q + 1, (size_t)(--tone_n) * sizeof tone_q[0]);
         }
@@ -620,7 +630,7 @@ static void ozkie_thread(void *param)
         if (bl_on && (int32_t)(now_ms() - bl_off_at) >= 0) {
             oz_ak1037_backlight(OZ_BL_OFF);
             bl_on = 0;
-        } else if (bl_on) {
+        } else if (bl_on == 1 || bl_on == 2) {
             bl_on = bl_on == 1 ? 2 : 1;     /* toggle: both LEDs of each pair */
             oz_ak1037_backlight(bl_on == 1 ? OZ_BL_HIGH : OZ_BL_LOW);
         }

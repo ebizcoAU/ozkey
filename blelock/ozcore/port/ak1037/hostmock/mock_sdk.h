@@ -124,6 +124,11 @@ void mock_rfid_card(const uint8_t *uid, int len);
  * and calls the SDK would refuse (not open, unaligned, bad parameters). */
 extern int      mock_dac_on, mock_dac_plays, mock_dac_bad, mock_dac_pa_missing;
 extern uint32_t mock_dac_rate, mock_dac_len;
+/* BEEP-RFID-1: the longest tone and the shortest silence between two tones
+ * since mock_dac_timing_reset(); open_fail makes hal_dac_open() refuse. */
+extern uint32_t mock_dac_longest_ms, mock_dac_shortest_gap_ms;
+extern int      mock_dac_open_fail;
+void mock_dac_timing_reset(void);
 
 extern int mock_chip_resets;            /* hal_clock_chip_reset() calls */
 
