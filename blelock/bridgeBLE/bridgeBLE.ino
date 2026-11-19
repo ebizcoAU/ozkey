@@ -251,7 +251,7 @@ static char g_advName[16] = BLE_NAME;
 //      UNCLAIMED v2 lock (released, 60 s hold-off).
 // 0.48 (2026-11-06): a v2 lock whose `info` read fails (mid-reboot) is retried
 //      after 15 s, not the 5 min stranger cooldown (F1 acceptance r6/r9).
-#define FW_VERSION "bridgeBLE-0.52"
+#define FW_VERSION "bridgeBLE-0.53"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -3003,6 +3003,13 @@ static void ozBridgeConsolePoll() {
                     (unsigned long)g_bcmdRefused[OZB_E_REPLAY], (unsigned long)g_bcmdRefused[OZB_E_BRIDGE],
                     (unsigned long)g_bcmdRefused[OZB_E_PARSE], (unsigned long)g_bcmdRefused[OZB_E_NOKEY],
                     (unsigned long)g_bcmdRefused[OZB_E_OP], (unsigned long)g_bcmdLegacyDropped);
+    } else if (cmd == "tfail") {          // BRIDGE-THREADFAIL-1 bench: next boot's attach fails
+      prefs.begin("bridge32", false);
+      prefs.putBool("tfail_once", true);
+      prefs.end();
+      Serial.println("[BENCH] tfail: the NEXT boot treats its Thread attach as failed; rebooting");
+      delay(200);
+      ESP.restart();
     } else if (cmd == "id") {
       Serial.printf("[BENCH] device_id=%s fw=%s broker=%s:%u mode=%s ozkie_pub=%s\n",
                     deviceId.c_str(), FW_VERSION, cfgBrokerHost.c_str(),
@@ -3057,6 +3064,50 @@ static void ozBridgeConsolePoll() {
 // Thread network formation — bridge32 is always the former in v0 (single
 // bridge per home; no "join an existing mesh" path yet).
 // ─────────────────────────────────────────────────────────────────────────────
+// BRIDGE-THREADFAIL-1: a Wi-Fi bridge whose Thread attach timed out runs
+// without Thread (MQTT + BLE relay) and the loop picks the attach up later.
+static bool threadLateWatch = false;          // running without Thread, polling the role
+static unsigned long threadLateLogAt = 0;
+static bool threadForceFailOnce = false;      // bench: console `tfail` (NVS, one boot)
+
+static bool otRoleAttached(ot_device_role_t r) {
+  return r == OT_ROLE_LEADER || r == OT_ROLE_ROUTER || r == OT_ROLE_CHILD;
+}
+
+static void threadAttachedTail();             // below: what an attach sets up
+
+// The personality dispatch after OPERATIONAL (was inline in formThreadNetwork).
+static void bridgeGoOperational() {
+  state = ST_OPERATIONAL;
+  if (cfgMode == "matter-bridge") {
+    // F5: Personality A stub — no functional Matter-over-Wi-Fi stack yet.
+    Serial.println("[MODE] matter-bridge — Matter bridge mode not yet implemented");
+  } else if (cfgMode == "mqtt-uplink") {
+    mqttBegin(); // F2
+  }
+}
+
+// loop(): the late attach. OpenThread keeps trying on its own after our 20 s
+// wait; this only notices, without blocking (a 20 s re-wait would starve MQTT
+// and the relay).
+static void threadLateAttachTick() {
+  if (!threadLateWatch) return;
+  const ot_device_role_t role = OpenThread::otGetDeviceRole();
+  if (ozThreadLateAttachDue(state == ST_OPERATIONAL, threadLateWatch, otRoleAttached(role))) {
+    threadLateWatch = false;
+    Serial.printf("[THREAD] attached LATE, role=%s (BRIDGE-THREADFAIL-1)\n",
+                  OpenThread::otGetStringDeviceRole());
+    threadAttachedTail();
+    notifyStatus("THREAD_OK");
+    refreshInfo();
+    threadUdpBegin();
+  } else if (millis() - threadLateLogAt > 60000) {
+    threadLateLogAt = millis();
+    Serial.printf("[THREAD] still not attached (role=%s); running on Wi-Fi without Thread\n",
+                  OpenThread::otGetStringDeviceRole());
+  }
+}
+
 void formThreadNetwork() {
   state = ST_THREAD_FORMING;
   notifyStatus("THREAD_FORMING");
@@ -3212,11 +3263,30 @@ void formThreadNetwork() {
     role = OpenThread::otGetDeviceRole();
   } while (role != OT_ROLE_LEADER && role != OT_ROLE_ROUTER && role != OT_ROLE_CHILD &&
            millis() - attachStart < 20000);
+  if (threadForceFailOnce) {                  // bench: treat this attach as timed out
+    threadForceFailOnce = false;
+    Serial.println("[THREAD] BENCH tfail: this attach is treated as FAILED");
+    role = OT_ROLE_DETACHED;
+  }
   Serial.printf("[THREAD] attach role=%s after %lums\n",
                 OpenThread::otGetStringDeviceRole(), millis() - attachStart);
 
 
-  if (role != OT_ROLE_LEADER && role != OT_ROLE_ROUTER && role != OT_ROLE_CHILD) {
+  const int outcome = ozThreadAttachOutcome(otRoleAttached(role), WiFi.status() == WL_CONNECTED);
+  if (outcome == OZ_TH_RUN_WITHOUT) {
+    // BRIDGE-THREADFAIL-1: still fail closed for Thread (no dataset published,
+    // THREAD_FAIL reported), but a Wi-Fi bridge runs: it used to stay in
+    // ST_THREAD_FORMING, so it never dialled MQTT and was deaf until a reboot
+    // happened to attach (Bridge 2, 2 of 3 boots, 2026-11-20).
+    Serial.println("[THREAD] attach failed — not publishing dataset; running on Wi-Fi "
+                   "WITHOUT Thread, a later attach is picked up (BRIDGE-THREADFAIL-1)");
+    notifyStatus("THREAD_FAIL");
+    threadLateWatch = true;
+    threadLateLogAt = millis();
+    bridgeGoOperational();
+    return;
+  }
+  if (outcome == OZ_TH_FAIL_CLOSED) {
     // Fail closed (CONTRACT-BRIDGE.md's documented THREAD_FAIL, never actually
     // sent before this fix) — declaring THREAD_OK here would let refreshInfo()
     // publish whatever getCurrentDataSet() has (unattached, likely garbage)
@@ -3226,6 +3296,19 @@ void formThreadNetwork() {
     return;
   }
 
+  threadAttachedTail();
+  state = ST_OPERATIONAL;
+  notifyStatus("THREAD_OK");
+  refreshInfo();
+  threadUdpBegin(); // F4 — open regardless of personality; only mqtt-uplink sends on it for now
+
+  // Personality dispatch — Thread network formation is common to both;
+  // only the post-THREAD_OK behavior differs (blelock/CONTRACT-BRIDGE.md).
+  bridgeGoOperational();
+}
+
+// What an attach sets up (at boot, or late: BRIDGE-THREADFAIL-1).
+static void threadAttachedTail() {
   threadFormed = true;
 
   // ── ozkey-20 R2 — event-driven half ─────────────────────────────────────
@@ -3265,19 +3348,6 @@ void formThreadNetwork() {
                   (unsigned)ds.getChannel(), (unsigned)ds.getPanId());
   }
 
-  state = ST_OPERATIONAL;
-  notifyStatus("THREAD_OK");
-  refreshInfo();
-  threadUdpBegin(); // F4 — open regardless of personality; only mqtt-uplink sends on it for now
-
-  // Personality dispatch — Thread network formation is common to both;
-  // only the post-THREAD_OK behavior differs (blelock/CONTRACT-BRIDGE.md).
-  if (cfgMode == "matter-bridge") {
-    // F5: Personality A stub — no functional Matter-over-Wi-Fi stack yet.
-    Serial.println("[MODE] matter-bridge — Matter bridge mode not yet implemented");
-  } else if (cfgMode == "mqtt-uplink") {
-    mqttBegin(); // F2
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3710,6 +3780,13 @@ void setup() {
 
   loadConfig();
   ozBcmdLoad();          // BRIDGE-CMD-AUTH-1
+  {   // BRIDGE-THREADFAIL-1 bench: `tfail` makes THIS boot's attach count as failed
+    prefs.begin("bridge32", false);
+    threadForceFailOnce = prefs.getBool("tfail_once", false);
+    if (threadForceFailOnce) prefs.remove("tfail_once");
+    prefs.end();
+    if (threadForceFailOnce) Serial.println("[THREAD] BENCH tfail armed for this boot");
+  }
 
   if (wifiProvisioned) {
     state = ST_WIFI_JOINING;
@@ -3745,6 +3822,7 @@ void loop() {
   ozBleCentralTick();
   ozBleConnInfoTick();   // BRIDGE-LAT-1
   ozBcmdDiag();          // BRIDGE-CMD-AUTH-1: refusal counters
+  threadLateAttachTick(); // BRIDGE-THREADFAIL-1
 
   // 1.38: keep the on-flash copy fresh. Self-throttled to hourly inside, so
   // calling it every iteration costs a millis() compare.
