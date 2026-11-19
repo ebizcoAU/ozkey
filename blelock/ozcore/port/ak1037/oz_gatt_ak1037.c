@@ -15,6 +15,7 @@
  * default advertising is off, and the mode is re-applied whenever it changes.
  */
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "rtthread.h"
@@ -434,6 +435,40 @@ void oz_gatt_ak1037_debug_hang(void) { dbg_hang = 1; }
  * outlives the kv it came from. Debug builds only. */
 static volatile int dbg_wipe;
 void oz_gatt_ak1037_debug_wipe_reset(void) { dbg_wipe = 1; }
+
+/* oz.flashlat (AK-FLASH-LAT-1): the request; the thread runs it. */
+static volatile int dbg_flat_n;
+void oz_gatt_ak1037_debug_flashlat(int n) { dbg_flat_n = n; }
+
+/* N kv writes of a 16-byte value (about a limit record), each timed by the
+ * ms tick, then the test key erased. On the OZKIE thread only. */
+static void flashlat_run(int n, int wdt_id)
+{
+    static const uint8_t v[16] = { 0x5a };
+    uint32_t mn = UINT32_MAX, mx = 0, sum = 0;
+    if (oz_kv_lfs_namespace("oz") != OZ_OK) {
+        oz_port_log("oz.flashlat: FAILED (kv namespace)");
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        uint32_t t0 = now_ms();
+        if (oz_kv_lfs_set("dbgflat", v, sizeof v) != OZ_OK) {
+            oz_port_log("oz.flashlat: FAILED at write %d", i + 1);
+            (void)oz_kv_lfs_erase("dbgflat");
+            return;
+        }
+        uint32_t dt = now_ms() - t0;
+        sum += dt;
+        if (dt < mn) mn = dt;
+        if (dt > mx) mx = dt;
+        oz_ak1037_wdt_checkin(wdt_id);  /* 50 slow writes must not trip the watchdog */
+    }
+    uint32_t t0 = now_ms();
+    int er = oz_kv_lfs_erase("dbgflat");
+    oz_port_log("oz.flashlat: %d writes, set min=%lu mean=%lu max=%lu ms, erase %lu ms%s", n,
+                (unsigned long)mn, (unsigned long)(sum / (uint32_t)n), (unsigned long)mx,
+                (unsigned long)(now_ms() - t0), er == OZ_OK ? "" : " (erase FAILED)");
+}
 #endif
 
 static void ozkie_thread(void *param)
@@ -461,6 +496,11 @@ static void ozkie_thread(void *param)
             } else {
                 oz_port_log("oz.wipe: FAILED (kv); nothing reset");
             }
+        }
+        if (dbg_flat_n > 0) {
+            int n = dbg_flat_n;
+            dbg_flat_n = 0;
+            flashlat_run(n, wdt_id);
         }
         if (!dbg_hang)
 #endif
@@ -713,6 +753,24 @@ static void touch_start(void)
 #define OZ_RFID_POLL_MS  250u
 #define OZ_RFID_SLOW_MS  20u
 static uint32_t rfid_next, rfid_slowest;
+#ifdef OZ_DEBUG_HOOKS
+/* RFID-TIME-1: every poll's time, for Anyka Q12 (polls of 243 and 1006 ms
+ * seen on the chip). Buckets: <50, 50-99, 100-249, 250-499, >=500 ms. */
+static volatile uint32_t rst_n, rst_sum, rst_max, rst_hist[5];
+
+void oz_gatt_ak1037_debug_rfidstat(int reset)
+{
+    if (reset) {
+        rst_n = rst_sum = rst_max = 0;
+        for (int i = 0; i < 5; i++)
+            rst_hist[i] = 0;
+    }
+    printf("oz.rfidstat: n=%lu mean=%lu ms max=%lu ms | <50:%lu 50-99:%lu 100-249:%lu 250-499:%lu >=500:%lu \r\n",
+           (unsigned long)rst_n, (unsigned long)(rst_n ? rst_sum / rst_n : 0), (unsigned long)rst_max,
+           (unsigned long)rst_hist[0], (unsigned long)rst_hist[1], (unsigned long)rst_hist[2],
+           (unsigned long)rst_hist[3], (unsigned long)rst_hist[4]);
+}
+#endif
 static uint8_t  rfid_last[OZ_CARD_ID_MAX];
 static size_t   rfid_last_len;
 
@@ -729,6 +787,16 @@ static int rfid_poll(oz_lock *L)
         rfid_slowest = dt;
         oz_port_log("rfid: slowest poll %lu ms", (unsigned long)dt);
     }
+#ifdef OZ_DEBUG_HOOKS
+    rst_n++;
+    rst_sum += dt;
+    if (dt > rst_max)
+        rst_max = dt;
+    rst_hist[dt < 50 ? 0 : dt < 100 ? 1 : dt < 250 ? 2 : dt < 500 ? 3 : 4]++;
+    if (dt >= 100)
+        oz_port_log("rfid: slow poll %lu ms @%lu ms (%s)", (unsigned long)dt, (unsigned long)t0,
+                    n > 0 ? "card" : "no card");
+#endif
     if (n <= 0 || n > (int32_t)OZ_CARD_ID_MAX) {
         rfid_last_len = 0;              /* the antenna is free again */
         return 0;
