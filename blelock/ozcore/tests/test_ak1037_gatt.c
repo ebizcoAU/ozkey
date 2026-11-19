@@ -328,14 +328,18 @@ static void claim(void)
     /* The answer meets a full send ring three times, then goes out. */
     uint32_t code;
     oz_edhoc_pair_code(&e, &code);
-    char cmd[32];
-    snprintf(cmd, sizeof cmd, "oz.key %06u#", (unsigned)code);   /* typed on the keypad */
+    char typed[16];
+    snprintf(typed, sizeof typed, "%06u#", (unsigned)code);       /* typed on the keypad */
     got_done = 0;
     oz_reasm_reset(&got);
     notify_full = 3;
     long attempts = notify_attempts, sent = notifies;
     uint32_t t0 = mock_ms;
-    expect_int("oz.key exists", mock_msh_run(cmd), 0);
+    int krc = OZ_OK;
+    for (const char *k = typed; *k; k++)    /* the touch pads' path, not the shell (REL-SHELL-1) */
+        if (oz_gatt_ak1037_key(*k) != OZ_OK)
+            krc = -1;
+    expect_int("keypad digits queued", krc, OZ_OK);
     for (int i = 0; i < 7; i++)             /* six digits and '#', one event each */
         mock_pass();
     expect_int("BUFFER_FULL retried, then sent", notify_attempts - attempts, (notifies - sent) + 3);
@@ -408,9 +412,8 @@ static void idle(uint32_t ms);
 /* Press keys; the thread takes one event per key. */
 static void keys(const char *k)
 {
-    char cmd[48];
-    snprintf(cmd, sizeof cmd, "oz.key %s", k);
-    mock_msh_run(cmd);
+    for (const char *c = k; *c; c++)        /* the touch pads' path (REL-SHELL-1) */
+        (void)oz_gatt_ak1037_key(*c);
     for (size_t i = 0; i < strlen(k); i++)
         mock_pass();
 }
@@ -585,10 +588,14 @@ static void keypad_lockout(void)
 
 static void card_reads(const char *hex, int reads, uint32_t every_ms)
 {
-    char cmd[64];
-    snprintf(cmd, sizeof cmd, "oz.card %s", hex);
+    uint8_t id[16];
+    size_t n = 0;
+    for (const char *h = hex; h[0] && h[1] && n < sizeof id; h += 2) {
+        char b[3] = { h[0], h[1], 0 };
+        id[n++] = (uint8_t)strtoul(b, NULL, 16);
+    }
     for (int i = 0; i < reads; i++) {
-        mock_msh_run(cmd);
+        (void)oz_gatt_ak1037_card(id, n);  /* the reader's path, not the shell (REL-SHELL-1) */
         mock_pass();
         mock_ms += every_ms;
     }
@@ -604,8 +611,7 @@ static void cards_at_reader(void)
     mock_progs_at_dac_open = -1;
     mock_ms += 2000;
     capture_start();
-    mock_msh_run("oz.card 04a1b2c3d4e5f6");
-    mock_pass();
+    card_reads("04a1b2c3d4e5f6", 1, 0);
     capture_end();
     expect_int("a wrong card", count("card: wrong"), 1);
     expect_int("kvlat: its first tone started before any flash write", mock_progs_at_dac_open, p0);
@@ -627,12 +633,8 @@ static void cards_at_reader(void)
 
     capture_start();
     card_reads("04a1b2c3d4e5f7", 1, 0);
-    mock_msh_run("oz.card 04a");                  /* odd length */
-    mock_msh_run("oz.card 0g");                   /* not hex */
-    mock_msh_run("oz.card 00112233445566778899aabbccddeeff00");   /* 17 bytes */
     capture_end();
     expect_int("locked out: not checked", count("card: locked out, 60 s left, not checked"), 1);
-    expect_int("bad ids refused by the shell", count("usage: oz.card"), 3);
 }
 
 /* ── the motor (P5-C), log-only driver: every move is unconfirmed ────── */
@@ -908,6 +910,21 @@ static const char *hook_name(void)
     return n;
 }
 
+/* REL-SHELL-1 (PM 2026-11-20, security blocker): "oz.key" / "oz.card" /
+ * "oz.code" inject keypad digits, a card UID or the pairing code from the
+ * UART, without the keypad or the card. Built at run time (as hook_name())
+ * so the release-binary scan sees them only where the commands exist. */
+static const char *inject_name(int which)
+{
+    static char n[3][16];
+    static volatile const char rev[3][8] = { "yek.zo", "drac.zo", "edoc.zo" };
+    size_t len = strlen((const char *)rev[which]);
+    for (size_t i = 0; i < len; i++)
+        n[which][i] = rev[which][len - 1 - i];
+    n[which][len] = 0;
+    return n[which];
+}
+
 /* Release and every default build: the shell has no such command. */
 /* "oz.wipe", built at run time for the same reason as hook_name(). */
 /* "oz.led", built backwards so this file's release binary never holds it. */
@@ -1140,7 +1157,46 @@ static void no_hooks(void)
     expect_int("no battery probe in the shell", mock_msh_run(batt_name()), -1);
     expect_int("no rfid stats in the shell", mock_msh_run(rfidstat_name()), -1);
     expect_int("no flash timer in the shell", mock_msh_run(flashlat_name()), -1);
+    expect_int("no keypad injection in the shell", mock_msh_run(inject_name(0)), -1);
+    expect_int("no card injection in the shell", mock_msh_run(inject_name(1)), -1);
+    expect_int("no pairing-code injection in the shell", mock_msh_run(inject_name(2)), -1);
 }
+
+#ifdef OZ_DEBUG_HOOKS
+/* REL-SHELL-1 positive control: the bench (_dbg) images keep the three
+ * commands (blelink.py types the pairing code and PINs with them). */
+static void inject_cmds(void)
+{
+    char cmd[64];
+    boot();
+    capture_start();
+    for (int i = 0; i < 3; i++)
+        expect_int("debug: the injection command exists", mock_msh_run(inject_name(i)), 0);
+    capture_end();
+    expect_int("…each explains its usage without an argument", count("usage:"), 3);
+    capture_start();
+    snprintf(cmd, sizeof cmd, "%s 0000#", inject_name(0));
+    mock_msh_run(cmd);
+    for (int i = 0; i < 5; i++)
+        mock_pass();
+    capture_end();
+    expect_int("debug: typed digits reach the keypad", count("keypad: wrong"), 1);
+    capture_start();
+    mock_ms += 2000;
+    snprintf(cmd, sizeof cmd, "%s 04a1b2c3", inject_name(1));
+    mock_msh_run(cmd);
+    mock_pass();
+    snprintf(cmd, sizeof cmd, "%s 04a", inject_name(1));                 /* odd length */
+    mock_msh_run(cmd);
+    snprintf(cmd, sizeof cmd, "%s 0g", inject_name(1));                  /* not hex */
+    mock_msh_run(cmd);
+    snprintf(cmd, sizeof cmd, "%s 00112233445566778899aabbccddeeff00", inject_name(1));   /* 17 bytes */
+    mock_msh_run(cmd);
+    capture_end();
+    expect_int("debug: a typed card reaches the reader", count("card: wrong"), 1);
+    expect_int("debug: bad ids refused by the shell", count("usage:"), 3);
+}
+#endif
 
 #ifdef OZ_DEBUG_HOOKS
 /* OZ-WIPE-1 (PM GO 2026-11-18): debug builds only, serial shell only. Erases
@@ -1502,6 +1558,14 @@ int main(int argc, char **argv)
         expect_int("built with OZ_DEBUG_HOOKS", 0, 1);
 #endif
         return report("ak1037_gatt_wipe");
+    }
+    if (argc > 1 && !strcmp(argv[1], "inject")) {
+#ifdef OZ_DEBUG_HOOKS
+        inject_cmds();
+#else
+        expect_int("built with OZ_DEBUG_HOOKS", 0, 1);
+#endif
+        return report("ak1037_gatt_inject");
     }
     if (argc > 1 && !strcmp(argv[1], "wdthang")) {
 #ifdef OZ_DEBUG_HOOKS

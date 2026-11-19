@@ -220,7 +220,7 @@ add_test(NAME ak1037_gatt_autostart COMMAND test_ak1037_gatt autostart)
 # port/ak1037/Makefile defines OZ_DEBUG_HOOKS except the debug test below.
 add_test(NAME ak1037_nohooks COMMAND test_ak1037_gatt nohooks)
 add_test(NAME ak1037_release_bin_no_wdthang
-         COMMAND sh -c "! LC_ALL=C grep -a -q -e 'oz\\.wdthang' -e 'oz\\.wipe' -e 'oz\\.led' -e 'oz\\.batt' -e 'oz\\.rfidstat' -e 'oz\\.flashlat' -e 'slow poll' -e 'sense OFF' \"$1\" && ! LC_ALL=C grep -a -q -e 'oz\\.wdthang' -e 'oz\\.wipe' -e 'oz\\.led' -e 'oz\\.batt' -e 'oz\\.rfidstat' -e 'oz\\.flashlat' -e 'slow poll' -e 'sense OFF' \"$2\""
+         COMMAND sh -c "! LC_ALL=C grep -a -q -e 'oz\\.wdthang' -e 'oz\\.wipe' -e 'oz\\.led' -e 'oz\\.batt' -e 'oz\\.rfidstat' -e 'oz\\.flashlat' -e 'slow poll' -e 'sense OFF' -e 'oz\\.key' -e 'oz\\.card' -e 'oz\\.code' \"$1\" && ! LC_ALL=C grep -a -q -e 'oz\\.wdthang' -e 'oz\\.wipe' -e 'oz\\.led' -e 'oz\\.batt' -e 'oz\\.rfidstat' -e 'oz\\.flashlat' -e 'slow poll' -e 'sense OFF' -e 'oz\\.key' -e 'oz\\.card' -e 'oz\\.code' \"$2\""
                  sh $<TARGET_FILE:test_ak1037_gatt> $<TARGET_FILE:test_ak1037_selftest>)
 # The burn tool refuses a partition without a file ("Partition name and BIN file
 # name are different", 2026-11-18): every partition gets a download line, in order.
@@ -241,9 +241,10 @@ add_test(NAME ak1037_led COMMAND test_ak1037_gatt_debug led)
 add_test(NAME ak1037_batt_bench COMMAND test_ak1037_gatt_debug batt)
 add_test(NAME ak1037_rfidstat COMMAND test_ak1037_gatt_debug rfidstat)
 add_test(NAME ak1037_flashlat COMMAND test_ak1037_gatt_debug flashlat)
+add_test(NAME ak1037_inject_debug_only COMMAND test_ak1037_gatt_debug inject)
 # Positive control for the scan above: it finds the name where the hook is built in.
 add_test(NAME ak1037_debug_bin_has_wdthang
-         COMMAND sh -c "LC_ALL=C grep -a -q 'oz\\.wdthang' \"$1\" && LC_ALL=C grep -a -q 'oz\\.wipe' \"$1\"" sh $<TARGET_FILE:test_ak1037_gatt_debug>)
+         COMMAND sh -c "LC_ALL=C grep -a -q 'oz\\.wdthang' \"$1\" && LC_ALL=C grep -a -q 'oz\\.wipe' \"$1\" && LC_ALL=C grep -a -q 'oz\\.key' \"$1\" && LC_ALL=C grep -a -q 'oz\\.card' \"$1\" && LC_ALL=C grep -a -q 'oz\\.code' \"$1\"" sh $<TARGET_FILE:test_ak1037_gatt_debug>)
 # P5-D: optimised builds hold the measured host stack peaks to the threads'
 # budgets (unoptimised frames are far bigger than the target's -Os ones).
 target_compile_definitions(test_ak1037_gatt PRIVATE $<$<CONFIG:Release>:OZ_STACK_TRIPWIRE>)
