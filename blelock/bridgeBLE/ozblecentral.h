@@ -723,6 +723,7 @@ class OzBleScanCb : public BLEAdvertisedDeviceCallbacks {
         !(dev.isAdvertisingService(BLEUUID(OZL_SVC_UUID)) ||
           dev.isAdvertisingService(BLEUUID("4f5a4b32-0001-4c4f-434b-000000000001")))) return;
     const String addr = dev.getAddress().toString();
+    ozAddrTypeNote(addr.c_str(), dev.getAddressType());   // BRIDGE-ADDRTYPE-1: connect with it
 
     // XF-144 P2 — a targeted scan is watching for one specific address this
     // tick, independent of (and not gated by) the normal pairing/discovery
@@ -813,8 +814,11 @@ static bool ozBleConnectOne(const String &addr) {
 
   BLEClient *cl = BLEDevice::createClient();
   if (!cl) return false;
-  if (!cl->connect(BLEAddress(addr))) {
-    Serial.printf("[BLE] %s: connect failed\n", addr.c_str());
+  // BRIDGE-ADDRTYPE-1: the type the lock advertised with (the AK1037 is RANDOM);
+  // unknown -> 0 = public, the old behaviour.
+  const uint8_t atype = ozAddrTypeOf(addr.c_str(), 0);
+  if (!cl->connect(BLEAddress(addr, atype), atype)) {
+    Serial.printf("[BLE] %s: connect failed (address type %u)\n", addr.c_str(), (unsigned)atype);
     delete cl;
     return false;
   }
