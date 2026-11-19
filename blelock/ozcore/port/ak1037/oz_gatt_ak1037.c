@@ -69,7 +69,13 @@ enum { CH_OZKIE = 0, CH_RELAY = 1 };
 
 enum { EV_CONNECT = 1, EV_DISCONNECT, EV_MTU, EV_FRAME, EV_PAIR_CODE, EV_TOUCH, EV_KEY, EV_CARD, EV_PAD };
 static char pad_char(int pad);          /* touch pad bit -> key (TOUCH-MAP-1) */
-static int rfid_poll(oz_lock *L);       /* the on-chip RFID reader (RFID-READER-1): 1 = a new card */
+static void rfid_thread_start(uint8_t prio);   /* the on-chip RFID reader's own thread (RFID-THREAD-1) */
+static volatile uint8_t rfid_hold = 1; /* the OZKIE thread: no read now (motor moving, tones) */
+#ifdef OZ_DEBUG_HOOKS
+/* RFID-THREAD-1: the OZKIE thread's own work per pass (after its queue wait),
+ * to show on the chip that card reads no longer stall it (oz.rfidstat). */
+static volatile uint32_t ozp_n, ozp_max, ozp_over50;
+#endif
 static void tones(int n, uint32_t gap_ms);  /* queue n beeps (LOCK-IO-1 patterns) */
 
 /* The door's own inputs (LOCK-IO-1). Policy numbers: the board's doorio
@@ -144,7 +150,9 @@ static void post_frame(const void *data, uint16_t len, uint32_t chr)
 
 /* A card's identity, from the reader's thread (or the shell): the same
  * layout as msg_t up to its 16 bytes of data, on the caller's stack. */
-static int post_card(const uint8_t *id, size_t len)
+static int post_card_ev(const uint8_t *id, size_t len, uint32_t fresh);
+static int post_card(const uint8_t *id, size_t len) { return post_card_ev(id, len, 0); }
+static int post_card_ev(const uint8_t *id, size_t len, uint32_t fresh)
 {
     struct {
         hdr_t   h;
@@ -154,7 +162,7 @@ static int post_card(const uint8_t *id, size_t len)
         return OZ_E_ARG;
     m.h.ev = EV_CARD;
     m.h.len = (uint16_t)len;
-    m.h.arg = 0;
+    m.h.arg = fresh;
     memcpy(m.data, id, len);
     if (rt_mq_send(&mq, &m, offsetof(msg_t, data) + len) != RT_EOK) {
         oz_port_log("gatt: queue full, card dropped");
@@ -512,6 +520,9 @@ static void ozkie_thread(void *param)
     uint32_t squat_drops = 0;
     int applied = -1, failed = 0;
     int wdt_id = oz_ak1037_wdt_add(OZ_GATT_WDT_MS);
+#ifdef OZ_DEBUG_HOOKS
+    uint32_t pass_t0 = 0;
+#endif
     int bl_on = 0;                  /* 0 dark; 1/2 all keys, toggling (card, alarm); 3 one key (PER-KEY-BL-1) */
     uint32_t bl_off_at = 0;
     refresh_info(L);
@@ -537,7 +548,21 @@ static void ozkie_thread(void *param)
         /* 10 ms while the motor moves (oz_motor_step's cadence) or the
          * backlight flashes (its toggle), else 100. */
         rt_int32_t wait = motor.phase == OZ_MOTOR_IDLE && !bl_on && !beeping && !tone_n ? 100 : 10;  /* 10 ms: motor, flash or beep */
-        if (rt_mq_recv(&mq, &m, sizeof m, ms_ticks((uint32_t)wait)) == RT_EOK) {
+#ifdef OZ_DEBUG_HOOKS
+        if (pass_t0) {                  /* the previous pass's work, its wait excluded */
+            uint32_t dt = now_ms() - pass_t0;
+            ozp_n++;
+            if (dt > ozp_max)
+                ozp_max = dt;
+            if (dt >= 50)
+                ozp_over50++;
+        }
+#endif
+        int got = rt_mq_recv(&mq, &m, sizeof m, ms_ticks((uint32_t)wait)) == RT_EOK;
+#ifdef OZ_DEBUG_HOOKS
+        pass_t0 = now_ms();
+#endif
+        if (got) {
             switch (m.h.ev) {
             case EV_CONNECT:
                 oz_ble_connect(&session);
@@ -613,6 +638,13 @@ static void ozkie_thread(void *param)
             }
             case EV_CARD:
                 card_in(L, m.data, m.h.len);
+                if (m.h.arg) {                  /* the reader: a new card on the antenna */
+                    if (bl_on != 1 && bl_on != 2) {     /* all keys flash + a beep */
+                        bl_on = 1;              /* (an alarm flash already on keeps its end) */
+                        bl_off_at = now_ms() + OZ_BL_FLASH_MS;
+                    }
+                    tones(1, 0);
+                }
                 break;
             default:
                 break;
@@ -641,16 +673,10 @@ static void ozkie_thread(void *param)
             (void)com_ble_disconnect(0);
         }
         motor_step(L);
-        /* BEEP-RFID-1: a read blocks the thread (243 ms seen on the chip), so
-         * none while a tone plays or waits: it would hold the tone on and run
-         * the next ones into it. */
-        if (motor.phase == OZ_MOTOR_IDLE && !beeping && !tone_n && rfid_poll(L)) {
-            if (bl_on != 1 && bl_on != 2) {     /* a new card: all keys flash + a beep */
-                bl_on = 1;                      /* (an alarm flash already on keeps its end) */
-                bl_off_at = now_ms() + OZ_BL_FLASH_MS;
-            }
-            tones(1, 0);
-        }
+        /* BEEP-RFID-1: no antenna read while the motor moves or a tone plays
+         * or waits. RFID-THREAD-1: the reads themselves run on the reader
+         * thread; this only tells it when not to. */
+        rfid_hold = !(motor.phase == OZ_MOTOR_IDLE && !beeping && !tone_n);
         /* LOCK-IO-1: the door switches. The exit button unlocks ALWAYS (PM). */
         {
             uint8_t pr[OZ_DIO_SW_N];
@@ -770,11 +796,13 @@ static void touch_start(void)
 
 /* ── On-chip RFID reader (RFID-READER-1) ─────────────────────────────────── */
 
-/* hal_rfid_read_card() runs one read on the antenna and blocks while it does,
- * so it is polled from the lock thread every OZ_RFID_POLL_MS, never while the
- * motor moves. The card path (oz_card_seen) makes a card held on the antenna
- * one check. The slowest poll so far is logged (from 20 ms), as the chip's
- * read time is not documented. */
+/* hal_rfid_read_card() runs one read on the antenna and blocks while it does
+ * (13 ms mean, 71 ms max measured; no non-blocking read: Anyka Q6). RFID-
+ * THREAD-1: so it runs on its own thread, one priority below the OZKIE thread
+ * (Anyka's advice), every OZ_RFID_POLL_MS, never while the OZKIE thread holds
+ * it (motor, tones). Each read is posted as EV_CARD (arg 1 = a new card on the
+ * antenna); the card path (oz_card_seen) makes a held card one check. The
+ * slowest poll so far is logged (from 20 ms). */
 #define OZ_RFID_POLL_MS  250u
 #define OZ_RFID_SLOW_MS  20u
 static uint32_t rfid_next, rfid_slowest;
@@ -789,22 +817,30 @@ void oz_gatt_ak1037_debug_rfidstat(int reset)
         rst_n = rst_sum = rst_max = 0;
         for (int i = 0; i < 5; i++)
             rst_hist[i] = 0;
+        ozp_n = ozp_max = ozp_over50 = 0;
     }
     printf("oz.rfidstat: n=%lu mean=%lu ms max=%lu ms | <50:%lu 50-99:%lu 100-249:%lu 250-499:%lu >=500:%lu \r\n",
            (unsigned long)rst_n, (unsigned long)(rst_n ? rst_sum / rst_n : 0), (unsigned long)rst_max,
            (unsigned long)rst_hist[0], (unsigned long)rst_hist[1], (unsigned long)rst_hist[2],
            (unsigned long)rst_hist[3], (unsigned long)rst_hist[4]);
+    printf("ozkie pass: n=%lu max=%lu ms over50=%lu \r\n",
+           (unsigned long)ozp_n, (unsigned long)ozp_max, (unsigned long)ozp_over50);
 }
 #endif
 static uint8_t  rfid_last[OZ_CARD_ID_MAX];
 static size_t   rfid_last_len;
 
-static int rfid_poll(oz_lock *L)
+#define OZ_RFID_TICK_MS  50u          /* the reader thread's wake-up */
+#define OZ_RFID_WDT_MS   5000u        /* a read hung this long resets the chip (1006 ms seen once) */
+#define OZ_RFID_STACK    2048u
+
+/* One reader iteration (the reader thread; the host mock steps it). */
+void oz_gatt_ak1037_rfid_step(void)
 {
     uint8_t id[32];
     uint32_t t0 = now_ms();
-    if ((int32_t)(t0 - rfid_next) < 0)
-        return 0;
+    if (rfid_hold || (int32_t)(t0 - rfid_next) < 0)
+        return;
     int32_t n = hal_rfid_read_card(CARD_TYPE_A, id);
     uint32_t dt = now_ms() - t0;
     rfid_next = now_ms() + OZ_RFID_POLL_MS;
@@ -824,7 +860,7 @@ static int rfid_poll(oz_lock *L)
 #endif
     if (n <= 0 || n > (int32_t)OZ_CARD_ID_MAX) {
         rfid_last_len = 0;              /* the antenna is free again */
-        return 0;
+        return;
     }
     int fresh = 0;
     if ((size_t)n != rfid_last_len || memcmp(id, rfid_last, (size_t)n) != 0) {
@@ -845,14 +881,38 @@ static int rfid_poll(oz_lock *L)
         memcpy(rfid_last, id, (size_t)n);
         rfid_last_len = (size_t)n;
     }
-    card_in(L, id, (size_t)n);
-    return fresh;
+    (void)post_card_ev(id, (size_t)n, (uint32_t)fresh);
+}
+
+static struct rt_thread rfid_thread_tcb;
+static uint8_t rfid_stack[OZ_RFID_STACK] __attribute__((aligned(8)));
+
+static void rfid_thread(void *param)
+{
+    (void)param;
+    int wdt_id = oz_ak1037_wdt_add(OZ_RFID_WDT_MS);
+    for (;;) {
+        rt_thread_delay((rt_tick_t)ms_ticks(OZ_RFID_TICK_MS));
+        oz_ak1037_wdt_checkin(wdt_id);
+        oz_gatt_ak1037_rfid_step();
+    }
 }
 
 static void rfid_start(void)
 {
     (void)hal_rfid_init();
     oz_port_log("rfid: reader on");
+}
+
+/* After the OZKIE thread exists (EV_CARD goes to its queue). */
+static void rfid_thread_start(uint8_t prio)
+{
+    uint8_t p = prio + 1u < RT_THREAD_PRIORITY_MAX - 1u ? (uint8_t)(prio + 1u) : (uint8_t)(RT_THREAD_PRIORITY_MAX - 2u);
+    if (rt_thread_init(&rfid_thread_tcb, "ozrfid", rfid_thread, NULL, rfid_stack, sizeof rfid_stack, p, 10) != RT_EOK) {
+        oz_port_log("rfid: reader thread FAILED, no cards");
+        return;
+    }
+    rt_thread_startup(&rfid_thread_tcb);
 }
 
 static void tones(int n, uint32_t gap_ms)
@@ -932,5 +992,6 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
                        thread_priority, 10) != RT_EOK)
         return OZ_E_HW;
     rt_thread_startup(&thread);
+    rfid_thread_start(thread_priority);  /* RFID-THREAD-1: after the queue's reader exists */
     return OZ_OK;
 }

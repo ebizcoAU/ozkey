@@ -31,6 +31,7 @@ struct rt_thread {
     size_t stack_size;
     int    started;
     int    finished;
+    int    priority;              /* as given to rt_thread_init */
     /* mock only: the painted part of the pthread stack it really runs on */
     uint8_t  *paint_lo;
     uintptr_t paint_top;

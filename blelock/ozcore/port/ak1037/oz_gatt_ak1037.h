@@ -56,6 +56,8 @@ int oz_gatt_ak1037_key(char key);
  * field; the OZKIE thread counts one tap per card (oz_card.h) and checks it.
  * OZ_E_ARG for a bad length, OZ_E_HW if the queue is full. */
 int oz_gatt_ak1037_card(const uint8_t *id, size_t len);
+/* RFID-THREAD-1: one iteration of the card reader thread (exposed for the host mock). */
+void oz_gatt_ak1037_rfid_step(void);
 
 /* The lock's pair_prompt hook, which runs on the OZKIE thread: while on, an
  * entry on the keypad is the pairing code. */

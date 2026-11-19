@@ -47,6 +47,9 @@ rt_tick_t rt_tick_from_millisecond(rt_int32_t ms)
  * a tenth of what was asked on this chip (see rt_tick_get). */
 rt_err_t rt_thread_delay(rt_tick_t ticks)
 {
+    extern int mock_reader_park(void);
+    if (mock_reader_park())
+        return RT_EOK;                  /* the reader: time is the OZKIE pass's */
     mock_ms += (uint32_t)ticks;
     return RT_EOK;
 }
@@ -225,6 +228,14 @@ static pthread_mutex_t big = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static int parked, go;
 static long passes;
+/* RFID-THREAD-1: the card reader thread ("ozrfid") is a real pthread, parked in
+ * its rt_thread_delay(); each OZKIE pass (rt_mq_recv) releases it for exactly
+ * one iteration and waits for it to park again, so the tests stay lock-step. */
+static __thread struct rt_thread *self_thread;
+static struct rt_thread *reader;
+static long reader_parks;
+static int reader_go;
+int mock_reads_off_reader;              /* hal_rfid_read_card() not on the reader thread */
 
 #if defined(__SANITIZE_ADDRESS__)
 #define STACK_MEASURE 0
@@ -283,6 +294,7 @@ static void *trampoline(void *arg)
 {
     struct rt_thread *t = arg;
     volatile char here;
+    self_thread = t;
     if (STACK_MEASURE)
         paint_stack(t, (uintptr_t)&here);
     t->entry(t->param);
@@ -310,6 +322,7 @@ rt_err_t rt_thread_init(struct rt_thread *thread, const char *name, void (*entry
     thread->param = parameter;
     thread->stack = stack_start;
     thread->stack_size = stack_size;
+    thread->priority = priority;
     memset(stack_start, '#', stack_size);       /* as RT-Thread does */
     for (unsigned i = 0; i < sizeof threads / sizeof threads[0]; i++)
         if (!threads[i]) {
@@ -330,9 +343,33 @@ rt_err_t rt_thread_startup(rt_thread_t thread)
     pthread_attr_setstacksize(&a, 8u * 1024u * 1024u);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     thread->started = 1;
+    if (!strcmp(thread->name, "ozrfid"))
+        reader = thread;
     int rc = pthread_create(&p, &a, trampoline, thread);
     pthread_attr_destroy(&a);
     return rc ? -RT_ERROR : RT_EOK;
+}
+
+/* 1 when the caller is the reader thread: it parked until the next OZKIE pass. */
+int mock_reader_park(void)
+{
+    if (!self_thread || self_thread != reader)
+        return 0;
+    pthread_mutex_lock(&big);
+    reader_parks++;
+    pthread_cond_broadcast(&cv);
+    while (!reader_go)
+        pthread_cond_wait(&cv, &big);
+    reader_go = 0;
+    pthread_mutex_unlock(&big);
+    return 1;
+}
+
+static struct rt_thread *find_thread(const char *name);
+int mock_thread_priority(const char *name)
+{
+    struct rt_thread *t = find_thread(name);
+    return t ? t->priority : -1;
 }
 
 static struct rt_thread *find_thread(const char *name)
@@ -418,6 +455,15 @@ rt_err_t rt_mq_recv(rt_mq_t mq, void *buffer, rt_size_t size, rt_int32_t timeout
     go = 0;
     parked = 0;
     passes++;
+    if (reader && !reader->finished) {  /* one reader iteration, the OZKIE thread waiting */
+        while (reader_parks == 0)
+            pthread_cond_wait(&cv, &big);
+        long n = reader_parks;
+        reader_go = 1;
+        pthread_cond_broadcast(&cv);
+        while (reader_parks == n)
+            pthread_cond_wait(&cv, &big);
+    }
     if (mq->count) {
         memcpy(buffer, mq->pool + mq->head * mq->msg_size, size < mq->msg_size ? size : mq->msg_size);
         mq->head = (mq->head + 1) % mq->max;
@@ -761,6 +807,8 @@ void    hal_rfid_destroy(void) { }
 int32_t hal_rfid_read_card(EN_RFID_CARD_TYPE t, uint8_t *data)
 {
     mock_rfid_reads++;
+    if (!self_thread || strcmp(self_thread->name, "ozrfid"))
+        mock_reads_off_reader++;
     mock_ms += mock_rfid_cost_ms;
     if (t != CARD_TYPE_A || rfid_len == 0)
         return 0;
