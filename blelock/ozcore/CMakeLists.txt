@@ -271,3 +271,36 @@ target_compile_definitions(test_ak1037_selftest PRIVATE OZ_SELFTEST_TARGET=1 $<$
 foreach(m good wrong)
     add_test(NAME ak1037_selftest_${m} COMMAND test_ak1037_selftest ${m})
 endforeach()
+
+# ── BRIDGE-HOST-SUITE-1: the bridge's (blelock/bridgeBLE) plain-C++ host tests ──
+# They ran only by hand (test/run_*.sh); here every gate config runs them, the
+# sanitizer one included (gate.sh passes CMAKE_CXX_FLAGS too).
+set(OZ_BRIDGE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../bridgeBLE)
+if(EXISTS ${OZ_BRIDGE_DIR}/test/test_bcmd.cpp)
+    enable_language(CXX)
+    add_library(monocypher_ed25519 STATIC third_party/monocypher/optional/monocypher-ed25519.c)
+    target_include_directories(monocypher_ed25519 PUBLIC third_party/monocypher/optional)
+    target_link_libraries(monocypher_ed25519 PUBLIC monocypher)
+    add_executable(test_bridge_addrtype ${OZ_BRIDGE_DIR}/test/test_addrtype.cpp)
+    target_include_directories(test_bridge_addrtype PRIVATE ${OZ_BRIDGE_DIR})
+    target_compile_options(test_bridge_addrtype PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME bridge_addrtype COMMAND test_bridge_addrtype)
+    add_executable(test_bridge_bcmd ${OZ_BRIDGE_DIR}/test/test_bcmd.cpp)
+    target_include_directories(test_bridge_bcmd PRIVATE ${OZ_BRIDGE_DIR} tests/vectors)
+    target_link_libraries(test_bridge_bcmd ozcore monocypher_ed25519)
+    target_compile_options(test_bridge_bcmd PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME bridge_bcmd COMMAND test_bridge_bcmd)
+    # The directory-wide NANO-PRINTF-1 -include maps snprintf to the AK1037's
+    # nano printf: link it (the bridge tests only use %s / %02x formats).
+    if(TARGET oznano)
+        target_link_libraries(test_bridge_addrtype oznano)
+        target_link_libraries(test_bridge_bcmd oznano)
+    endif()
+    # The committed vectors are exactly what the generator makes (no drift
+    # between gen_bcmd_vectors.py and tests/vectors/, which ozlock pins).
+    if(Python3_FOUND AND _no_crypto EQUAL 0)
+        add_test(NAME bridge_bcmd_vectors_fresh
+                 COMMAND sh -c "d=$(mktemp -d) && ${Python3_EXECUTABLE} -I \"$1/tools/gen_bcmd_vectors.py\" \"$d\" >/dev/null && cmp \"$d/bridge_cmd_v1.json\" \"$1/tests/vectors/bridge_cmd_v1.json\" && cmp \"$d/bridge_cmd_v1.h\" \"$1/tests/vectors/bridge_cmd_v1.h\"; rc=$?; rm -rf \"$d\"; exit $rc"
+                         sh ${CMAKE_CURRENT_SOURCE_DIR})
+    endif()
+endif()

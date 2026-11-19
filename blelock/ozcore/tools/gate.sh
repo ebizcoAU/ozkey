@@ -34,7 +34,7 @@ rc=0
         default) cmake -S "$oz" -B "$b" >/dev/null ;;
         release) cmake -S "$oz" -B "$b" -DCMAKE_BUILD_TYPE=Release >/dev/null ;;
         asan)    cmake -S "$oz" -B "$b" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-                       -DCMAKE_C_FLAGS="$san" -DCMAKE_EXE_LINKER_FLAGS="$san" >/dev/null ;;
+                       -DCMAKE_C_FLAGS="$san" -DCMAKE_CXX_FLAGS="$san" -DCMAKE_EXE_LINKER_FLAGS="$san" >/dev/null ;;
         esac
         echo "--- $kind"
         if cmake --build "$b" -j8 >"$b.build.log" 2>&1 && ctest --test-dir "$b" --output-on-failure; then
