@@ -87,6 +87,9 @@ int oz_lockapp_ak1037_start(void)
         printf("oz.start: oz_lock_init failed\r\n");
         return OZ_E_HW;
     }
+    /* KV-LAT-1: a kv write can take ~530 ms on this NOR, so the limit
+     * writes follow the beep (the OZKIE thread flushes at once). */
+    oz_lock_defer_saves(&lock, 1);
     running = 1;
     if (oz_gatt_ak1037_start(&lock, OZ_START_PRIORITY) != OZ_OK) {
         printf("oz.start: GATT start failed; reboot\r\n");

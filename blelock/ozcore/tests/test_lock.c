@@ -30,7 +30,29 @@ static void expect_left(const char *name, uint64_t left, uint64_t full)
 
 static oz_lock L;
 static int unlocks, locks, prompt_on;
-static void hw_actuate(void *app, int unlock) { (void)app; if (unlock) unlocks++; else locks++; }
+/* KV-LAT-1: what was durable in the kv when the actuate hook ran. */
+static int probe_act, rl_misses_at_act = -1;
+static uint8_t cr_at_act[1024];
+static size_t cr_len_at_act;
+static int kv_misses(const char *key)
+{
+    uint8_t b[16];
+    size_t n = 0;
+    oz_limit l;
+    if (oz_port_kv_get(key, b, sizeof b, &n) != OZ_OK || oz_limit_load(&l, b, n, oz_port_monotonic_ms()))
+        return -1;
+    return l.misses;
+}
+static void hw_actuate(void *app, int unlock)
+{
+    (void)app;
+    if (unlock) unlocks++; else locks++;
+    if (probe_act) {
+        rl_misses_at_act = kv_misses("rl");
+        if (oz_port_kv_get("cr", cr_at_act, sizeof cr_at_act, &cr_len_at_act) != OZ_OK)
+            cr_len_at_act = 0;
+    }
+}
 static void hw_prompt(void *app, int on) { (void)app; prompt_on = on; }
 static const oz_lock_hooks HOOKS = { hw_actuate, hw_prompt, NULL };
 
@@ -695,6 +717,95 @@ static void cards(void)
     handshake(&owner, &ble, NULL, 0, NULL);
     call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0);
     expect_int("owner clears it", oz_lock_card(&L, UID, sizeof UID), OZ_CARD_OPEN);
+}
+
+/* KV-LAT-1 (PM nexus-1b): with deferred limit writes the counter is still
+ * enforced in RAM at once, a second attempt is never checked before the first
+ * one's count is durable, and a power cut can lose at most the attempt whose
+ * write was in flight (the window = one kv write, as before). */
+static void kv_lat(void)
+{
+    static const uint8_t KUID[4] = { 0x6b, 0x76, 0x6c, 0x61 };
+    static const uint8_t KONCE[4] = { 0x6b, 0x76, 0x6c, 0x62 };
+    static const uint8_t BAD[4] = { 0x00, 0x00, 0x00, 0x01 };
+    uint8_t b[96], rl4[16];
+    size_t bl, rl4_len = 0;
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0);     /* clears any lockout */
+    bl = body_card(b, sizeof b, KUID, sizeof KUID, 0);
+    expect_int("kvlat: add card", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    bl = body_card(b, sizeof b, KONCE, sizeof KONCE, 1);
+    expect_int("kvlat: add one-use card", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    expect_int("kvlat: card counter clean", kv_misses("rl"), 0);
+
+    oz_lock_defer_saves(&L, 1);
+    expect_int("kvlat: miss 1", oz_lock_card(&L, BAD, sizeof BAD), OZ_CARD_WRONG);
+    expect_int("…counted in RAM at once", L.card_limit.misses, 1);
+    expect_int("…not yet written (the port flushes after its feedback)", kv_misses("rl"), 0);
+    expect_int("miss 2, no flush between", oz_lock_card(&L, BAD, sizeof BAD), OZ_CARD_WRONG);
+    expect_int("…miss 1 was made durable BEFORE miss 2 was checked", kv_misses("rl"), 1);
+    oz_lock_flush(&L);
+    expect_int("flush: miss 2 durable", kv_misses("rl"), 2);
+    oz_lock_flush(&L);
+    expect_int("…a flush with nothing dirty changes nothing", kv_misses("rl"), 2);
+
+    /* A right card: the motor first, the reset after (fails safe). */
+    probe_act = 1;
+    expect_int("right card opens", oz_lock_card(&L, KUID, sizeof KUID), OZ_CARD_OPEN);
+    expect_int("…reset in RAM at once", L.card_limit.misses, 0);
+    expect_int("…actuated before the reset was written", rl_misses_at_act, 2);
+    oz_lock_flush(&L);
+    expect_int("…written by the flush", kv_misses("rl"), 0);
+    /* A one-use card: its use is written BEFORE the door opens. */
+    uint8_t cr0[1024];
+    size_t cr0_len = 0;
+    (void)oz_port_kv_get("cr", cr0, sizeof cr0, &cr0_len);
+    expect_int("one-use card opens", oz_lock_card(&L, KONCE, sizeof KONCE), OZ_CARD_OPEN);
+    expect_int("…its use was durable before actuate", cr_len_at_act > 0 &&
+               (cr_len_at_act != cr0_len || memcmp(cr_at_act, cr0, cr0_len)), 1);
+    probe_act = 0;
+    oz_lock_flush(&L);
+
+    /* The power-cut row: 4 misses durable, the 5th's write cut mid-commit
+     * (littlefs: the old record stays). After the reboot only that miss is
+     * gone: the next one still locks the reader out. */
+    for (int i = 0; i < 4; i++) {
+        (void)oz_lock_card(&L, BAD, sizeof BAD);
+        oz_lock_flush(&L);
+    }
+    expect_int("4 misses durable", kv_misses("rl"), 4);
+    (void)oz_port_kv_get("rl", rl4, sizeof rl4, &rl4_len);
+    (void)oz_lock_card(&L, BAD, sizeof BAD);
+    expect_int("5th miss: locked out in RAM at once", oz_lock_card_lockout_ms(&L) > 0, 1);
+    oz_port_kv_set("rl", rl4, rl4_len);                 /* the power cut, mid-write */
+    boot_lock();
+    oz_lock_defer_saves(&L, 1);
+    expect_int("after the cut: the count is 4, not lower", L.card_limit.misses, 4);
+    expect_int("…so no lockout yet", oz_lock_card_lockout_ms(&L), 0);
+    (void)oz_lock_card(&L, BAD, sizeof BAD);
+    expect_left("…and the very next miss locks it out", oz_lock_card_lockout_ms(&L), 60000);
+    oz_lock_flush(&L);
+    boot_lock();
+    expect_left("a cut AFTER the write: the lockout survives", oz_lock_card_lockout_ms(&L), 60000);
+
+    /* The keypad: the same rules. */
+    oz_lock_defer_saves(&L, 1);
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0);
+    oz_lock_flush(&L);
+    expect_int("PIN miss 1", oz_lock_keypad_pin(&L, "000000"), OZ_PIN_WRONG);
+    expect_int("…counted in RAM", L.pin_limit.misses, 1);
+    expect_int("…not yet written", kv_misses("pl"), 0);
+    expect_int("PIN miss 2", oz_lock_keypad_pin(&L, "000000"), OZ_PIN_WRONG);
+    expect_int("…miss 1 durable before miss 2 was checked", kv_misses("pl"), 1);
+    oz_lock_flush(&L);
+    expect_int("flush: 2 durable", kv_misses("pl"), 2);
+    expect_int("a right PIN opens", oz_lock_keypad_pin(&L, "482613"), OZ_PIN_OPEN);
+    oz_lock_flush(&L);
+    expect_int("…reset written", kv_misses("pl"), 0);
+    oz_lock_defer_saves(&L, 0);
 }
 
 /* The battery (P5-F): a weak one refuses to throw the bolt, never to
@@ -1425,6 +1536,7 @@ static void run_suite(size_t mtu)
     credentials();
     keypad_limit();
     cards();
+    kv_lat();
     battery();
     safe_mode();
     relay_and_reboot();
