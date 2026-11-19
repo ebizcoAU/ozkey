@@ -251,7 +251,7 @@ static char g_advName[16] = BLE_NAME;
 //      UNCLAIMED v2 lock (released, 60 s hold-off).
 // 0.48 (2026-11-06): a v2 lock whose `info` read fails (mid-reboot) is retried
 //      after 15 s, not the 5 min stranger cooldown (F1 acceptance r6/r9).
-#define FW_VERSION "bridgeBLE-0.49"
+#define FW_VERSION "bridgeBLE-0.50"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -2868,6 +2868,7 @@ void forwardOverThread(const String &target, const String &fieldName,
 // cfgSiteId and forwardOverThread's neighbours, all declared above this line.
 #include "ozbleaddrtype.h"   // BRIDGE-ADDRTYPE-1 (before ozblecentral.h, which uses it)
 #include "ozblecentral.h"
+#include "ozbleconninfo.h"   // BRIDGE-LAT-1: connection timing on MQTT diag
 
 
 void mqttConnect() {
@@ -3599,6 +3600,13 @@ void startBle() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+  // BRIDGE-LAT-1 (2026-11-20): never block on the USB CDC. Plugged into a host
+  // that isn't reading (the bench's normal state), every Serial.printf
+  // waited for the full TX FIFO: measured main-loop passes of 15-20 s, relay
+  // hops quantised in ~2 s steps (2.4/4.4/6.3 s round trips) and MQTT LWT
+  // drops. Same fix as the doorlock's 1.72 (memory serial-print-blocks-the-loop:
+  // 20,271 ms -> 95 ms). Unread output is dropped instead.
+  Serial.setTxTimeoutMs(0);
   delay(300);
   Serial.println("\n*** OZBRIDGE Thread border router bootstrap ***");
   Serial.printf("[FW] %s built %s %s\n", FW_VERSION, __DATE__, __TIME__);
@@ -3706,6 +3714,7 @@ void loop() {
   // the BLE work that must not happen on the BLE stack's own task lives here.
   // Self-throttled inside, so calling it every iteration is cheap.
   ozBleCentralTick();
+  ozBleConnInfoTick();   // BRIDGE-LAT-1
 
   // 1.38: keep the on-flash copy fresh. Self-throttled to hourly inside, so
   // calling it every iteration costs a millis() compare.
