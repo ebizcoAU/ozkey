@@ -184,7 +184,10 @@ static void on_write(void *handle, T_BT_ATTRECV_CB *info, uint32_t info_len)
 
 /* `info` is read from the BLE context, so it serves a snapshot the OZKIE
  * thread refreshes; it never calls into the lock. */
-static uint8_t info_snap[96];
+/* INFO-SIZE-1 (2026-11-20): was 96; a release version "ozkie-ak1037-0.1.0+<sha7>"
+ * made INFO 97 bytes, oz_lock_info() refused it and the lock served an EMPTY
+ * INFO (unclaimable, unidentifiable). 160 leaves room for a longer version. */
+static uint8_t info_snap[160];
 static size_t info_snap_len;
 
 static void on_read(void *handle, T_BT_ATTRECV_CB *info, uint32_t info_len)
@@ -306,8 +309,12 @@ static void refresh_info(const oz_lock *L)
 {
     uint8_t buf[sizeof info_snap];
     size_t n = 0;
-    if (oz_lock_info(L, buf, sizeof buf, &n))
+    int rc = oz_lock_info(L, buf, sizeof buf, &n);
+    if (rc) {                           /* never silently: an empty INFO = an unclaimable lock */
+        oz_port_log("gatt: INFO does not fit its %u-byte buffer (%d): the lock can't be identified",
+                    (unsigned)sizeof buf, rc);
         return;
+    }
     rt_base_t level = rt_hw_interrupt_disable();
     memcpy(info_snap, buf, n);
     info_snap_len = n;
