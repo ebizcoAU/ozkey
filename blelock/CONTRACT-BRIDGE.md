@@ -62,7 +62,8 @@ both ends already agree on the network — no discovery step happens on 802.15.4
 
 Mode values:
 
-- `"mqtt-uplink"` – bridge connects to Wi-Fi, MQTT broker; subscribes to `ozkey/<site>/locks/<bridge>/command`.
+- `"mqtt-uplink"` – bridge connects to Wi-Fi, MQTT broker; subscribes to its command topics (signed: see
+  "MQTT signed bridge commands" below; legacy: `ozkie/<site>/bridges/<bridge>/command`).
 - `"matter-bridge"` – bridge starts Matter-over-Wi-Fi stack (stubbed in v0; only stores the mode).
 
 If `mode` is missing or invalid, bridge rejects provision with `ERR_PAYLOAD` and notifies `PAYLOAD_REJECTED`.
@@ -249,6 +250,70 @@ lock commissioned from a recovered handset.
 `info.transport == 'thread'` survives in the app's condition as a legacy arm for
 a board running the old split `threadcomm.ino`. It is inert for current
 firmware, which reports `xport=unset` until the app picks a transport.
+
+## MQTT signed bridge commands — BRIDGE-CMD-AUTH-1 (v1, 2026-11-20)
+
+Joint text: ozkey-fw (bridge) + ozkey-srv (ozlock); PM rulings of 2026-11-20. **Depends on OZLOCK-AUTH-1**
+(ozlock's API must authenticate its callers before ozlock's signature means anything).
+
+### Keys
+- **Site key:** one Ed25519 key pair per site/environment (lab, test-production C, production). The 32-byte seed is
+  an ozlock process secret (resolveSecret, required in every mode), separate from ozlock's X25519 identity.
+- The bridge stores only the **public** key (NVS), set at commissioning (below). No private key on any bridge.
+
+### Topic and frame
+- Topic: `ozkie/<site>/bridges/<bridge_id>/cmd` (NEW). ozlock uses it for a bridge whose `info`/presence says
+  `"signed_cmd": 1`; the legacy JSON `…/command` stays for older firmware until the PM retires it.
+- Payload (binary): `sig (64 B) ‖ body`.
+  - `body` = CBOR array of 5: `[v, op, bridge, ctr, args]`
+    - `v` uint = 1; `op` tstr (table below); `bridge` tstr = the target `ozb-…` id; `ctr` uint (64-bit);
+    - `args` = a CBOR map with text keys, or `null`.
+  - `sig` = Ed25519(site key, `"ozkie-bcmd-v1"` (13 ASCII bytes, no NUL) ‖ body). The prefix separates these
+    signatures from anything else ozlock signs.
+- Size: the whole MQTT packet must stay ≤ 256 B (PubSubClient): `body` ≤ 140 B with a topic ≤ 48 B.
+- Encoding: deterministic CBOR (shortest-form integers and lengths, definite lengths, map keys in bytewise order).
+  The bridge verifies the received bytes as they are; the rule exists so both encoders agree with the shared test
+  vectors (`blelock/ozcore/tests/vectors/bridge_cmd_v1.*`, generated from ozcore's CBOR writer).
+
+### Ops
+| op | args | notes |
+|---|---|---|
+| `pair_lock` | `{"id": "ozk-…"}` | add to the allowlist |
+| `unpair_lock` | `{"id"}` | remove (app-driven, permanent) |
+| `release_lock` | `{"id"}` | let go (server-driven failover) |
+| `scan` | `{"target"?: tstr, "duration_s": 1..30}` | bounded probe |
+| `factory_reset` | `null` | wipe the bridge |
+| `unpair` | `null` | the owner releases the bridge |
+| `time` | `{"utc": uint}` | the clock push. **Only moves the bridge clock forward.** ctr checked in RAM only (below) |
+| `set_site_key` | `{"pub": bstr 32, "ctr_floor": uint}` | rotation, signed by the CURRENT key |
+| `broker_credentials` | reserved | NOT sent signed-in-clear: BRIDGE-CRED-CLEAR-1 decides its form |
+v1 job envelopes for bridged v1 locks are **not** carried here; a signed-capable bridge refuses them (PM).
+
+### Bridge rules (in this order)
+1. `len < 64 + 1` → refuse. **Verify the signature before parsing anything.** No site key set → refuse every frame.
+2. Parse; `v == 1`; `bridge == own id`; `op` known; `args` well-formed for that op. Else refuse.
+3. Counter (`last` = the highest accepted ctr; NVS copy + RAM copy, RAM ≥ NVS):
+   - `ctr == last` and the frame is byte-identical to the last accepted one → **silent duplicate** (QoS 1
+     redelivery): not acted on, not counted as a refusal.
+   - `ctr <= last` otherwise → refuse (replay / out of order).
+   - `op == time`: accept, update RAM `last` only (no flash write per push).
+   - every other op: write `last = ctr` to NVS **before** acting, then act.
+4. Refusals are never acted on; they are counted by reason on `ozkie/<site>/bridges/<id>/diag`
+   (`{"cmd_refused": {"sig":n, "bridge":n, "replay":n, "parse":n, "nokey":n, "op":n}}`).
+- **ozlock side:** `ctr = GREATEST(stored + 1, now_ms)`, atomic in SQL per bridge (a DB restore still moves forward;
+  no bridge clock needed). An older command arriving after a newer one is refused; ozlock's timeouts apply.
+
+### Commissioning, rotation, recovery
+- The `provision` payload (above) gains `"site_pub"` (64 hex, the Ed25519 public key) and `"ctr_floor"` (uint, the
+  app's unix_ms). Accepted only in the physical claim window. `ctr_floor` sets `last`, so after a factory reset
+  commands captured earlier don't verify again. The lab bench console can set both (lab only).
+- `info` gains `"signed_cmd": 1` (capability) and `"site_key": 0|1` (set or not).
+- Rotation: `set_site_key`, signed by the current key, carries the new key and a new floor.
+- Compromise or lost key: re-commission over BLE (physical presence). There is no unsigned recovery over MQTT.
+
+### Broker ACLs (defence in depth; the broker per environment is the operator's choice)
+Only ozlock publishes to `…/bridges/+/cmd` and `…/bridges/+/ozkie/#`. A bridge publishes only under its own id
+and subscribes only to its own `cmd` + `ozkie/#`. The legacy `ozkey/<site>/…` topics are dropped.
 
 ## Not in this increment
 
