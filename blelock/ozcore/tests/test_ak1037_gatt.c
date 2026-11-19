@@ -402,6 +402,8 @@ static int count(const char *s)
     return n;
 }
 
+static void idle(uint32_t ms);
+
 /* Press keys; the thread takes one event per key. */
 static void keys(const char *k)
 {
@@ -434,14 +436,23 @@ static void touch_pads(void)
         expect_int("bit 14 (16384) is '1'", count("touch: pad 16384 -> 1"), 1);
         expect_int("the pads reached the keypad (an entry, checked: wrong)", count("keypad: wrong"), 1);
     }
-    /* TOUCH-LED-1 (operator): every pad press flashes the keypad backlight
-     * (J7: GPIO22, 24-29, 34). BACKLIGHT-2, from the chip run: each pin drives a
-     * PAIR of key LEDs, one lit by HIGH and one by LOW (driving all pins high lit
-     * 2 4 7 9 * and the bottom corners). So at rest the pins are released
-     * (inputs: all dark), and a flash toggles them every 10 ms (both halves lit). */
+    /* PER-KEY-BL-1 (operator: light only the pressed key, it saves power).
+     * The J7 map (LED-MAP-1, chip 2026-11-19): every pin lights one key when
+     * driven HIGH and another when driven LOW, released = dark. So a press
+     * drives ONE pin to ONE level for the flash, every other pin released. */
     {
         static const int bl[] = { 22, 24, 25, 26, 27, 28, 29, 34 };
         const size_t n = sizeof bl / sizeof bl[0];
+        static const struct { int pad, gpio, level; const char *what; } one[] = {
+            { 1 << 14, 22, 0, "'1' = GPIO22 low" },
+            { 1 << 13, 24, 1, "'2' = GPIO24 high" },
+            { 1 << 12, 24, 0, "'3' = GPIO24 low" },
+            { 1 << 6,  26, 1, "'9' = GPIO26 high" },
+            { 1 << 9,  26, 0, "'6' = GPIO26 low" },
+            { 1 << 5,  28, 1, "'*' = GPIO28 high" },
+            { 1 << 4,  28, 0, "'0' = GPIO28 low" },
+            { 1 << 3,  29, 0, "'#' = GPIO29 low" },
+        };
         uint32_t t0 = mock_ms;
         while (mock_ms - t0 < 1000)
             mock_pass();                /* the presses above: let their flash end */
@@ -449,31 +460,41 @@ static void touch_pads(void)
         for (size_t i = 0; i < n; i++)
             rel &= mock_gpio_dir[bl[i]] == GPIO_DIR_INPUT;
         expect_int("backlight pins released at rest (all keys dark)", rel, 1);
-        mock_tk_press(1 << 14);
-        mock_pass();                    /* takes the press */
-        uint32_t f0 = mock_ms;
-        int hi[8] = { 0 }, lo[8] = { 0 }, out = 1;
-        for (int k = 0; k < 4; k++) {
-            mock_pass();
-            for (size_t i = 0; i < n; i++) {
-                out &= mock_gpio_dir[bl[i]] == GPIO_DIR_OUTPUT;
-                hi[i] |= mock_gpio_level[bl[i]] == 1;
-                lo[i] |= mock_gpio_level[bl[i]] == 0;
+        for (size_t k = 0; k < sizeof one / sizeof one[0]; k++) {
+            char name[96];
+            mock_ms += 2000;
+            mock_tk_press(one[k].pad);
+            mock_pass();                /* takes the press */
+            int only = 1;
+            for (int p = 0; p < 4; p++) {
+                mock_pass();
+                for (size_t i = 0; i < n; i++)
+                    only &= bl[i] == one[k].gpio
+                            ? mock_gpio_dir[bl[i]] == GPIO_DIR_OUTPUT && mock_gpio_level[bl[i]] == one[k].level
+                            : mock_gpio_dir[bl[i]] == GPIO_DIR_INPUT;
             }
+            snprintf(name, sizeof name, "a press lights only its own key: %s, the rest released", one[k].what);
+            expect_int(name, only, 1);
+            t0 = mock_ms;
+            while (mock_ms - t0 < 600)
+                mock_pass();
+            rel = 1;
+            for (size_t i = 0; i < n; i++)
+                rel &= mock_gpio_dir[bl[i]] == GPIO_DIR_INPUT;
+            snprintf(name, sizeof name, "…%s: dark again by itself", one[k].what);
+            expect_int(name, rel, 1);
         }
-        int both = 1;
-        for (size_t i = 0; i < n; i++)
-            both &= hi[i] && lo[i];
-        expect_int("a press drives the backlight pins", out, 1);
-        expect_int("…toggling high and low (both LEDs of each pair light)", both, 1);
-        expect_int("…every 10 ms (4 toggles inside the 300 ms flash)", mock_ms - f0 <= 40, 1);
-        t0 = mock_ms;
-        while (mock_ms - t0 < 600)
-            mock_pass();
+        /* The bottom row (mute, bell, lock pads) is not mapped to its LEDs yet:
+         * it lights nothing rather than a wrong key. */
+        mock_ms += 2000;
+        mock_tk_press(1 << 0);
+        mock_pass();
+        mock_pass();
         rel = 1;
         for (size_t i = 0; i < n; i++)
             rel &= mock_gpio_dir[bl[i]] == GPIO_DIR_INPUT;
-        expect_int("…and the pins are released again by themselves", rel, 1);
+        expect_int("an unmapped pad lights nothing", rel, 1);
+        idle(1000);
     }
 }
 
@@ -1124,6 +1145,16 @@ static void beeps(void)
     while (mock_ms - t0 < 1000)
         mock_pass();
     expect_int("a card read: a tone, then the wrong pattern (3 tones)", mock_dac_plays - p0, 4);
+    /* BEEP-RFID-1: a tone the DAC refuses is logged, not lost silently. */
+    capture_start();
+    mock_dac_open_fail = 1;
+    mock_tk_press(1 << 14);
+    mock_pass();
+    mock_pass();
+    mock_dac_open_fail = 0;
+    idle(1000);
+    capture_end();
+    expect_int("a refused DAC open is logged", count("beep: start failed") >= 1, 1);
     expect_int("every DAC call was one the SDK accepts", mock_dac_bad, 0);
     expect_int("amplifier callback registered (no 'pa ctrl callback is empty!')", mock_dac_pa_missing, 0);
 }
@@ -1187,11 +1218,21 @@ static void door_io(void)
     expect_int("exit during the tamper alarm unlocks (PM)", count("lock: exit button") == 1 && count("motor: to unlock @") == 1, 1);
     idle(20000);                        /* alarm over, relocked (unopened) */
 
+    /* BEEP-RFID-1 (chip 2026-11-19): 2 of the 5 left-open tones heard, and an
+     * RFID poll took 243 ms. A poll while a tone plays keeps it on; the next
+     * one starts at once, and the tones run together. Polls here cost 243 ms. */
     capture_start();
-    hold(GPIO31, 31000);                /* the door left open */
+    mock_rfid_cost_ms = 243;
+    mock_dac_timing_reset();
+    int p1 = mock_dac_plays;
+    hold(GPIO31, 32000);                /* the door left open (32 s: the tones end) */
+    mock_rfid_cost_ms = 0;
     capture_end();
     expect_int("door left open 30 s: warned", count("lock: door left open"), 1);
     expect_int("…and never relocked while open (PM)", count("lock: auto-relock"), 0);
+    expect_int("…5 tones", mock_dac_plays - p1, 5);
+    expect_int("…each tone at most 100 ms with 243 ms RFID polls (BEEP-RFID-1)", mock_dac_longest_ms <= 100, 1);
+    expect_int("…at least 100 ms of silence between tones (BEEP-RFID-1)", mock_dac_shortest_gap_ms >= 100, 1);
     idle(20000);
 }
 

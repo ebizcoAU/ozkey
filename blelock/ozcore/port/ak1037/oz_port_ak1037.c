@@ -471,8 +471,9 @@ void oz_ak1037_motor_pins_init(void)
 /* The EVB's 15 key LEDs through jumper header J7: GPIO22 and GPIO24-29,
  * GPIO34. BACKLIGHT-2 (chip run 2026-11-19): each pin drives a PAIR of LEDs,
  * one lit by HIGH and one by LOW: all pins high lit 2 4 7 9 * and the bottom
- * corners. So "off" is released (input: neither LED of a pair), and the lock
- * thread toggles high/low every 10 ms during a flash so both halves light. */
+ * corners. So "off" is released (input: neither LED of a pair). A key press
+ * lights its own key only (PER-KEY-BL-1, below); a card read or the tamper
+ * alarm toggles all pins high/low every 10 ms so every key lights. */
 static const T_eGPIO bl_pin[8] = { GPIO22, GPIO24, GPIO25, GPIO26, GPIO27, GPIO28, GPIO29, GPIO34 };
 
 void oz_ak1037_backlight(int state)
@@ -502,6 +503,34 @@ int oz_ak1037_backlight_pin(int i, int state)
         (void)hal_gpio_output_value(bl_pin[i], (uint8_t)(state == OZ_BL_HIGH));
     }
     return (int)bl_pin[i];
+}
+
+/* PER-KEY-BL-1, from the LED map (LED-MAP-1, measured on the EVB 2026-11-19
+ * with oz.led): pin index (0..7 as bl_pin) and level per touch pad bit (TOUCH-
+ * MAP-1: bit 14 = '1' .. bit 6 = '9', 5 '*', 4 '0', 3 '#'). GPIO22 high lights
+ * nothing. The bottom row's LEDs are known (GPIO34 high = left, GPIO34 low =
+ * middle, GPIO29 high = right) but not which of pads 0-2 sits where: those
+ * stay dark until that is measured. pin -1 = no LED. */
+static const struct { int8_t pin; uint8_t state; } bl_key[15] = {
+    [14] = { 0, OZ_BL_LOW },  [13] = { 1, OZ_BL_HIGH }, [12] = { 1, OZ_BL_LOW },   /* 1 2 3 */
+    [11] = { 2, OZ_BL_HIGH }, [10] = { 2, OZ_BL_LOW },  [9]  = { 3, OZ_BL_LOW },   /* 4 5 6 */
+    [8]  = { 4, OZ_BL_HIGH }, [7]  = { 4, OZ_BL_LOW },  [6]  = { 3, OZ_BL_HIGH },  /* 7 8 9 */
+    [5]  = { 5, OZ_BL_HIGH }, [4]  = { 5, OZ_BL_LOW },  [3]  = { 6, OZ_BL_LOW },   /* * 0 # */
+    [2]  = { -1, OZ_BL_OFF }, [1]  = { -1, OZ_BL_OFF }, [0]  = { -1, OZ_BL_OFF },  /* bottom row: unmapped */
+};
+
+int oz_ak1037_backlight_pad(int pad)
+{
+    oz_ak1037_backlight(OZ_BL_OFF);
+    for (int b = 0; b < 15; b++) {
+        if (pad != (1 << b))
+            continue;
+        if (bl_key[b].pin < 0)
+            return 0;
+        (void)oz_ak1037_backlight_pin(bl_key[b].pin, bl_key[b].state);
+        return 1;
+    }
+    return 0;                           /* two pads at once, or none: dark */
 }
 
 void oz_ak1037_backlight_init(void)

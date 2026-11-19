@@ -58,6 +58,9 @@ void oz_ak1037_backlight(int state);
 /* One pin (0..7) only, for mapping keys to pins on the bench: the GPIO number,
  * or -1 for a bad index (LED-MAP-1). */
 int  oz_ak1037_backlight_pin(int i, int state);
+/* PER-KEY-BL-1: light only the key of this touch pad (its one-bit mask):
+ * every other pin released. 1 = lit, 0 = no LED known for it (all dark). */
+int  oz_ak1037_backlight_pad(int pad);
 
 /* Battery sensing (BATT-SENSE-1): 0 on the bench build only; the raw ADC and
  * its pin voltage, for measuring the divider (oz.batt). */
