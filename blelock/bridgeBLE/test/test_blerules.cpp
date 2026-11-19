@@ -1,0 +1,75 @@
+// Host test for ozblerules.h (BRIDGE-HOST-SUITE-1 step 2).
+#include <stdio.h>
+#include <string>
+#include <vector>
+#include "ozblerules.h"
+
+static int fails, checks;
+static void expect(const char *what, long long got, long long want)
+{
+    checks++;
+    if (got != want) { fails++; printf("FAIL %s: %lld, want %lld\n", what, got, want); }
+}
+
+static const char *P = "ozkie/lab/bridges/ozb-98a316a7e638/ozkie/";
+
+static int dn(const char *topic, std::vector<uint8_t> p, const char **lock = nullptr)
+{
+    const char *l;
+    int r = oz2DownlinkCheck(topic, P, p.data(), p.size(), 1024, 2, &l);
+    if (lock) *lock = l;
+    return r;
+}
+
+static void downlink(void)
+{
+    const char *lock = "";
+    std::vector<uint8_t> ok = { 0, 0xaa };
+    expect("downlink: a lock's topic, type 0, 1 B", dn("ozkie/lab/bridges/ozb-98a316a7e638/ozkie/ozk-568afbc4ba9b", ok, &lock), OZ2_DN_OK);
+    expect("…the lock id from the topic", std::string(lock) == "ozk-568afbc4ba9b", 1);
+    expect("another bridge's topic: not ours", dn("ozkie/lab/bridges/ozb-000000000001/ozkie/ozk-568afbc4ba9b", ok), OZ2_DN_NOT_OURS);
+    expect("the command topic: not ours", dn("ozkie/lab/bridges/ozb-98a316a7e638/cmd", ok), OZ2_DN_NOT_OURS);
+    expect("no lock after the prefix: bad topic", dn(P, ok), OZ2_DN_BAD_TOPIC);
+    expect("a deeper topic: bad topic", dn("ozkie/lab/bridges/ozb-98a316a7e638/ozkie/ozk-568afbc4ba9b/x", ok), OZ2_DN_BAD_TOPIC);
+    expect("1 byte (type only): bad length", dn("ozkie/lab/bridges/ozb-98a316a7e638/ozkie/ozk-1", { 1 }), OZ2_DN_BAD_LEN);
+    expect("0 bytes: bad length", dn("ozkie/lab/bridges/ozb-98a316a7e638/ozkie/ozk-1", {}), OZ2_DN_BAD_LEN);
+    std::vector<uint8_t> max(1 + 1024, 0), over(1 + 1025, 0);
+    expect("1 + 1024 B: the largest accepted", dn("ozkie/lab/bridges/ozb-98a316a7e638/ozkie/ozk-1", max), OZ2_DN_OK);
+    expect("1 + 1025 B: bad length", dn("ozkie/lab/bridges/ozb-98a316a7e638/ozkie/ozk-1", over), OZ2_DN_BAD_LEN);
+    expect("type 2 (error): accepted", dn("ozkie/lab/bridges/ozb-98a316a7e638/ozkie/ozk-1", { 2, 0 }), OZ2_DN_OK);
+    expect("type 3: bad type (closed set)", dn("ozkie/lab/bridges/ozb-98a316a7e638/ozkie/ozk-1", { 3, 0 }), OZ2_DN_BAD_TYPE);
+    expect("type 255: bad type", dn("ozkie/lab/bridges/ozb-98a316a7e638/ozkie/ozk-1", { 255, 0 }), OZ2_DN_BAD_TYPE);
+}
+
+static void emit(const char *id, size_t n, void *ctx) { ((std::vector<std::string> *)ctx)->push_back(std::string(id, n)); }
+static std::vector<std::string> split(const char *blob, unsigned max)
+{
+    std::vector<std::string> v;
+    unsigned n = ozPairBlobSplit(blob, max, emit, &v);
+    if (n != v.size()) v.push_back("<count mismatch>");
+    return v;
+}
+
+static void allowlist(void)
+{
+    auto v = split("ozk-a\nozk-b\n", 9);
+    expect("blob: two ids, trailing newline", v.size() == 2 && v[0] == "ozk-a" && v[1] == "ozk-b", 1);
+    v = split("ozk-a\nozk-b", 9);
+    expect("blob: no trailing newline", v.size() == 2 && v[1] == "ozk-b", 1);
+    v = split("", 9);
+    expect("blob: empty = unpaired", v.size(), 0);
+    v = split("\n\nozk-a\n\n", 9);
+    expect("blob: empty lines skipped", v.size() == 1 && v[0] == "ozk-a", 1);
+    v = split("a\nb\nc\nd\n", 3);
+    expect("blob: at most max ids", v.size() == 3 && v[2] == "c", 1);
+    v = split("ozk-568afbc4ba9b\n", 9);
+    expect("blob: a real id", v.size() == 1 && v[0] == "ozk-568afbc4ba9b", 1);
+}
+
+int main()
+{
+    downlink();
+    allowlist();
+    printf("blerules: %d checks, %d failures\n", checks, fails);
+    return fails != 0;
+}

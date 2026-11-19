@@ -283,14 +283,9 @@ static void ozBleLoadPaired() {
   const String blob = prefs.getString("paired", "");
   prefs.end();
   g_pairedCount = 0;
-  int start = 0;
-  while (start < (int)blob.length() && g_pairedCount < OZ_BLE_MAX_PAIRED) {
-    int nl = blob.indexOf('\n', start);
-    if (nl < 0) nl = blob.length();
-    const String id = blob.substring(start, nl);
-    if (id.length()) g_pairedIds[g_pairedCount++] = id;
-    start = nl + 1;
-  }
+  // BRIDGE-HOST-SUITE-1: the split is ozblerules.h's (host-tested), unchanged.
+  (void)ozPairBlobSplit(blob.c_str(), OZ_BLE_MAX_PAIRED,
+      [](const char *id, size_t n, void *) { g_pairedIds[g_pairedCount++] = String(id).substring(0, n); }, nullptr);
   Serial.printf("[PAIR] loaded %u paired lock(s)%s\n", g_pairedCount,
                 g_pairedCount ? "" : " — bridge is UNPAIRED, will hold no locks");
   for (uint8_t i = 0; i < g_pairedCount; i++)

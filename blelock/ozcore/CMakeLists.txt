@@ -290,11 +290,16 @@ if(EXISTS ${OZ_BRIDGE_DIR}/test/test_bcmd.cpp)
     target_link_libraries(test_bridge_bcmd ozcore monocypher_ed25519)
     target_compile_options(test_bridge_bcmd PRIVATE -Wall -Wextra -Werror)
     add_test(NAME bridge_bcmd COMMAND test_bridge_bcmd)
+    add_executable(test_bridge_blerules ${OZ_BRIDGE_DIR}/test/test_blerules.cpp)
+    target_include_directories(test_bridge_blerules PRIVATE ${OZ_BRIDGE_DIR})
+    target_compile_options(test_bridge_blerules PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME bridge_blerules COMMAND test_bridge_blerules)
     # The directory-wide NANO-PRINTF-1 -include maps snprintf to the AK1037's
     # nano printf: link it (the bridge tests only use %s / %02x formats).
     if(TARGET oznano)
         target_link_libraries(test_bridge_addrtype oznano)
         target_link_libraries(test_bridge_bcmd oznano)
+        target_link_libraries(test_bridge_blerules oznano)
     endif()
     # The committed vectors are exactly what the generator makes (no drift
     # between gen_bcmd_vectors.py and tests/vectors/, which ozlock pins).

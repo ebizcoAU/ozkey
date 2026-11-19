@@ -95,18 +95,20 @@ static void oz2NotifyCb(BLERemoteCharacteristic *chr, uint8_t *data, size_t len,
 static bool oz2OnMqtt(const char *topic, const byte *payload, unsigned int len) {
   static String prefix;
   prefix = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/ozkie/";
-  if (strncmp(topic, prefix.c_str(), prefix.length()) != 0) return false;
-  const char *lock = topic + prefix.length();
-  if (!*lock || strchr(lock, '/')) { g_oz2.notHeld++; return true; }
-  if (len < 2 || len > 1 + OZ2_MSG_MAX) {
-    g_oz2.badLen++;
-    Serial.printf("[OZ2-DN] %s: %u B refused (closed set: 2..%u)\n", lock, len, 1 + OZ2_MSG_MAX);
-    return true;
-  }
-  if (payload[0] > OZ2_TYPE_MAX) {
-    g_oz2.badType++;
-    Serial.printf("[OZ2-DN] %s: type %u refused (closed set 0..2)\n", lock, payload[0]);
-    return true;
+  // BRIDGE-HOST-SUITE-1: the checks are ozblerules.h's (host-tested), unchanged.
+  const char *lock;
+  switch (oz2DownlinkCheck(topic, prefix.c_str(), payload, len, OZ2_MSG_MAX, OZ2_TYPE_MAX, &lock)) {
+    case OZ2_DN_NOT_OURS: return false;
+    case OZ2_DN_BAD_TOPIC: g_oz2.notHeld++; return true;
+    case OZ2_DN_BAD_LEN:
+      g_oz2.badLen++;
+      Serial.printf("[OZ2-DN] %s: %u B refused (closed set: 2..%u)\n", lock, len, 1 + OZ2_MSG_MAX);
+      return true;
+    case OZ2_DN_BAD_TYPE:
+      g_oz2.badType++;
+      Serial.printf("[OZ2-DN] %s: type %u refused (closed set 0..2)\n", lock, payload[0]);
+      return true;
+    default: break;
   }
   OzBleLock *l = ozBleFindByDeviceId(String(lock));
   if (!l || l->ozkie != 2 || !ozBleConnected(*l) || !l->chrRelay) {
