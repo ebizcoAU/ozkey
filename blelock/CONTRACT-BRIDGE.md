@@ -309,13 +309,15 @@ v1 job envelopes for bridged v1 locks are **not** carried here; a signed-capable
    - `ctr == last` and the frame is byte-identical to the last accepted one → **silent duplicate** (QoS 1
      redelivery): not acted on, not counted as a refusal.
    - `ctr <= last` otherwise → refuse (replay / out of order).
-   - `op == time`: accept, update RAM `last`. Write `last` to NVS only when `ctr` is more than 24 h
+   - `op == time` or `tz`: accept, update RAM `last`. Write `last` to NVS only when `ctr` is more than 24 h
      (86 400 000) above the NVS copy: at most one flash write per day. Without this, after a reboot every
      time push captured since the last non-time command would verify again and could set a just-booted clock
      (which starts at 0) to an old time; with it the replay window is bounded to 24 h.
    - every other op: write `last = ctr` to NVS **before** acting, then act.
-   - A bridge with a site key takes its clock from signed `time` only: it ignores the unsigned retained
-     `ozkie/<site>/time` topic and any `utc` on the legacy topic.
+   - A bridge with a site key takes its clock from signed `time` only and its timezone from signed `tz`
+     only: it ignores the unsigned retained `ozkie/<site>/time` topic (`utc` and `tz` alike) and any `utc` or
+     `tz` on the legacy topic. (Accepted: `tz` has no forward-only guard, so an old captured `tz` can be
+     replayed within the 24 h window after a reboot; the effect is the panel display only, until the next push.)
 4. Refusals are never acted on; they are counted by reason on `ozkie/<site>/bridges/<id>/diag`
    (`{"cmd_refused": {"sig":n, "bridge":n, "replay":n, "parse":n, "nokey":n, "op":n}}`).
 - **ozlock side:** `ctr = GREATEST(stored + 1, now_ms)`, atomic in SQL per bridge (a DB restore still moves forward;
