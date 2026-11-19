@@ -23,16 +23,25 @@ Environment (all optional):
   BRIDGE_BOND=1          enrol the bridge's key (its retained presence
                          "ozkie_pub") as a `bridge` bond at the door, label =
                          the bridge id (F1-BRIDGE-BOND-1, rev 7)
+  RELAY_WAIT_S=<s>       minimum wait for each relayed reply (default 2)
+  OWNER_LOAD=<file>      skip the door: the lock is already CLAIMED by the owner in
+                         this OWNER_SAVE file; run only the relay rounds (no BLE
+                         from this Mac, no wipe), so a later client can reuse it.
+  OWNER_SAVE=<file>      after the door, save the owner's bench test identity as
+                         JSON {priv, slot, lock_pub, device_id, bridge_id} (mode
+                         0600), so a client through ozlock (ozkey-srv's
+                         ozkierelay_ak.py) can act as the same owner. BENCH
+                         ONLY: never a real owner's key.
   DOOR_AFTER_REBOOT=K    after the relay rounds, K times: reset the lock (serial
                          reopen), wait for the bridge to hold it again, then the
                          owner connects AT THE DOOR over direct BLE and reads
                          lock/state. The rev 7 acceptance check: an idle bridge
                          must not keep the app out.
 """
-import os, queue, sys, threading, time
+import json, os, queue, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ozapp import OzApp, R, uncbor                    # noqa: E402
+from ozapp import OzApp, R, uncbor, x25519_pub, ccs   # noqa: E402
 from blelink import BleLockLink                       # noqa: E402
 from mqttrun import PresenceWatch                     # noqa: E402
 
@@ -47,8 +56,10 @@ class TeeSerial:
     a timestamp; blelink still gets read()/write()/reset_input_buffer()."""
     def __init__(self, port, path):
         import serial as pyserial
-        self.s = pyserial.Serial()
-        self.s.port, self.s.baudrate, self.s.timeout = port, 115200, 0.1
+        # serial_for_url: a device path, or a socket:// relay (the AK1037's COM3
+        # on Mac2 Windows, relayed to this Mac); DTR/RTS low before the open.
+        self.s = pyserial.serial_for_url(port, do_not_open=True)
+        self.s.baudrate, self.s.timeout = 115200, 0.1
         self.s.dtr = self.s.rts = False
         self.s.open()
         self.f = open(path, 'a', buffering=1)
@@ -125,6 +136,11 @@ class LoggedRelayLink:
         self.raw(bytes([typ]) + p)
 
     def recv(self, timeout=2.0):
+        # RELAY_WAIT_S (default 2): every wait at least this long. The bench
+        # relay via bridgeBLE + the AK1037 measured 2.4-4.2 s per hop
+        # (2026-11-20, BRIDGE-LAT-1); a short wait picks up the PREVIOUS
+        # round's late reply and fails EDHOC at message_2.
+        timeout = max(timeout, float(os.environ.get('RELAY_WAIT_S') or 2.0))
         self.waiting = True
         try:
             m = self.q.get(timeout=timeout)
@@ -186,49 +202,71 @@ def main(dev, port, bridge, n, prefix, host, site):
     time.sleep(3.0)                         # the one open may reset the lock: let it boot
     say(f'{ts()} relayrun {dev} via {bridge}, N={n}')
 
-    # --- door, once ---
+    # --- door, once (or OWNER_LOAD: the lock is already claimed) ---
     owner, svc = OzApp('owner'), OzApp('ozlodge')
-    k = None
-    for attempt in range(3):
+    oload = os.environ.get('OWNER_LOAD')
+    if oload:
+        rec = json.load(open(oload))
+        if rec.get('device_id') != dev:
+            say(f'OWNER_LOAD: {oload} is for {rec.get("device_id")}, not {dev}'); return False
+        owner.priv = bytes.fromhex(rec['priv'])
+        owner.pub = x25519_pub(owner.priv)
+        owner.cred = ccs(owner.pub)
+        owner.slot = rec['slot']
+        lock_pub = bytes.fromhex(rec['lock_pub'])
+        say(f'{ts()} OWNER_LOAD: owner app_id {owner.pub.hex()} slot {owner.slot}; door skipped')
+        t_open = time.time() - 100.0       # the bridge may already hold the lock
+    k = None if not oload else 'skip'
+    for attempt in range(0 if oload else 3):
         try:
             k = BleLockLink(dev, serial=ser, scan_s=20.0); break
         except Exception as e:              # noqa: BLE001
             say(f'{ts()} door connect attempt {attempt + 1} failed: {type(e).__name__} {e}')
             time.sleep(5)
-    if k is None:
-        say('DOOR FAILED (RIG-BLE-FLAKE-1): no relay rounds run'); return False
-    k.send(0x82, b''); _, iv = k.recv()
-    info = uncbor(iv)[0]
-    lock_pub = info[3]
-    if info[4] != 0:
-        say('lock is not UNCLAIMED: oz.wipe CONFIRM first'); return False
-    if owner.connect(k, lock_pub) is not None:
-        say('door pairing handshake failed'); return False
-    owner.mid += 1
-    req, x = owner.osc.protect(0x02, 'pair', mid=owner.mid)
-    k.send(1, req); k.send(0x80, owner.e.pair_code().to_bytes(4, 'big'))
-    t, p = k.recv(timeout=5.0)
-    code, _, res = owner.osc.unprotect(p, x)
-    if not (code == 0x44 and res[0] == R['BOND_OK']):
-        say('door BOND failed'); return False
-    owner.slot = 0
-    rc, res = owner.call(0x01, 'bond')
-    rc, res = owner.call(0x02, 'bond', {0: res[1], 1: 3, 2: svc.pub, 3: 'ozlodge'})
-    svc.slot = res[1]
-    if os.environ.get('BRIDGE_BOND'):
-        bp = bridge_pub(host, site, bridge)
-        if bp is None:
-            say(f'{ts()} BRIDGE_BOND: {bridge} publishes no ozkie_pub (firmware < 0.47?)'); return False
+    if not oload:
+        if k is None:
+            say('DOOR FAILED (RIG-BLE-FLAKE-1): no relay rounds run'); return False
+        k.send(0x82, b''); _, iv = k.recv()
+        info = uncbor(iv)[0]
+        lock_pub = info[3]
+        if info[4] != 0:
+            say('lock is not UNCLAIMED: oz.wipe CONFIRM first'); return False
+        if owner.connect(k, lock_pub) is not None:
+            say('door pairing handshake failed'); return False
+        owner.mid += 1
+        req, x = owner.osc.protect(0x02, 'pair', mid=owner.mid)
+        k.send(1, req); k.send(0x80, owner.e.pair_code().to_bytes(4, 'big'))
+        t, p = k.recv(timeout=5.0)
+        code, _, res = owner.osc.unprotect(p, x)
+        if not (code == 0x44 and res[0] == R['BOND_OK']):
+            say('door BOND failed'); return False
+        owner.slot = 0
         rc, res = owner.call(0x01, 'bond')
-        rc, res = owner.call(0x02, 'bond', {0: res[1], 1: 4, 2: bp, 3: bridge})
-        if not (res and res[0] == R['BOND_OK']):
-            say(f'{ts()} BRIDGE_BOND: enrolment refused: {res}'); return False
-        say(f'{ts()} bridge bond enrolled: {bridge} key {bp.hex()[:16]}… slot {res[1]}')
-    k.close()
-    say(f'{ts()} door done: owner slot 0, service slot {svc.slot}')
-    ser.mark('door done, Mac BLE closed')
-    if bcon:
-        bridge_cmd(f'pair {dev}')
+        rc, res = owner.call(0x02, 'bond', {0: res[1], 1: 3, 2: svc.pub, 3: 'ozlodge'})
+        svc.slot = res[1]
+        if os.environ.get('BRIDGE_BOND'):
+            bp = bridge_pub(host, site, bridge)
+            if bp is None:
+                say(f'{ts()} BRIDGE_BOND: {bridge} publishes no ozkie_pub (firmware < 0.47?)'); return False
+            rc, res = owner.call(0x01, 'bond')
+            rc, res = owner.call(0x02, 'bond', {0: res[1], 1: 4, 2: bp, 3: bridge})
+            if not (res and res[0] == R['BOND_OK']):
+                say(f'{ts()} BRIDGE_BOND: enrolment refused: {res}'); return False
+            say(f'{ts()} bridge bond enrolled: {bridge} key {bp.hex()[:16]}… slot {res[1]}')
+        k.close()
+        say(f'{ts()} door done: owner slot 0, service slot {svc.slot}')
+        osave = os.environ.get('OWNER_SAVE')
+        if osave:
+            rec = {'priv': owner.priv.hex(), 'slot': 0, 'lock_pub': lock_pub.hex(),
+                   'device_id': dev, 'bridge_id': bridge}
+            fd = os.open(osave, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                json.dump(rec, f)
+            os.chmod(osave, 0o600)
+            say(f'{ts()} OWNER_SAVE: owner app_id (pub) {owner.pub.hex()} -> {osave}')
+        ser.mark('door done, Mac BLE closed')
+        if bcon:
+            bridge_cmd(f'pair {dev}')
 
     t0 = time.time()
     held = pw.wait_held(after=t_open, timeout=100.0)   # 0.47 holds off an unclaimed lock 60 s
