@@ -1,4 +1,5 @@
 {
+ "expect_note": "expect = the verdict on a FRESH bridge state (site key = pub, ctr floor 0, bridge = \"bridge\"); order-dependent verdicts (dup, replay, rotation) are in the bridge test",
  "domain": "ozkie-bcmd-v1",
  "seed": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
  "pub": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
@@ -8,9 +9,12 @@
  "frames": [
   {
    "name": "pair_lock",
+   "v": 1,
    "op": "pair_lock",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000001,
+   "args_bstr": [],
+   "expect": "accept",
    "args": {
     "id": "ozk-568afbc4ba9b"
    },
@@ -20,9 +24,12 @@
   },
   {
    "name": "unpair_lock",
+   "v": 1,
    "op": "unpair_lock",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000002,
+   "args_bstr": [],
+   "expect": "accept",
    "args": {
     "id": "ozk-568afbc4ba9b"
    },
@@ -32,9 +39,12 @@
   },
   {
    "name": "release_lock",
+   "v": 1,
    "op": "release_lock",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000003,
+   "args_bstr": [],
+   "expect": "accept",
    "args": {
     "id": "ozk-568afbc4ba9b"
    },
@@ -44,9 +54,12 @@
   },
   {
    "name": "scan_both_args",
+   "v": 1,
    "op": "scan",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000004,
+   "args_bstr": [],
+   "expect": "accept",
    "args": {
     "target": "ozk-568afbc4ba9b",
     "duration_s": 7
@@ -57,9 +70,12 @@
   },
   {
    "name": "factory_reset",
+   "v": 1,
    "op": "factory_reset",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000005,
+   "args_bstr": [],
+   "expect": "accept",
    "args": {},
    "args_null": true,
    "body": "85016d666163746f72795f7265736574706f7a622d3938613331366137653633381b0000019a9ec06405f6",
@@ -67,9 +83,12 @@
   },
   {
    "name": "unpair",
+   "v": 1,
    "op": "unpair",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000006,
+   "args_bstr": [],
+   "expect": "accept",
    "args": {},
    "args_null": true,
    "body": "850166756e70616972706f7a622d3938613331366137653633381b0000019a9ec06406f6",
@@ -77,9 +96,12 @@
   },
   {
    "name": "time",
+   "v": 1,
    "op": "time",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000007,
+   "args_bstr": [],
+   "expect": "accept",
    "args": {
     "utc": 1763600123
    },
@@ -89,9 +111,14 @@
   },
   {
    "name": "set_site_key",
+   "v": 1,
    "op": "set_site_key",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000008,
+   "args_bstr": [
+    "pub"
+   ],
+   "expect": "accept",
    "args": {
     "pub": "e7f162a10bec559afea195e4dce84b69568d5d2cb0963eb446c0685e2b17f2f0"
    },
@@ -101,9 +128,12 @@
   },
   {
    "name": "ctr_small",
+   "v": 1,
    "op": "pair_lock",
    "bridge": "ozb-98a316a7e638",
    "ctr": 70000,
+   "args_bstr": [],
+   "expect": "accept",
    "args": {
     "id": "ozk-568afbc4ba9b"
    },
@@ -113,9 +143,12 @@
   },
   {
    "name": "same_ctr_other",
+   "v": 1,
    "op": "unpair_lock",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000001,
+   "args_bstr": [],
+   "expect": "accept",
    "args": {
     "id": "ozk-568afbc4ba9b"
    },
@@ -125,9 +158,12 @@
   },
   {
    "name": "other_bridge",
+   "v": 1,
    "op": "pair_lock",
    "bridge": "ozb-000000000001",
    "ctr": 1763600000009,
+   "args_bstr": [],
+   "expect": "bridge",
    "args": {
     "id": "ozk-568afbc4ba9b"
    },
@@ -137,9 +173,12 @@
   },
   {
    "name": "foreign_signer",
+   "v": 1,
    "op": "pair_lock",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000010,
+   "args_bstr": [],
+   "expect": "sig",
    "args": {
     "id": "ozk-568afbc4ba9b"
    },
@@ -149,9 +188,12 @@
   },
   {
    "name": "unknown_op",
+   "v": 1,
    "op": "launch_rockets",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000011,
+   "args_bstr": [],
+   "expect": "op",
    "args": {},
    "args_null": true,
    "body": "85016e6c61756e63685f726f636b657473706f7a622d3938613331366137653633381b0000019a9ec0640bf6",
@@ -159,9 +201,12 @@
   },
   {
    "name": "version_2",
+   "v": 2,
    "op": "pair_lock",
    "bridge": "ozb-98a316a7e638",
    "ctr": 1763600000012,
+   "args_bstr": [],
+   "expect": "parse",
    "args": {
     "id": "ozk-568afbc4ba9b"
    },

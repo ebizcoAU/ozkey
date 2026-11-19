@@ -82,7 +82,9 @@ def main(out):
         ('unknown_op', k, 'launch_rockets', me, base + 11, None),
         ('version_2', k, 'pair_lock', me, base + 12, {'id': 'ozk-568afbc4ba9b'}),
     ]
-    vec = {'domain': DOMAIN.decode(), 'seed': SEED.hex(), 'pub': pub.hex(), 'seed2': SEED2.hex(),
+    vec = {'expect_note': 'expect = the verdict on a FRESH bridge state (site key = pub, ctr floor 0, bridge = "bridge"); '
+                          'order-dependent verdicts (dup, replay, rotation) are in the bridge test',
+           'domain': DOMAIN.decode(), 'seed': SEED.hex(), 'pub': pub.hex(), 'seed2': SEED2.hex(),
            'pub2': pub2.hex(), 'bridge': me, 'frames': []}
     for name, key, op, bridge, ctr, args in cases:
         if name == 'version_2':
@@ -91,7 +93,11 @@ def main(out):
         else:
             pkt, body = frame(key, op, bridge, ctr, args)
         assert len(body) <= 512
-        vec['frames'].append({'name': name, 'op': op, 'bridge': bridge, 'ctr': ctr,
+        verdict = {'other_bridge': 'bridge', 'foreign_signer': 'sig', 'unknown_op': 'op',
+                   'version_2': 'parse'}.get(name, 'accept')
+        vec['frames'].append({'name': name, 'v': 2 if name == 'version_2' else 1, 'op': op, 'bridge': bridge, 'ctr': ctr,
+                              'args_bstr': sorted(kk for kk, vv in (args or {}).items() if isinstance(vv, bytes)),
+                              'expect': verdict,
                               'args': {kk: (vv.hex() if isinstance(vv, bytes) else vv) for kk, vv in (args or {}).items()},
                               'args_null': args is None, 'body': body.hex(), 'frame': pkt.hex()})
     os.makedirs(out, exist_ok=True)
