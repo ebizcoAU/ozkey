@@ -26,6 +26,7 @@
 #include "oz_ble.h"
 #include "oz_kv_lfs.h"
 #include "oz_gatt_ak1037.h"
+#include "rtthread.h"
 #include "oz_board_ak1037.h"
 #include "oz_port_ak1037.h"
 #include "oz_motor.h"
@@ -1109,12 +1110,18 @@ static void rfidstat(void)
     expect_int("…prints the slowest poll", count("max=300 ms"), 1);
     expect_int("…counts the 30 ms polls under 50", count("<50:0 "), 0);
     expect_int("…and the 300 ms poll in 250-499", count("250-499:1 "), 1);
+    /* RFID-THREAD-1: the OZKIE thread's own work per pass, for the chip run:
+     * with the reads on the reader thread, even 300 ms reads leave no OZKIE
+     * pass of 50 ms or more. */
+    expect_int("…and the OZKIE pass times", count("ozkie pass: n="), 1);
+    expect_int("…no OZKIE pass >= 50 ms with 300 ms reads", count(" over50=0 "), 1);
     snprintf(cmd, sizeof cmd, "%s reset", rfidstat_name());
     capture_start();
     expect_int("oz.rfidstat reset", mock_msh_run(cmd), 0);
     expect_int("…then empty", mock_msh_run(rfidstat_name()), 0);
     capture_end();
     expect_int("…n=0 after reset (reset prints the cleared table, then the plain call)", count("oz.rfidstat: n=0 "), 2);
+    expect_int("…the OZKIE pass table too", count("ozkie pass: n=0 "), 2);
     mock_rfid_cost_ms = 0;
 }
 
@@ -1558,6 +1565,13 @@ static void rfid_reader(void)
     mock_rfid_cost_ms = 0;
     capture_end();
     expect_int("a 30 ms poll is logged once (new maximum)", count("rfid: slowest poll 30 ms"), 1);
+    /* RFID-THREAD-1 (Anyka Q6: no non-blocking read; read on a lower-priority
+     * thread): a read blocks only the reader, never the OZKIE thread. */
+    expect_int("rfid: a reader thread \"ozrfid\" exists", mock_thread_priority("ozrfid") >= 0, 1);
+    expect_int("rfid: …below the OZKIE thread's priority",
+               mock_thread_priority("ozrfid") > mock_thread_priority("ozkie"), 1);
+    expect_int("rfid: …above idle", mock_thread_priority("ozrfid") < RT_THREAD_PRIORITY_MAX - 1, 1);
+    expect_int("rfid: the OZKIE thread never reads the antenna", mock_reads_off_reader, 0);
 }
 
 int main(int argc, char **argv)

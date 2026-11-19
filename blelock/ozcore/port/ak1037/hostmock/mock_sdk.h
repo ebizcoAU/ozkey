@@ -134,4 +134,8 @@ void mock_dac_timing_reset(void);
 
 extern int mock_chip_resets;            /* hal_clock_chip_reset() calls */
 
+/* RFID-THREAD-1: a thread's priority (-1: none of that name); card reads made
+ * anywhere but the "ozrfid" reader thread. */
+int mock_thread_priority(const char *name);
+extern int mock_reads_off_reader;
 #endif
