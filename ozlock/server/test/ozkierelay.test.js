@@ -157,7 +157,7 @@ test('owner app: door pairing, then EDHOC, read and Echo unlock through ozlock',
     const child = spawn(
       'python3',
       ['-I', path.join(__dirname, 'ozkierelay_app.py'), path.join(OZCORE, 'tools'), String(fx.blePort), fx.base, L, B],
-      { stdio: ['ignore', 'pipe', 'pipe'] }
+      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, OWNER_SAVE: path.join(fx.tmp, 'owner.json') } }
     );
     let stdout = '';
     let stderr = '';
@@ -286,4 +286,52 @@ test('transit-only: no relay call wrote pending_queue or grants; audit = pairing
   // move the failover test makes; ozkie_edhoc: the one relay handshake.
   // Nothing else: no relayed request leaves a row.
   assert.deepEqual(byAction, { pair: 4, bridge_reconcile: 1, ozkie_edhoc: 1 });
+});
+
+/* ===========================================================================
+ * The client for a REAL lock (ozkierelay_ak.py): it loads the owner that
+ * claimed at the door (saved above) and reaches the lock through ozlock only.
+ * LAST on purpose: its pairing + handshakes add audit rows the row above counts.
+ * ========================================================================= */
+const runAk = (ownerFile, n) =>
+  new Promise((resolve) => {
+    const child = spawn(
+      'python3',
+      ['-I', path.join(__dirname, 'ozkierelay_ak.py'), path.join(OZCORE, 'tools'), ownerFile, fx.base, String(n)],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => (stdout += d));
+    child.stderr.on('data', (d) => (stderr += d));
+    const kill = setTimeout(() => child.kill(), 90_000);
+    child.on('close', (status) => {
+      clearTimeout(kill);
+      resolve({ status, stdout, stderr, lines: stdout.trim().split('\n').filter(Boolean).map((s) => JSON.parse(s)) });
+    });
+  });
+
+test('real-lock client: a saved door owner does 2 fresh handshakes + Echo unlocks through ozlock', async () => {
+  const before = (hostOut.match(/\[DOOR\] UNLOCKED/g) || []).length;
+  const r = await runAk(path.join(fx.tmp, 'owner.json'), 2);
+  for (const c of r.lines.filter((x) => x.check)) assert.ok(c.ok, `${c.check}: ${JSON.stringify(c)}`);
+  assert.equal(r.status, 0, `ozkierelay_ak.py failed:\n${r.stdout}\n${r.stderr}`);
+  assert.equal(r.lines.filter((x) => x.check).length, 1 + 2 * 4, 'pairing + 4 checks per round');
+  const sum = r.lines.at(-1);
+  assert.deepEqual([sum.rounds, sum.passed, sum.fails, sum.lock, sum.bridge], [2, 2, 0, L, B]);
+  assert.equal((hostOut.match(/\[DOOR\] UNLOCKED/g) || []).length, before + 2, 'the host lock actuated once per round');
+});
+
+test('real-lock client: a different key is refused by ozlock and by nothing else; exit 1, no actuation', async () => {
+  const fs = require('node:fs');
+  const owner = JSON.parse(fs.readFileSync(path.join(fx.tmp, 'owner.json'), 'utf8'));
+  const stranger = path.join(fx.tmp, 'stranger.json');
+  fs.writeFileSync(stranger, JSON.stringify({ ...owner, priv: '11'.repeat(32) }), { mode: 0o600 });
+  const before = (hostOut.match(/\[DOOR\] UNLOCKED/g) || []).length;
+  const r = await runAk(stranger, 1);
+  assert.equal(r.status, 1);
+  const pairing = r.lines.find((x) => x.check === 'ozlock: pairing registered as v2');
+  assert.deepEqual([pairing.ok, pairing.status, pairing.code], [false, 409, 'device_paired_elsewhere']);
+  assert.equal(r.lines.filter((x) => x.check).length, 1, 'it stopped at the refused pairing');
+  assert.equal((hostOut.match(/\[DOOR\] UNLOCKED/g) || []).length, before);
 });

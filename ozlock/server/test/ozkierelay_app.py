@@ -82,6 +82,13 @@ code, _, res = owner.osc.unprotect(p, x)
 check('door: BOND_OK after keypad code', code == 0x44 and res[0] == R['BOND_OK'])
 owner.slot = 0
 k.close()
+# OWNER_SAVE=<file>: keep this owner for ozkierelay_ak.py (the client for a real
+# lock, which loads an owner that claimed at the door earlier). Test key only.
+if os.environ.get('OWNER_SAVE'):
+    fd = os.open(os.environ['OWNER_SAVE'], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump({'priv': owner.priv.hex(), 'slot': owner.slot, 'lock_pub': bytes(lock_pub).hex(),
+                   'device_id': LOCK, 'bridge_id': BRIDGE}, f)
 
 # 2. tell ozlock
 st, body = post('/pairings', {'app_id': APP_ID, 'device_id': LOCK, 'bridge_id': BRIDGE, 'ozkie_version': 2})
