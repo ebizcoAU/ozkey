@@ -24,7 +24,8 @@ int oz_ak1037_kv_claim(int owner);
 int oz_ak1037_kv_owner(void);
 
 /* The battery in mV from the SAR ADC (P5-F). Channel, divider and reference
- * are placeholders until OZ-7 5a: OZ_BATT_AIN, OZ_BATT_DIV, OZ_BATT_VREF_MV.
+ * (BATT-AIN-1): AIN5 = GPIO39, divider 3 (Anyka schematic); OZ_BATT_VREF_MV
+ * is still uncalibrated.
  * 0 when the ADC reports an error (oz_power ignores it). */
 uint16_t oz_ak1037_battery_mv(void);
 
@@ -68,5 +69,7 @@ int      oz_ak1037_battery_sensing(void);
 void     oz_ak1037_battery_note(void);
 int      oz_ak1037_battery_raw(void);
 uint16_t oz_ak1037_battery_pin_mv(int raw);
+/* The pack voltage that raw means (pin x OZ_BATT_DIV), for oz.batt. */
+uint16_t oz_ak1037_battery_pack_mv(int raw);
 
 #endif

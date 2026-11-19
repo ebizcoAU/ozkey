@@ -216,7 +216,8 @@ static void oz_batt_cmd(char argc, char **argv)
     (void)argc;
     (void)argv;
     int raw = oz_ak1037_battery_raw();
-    printf("oz.batt: raw %d, pin %u mV (sense %s)\r\n", raw, (unsigned)oz_ak1037_battery_pin_mv(raw),
+    printf("oz.batt: raw %d, pin %u mV, pack %u mV (AIN5; full scale UNCALIBRATED; sense %s)\r\n", raw,
+           (unsigned)oz_ak1037_battery_pin_mv(raw), (unsigned)oz_ak1037_battery_pack_mv(raw),
            oz_ak1037_battery_sensing() ? "on" : "OFF");
 }
 AK_MSH_CMD_EXPORT(oz_batt_cmd, oz.batt, DEBUG BUILD ONLY: raw battery ADC);
