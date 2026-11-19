@@ -106,6 +106,10 @@ target_link_libraries(ccm_vec ozport_host)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
+    # REL-PKG-1: the release-image check refuses a wrong/missing version stamp
+    # and every debug hook named in port/ak1037/link_app_mcu.ps1.
+    add_test(NAME relcheck_python
+             COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/relcheck.py --selftest)
     execute_process(COMMAND ${Python3_EXECUTABLE} -I -c "import cryptography"
                     RESULT_VARIABLE _no_crypto OUTPUT_QUIET ERROR_QUIET)
     if(_no_crypto EQUAL 0)
