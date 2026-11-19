@@ -101,6 +101,7 @@ static oz_oscore_ctx osc;
 static uint16_t mid;
 static uint8_t lock_pub[32], lock_ccs[OZ_CCS_LEN];
 static char lock_id[32];
+static char info_fw[48], info_model[32];   /* REL-VER-1 */
 static int lock_claimed = -1;
 
 static int read_info(void)
@@ -121,6 +122,10 @@ static int read_info(void)
             memcpy(lock_pub, v, 32);
         } else if (k == 4) {
             lock_claimed = (int)oz_cbor_get_uint(&r);
+        } else if ((k == 2 || k == 5) && (v = oz_cbor_get_tstr(&r, &l)) && l < sizeof info_fw) {
+            char *dst = k == 2 ? info_fw : info_model;
+            memcpy(dst, v, l);
+            dst[l] = 0;
         } else {
             (void)oz_cbor_skip(&r, &l);
         }
@@ -347,6 +352,9 @@ static void claim(void)
     expect_int("pair answered", got_done, 1);
     expect_int("right code -> 2.04", response(got.buf, got.len, &x, &result), OZ_COAP_CHANGED);
     expect_int("info says claimed", read_info() > 0 && lock_claimed == 1, 1);
+    /* REL-VER-1: a release-shaped version and the board's model (CN-LAB-1 T3). */
+    expect_int("INFO fw = ozkie-ak1037-<semver>+<sha>", !strncmp(info_fw, "ozkie-ak1037-0.1.0+", 19) && strlen(info_fw) > 19, 1);
+    expect_int("INFO model = ak1037-evb", !strcmp(info_model, "ak1037-evb"), 1);
 
     n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
     size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);

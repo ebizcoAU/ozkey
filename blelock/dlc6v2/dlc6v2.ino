@@ -98,7 +98,7 @@ void setup()
   delay(300);
   Serial.printf("[FW] %s\n", FW_VERSION);
 
-  static const oz_lock_hooks hooks = { actuate, prompt, NULL };
+  static const oz_lock_hooks hooks = { actuate, prompt, NULL, "esp32c6-dlc6v2" };
   uint8_t a[8];  /* 6 used; room for an 8-byte MAC API */
   char id[4 + 12 + 1];
   /* device_id = "ozk-" + the BASE MAC (eFuse), as v1 does: the same id as the
