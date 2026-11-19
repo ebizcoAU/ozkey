@@ -58,4 +58,27 @@ static inline int ozThreadAttachOutcome(int attached, int wifi_uplink) {
 static inline int ozThreadLateAttachDue(int operational, int watching, int attached_now) {
   return operational && watching && attached_now;
 }
+
+// ── Phase D2 bench lever `tdetach <s>` (console only): the NEXT boot holds
+// Thread disabled for s seconds, so the attach really times out and the late
+// attach (BRIDGE-THREADFAIL-1) must wait the whole hold.
+#define OZ_TDETACH_MAX_S 3600u
+
+// "<s>" -> 1..OZ_TDETACH_MAX_S, or 0 when not a plain decimal in range.
+static inline unsigned ozTdetachSeconds(const char *arg) {
+  unsigned long v = 0;
+  if (!arg || !*arg) return 0;
+  for (const char *p = arg; *p; p++) {
+    if (*p < '0' || *p > '9') return 0;
+    v = v * 10 + (unsigned long)(*p - '0');
+    if (v > OZ_TDETACH_MAX_S) return 0;     // also stops any overflow
+  }
+  return (unsigned)v;                       // 0 stays 0 (refused)
+}
+
+// Re-enable once hold_ms has passed since start. uint32_t like the ESP32's
+// millis(), so the subtraction is wrap-safe (a 64-bit host long would not be).
+static inline int ozTdetachReenableDue(int holding, uint32_t now, uint32_t start, uint32_t hold_ms) {
+  return holding && (uint32_t)(now - start) >= hold_ms;
+}
 #endif

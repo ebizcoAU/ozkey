@@ -78,8 +78,27 @@ static void threadfail(void)
     expect("late attach: not operational (forming / re-armed)", ozThreadLateAttachDue(0, 1, 1), 0);
 }
 
+static void tdetach(void)
+{
+    expect("tdetach 120", ozTdetachSeconds("120"), 120);
+    expect("tdetach 1 (min)", ozTdetachSeconds("1"), 1);
+    expect("tdetach 3600 (max)", ozTdetachSeconds("3600"), 3600);
+    expect("tdetach 3601: refused", ozTdetachSeconds("3601"), 0);
+    expect("tdetach 0: refused", ozTdetachSeconds("0"), 0);
+    expect("tdetach empty: refused", ozTdetachSeconds(""), 0);
+    expect("tdetach -5: refused", ozTdetachSeconds("-5"), 0);
+    expect("tdetach 12x: refused", ozTdetachSeconds("12x"), 0);
+    expect("tdetach 99999999999999999999 (overflow): refused", ozTdetachSeconds("99999999999999999999"), 0);
+    expect("re-enable: not holding", ozTdetachReenableDue(0, 5000, 0, 1000), 0);
+    expect("re-enable: before the hold ends", ozTdetachReenableDue(1, 999, 0, 1000), 0);
+    expect("re-enable: at the hold's end", ozTdetachReenableDue(1, 1000, 0, 1000), 1);
+    expect("re-enable: across a millis() wrap, not yet", ozTdetachReenableDue(1, 100UL, 0xFFFFFF00UL, 1000), 0);
+    expect("re-enable: across a millis() wrap, due", ozTdetachReenableDue(1, 0x2F0UL, 0xFFFFFF00UL, 1000), 1);
+}
+
 int main()
 {
+    tdetach();
     downlink();
     allowlist();
     threadfail();

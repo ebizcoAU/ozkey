@@ -251,7 +251,7 @@ static char g_advName[16] = BLE_NAME;
 //      UNCLAIMED v2 lock (released, 60 s hold-off).
 // 0.48 (2026-11-06): a v2 lock whose `info` read fails (mid-reboot) is retried
 //      after 15 s, not the 5 min stranger cooldown (F1 acceptance r6/r9).
-#define FW_VERSION "bridgeBLE-0.53"
+#define FW_VERSION "bridgeBLE-0.54"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -3003,6 +3003,20 @@ static void ozBridgeConsolePoll() {
                     (unsigned long)g_bcmdRefused[OZB_E_REPLAY], (unsigned long)g_bcmdRefused[OZB_E_BRIDGE],
                     (unsigned long)g_bcmdRefused[OZB_E_PARSE], (unsigned long)g_bcmdRefused[OZB_E_NOKEY],
                     (unsigned long)g_bcmdRefused[OZB_E_OP], (unsigned long)g_bcmdLegacyDropped);
+    } else if (cmd.startsWith("tdetach")) {  // phase D2 bench lever: next boot holds Thread off <s> s
+      String a = cmd.substring(7);
+      a.trim();
+      const unsigned holdS = ozTdetachSeconds(a.c_str());
+      if (!holdS) {
+        Serial.printf("[BENCH] tdetach: usage 'tdetach <1..%u s>'\n", OZ_TDETACH_MAX_S);
+      } else {
+        prefs.begin("bridge32", false);
+        prefs.putUInt("tdetach_s", holdS);
+        prefs.end();
+        Serial.printf("[BENCH] tdetach: the NEXT boot holds Thread disabled for %u s; rebooting\n", holdS);
+        delay(200);
+        ESP.restart();
+      }
     } else if (cmd == "tfail") {          // BRIDGE-THREADFAIL-1 bench: next boot's attach fails
       prefs.begin("bridge32", false);
       prefs.putBool("tfail_once", true);
@@ -3069,6 +3083,26 @@ static void ozBridgeConsolePoll() {
 static bool threadLateWatch = false;          // running without Thread, polling the role
 static unsigned long threadLateLogAt = 0;
 static bool threadForceFailOnce = false;      // bench: console `tfail` (NVS, one boot)
+// Phase D2 bench lever, console only (serial; no MQTT/BLE path sets it):
+// `tdetach <s>` -> the NEXT boot holds Thread disabled for s seconds.
+static uint32_t tdetachHoldS = 0;             // from NVS at boot, one-shot
+static bool tdetachHolding = false;
+static uint32_t tdetachStart = 0;
+
+// loop(): end the tdetach hold (the late attach then takes over).
+static void threadDetachTick() {
+  if (!ozTdetachReenableDue(tdetachHolding, millis(), tdetachStart, tdetachHoldS * 1000u)) return;
+  tdetachHolding = false;
+  otInstance *inst = esp_openthread_get_instance();
+  otError e = OT_ERROR_INVALID_STATE;
+  if (inst) {
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    e = otThreadSetEnabled(inst, true);
+    esp_openthread_lock_release();
+  }
+  Serial.printf("[THREAD] BENCH tdetach: %lu s hold over, Thread re-enabled (err=%d)\n",
+                (unsigned long)tdetachHoldS, (int)e);
+}
 
 static bool otRoleAttached(ot_device_role_t r) {
   return r == OT_ROLE_LEADER || r == OT_ROLE_ROUTER || r == OT_ROLE_CHILD;
@@ -3256,6 +3290,18 @@ void formThreadNetwork() {
   // parent-search state machine to give up and form as Leader — observed
   // still Detached at the 5000ms mark on live hardware. 20s comfortably
   // covers that on a single-node network with nothing to attach to.
+  if (tdetachHoldS) {                         // bench tdetach: hold Thread off from here
+    otInstance *inst = esp_openthread_get_instance();
+    if (inst) {
+      esp_openthread_lock_acquire(portMAX_DELAY);
+      const otError e = otThreadSetEnabled(inst, false);
+      esp_openthread_lock_release();
+      tdetachHolding = true;
+      tdetachStart = millis();
+      Serial.printf("[THREAD] BENCH tdetach: Thread DISABLED for %lu s (err=%d)\n",
+                    (unsigned long)tdetachHoldS, (int)e);
+    }
+  }
   unsigned long attachStart = millis();
   ot_device_role_t role;
   do {
@@ -3784,8 +3830,13 @@ void setup() {
     prefs.begin("bridge32", false);
     threadForceFailOnce = prefs.getBool("tfail_once", false);
     if (threadForceFailOnce) prefs.remove("tfail_once");
-    prefs.end();
     if (threadForceFailOnce) Serial.println("[THREAD] BENCH tfail armed for this boot");
+    tdetachHoldS = prefs.getUInt("tdetach_s", 0);
+    if (tdetachHoldS) prefs.remove("tdetach_s");
+    if (tdetachHoldS > OZ_TDETACH_MAX_S) tdetachHoldS = 0;
+    if (tdetachHoldS) Serial.printf("[THREAD] BENCH tdetach armed for this boot: %lu s\n",
+                                    (unsigned long)tdetachHoldS);
+    prefs.end();
   }
 
   if (wifiProvisioned) {
@@ -3823,6 +3874,7 @@ void loop() {
   ozBleConnInfoTick();   // BRIDGE-LAT-1
   ozBcmdDiag();          // BRIDGE-CMD-AUTH-1: refusal counters
   threadLateAttachTick(); // BRIDGE-THREADFAIL-1
+  threadDetachTick();     // phase D2 bench lever (tdetach)
 
   // 1.38: keep the on-flash copy fresh. Self-throttled to hourly inside, so
   // calling it every iteration costs a millis() compare.
