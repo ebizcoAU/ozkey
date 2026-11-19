@@ -20,7 +20,7 @@
 #define OZB_TIME_SAVE_MS (24ull * 3600ull * 1000ull)   // persist a time ctr this far above NVS
 
 enum { OZB_OP_NONE = 0, OZB_OP_PAIR_LOCK, OZB_OP_UNPAIR_LOCK, OZB_OP_RELEASE_LOCK, OZB_OP_SCAN,
-       OZB_OP_FACTORY_RESET, OZB_OP_UNPAIR, OZB_OP_TIME, OZB_OP_SET_SITE_KEY };
+       OZB_OP_FACTORY_RESET, OZB_OP_UNPAIR, OZB_OP_TIME, OZB_OP_SET_SITE_KEY, OZB_OP_TZ };
 
 // Results. OZB_DUP = a QoS 1 redelivery: not acted on, not a refusal.
 enum { OZB_OK = 0, OZB_DUP, OZB_E_NOKEY, OZB_E_SIG, OZB_E_PARSE, OZB_E_BRIDGE, OZB_E_REPLAY, OZB_E_OP,
@@ -41,6 +41,7 @@ struct OzBcmd {
   char     id[32];          // pair_lock / unpair_lock / release_lock: the lock; scan: target ("" = none)
   uint32_t duration_s;      // scan
   uint64_t utc;             // time
+  int32_t  tz_min;          // tz: minutes east of UTC, -720..840
   uint8_t  new_pub[32];     // set_site_key
   int      persist;         // 1: write ctr to NVS BEFORE acting (then ozBcmdSaved)
 };
@@ -80,7 +81,7 @@ static inline int ozBcmdArgs(oz_cbor_r *r, int op, OzBcmd *out) {
   }
   if (null_args || oz_cbor_peek(r) != OZ_CBOR_MAP) return 0;
   size_t pairs = oz_cbor_get_map(r);
-  int have_id = 0, have_dur = 0, have_utc = 0, have_pub = 0;
+  int have_id = 0, have_dur = 0, have_utc = 0, have_pub = 0, have_tz = 0;
   for (size_t i = 0; i < pairs && !r->err; i++) {
     char key[16];
     if (!ozBcmdTstr(r, key, sizeof key)) return 0;
@@ -97,6 +98,13 @@ static inline int ozBcmdArgs(oz_cbor_r *r, int op, OzBcmd *out) {
       if (oz_cbor_peek(r) != OZ_CBOR_UINT) return 0;
       out->utc = oz_cbor_get_uint(r);
       have_utc = 1;
+    } else if (!strcmp(key, "min") && op == OZB_OP_TZ) {
+      const int t = oz_cbor_peek(r);
+      if (t != OZ_CBOR_UINT && t != OZ_CBOR_NINT) return 0;
+      const int64_t m = oz_cbor_get_int(r);
+      if (r->err || m < -720 || m > 840) return 0;
+      out->tz_min = (int32_t)m;
+      have_tz = 1;
     } else if (!strcmp(key, "pub") && op == OZB_OP_SET_SITE_KEY) {
       size_t n;
       const uint8_t *v = oz_cbor_peek(r) == OZ_CBOR_BSTR ? oz_cbor_get_bstr(r, &n) : NULL;
@@ -114,6 +122,7 @@ static inline int ozBcmdArgs(oz_cbor_r *r, int op, OzBcmd *out) {
     case OZB_OP_SCAN: return have_dur;                         // target is optional
     case OZB_OP_TIME: return have_utc;
     case OZB_OP_SET_SITE_KEY: return have_pub;
+    case OZB_OP_TZ: return have_tz;
     default: return 0;
   }
 }
@@ -123,7 +132,7 @@ static inline int ozBcmdOpOf(const char *s) {
     { "pair_lock", OZB_OP_PAIR_LOCK }, { "unpair_lock", OZB_OP_UNPAIR_LOCK },
     { "release_lock", OZB_OP_RELEASE_LOCK }, { "scan", OZB_OP_SCAN },
     { "factory_reset", OZB_OP_FACTORY_RESET }, { "unpair", OZB_OP_UNPAIR },
-    { "time", OZB_OP_TIME }, { "set_site_key", OZB_OP_SET_SITE_KEY },
+    { "time", OZB_OP_TIME }, { "set_site_key", OZB_OP_SET_SITE_KEY }, { "tz", OZB_OP_TZ },
   };
   for (auto &e : t) if (!strcmp(s, e.name)) return e.op;
   return OZB_OP_NONE;
@@ -162,7 +171,8 @@ static inline int ozBcmdCheck(OzBcmdState *st, const char *self_id, const uint8_
   st->last = out->ctr;
   memcpy(st->last_hash, h, 32);
   st->has_hash = 1;
-  out->persist = out->op != OZB_OP_TIME || out->ctr > st->nvs_last + OZB_TIME_SAVE_MS;
+  // time and tz (PM 2026-11-20: tz has time's counter rules): RAM unless 24 h ahead.
+  out->persist = (out->op != OZB_OP_TIME && out->op != OZB_OP_TZ) || out->ctr > st->nvs_last + OZB_TIME_SAVE_MS;
   return OZB_OK;
 }
 

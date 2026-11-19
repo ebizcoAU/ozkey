@@ -106,6 +106,7 @@ static void ozBcmdExecute(const OzBcmd &c) {
       doc["utc"] = (uint32_t)c.utc;
       break;
     }
+    case OZB_OP_TZ: doc["tz"] = c.tz_min; break;    // the existing tz path (panel only)
     case OZB_OP_SET_SITE_KEY: {
       prefs.begin("bridge32", false);
       const bool ok = prefs.putBytes("bc_pub", c.new_pub, 32) == 32;

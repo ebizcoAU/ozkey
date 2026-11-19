@@ -165,6 +165,16 @@ static void rules(void)
     ozBcmdProvision(&st, pub2, 0);
     expect("after rotation: an old-key frame refused", (ozBcmdRotate(&st, pub2), check("pair_lock")), OZB_E_SIG);
 
+    // tz (PM 2026-11-20): a signed op with time's counter rules.
+    ozBcmdProvision(&st, pub, base + 12);
+    st.nvs_last = base + 12;
+    expect("tz (east) accepted", check("tz_east"), OZB_OK);
+    expect("…minutes", cmd.tz_min, 420);
+    expect("…RAM only, like time", cmd.persist, 0);
+    expect("tz (west, a negative int) accepted", check("tz_west"), OZB_OK);
+    expect("…minutes", cmd.tz_min, -300);
+    expect("tz out of range (900): refused", check("tz_out_of_range"), OZB_E_PARSE);
+
     // The commissioning floor: commands from before it never verify again.
     ozBcmdProvision(&st, pub, base + 100);
     expect("below the commissioning floor: refused", check("unpair_lock"), OZB_E_REPLAY);

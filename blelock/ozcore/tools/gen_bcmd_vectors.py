@@ -75,6 +75,9 @@ def main(out):
         ('unpair', k, 'unpair', me, base + 6, None),
         ('time', k, 'time', me, base + 7, {'utc': 1763600123}),
         ('set_site_key', k, 'set_site_key', me, base + 8, {'pub': pub2}),
+        ('tz_east', k, 'tz', me, base + 13, {'min': 420}),
+        ('tz_west', k, 'tz', me, base + 14, {'min': -300}),
+        ('tz_out_of_range', k, 'tz', me, base + 15, {'min': 900}),
         ('ctr_small', k, 'pair_lock', me, 70000, {'id': 'ozk-568afbc4ba9b'}),   # 3-byte..4-byte heads
         ('same_ctr_other', k, 'unpair_lock', me, base + 1, {'id': 'ozk-568afbc4ba9b'}),  # pair_lock's ctr, other bytes
         ('other_bridge', k, 'pair_lock', 'ozb-000000000001', base + 9, {'id': 'ozk-568afbc4ba9b'}),
@@ -94,7 +97,7 @@ def main(out):
             pkt, body = frame(key, op, bridge, ctr, args)
         assert len(body) <= 512
         verdict = {'other_bridge': 'bridge', 'foreign_signer': 'sig', 'unknown_op': 'op',
-                   'version_2': 'parse'}.get(name, 'accept')
+                   'version_2': 'parse', 'tz_out_of_range': 'parse'}.get(name, 'accept')
         vec['frames'].append({'name': name, 'v': 2 if name == 'version_2' else 1, 'op': op, 'bridge': bridge, 'ctr': ctr,
                               'args_bstr': sorted(kk for kk, vv in (args or {}).items() if isinstance(vv, bytes)),
                               'expect': verdict,
