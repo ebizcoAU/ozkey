@@ -1536,7 +1536,7 @@ static void safe_mode(void)
                    !strcmp(cbor_tstr_at(owner.resp.payload, owner.resp.payload_len, 2, t, sizeof t), "test-model"), 1);
         expect_int("INFO builds", oz_lock_info(&L, ib, sizeof ib, &il), OZ_OK);
         expect_int("INFO: model from the hooks", !strcmp(cbor_tstr_at(ib, il, 5, t, sizeof t), "test-model"), 1);
-        oz_lock M;
+        static oz_lock M;   /* static: the self-test image runs this on a 16 KB stack */
         static const oz_lock_hooks nomodel = { hw_actuate, hw_prompt, NULL, NULL };
         oz_lock_init(&M, "ozk-test0002", "x", &nomodel);
         expect_int("INFO (no model) builds", oz_lock_info(&M, ib, sizeof ib, &il), OZ_OK);
