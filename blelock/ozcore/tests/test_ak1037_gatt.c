@@ -712,7 +712,9 @@ static void motor_moves(void)
 /* ── the battery (P5-F), on the mocked SAR ADC ────────────────────────── */
 
 /* Placeholder scaling (oz_port_ak1037.c): mV = raw × 2400 × 3 / 4095. */
-#define RAW(mv) ((int)((mv) * 4095u / 7200u) + 1)
+/* BATT-CAL-1 (chip 2026-11-19): pack 6340 mV (multimeter) read raw 2350 (mean of
+ * 13), so the pack full scale (VREF x DIV) is 11049 mV. */
+#define RAW(mv) ((int)((mv) * 4095u / 11049u) + 1)
 
 static void battery_reads(void)
 {
@@ -1010,7 +1012,12 @@ static void batt_bench(void)
     capture_end();
     expect_int("…prints the raw reading", count("oz.batt: raw 2047"), 1);
     expect_int("…on AIN5", mock_adc_channel, 1 << 5);
-    expect_int("…says the full scale is not calibrated", count("full scale UNCALIBRATED"), 1);
+    expect_int("…says it is calibrated at one point", count("1-point cal 6340 mV"), 1);
+    capture_start();
+    mock_adc_raw = 2350;                /* the chip's mean at the multimeter's 6.34 V */
+    expect_int("oz.batt again", mock_msh_run(batt_name()), 0);
+    capture_end();
+    expect_int("…raw 2350 is the 6.34 V pack (calibration point)", count("pack 6340 mV"), 1);
 }
 #endif
 

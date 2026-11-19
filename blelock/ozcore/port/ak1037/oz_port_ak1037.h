@@ -25,7 +25,7 @@ int oz_ak1037_kv_owner(void);
 
 /* The battery in mV from the SAR ADC (P5-F). Channel, divider and reference
  * (BATT-AIN-1): AIN5 = GPIO39, divider 3 (Anyka schematic); OZ_BATT_VREF_MV
- * is still uncalibrated.
+ * is an effective full scale from a 1-point chip calibration (BATT-CAL-1).
  * 0 when the ADC reports an error (oz_power ignores it). */
 uint16_t oz_ak1037_battery_mv(void);
 
