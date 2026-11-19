@@ -452,6 +452,11 @@ static void touch_pads(void)
             { 1 << 5,  28, 1, "'*' = GPIO28 high" },
             { 1 << 4,  28, 0, "'0' = GPIO28 low" },
             { 1 << 3,  29, 0, "'#' = GPIO29 low" },
+            /* BL-BOTTOM-1 (chip 2026-11-19: bottom-left, -middle, -right
+             * pressed in order gave masks 4, 2, 1, twice) */
+            { 1 << 2,  34, 1, "bottom-left = GPIO34 high" },
+            { 1 << 1,  34, 0, "bottom-middle = GPIO34 low" },
+            { 1 << 0,  29, 1, "bottom-right = GPIO29 high" },
         };
         uint32_t t0 = mock_ms;
         while (mock_ms - t0 < 1000)
@@ -484,16 +489,16 @@ static void touch_pads(void)
             snprintf(name, sizeof name, "…%s: dark again by itself", one[k].what);
             expect_int(name, rel, 1);
         }
-        /* The bottom row (mute, bell, lock pads) is not mapped to its LEDs yet:
-         * it lights nothing rather than a wrong key. */
+        /* Two pads at once are no one key: nothing lights rather than a
+         * wrong key. */
         mock_ms += 2000;
-        mock_tk_press(1 << 0);
+        mock_tk_press((1 << 2) | (1 << 0));
         mock_pass();
         mock_pass();
         rel = 1;
         for (size_t i = 0; i < n; i++)
             rel &= mock_gpio_dir[bl[i]] == GPIO_DIR_INPUT;
-        expect_int("an unmapped pad lights nothing", rel, 1);
+        expect_int("two pads at once light nothing", rel, 1);
         idle(1000);
     }
 }
