@@ -150,6 +150,7 @@ uint32_t mock_part_start_page = (1024u * 1024u) / SPIFLASH_PAGE_SIZE;
 uint32_t mock_part_size = 64u * 1024u;
 long mock_flash_progs, mock_flash_erases, mock_nor_violations, mock_flash_out_of_part;
 long mock_flash_fail_prog_at;
+uint32_t mock_flash_prog_cost_ms;   /* AK-FLASH-LAT-1: how long one page write blocks */
 int mock_flash_dead;
 long mock_part_lookups;
 
@@ -185,6 +186,7 @@ T_BOOL spi_flash_write(T_U32 page, T_U8 *buf, T_U32 page_cnt)
     if (mock_flash_fail_prog_at > 0 && --mock_flash_fail_prog_at == 0)
         return AK_FALSE;
     mock_flash_progs++;
+    mock_ms += mock_flash_prog_cost_ms;
     uint8_t *p = mock_flash + (size_t)page * SPIFLASH_PAGE_SIZE;
     for (size_t i = 0; i < (size_t)page_cnt * SPIFLASH_PAGE_SIZE; i++) {
         if ((p[i] & buf[i]) != buf[i])  /* NOR: programming only clears bits */

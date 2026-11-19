@@ -46,6 +46,7 @@ extern uint8_t mock_flash[MOCK_FLASH_SIZE];
 extern int mock_part_present;           /* partition_get_bin_info finds "OZKV" */
 extern uint32_t mock_part_start_page, mock_part_size;
 extern long mock_flash_progs, mock_flash_erases, mock_nor_violations, mock_flash_out_of_part;
+extern uint32_t mock_flash_prog_cost_ms; /* AK-FLASH-LAT-1: ms each page write blocks */
 extern long mock_flash_fail_prog_at;    /* >0: the Nth write from now fails, no bits change */
 extern int mock_flash_dead;             /* every read, write and erase fails */
 extern long mock_part_lookups;          /* partition_get_bin_info calls */

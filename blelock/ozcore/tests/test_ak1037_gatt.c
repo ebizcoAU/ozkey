@@ -24,6 +24,7 @@
 #include "oz_frame.h"
 #include "oz_adv.h"
 #include "oz_ble.h"
+#include "oz_kv_lfs.h"
 #include "oz_gatt_ak1037.h"
 #include "oz_motor.h"
 #include "mock_sdk.h"
@@ -1021,12 +1022,111 @@ static void batt_bench(void)
 }
 #endif
 
+
+/* "oz.rfidstat" and "oz.flashlat", built backwards like the others so the
+ * release binary scan only finds them where they are compiled in. */
+static const char *rev_name(volatile const char *rev, size_t len, char *n)
+{
+    for (size_t i = 0; i < len; i++)
+        n[i] = rev[len - 1 - i];
+    n[len] = 0;
+    return n;
+}
+static const char *rfidstat_name(void)
+{
+    static char n[16];
+    static volatile const char rev[] = "tatsdifr.zo";
+    return rev_name(rev, sizeof rev - 1, n);
+}
+static const char *flashlat_name(void)
+{
+    static char n[16];
+    static volatile const char rev[] = "talhsalf.zo";
+    return rev_name(rev, sizeof rev - 1, n);
+}
+
+#ifdef OZ_DEBUG_HOOKS
+/* RFID-TIME-1 (PM GO 2026-11-19): the chip showed card polls of 243 ms and
+ * 1006 ms (Anyka Q12). Debug builds log every poll of 100 ms or more with its
+ * time, and oz.rfidstat prints a histogram of all polls (reset clears it). */
+static void rfidstat(void)
+{
+    char cmd[40];
+    boot();
+    mock_rfid_cost_ms = 30;
+    capture_start();
+    idle(3000);
+    mock_rfid_cost_ms = 300;
+    idle(600);
+    mock_rfid_cost_ms = 30;
+    idle(600);
+    capture_end();
+    expect_int("a 300 ms poll is logged with its time", count("rfid: slow poll 300 ms @"), 1);
+    expect_int("…a 30 ms poll is not", count("rfid: slow poll 30 ms"), 0);
+    capture_start();
+    expect_int("oz.rfidstat exists", mock_msh_run(rfidstat_name()), 0);
+    capture_end();
+    expect_int("…prints the slowest poll", count("max=300 ms"), 1);
+    expect_int("…counts the 30 ms polls under 50", count("<50:0 "), 0);
+    expect_int("…and the 300 ms poll in 250-499", count("250-499:1 "), 1);
+    snprintf(cmd, sizeof cmd, "%s reset", rfidstat_name());
+    capture_start();
+    expect_int("oz.rfidstat reset", mock_msh_run(cmd), 0);
+    expect_int("…then empty", mock_msh_run(rfidstat_name()), 0);
+    capture_end();
+    expect_int("…n=0 after reset (reset prints the cleared table, then the plain call)", count("oz.rfidstat: n=0 "), 2);
+    mock_rfid_cost_ms = 0;
+}
+
+/* AK-FLASH-LAT-1 (PM GO 2026-11-19): a card miss once took ~1.85 s on the
+ * chip, likely the limit-record write. oz.flashlat N times N kv writes of the
+ * size of a limit record on the OZKIE thread (the only kv writer), erases the
+ * test key, and prints min/mean/max for the writes. */
+static void flashlat(void)
+{
+    char cmd[40];
+    uint8_t b[64];                      /* larger than the 16-byte test value */
+    size_t l;
+    boot();
+    claim();
+    mock_flash_prog_cost_ms = 20;
+    snprintf(cmd, sizeof cmd, "%s 5", flashlat_name());
+    capture_start();
+    expect_int("oz.flashlat exists", mock_msh_run(cmd), 0);
+    passes(3);
+    capture_end();
+    expect_int("…5 writes timed", count("oz.flashlat: 5 writes, set min="), 1);
+    expect_int("…the 20 ms page write shows", count("max=0 ms"), 0);
+    expect_int("…nothing failed", count("FAILED"), 0);
+    expect_int("…the test key is gone", oz_kv_lfs_get("dbgflat", b, sizeof b, &l) == OZ_OK, 0);
+    snprintf(cmd, sizeof cmd, "%s 999", flashlat_name());
+    capture_start();
+    (void)mock_msh_run(cmd);
+    passes(3);
+    capture_end();
+    expect_int("…a large N is capped at 50", count("oz.flashlat: 50 writes, set min="), 1);
+    mock_flash_prog_cost_ms = 0;
+    {
+        uint8_t out[600], req[300];
+        oz_oscore_xchg x;
+        int result = -1;
+        passes(200);                    /* motor idle */
+        size_t n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
+        size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
+        expect_int("…the claimed lock still unlocks after", response(out, ol, &x, &result) == OZ_COAP_CHANGED &&
+                   result == OZ_R_UNLOCK_OK, 1);
+    }
+}
+#endif
+
 static void no_hooks(void)
 {
     expect_int("no debug hook in the shell", mock_msh_run(hook_name()), -1);
     expect_int("no wipe in the shell", mock_msh_run(wipe_name()), -1);
     expect_int("no led map in the shell", mock_msh_run(led_name()), -1);
     expect_int("no battery probe in the shell", mock_msh_run(batt_name()), -1);
+    expect_int("no rfid stats in the shell", mock_msh_run(rfidstat_name()), -1);
+    expect_int("no flash timer in the shell", mock_msh_run(flashlat_name()), -1);
 }
 
 #ifdef OZ_DEBUG_HOOKS
@@ -1357,6 +1457,22 @@ int main(int argc, char **argv)
         expect_int("built with OZ_DEBUG_HOOKS", 0, 1);
 #endif
         return report("ak1037_gatt_batt");
+    }
+    if (argc > 1 && !strcmp(argv[1], "rfidstat")) {
+#ifdef OZ_DEBUG_HOOKS
+        rfidstat();
+#else
+        expect_int("built with OZ_DEBUG_HOOKS", 0, 1);
+#endif
+        return report("ak1037_gatt_rfidstat");
+    }
+    if (argc > 1 && !strcmp(argv[1], "flashlat")) {
+#ifdef OZ_DEBUG_HOOKS
+        flashlat();
+#else
+        expect_int("built with OZ_DEBUG_HOOKS", 0, 1);
+#endif
+        return report("ak1037_gatt_flashlat");
     }
     if (argc > 1 && !strcmp(argv[1], "led")) {
 #ifdef OZ_DEBUG_HOOKS

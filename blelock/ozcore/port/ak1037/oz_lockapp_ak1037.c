@@ -222,6 +222,30 @@ static void oz_batt_cmd(char argc, char **argv)
 }
 AK_MSH_CMD_EXPORT(oz_batt_cmd, oz.batt, DEBUG BUILD ONLY: raw battery ADC);
 
+/* RFID-TIME-1 (debug builds only): the card-poll time histogram, for Anyka Q12. */
+static void oz_rfidstat_cmd(char argc, char **argv)
+{
+    oz_gatt_ak1037_debug_rfidstat(argc >= 2 && !strcmp(argv[1], "reset"));
+}
+AK_MSH_CMD_EXPORT(oz_rfidstat_cmd, oz.rfidstat, DEBUG BUILD ONLY: card poll times [reset]);
+
+/* AK-FLASH-LAT-1 (debug builds only): time N kv writes on the lock thread. */
+static void oz_flashlat_cmd(char argc, char **argv)
+{
+    int n = argc >= 2 ? atoi(argv[1]) : 10;
+    if (!running) {
+        printf("oz.flashlat: the lock isn't running\r\n");
+        return;
+    }
+    if (n < 1)
+        n = 1;
+    if (n > 50)
+        n = 50;
+    printf("oz.flashlat: %d writes queued on the lock thread\r\n", n);
+    oz_gatt_ak1037_debug_flashlat(n);
+}
+AK_MSH_CMD_EXPORT(oz_flashlat_cmd, oz.flashlat, DEBUG BUILD ONLY: time N kv writes [N<=50]);
+
 /* OZ-WIPE-1 (debug builds only, PM GO 2026-11-18): erase the lock's kv, its
  * identity and bonds, so the next oz.start is a fresh UNCLAIMED lock (bench:
  * a claimed lock back to the start of blerun without a reburn). Serial shell

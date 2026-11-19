@@ -70,6 +70,12 @@ void oz_gatt_ak1037_actuate(int unlock);
 void oz_gatt_ak1037_debug_hang(void);
 /* Debug builds only: erase the lock's kv from its own thread, then reset. */
 void oz_gatt_ak1037_debug_wipe_reset(void);
+/* RFID-TIME-1, debug builds only: print the card-poll histogram (oz.rfidstat);
+ * reset != 0 clears it first. */
+void oz_gatt_ak1037_debug_rfidstat(int reset);
+/* AK-FLASH-LAT-1, debug builds only: the OZKIE thread (the only kv writer)
+ * times n kv writes on its next pass and logs min/mean/max (oz.flashlat). */
+void oz_gatt_ak1037_debug_flashlat(int n);
 #endif
 
 #endif
