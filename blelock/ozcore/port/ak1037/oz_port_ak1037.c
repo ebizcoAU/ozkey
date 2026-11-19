@@ -508,15 +508,15 @@ int oz_ak1037_backlight_pin(int i, int state)
 /* PER-KEY-BL-1, from the LED map (LED-MAP-1, measured on the EVB 2026-11-19
  * with oz.led): pin index (0..7 as bl_pin) and level per touch pad bit (TOUCH-
  * MAP-1: bit 14 = '1' .. bit 6 = '9', 5 '*', 4 '0', 3 '#'). GPIO22 high lights
- * nothing. The bottom row's LEDs are known (GPIO34 high = left, GPIO34 low =
- * middle, GPIO29 high = right) but not which of pads 0-2 sits where: those
- * stay dark until that is measured. pin -1 = no LED. */
+ * nothing. Bottom row (BL-BOTTOM-1, chip 2026-11-19: left, middle, right gave
+ * masks 4, 2, 1): bit 2 = GPIO34 high, bit 1 = GPIO34 low, bit 0 = GPIO29
+ * high. pin -1 = no LED. */
 static const struct { int8_t pin; uint8_t state; } bl_key[15] = {
     [14] = { 0, OZ_BL_LOW },  [13] = { 1, OZ_BL_HIGH }, [12] = { 1, OZ_BL_LOW },   /* 1 2 3 */
     [11] = { 2, OZ_BL_HIGH }, [10] = { 2, OZ_BL_LOW },  [9]  = { 3, OZ_BL_LOW },   /* 4 5 6 */
     [8]  = { 4, OZ_BL_HIGH }, [7]  = { 4, OZ_BL_LOW },  [6]  = { 3, OZ_BL_HIGH },  /* 7 8 9 */
     [5]  = { 5, OZ_BL_HIGH }, [4]  = { 5, OZ_BL_LOW },  [3]  = { 6, OZ_BL_LOW },   /* * 0 # */
-    [2]  = { -1, OZ_BL_OFF }, [1]  = { -1, OZ_BL_OFF }, [0]  = { -1, OZ_BL_OFF },  /* bottom row: unmapped */
+    [2]  = { 7, OZ_BL_HIGH }, [1]  = { 7, OZ_BL_LOW },  [0]  = { 6, OZ_BL_HIGH },  /* bottom L M R */
 };
 
 int oz_ak1037_backlight_pad(int pad)
