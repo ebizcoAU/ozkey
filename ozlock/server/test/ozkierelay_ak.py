@@ -11,6 +11,15 @@ This client:
      unlock (4.01 + Echo), the repeat with Echo (UNLOCK_OK).
 It opens no BLE, no serial port and no MQTT: it cannot reach the lock except via ozlock.
 Prints one JSON line per check; exits 0 when every round passed.
+
+Timing (real radio: 2-8 s per hop measured on the AK1037 bench, 2026-11-19):
+  - each call waits for ozlock's own answer (its relay wait, 10 s by default),
+    so this client has no short wait of its own (HTTP timeout 30 s);
+  - a late message_2 cannot be told from a fresh one (EDHOC type 0 carries no
+    token), so after a FAILED round the client stays silent for STALE_S seconds
+    (env, default 15) before the next message_1: the late frame then reaches
+    ozlock with no handshake waiting and is dropped there.
+  ROUND_GAP_S (env, default 3) is the spacing after a passed round.
 """
 import base64, json, os, sys, time, urllib.error, urllib.request
 
@@ -18,6 +27,8 @@ sys.path.insert(0, sys.argv[1])
 from ozapp import OzApp, R, ccs, x25519_pub  # noqa: E402
 
 OWNER_FILE, BASE, N = sys.argv[2], sys.argv[3].rstrip('/'), int(sys.argv[4])
+STALE_S = float(os.environ.get('STALE_S') or 15)
+ROUND_GAP_S = float(os.environ.get('ROUND_GAP_S') or 3)
 LOG = open(sys.argv[5], 'a', buffering=1) if len(sys.argv) > 5 else None
 fails = 0
 
@@ -137,8 +148,10 @@ def main():
     link = HttpLink(app_id, lock)
     passes = 0
     for r in range(1, N + 1):
-        passes += one_round(owner, lock_pub, link, r)
-        time.sleep(3.0)                     # spacing, as relayrun.py
+        ok = one_round(owner, lock_pub, link, r)
+        passes += ok
+        if r < N:
+            time.sleep(ROUND_GAP_S if ok else STALE_S)
     summary = json.dumps({'t': ts(), 'lock': lock, 'bridge': bridge, 'app_id': app_id,
                           'rounds': N, 'passed': passes, 'fails': fails})
     print(summary, flush=True)
