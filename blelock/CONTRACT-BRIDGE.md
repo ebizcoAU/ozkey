@@ -297,6 +297,7 @@ Joint text: ozkey-fw (bridge) + ozkey-srv (ozlock); PM rulings of 2026-11-20. **
 | `factory_reset` | `null` | wipe the bridge |
 | `unpair` | `null` | the owner releases the bridge (ozlock sends no such command today; reserved for the app-driven path) |
 | `time` | `{"utc": uint}` | the clock push. **Only moves the bridge clock forward.** ctr persisted at most once per 24 h (below) |
+| `tz` | `{"min": int}` (-720..840, minutes east of UTC) | the panel timezone (display only; locks get UTC). **Same counter rules as `time`** (RAM ctr, NVS only > 24 h above it). PM 2026-11-20 |
 | `set_site_key` | `{"pub": bstr 32}` | rotation, signed by the CURRENT key. No floor field: `last` = this command's ctr |
 | `broker_credentials` | reserved | NOT sent signed-in-clear: BRIDGE-CRED-CLEAR-1 decides its form |
 v1 job envelopes for bridged v1 locks are **not** carried here; a signed-capable bridge refuses them (PM).
