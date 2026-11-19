@@ -25,6 +25,7 @@
 #include "oz_port.h"
 #include "oz_lock.h"
 #include "oz_gatt_ak1037.h"
+#include "oz_board_ak1037.h"
 #include "oz_port_ak1037.h"
 #ifdef OZ_DEBUG_HOOKS
 #include "oz_kv_lfs.h"
@@ -47,7 +48,6 @@
 #endif
 #define OZ_LOCKAPP_SEMVER "0.1.0"
 #define OZ_LOCKAPP_FW "ozkie-ak1037-" OZ_LOCKAPP_SEMVER "+" OZ_BUILD_SHA
-#define OZ_LOCKAPP_MODEL "ak1037-evb"   /* the EVB_MBD_AK1037D bench board */
 
 static volatile int running;
 
@@ -69,7 +69,8 @@ static void log_prompt(void *app, int on)
 
 int oz_lockapp_ak1037_start(void)
 {
-    static const oz_lock_hooks hooks = { actuate, log_prompt, NULL, OZ_LOCKAPP_MODEL };
+    static oz_lock_hooks hooks = { actuate, log_prompt, NULL, NULL };
+    hooks.model = oz_ak1037_board()->model;     /* BOARD-PROFILE-1 */
     char id[4 + 12 + 1];
 
     if (running) {

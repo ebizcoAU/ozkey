@@ -37,6 +37,7 @@
 #include "oz_doorio.h"
 #include "oz_events.h"
 #include "oz_gatt_ak1037.h"
+#include "oz_board_ak1037.h"
 #include "oz_port_ak1037.h"
 #include "oz_wdt_ak1037.h"
 
@@ -71,8 +72,8 @@ static char pad_char(int pad);          /* touch pad bit -> key (TOUCH-MAP-1) */
 static int rfid_poll(oz_lock *L);       /* the on-chip RFID reader (RFID-READER-1): 1 = a new card */
 static void tones(int n, uint32_t gap_ms);  /* queue n beeps (LOCK-IO-1 patterns) */
 
-/* The door's own inputs (LOCK-IO-1). Policy numbers: OZ_DOORIO_BENCH, one place. */
-static const oz_doorio_cfg doorio_cfg = OZ_DOORIO_BENCH;
+/* The door's own inputs (LOCK-IO-1). Policy numbers: the board's doorio
+ * (BOARD-PROFILE-1; the EVB: OZ_DOORIO_BENCH), copied into dio at start. */
 static oz_doorio dio;
 
 /* Beep patterns (LOCK-IO-1): each beep is OZ_BEEP_MS; the queue holds start
@@ -660,13 +661,13 @@ static void ozkie_thread(void *param)
                 oz_lock_auto_relock(L);
             if (d & OZ_DIO_TAMPER) {
                 oz_lock_door_event(L, OZ_EV_TAMPER, 0);
-                bl_off_at = now_ms() + doorio_cfg.alarm_ms;
+                bl_off_at = now_ms() + dio.cfg.alarm_ms;
                 bl_on = 1;
             }
             if (d & OZ_DIO_ALARM_END)
                 oz_port_log("lock: tamper alarm over");
             if (d & OZ_DIO_LEFT_OPEN) {
-                oz_lock_door_event(L, OZ_EV_DOOR_LEFT_OPEN, doorio_cfg.left_open_ms / 1000u);
+                oz_lock_door_event(L, OZ_EV_DOOR_LEFT_OPEN, dio.cfg.left_open_ms / 1000u);
                 tones(5, 120);
             }
             if (oz_doorio_alarm(&dio) && tone_n == 0 && !beeping)
@@ -913,11 +914,11 @@ int oz_gatt_ak1037_start(oz_lock *L, uint8_t thread_priority)
     oz_ble_init(&relay_ble, L, &relay_link, notify, (void *)&relay_idx);
     oz_adv_init(&adv, OZ_GATT_ADV_ALWAYS, now_ms());
     oz_keypad_init(&keypad);
-    oz_motor_init(&motor, NULL);
+    oz_motor_init(&motor, &oz_ak1037_board()->motor);   /* BOARD-PROFILE-1 */
     oz_card_init(&card);
     oz_ak1037_speaker_init();
     oz_ak1037_switches_init();
-    oz_doorio_init(&dio, &doorio_cfg);
+    oz_doorio_init(&dio, &oz_ak1037_board()->doorio);
     touch_start();
     rfid_start();
     if (rt_thread_init(&thread, "ozkie", ozkie_thread, L, thread_stack, sizeof thread_stack,

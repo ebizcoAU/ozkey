@@ -220,6 +220,7 @@ add_test(NAME ak1037_gatt COMMAND test_ak1037_gatt)
 add_test(NAME ak1037_gatt_safe COMMAND test_ak1037_gatt safe)
 add_test(NAME ak1037_gatt_zeroaddr COMMAND test_ak1037_gatt zeroaddr)
 add_test(NAME ak1037_gatt_autostart COMMAND test_ak1037_gatt autostart)
+add_test(NAME ak1037_board COMMAND test_ak1037_gatt board)   # BOARD-PROFILE-1
 # oz.wdthang (PM GO 2026-11-07): a debug-only hook. No build here or in
 # port/ak1037/Makefile defines OZ_DEBUG_HOOKS except the debug test below.
 add_test(NAME ak1037_nohooks COMMAND test_ak1037_gatt nohooks)

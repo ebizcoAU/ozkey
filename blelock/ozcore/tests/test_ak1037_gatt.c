@@ -26,6 +26,8 @@
 #include "oz_ble.h"
 #include "oz_kv_lfs.h"
 #include "oz_gatt_ak1037.h"
+#include "oz_board_ak1037.h"
+#include "oz_port_ak1037.h"
 #include "oz_motor.h"
 #include "mock_sdk.h"
 #include "hal_gpio.h"
@@ -1157,6 +1159,51 @@ static void flashlat(void)
 }
 #endif
 
+/* BOARD-PROFILE-1: one record per lock model; a record oz_board_valid()
+ * rejects never touches the motor pins (LOCK-MODELS-1 §1, PM sign-off). */
+static void board_profile(void)
+{
+    const oz_board *evb = oz_ak1037_board();
+    expect_int("board: the EVB is the active board", evb == &OZ_BOARD_EVB_AK1037D, 1);
+    expect_int("board: its model is ak1037-evb", evb->model && !strcmp(evb->model, "ak1037-evb"), 1);
+    expect_int("board: the EVB record is valid", oz_board_valid(evb), OZ_BOARD_OK);
+    expect_int("board: NULL refused", oz_board_valid(NULL), OZ_BOARD_E_NULL);
+
+    static oz_board b;
+#define BAD(what, change, why) do { b = *evb; change; \
+        expect_int("board: refused: " what, oz_board_valid(&b), why); } while (0)
+    BAD("no model", b.model = NULL, OZ_BOARD_E_MODEL);
+    BAD("an empty model", b.model = "", OZ_BOARD_E_MODEL);
+    BAD("both motor wires on one pin", b.motor_b = b.motor_a, OZ_BOARD_E_MOTOR_PINS);
+    BAD("a motor wire on a switch input", b.motor_a = b.sw_pin[OZ_DIO_SW_DOOR], OZ_BOARD_E_MOTOR_PINS);
+    BAD("a drive time past the hard cap", b.motor.drive_ms = OZ_MOTOR_MAX_DRIVE_MS + 1, OZ_BOARD_E_MOTOR_TIME);
+    BAD("a zero drive time", b.motor.drive_ms = 0, OZ_BOARD_E_MOTOR_TIME);
+    BAD("a sensor timeout past the hard cap", b.motor.timeout_ms = OZ_MOTOR_MAX_DRIVE_MS + 1, OZ_BOARD_E_MOTOR_TIME);
+    BAD("a zero divider", b.batt_div = 0, OZ_BOARD_E_BATT);
+    BAD("an absurd battery full scale", b.batt_vref_mv = 50, OZ_BOARD_E_BATT);
+    BAD("two switches on one pin", b.sw_pin[OZ_DIO_SW_EXIT] = b.sw_pin[OZ_DIO_SW_DOOR], OZ_BOARD_E_SW_PINS);
+    BAD("a backlight index past the pins", b.bl_key[3].pin = OZ_BOARD_BL_PINS, OZ_BOARD_E_BL);
+#undef BAD
+
+    /* A corrupt record: the motor pins are never configured or driven. */
+    b = *evb;
+    b.motor_b = b.motor_a;
+    oz_ak1037_board_set(&b);
+    capture_start();
+    oz_ak1037_motor_pins_init();
+    oz_ak1037_motor_pins(1, 0);
+    oz_ak1037_motor_pins(0, 1);
+    capture_end();
+    expect_int("board: invalid -> motor pins never set up", mock_gpio_dir[17] == -1 && mock_gpio_dir[18] == -1, 1);
+    expect_int("board: invalid -> motor pins never driven", mock_gpio_level[17] == 0 && mock_gpio_level[18] == 0, 1);
+    expect_int("board: invalid -> said once, with the reason", count("board: INVALID profile (3), motor refused"), 1);
+    oz_ak1037_board_set(evb);
+    oz_ak1037_motor_pins_init();
+    oz_ak1037_motor_pins(1, 0);
+    expect_int("board: valid again -> A drives", mock_gpio_dir[17] == GPIO_DIR_OUTPUT && mock_gpio_level[17] == 1, 1);
+    oz_ak1037_motor_pins(0, 0);
+}
+
 static void no_hooks(void)
 {
     expect_int("no debug hook in the shell", mock_msh_run(hook_name()), -1);
@@ -1518,6 +1565,10 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "zeroaddr")) {
         zero_addr();
         return report("ak1037_gatt_zeroaddr");
+    }
+    if (argc > 1 && !strcmp(argv[1], "board")) {
+        board_profile();
+        return report("ak1037_gatt_board");
     }
     if (argc > 1 && !strcmp(argv[1], "nohooks")) {
         no_hooks();
