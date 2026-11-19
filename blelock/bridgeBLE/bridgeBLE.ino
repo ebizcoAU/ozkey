@@ -251,7 +251,7 @@ static char g_advName[16] = BLE_NAME;
 //      UNCLAIMED v2 lock (released, 60 s hold-off).
 // 0.48 (2026-11-06): a v2 lock whose `info` read fails (mid-reboot) is retried
 //      after 15 s, not the 5 min stranger cooldown (F1 acceptance r6/r9).
-#define FW_VERSION "bridgeBLE-0.51"
+#define FW_VERSION "bridgeBLE-0.52"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -2869,6 +2869,7 @@ void forwardOverThread(const String &target, const String &fieldName,
 // for the full reason. Included HERE, not at the top: it uses mqttClient,
 // cfgSiteId and forwardOverThread's neighbours, all declared above this line.
 #include "ozbleaddrtype.h"   // BRIDGE-ADDRTYPE-1 (before ozblecentral.h, which uses it)
+#include "ozblerules.h"      // BRIDGE-HOST-SUITE-1: pure rules, host-tested
 #include "ozblecentral.h"
 #include "ozbleconninfo.h"   // BRIDGE-LAT-1: connection timing on MQTT diag
 
