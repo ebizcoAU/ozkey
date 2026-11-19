@@ -251,7 +251,7 @@ static char g_advName[16] = BLE_NAME;
 //      UNCLAIMED v2 lock (released, 60 s hold-off).
 // 0.48 (2026-11-06): a v2 lock whose `info` read fails (mid-reboot) is retried
 //      after 15 s, not the 5 min stranger cooldown (F1 acceptance r6/r9).
-#define FW_VERSION "bridgeBLE-0.50"
+#define FW_VERSION "bridgeBLE-0.51"
 // ── FW_DISPLAY_VERSION is DERIVED, never hand-maintained (2026-08-12) ──────
 //
 // It read "v1.17" while FW_VERSION said bridge32-1.31 — stale by fourteen
@@ -445,6 +445,7 @@ bool threadFormed = false;
 // error caught 2026-07-26: "'mqttClient' was not declared in this scope").
 WiFiClient wifiNetClient;
 PubSubClient mqttClient(wifiNetClient);
+#include "ozbcmdglue.h"   // BRIDGE-CMD-AUTH-1: signed bridge commands only (0.51)
 
 // BLE
 BLEServer *bleServer = nullptr;
@@ -973,6 +974,8 @@ void refreshInfo() {
   // the app reads it here, in BLE range, and refuses on a mismatch with the
   // server's TOFU-pinned copy.
   if (g_bbPubHex.length()) doc["ozkie_pub"] = g_bbPubHex;
+  doc["signed_cmd"] = 1;                       // BRIDGE-CMD-AUTH-1
+  doc["site_key"] = g_bcmd.has_key ? 1 : 0;
   doc["transport"] = "bridge";
   doc["mode"] = cfgMode; // F1: stored personality ("mqtt-uplink" | "matter-bridge")
   doc["thread_role"] = thread ? OpenThread::otGetStringDeviceRole() : "disabled";
@@ -1046,10 +1049,13 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   // OZKIE v2 downlink: a binary payload, so it is taken BEFORE the String/JSON
   // handling below ever sees it (ozkey-48 rev 6 §2.4).
   if (oz2OnMqtt(topic, payload, len)) return;
-  String body;
-  body.reserve(len);
-  for (unsigned int i = 0; i < len; i++) body += (char)payload[i];
-  Serial.printf("[MQTT] << %s : %s\n", topic, body.c_str());
+  // BRIDGE-CMD-AUTH-1: everything else must be a signed command on …/cmd.
+  ozBcmdOnMqtt(topic, payload, len);
+}
+
+// The per-op command code, unchanged, now reached ONLY from a verified signed
+// command (ozbcmdglue.h ozBcmdExecute rebuilds this JSON from its fields).
+static void handleCommandJson(JsonDocument &doc) {
 
   // F4: distill to {target, payload}/{target, envelope_hex} for the Thread
   // hop. Accepts either the lean v0 shape (a bench `mosquitto_pub` test) or
@@ -1058,11 +1064,6 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
   // ozkey-13 §8 BR1: `envelope_hex` (sealed) is checked first and relayed
   // under its own field name — the bridge never decodes it, same pure-
   // forward treatment `payload`/`payload_hex` always got.
-  JsonDocument doc;
-  if (deserializeJson(doc, body) != DeserializationError::Ok) {
-    Serial.println("[MQTT] payload not valid JSON, dropped");
-    return;
-  }
   // ── ozkey-21 T3 — accept UTC from our own server over MQTT ──────────────
   //
   // NTP IS NOT A DEPENDABLE TIME SOURCE ON A CUSTOMER SITE. Measured on the lab
@@ -1179,7 +1180,8 @@ void mqttMessageReceived(char *topic, byte *payload, unsigned int len) {
       // whole table (claim window, BRIDGE_CLAIM_REQUIRED, idempotent match,
       // BRIDGE_DENIED) and is the same gate the BLE reset uses.
       const String reqApp = (const char *)(doc["app_id"] | "");
-      if (!bridgeOwnershipCheck(reqApp)) {
+      // BRIDGE-CMD-AUTH-1: a verified signed command is the authority.
+      if (!g_bcmdAuthorised && !bridgeOwnershipCheck(reqApp)) {
         Serial.printf("[RESET] REFUSED over MQTT (app_id '%s')\n",
                       reqApp.length() ? reqApp.c_str() : "(absent)");
         // ── SAY NO OUT LOUD (ozkey-25 §3, 2026-08-12) ────────────────────
@@ -2913,18 +2915,18 @@ void mqttConnect() {
     const String online = String("{\"state\":\"online\",\"id\":\"") + deviceId +
                           "\",\"role\":\"bridge\"" +
                           (g_bbPubHex.length() ? String(",\"ozkie_pub\":\"") + g_bbPubHex + "\"" : String("")) +
+                          ",\"signed_cmd\":1,\"site_key\":" + (g_bcmd.has_key ? "1" : "0") +
                           "}";
     mqttClient.publish(willTopic.c_str(), online.c_str(), true /*retain*/);
     Serial.printf("[MQTT] presence ONLINE -> %s\n", willTopic.c_str());
-    mqttClient.subscribe(mqttCommandTopic.c_str());
+    mqttClient.subscribe(mqttCmdSignedTopic.c_str());   // BRIDGE-CMD-AUTH-1: signed only
     {
       const String v2 = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/ozkie/+";
       mqttClient.subscribe(v2.c_str());           // OZKIE v2 downlink (ozkey-48 rev 6 §2.4.2)
       Serial.printf("[MQTT] subscribed %s\n", v2.c_str());
     }
-    if (mqttCommandTopicLegacy.length())
-      mqttClient.subscribe(mqttCommandTopicLegacy.c_str()); // S16 transition
-    Serial.printf("[MQTT] subscribed %s\n", mqttCommandTopic.c_str());
+    // The legacy JSON …/command topics are no longer subscribed (no downgrade).
+    Serial.printf("[MQTT] subscribed %s\n", mqttCmdSignedTopic.c_str());
   } else {
     Serial.printf("[MQTT] connect failed, rc=%d\n", mqttClient.state());
     notifyStatus("BROKER_FAIL");
@@ -2938,6 +2940,7 @@ void mqttBegin() {
   // does not matter and nothing goes dark by being flashed second.
   mqttCommandTopic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/command";
   mqttCommandTopicLegacy = "ozkey/" + cfgSiteId + "/bridges/" + deviceId + "/command";
+  mqttCmdSignedTopic = "ozkie/" + cfgSiteId + "/bridges/" + deviceId + "/cmd";
   mqttClient.setServer(cfgBrokerHost.c_str(), cfgBrokerPort);
   mqttClient.setCallback(mqttMessageReceived);
   // ROOT CAUSE of "the app can't open the door" (found 2026-07-29).
@@ -2975,7 +2978,7 @@ static void ozBridgeConsolePoll() {
     const char c = (char)Serial.read();
     if (c == '\r') continue;
     if (c != '\n') {
-      if (line.length() < 64) line += c;   // bounded: never grow on noise
+      if (line.length() < 128) line += c;  // bounded: never grow on noise
       continue;
     }
     line.trim();
@@ -2983,7 +2986,23 @@ static void ozBridgeConsolePoll() {
     line = "";
     if (!cmd.length()) continue;
 
-    if (cmd == "id") {
+    if (cmd.startsWith("sitekey ")) {      // BRIDGE-CMD-AUTH-1, bench: sitekey <64 hex> <ctr floor>
+      String a = cmd.substring(8);
+      a.trim();
+      const int sp = a.indexOf(' ');
+      uint8_t pub[32];
+      const String hex = sp > 0 ? a.substring(0, sp) : a;
+      const uint64_t floor = sp > 0 ? strtoull(a.substring(sp + 1).c_str(), nullptr, 10) : 0;
+      if (!ozHexBytes(hex, pub, 32)) Serial.println("[BENCH] sitekey: usage 'sitekey <64 hex> <ctr floor>'");
+      else ozBcmdSetKey(pub, floor);
+    } else if (cmd == "bcmd") {
+      Serial.printf("[BENCH] signed commands: key %s, ctr %llu (NVS %llu), refused sig %lu replay %lu bridge %lu parse %lu nokey %lu op %lu, legacy dropped %lu\n",
+                    g_bcmd.has_key ? "set" : "NOT set", (unsigned long long)g_bcmd.last,
+                    (unsigned long long)g_bcmd.nvs_last, (unsigned long)g_bcmdRefused[OZB_E_SIG],
+                    (unsigned long)g_bcmdRefused[OZB_E_REPLAY], (unsigned long)g_bcmdRefused[OZB_E_BRIDGE],
+                    (unsigned long)g_bcmdRefused[OZB_E_PARSE], (unsigned long)g_bcmdRefused[OZB_E_NOKEY],
+                    (unsigned long)g_bcmdRefused[OZB_E_OP], (unsigned long)g_bcmdLegacyDropped);
+    } else if (cmd == "id") {
       Serial.printf("[BENCH] device_id=%s fw=%s broker=%s:%u mode=%s ozkie_pub=%s\n",
                     deviceId.c_str(), FW_VERSION, cfgBrokerHost.c_str(),
                     cfgBrokerPort, cfgMode.c_str(),
@@ -3375,6 +3394,14 @@ void applyProvision(JsonDocument &doc) {
   cfgTzMin = tzMin;
   wifiProvisioned = true;
   saveConfig();
+  {   // BRIDGE-CMD-AUTH-1: the site key arrives with commissioning (from ozlock, via the app)
+    const String sp = (const char *)(doc["site_pub"] | "");
+    uint8_t pub[32];
+    if (sp.length() && ozHexBytes(sp, pub, 32))
+      ozBcmdSetKey(pub, (uint64_t)(doc["ctr_floor"] | 0ULL));
+    else if (sp.length())
+      Serial.println("[PROV] site_pub is not 64 hex: ignored");
+  }
   Serial.printf("[TIME] timezone from app: %+d min (%+.2f h)\n",
                 (int)cfgTzMin, cfgTzMin / 60.0);
 
@@ -3681,6 +3708,7 @@ void setup() {
   drawStatus();
 
   loadConfig();
+  ozBcmdLoad();          // BRIDGE-CMD-AUTH-1
 
   if (wifiProvisioned) {
     state = ST_WIFI_JOINING;
@@ -3715,6 +3743,7 @@ void loop() {
   // Self-throttled inside, so calling it every iteration is cheap.
   ozBleCentralTick();
   ozBleConnInfoTick();   // BRIDGE-LAT-1
+  ozBcmdDiag();          // BRIDGE-CMD-AUTH-1: refusal counters
 
   // 1.38: keep the on-flash copy fresh. Self-throttled to hourly inside, so
   // calling it every iteration costs a millis() compare.
