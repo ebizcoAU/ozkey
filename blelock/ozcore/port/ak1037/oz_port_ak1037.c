@@ -36,6 +36,72 @@
 #include "lfs.h"
 #include "oz_kv_lfs.h"
 #include "oz_port_ak1037.h"
+#include "oz_board_ak1037.h"
+
+/* ── BOARD-PROFILE-1: the built-in board table ──────────────────────────── */
+
+/* The bench kit: EVB_MBD_AK1037D V1.0.4 + Anyka's motor board V1.0. Every
+ * value is the one the port hard-coded before (MOTOR-GPIO-1, BATT-AIN-1,
+ * BATT-CAL-1, LOCK-IO-1, LED-MAP-1, PER-KEY-BL-1, BL-BOTTOM-1). */
+const oz_board OZ_BOARD_EVB_AK1037D = {
+    .model = "ak1037-evb", .profile_ver = 1,
+    .motor_a = GPIO17, .motor_b = GPIO18,
+    .motor = { OZ_MOTOR_DRIVE_MS, OZ_MOTOR_TIMEOUT_MS, OZ_MOTOR_BRAKE_MS, OZ_MOTOR_REST_MS, 0 },
+    .batt_ain = SARADC_SEL_AIN5, .batt_div = 3u, .batt_vref_mv = 3683u,
+    .sw_pin = { [OZ_DIO_SW_TAMPER] = GPIO30, [OZ_DIO_SW_DOOR] = GPIO31, [OZ_DIO_SW_EXIT] = GPIOAO9 },
+    .doorio = OZ_DOORIO_BENCH,
+    .bl_key = {
+        [14] = { 0, OZ_BL_LOW },  [13] = { 1, OZ_BL_HIGH }, [12] = { 1, OZ_BL_LOW },   /* 1 2 3 */
+        [11] = { 2, OZ_BL_HIGH }, [10] = { 2, OZ_BL_LOW },  [9]  = { 3, OZ_BL_LOW },   /* 4 5 6 */
+        [8]  = { 4, OZ_BL_HIGH }, [7]  = { 4, OZ_BL_LOW },  [6]  = { 3, OZ_BL_HIGH },  /* 7 8 9 */
+        [5]  = { 5, OZ_BL_HIGH }, [4]  = { 5, OZ_BL_LOW },  [3]  = { 6, OZ_BL_LOW },   /* * 0 # */
+        [2]  = { 7, OZ_BL_HIGH }, [1]  = { 7, OZ_BL_LOW },  [0]  = { 6, OZ_BL_HIGH },  /* bottom L M R */
+    },
+};
+
+static const oz_board *board = &OZ_BOARD_EVB_AK1037D;
+
+const oz_board *oz_ak1037_board(void) { return board; }
+void oz_ak1037_board_set(const oz_board *b) { board = b; }
+
+int oz_board_valid(const oz_board *b)
+{
+    if (!b)
+        return OZ_BOARD_E_NULL;
+    if (!b->model || !b->model[0])
+        return OZ_BOARD_E_MODEL;
+    if (b->motor_a == b->motor_b)
+        return OZ_BOARD_E_MOTOR_PINS;
+    for (int i = 0; i < OZ_DIO_SW_N; i++)
+        if (b->sw_pin[i] == b->motor_a || b->sw_pin[i] == b->motor_b)
+            return OZ_BOARD_E_MOTOR_PINS;
+    if (b->motor.drive_ms == 0 || b->motor.drive_ms > OZ_MOTOR_MAX_DRIVE_MS ||
+        b->motor.timeout_ms > OZ_MOTOR_MAX_DRIVE_MS)
+        return OZ_BOARD_E_MOTOR_TIME;
+    /* 1..10 x divider; full scale 1-20 V at the pin's ADC (the EVB: 3 x 3683 mV) */
+    if (b->batt_div == 0 || b->batt_div > 10 || b->batt_vref_mv < 1000u || b->batt_vref_mv > 20000u)
+        return OZ_BOARD_E_BATT;
+    for (int i = 0; i < OZ_DIO_SW_N; i++)
+        for (int j = i + 1; j < OZ_DIO_SW_N; j++)
+            if (b->sw_pin[i] == b->sw_pin[j])
+                return OZ_BOARD_E_SW_PINS;
+    for (int k = 0; k < OZ_BOARD_PADS; k++)
+        if (b->bl_key[k].pin < -1 || b->bl_key[k].pin >= OZ_BOARD_BL_PINS)
+            return OZ_BOARD_E_BL;
+    return OZ_BOARD_OK;
+}
+
+/* The motor's gate: 0 = this board may drive it. Said once per bad record. */
+static int motor_refused(void)
+{
+    static const oz_board *told;
+    int why = oz_board_valid(board);
+    if (why && told != board) {
+        told = board;
+        oz_port_log("board: INVALID profile (%d), motor refused", why);
+    }
+    return why;
+}
 
 /* ── SHA-256 ─────────────────────────────────────────────────────────────── */
 
@@ -385,15 +451,8 @@ uint64_t oz_port_monotonic_ms(void)
  * VOL_DET): OZ_BATT_VREF_MV below is an EFFECTIVE full scale for this divider,
  * not the ADC's reference. One point only: a second point (a tired pack)
  * would check the offset. */
-#ifndef OZ_BATT_AIN
-#define OZ_BATT_AIN     SARADC_SEL_AIN5
-#endif
-#ifndef OZ_BATT_DIV
-#define OZ_BATT_DIV     3u              /* 2M over 1M: 6 V pack → 2 V at the pin */
-#endif
-#ifndef OZ_BATT_VREF_MV
-#define OZ_BATT_VREF_MV 3683u           /* effective, 1-point cal (3683 x 3 = 11049) */
-#endif
+/* BOARD-PROFILE-1: channel, divider and full scale are the board's
+ * (OZ_BOARD_EVB_AK1037D: AIN5, 2M over 1M = 3, 3683 mV effective). */
 
 /* BATT-SENSE-1 (PM): sensing may be OFF only on the bench (the debug image,
  * on an EVB whose vol_check is not wired: a floating ADC read "CRITICAL, 0%"
@@ -424,21 +483,21 @@ int oz_ak1037_battery_raw(void)
 {
     static int ready;
     if (!ready) {
-        hal_saradc_init(OZ_BATT_AIN);
+        hal_saradc_init(board->batt_ain);
         ready = 1;
     }
-    int raw = hal_saradc_get_data(OZ_BATT_AIN);
+    int raw = hal_saradc_get_data(board->batt_ain);
     return (raw < 0 || raw > 4095) ? -1 : raw;  /* 0xffff: the SDK's error */
 }
 
 uint16_t oz_ak1037_battery_pin_mv(int raw)
 {
-    return raw < 0 ? 0 : (uint16_t)((uint32_t)raw * OZ_BATT_VREF_MV / 4095u);
+    return raw < 0 ? 0 : (uint16_t)((uint32_t)raw * board->batt_vref_mv / 4095u);
 }
 
 uint16_t oz_ak1037_battery_pack_mv(int raw)
 {
-    uint32_t mv = raw < 0 ? 0 : (uint32_t)raw * OZ_BATT_VREF_MV * OZ_BATT_DIV / 4095u;
+    uint32_t mv = raw < 0 ? 0 : (uint32_t)raw * board->batt_vref_mv * board->batt_div / 4095u;
     return mv > UINT16_MAX ? UINT16_MAX : (uint16_t)mv;
 }
 
@@ -456,14 +515,15 @@ uint16_t oz_ak1037_battery_mv(void)
 
 /* The kit's motor board (Roy, Anyka, 2026-11-18): A high + B low turns one way,
  * A low + B high the other, both high brakes, both low stops (lowest current).
- * No PWM. Pins are ours to choose: J8 GPIO17 / GPIO18 (PM nexus-46). */
-#define OZ_MOTOR_A_GPIO GPIO17
-#define OZ_MOTOR_B_GPIO GPIO18
-
+ * No PWM. The pins are the board's (the EVB: J8 GPIO17 / GPIO18, PM nexus-46).
+ * BOARD-PROFILE-1: on a record oz_board_valid() rejects, neither function
+ * touches any pin. */
 void oz_ak1037_motor_pins(int a, int b)
 {
-    (void)hal_gpio_output_value(OZ_MOTOR_A_GPIO, (uint8_t)(a != 0));
-    (void)hal_gpio_output_value(OZ_MOTOR_B_GPIO, (uint8_t)(b != 0));
+    if (motor_refused())
+        return;
+    (void)hal_gpio_output_value(board->motor_a, (uint8_t)(a != 0));
+    (void)hal_gpio_output_value(board->motor_b, (uint8_t)(b != 0));
 }
 
 /* Both LOW, as outputs with pull-downs: called first thing at boot, before
@@ -471,7 +531,9 @@ void oz_ak1037_motor_pins(int a, int b)
  * the pin never drives high on the way. */
 void oz_ak1037_motor_pins_init(void)
 {
-    static const T_eGPIO pin[2] = { OZ_MOTOR_A_GPIO, OZ_MOTOR_B_GPIO };
+    if (motor_refused())
+        return;
+    const T_eGPIO pin[2] = { board->motor_a, board->motor_b };
     for (int i = 0; i < 2; i++) {
         (void)hal_gpio_init(pin[i]);
         (void)hal_gpio_set_pull(pin[i], GPIO_PULL_DOWN, 1);
@@ -526,13 +588,7 @@ int oz_ak1037_backlight_pin(int i, int state)
  * nothing. Bottom row (BL-BOTTOM-1, chip 2026-11-19: left, middle, right gave
  * masks 4, 2, 1): bit 2 = GPIO34 high, bit 1 = GPIO34 low, bit 0 = GPIO29
  * high. pin -1 = no LED. */
-static const struct { int8_t pin; uint8_t state; } bl_key[15] = {
-    [14] = { 0, OZ_BL_LOW },  [13] = { 1, OZ_BL_HIGH }, [12] = { 1, OZ_BL_LOW },   /* 1 2 3 */
-    [11] = { 2, OZ_BL_HIGH }, [10] = { 2, OZ_BL_LOW },  [9]  = { 3, OZ_BL_LOW },   /* 4 5 6 */
-    [8]  = { 4, OZ_BL_HIGH }, [7]  = { 4, OZ_BL_LOW },  [6]  = { 3, OZ_BL_HIGH },  /* 7 8 9 */
-    [5]  = { 5, OZ_BL_HIGH }, [4]  = { 5, OZ_BL_LOW },  [3]  = { 6, OZ_BL_LOW },   /* * 0 # */
-    [2]  = { 7, OZ_BL_HIGH }, [1]  = { 7, OZ_BL_LOW },  [0]  = { 6, OZ_BL_HIGH },  /* bottom L M R */
-};
+/* BOARD-PROFILE-1: the map is the board's bl_key[] (the EVB values above). */
 
 int oz_ak1037_backlight_pad(int pad)
 {
@@ -540,9 +596,9 @@ int oz_ak1037_backlight_pad(int pad)
     for (int b = 0; b < 15; b++) {
         if (pad != (1 << b))
             continue;
-        if (bl_key[b].pin < 0)
+        if (board->bl_key[b].pin < 0)
             return 0;
-        (void)oz_ak1037_backlight_pin(bl_key[b].pin, bl_key[b].state);
+        (void)oz_ak1037_backlight_pin(board->bl_key[b].pin, board->bl_key[b].state);
         return 1;
     }
     return 0;                           /* two pads at once, or none: dark */
@@ -617,21 +673,21 @@ void oz_ak1037_beep_stop(void)
  * to 3.3 V (and the pin's own pull-up): pressed = LOW. Pins free in the SDK's
  * EVB V103 configuration: GPIO30 tamper, GPIO31 door, AO_GPIO9 exit (an
  * always-on pin, so it can wake the chip later). */
-static const T_eGPIO sw_pin[OZ_DIO_SW_N] = { GPIO30, GPIO31, GPIOAO9 };
+/* BOARD-PROFILE-1: the pins are the board's sw_pin[] (the EVB values above). */
 
 void oz_ak1037_switches_init(void)
 {
     for (int i = 0; i < OZ_DIO_SW_N; i++) {
-        (void)hal_gpio_init(sw_pin[i]);
-        (void)hal_gpio_set_dir(sw_pin[i], GPIO_DIR_INPUT);
-        (void)hal_gpio_set_pull(sw_pin[i], GPIO_PULL_UP, 1);
+        (void)hal_gpio_init(board->sw_pin[i]);
+        (void)hal_gpio_set_dir(board->sw_pin[i], GPIO_DIR_INPUT);
+        (void)hal_gpio_set_pull(board->sw_pin[i], GPIO_PULL_UP, 1);
     }
 }
 
 void oz_ak1037_switches(uint8_t pressed[OZ_DIO_SW_N])
 {
     for (int i = 0; i < OZ_DIO_SW_N; i++)
-        pressed[i] = (uint8_t)(hal_gpio_input_value(sw_pin[i]) == 0);
+        pressed[i] = (uint8_t)(hal_gpio_input_value(board->sw_pin[i]) == 0);
 }
 
 /* ── Log ─────────────────────────────────────────────────────────────────── */
