@@ -23,6 +23,10 @@ Environment (all optional):
   BRIDGE_BOND=1          enrol the bridge's key (its retained presence
                          "ozkie_pub") as a `bridge` bond at the door, label =
                          the bridge id (F1-BRIDGE-BOND-1, rev 7)
+  ENROL_BRIDGE=<id>      with OWNER_LOAD: before the rounds, enrol bridge <id>'s key
+                         (its retained presence "ozkie_pub") as a `bridge` bond
+                         THROUGH this bridge's relay (no wipe, no door): phase C
+                         failover, the lock's 2nd bridge (OZ_LOCK_MAX_BRIDGE_BONDS)
   RELAY_WAIT_S=<s>       minimum wait for each relayed reply (default 2)
   OWNER_LOAD=<file>      skip the door: the lock is already CLAIMED by the owner in
                          this OWNER_SAVE file; run only the relay rounds (no BLE
@@ -275,6 +279,18 @@ def main(dev, port, bridge, n, prefix, host, site):
 
     # --- relay rounds ---
     m = LoggedRelayLink(host, site, bridge, dev, prefix + '_mqtt.log')
+    eb = os.environ.get('ENROL_BRIDGE')
+    if eb:
+        bp = bridge_pub(host, site, eb)
+        if bp is None:
+            say(f'{ts()} ENROL_BRIDGE: {eb} publishes no ozkie_pub'); return False
+        if owner.connect(m, lock_pub) is not None:
+            say(f'{ts()} ENROL_BRIDGE: no owner session through {bridge}'); return False
+        rc, res = owner.call(0x01, 'bond')
+        rc, res = owner.call(0x02, 'bond', {0: res[1], 1: 4, 2: bp, 3: eb})
+        if not (res and res[0] == R['BOND_OK']):
+            say(f'{ts()} ENROL_BRIDGE: enrolment of {eb} refused: {res}'); return False
+        say(f'{ts()} ENROL_BRIDGE: {eb} key {bp.hex()[:16]}… enrolled as bridge bond, slot {res[1]} (via {bridge})')
     passes, fails = 0, []
     for r in range(1, n + 1):
         m.round = r
