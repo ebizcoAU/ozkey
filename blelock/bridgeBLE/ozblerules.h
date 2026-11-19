@@ -41,4 +41,21 @@ static inline unsigned ozPairBlobSplit(const char *blob, unsigned max,
   }
   return count;
 }
+
+// ── BRIDGE-THREADFAIL-1: what a failed Thread attach means for the bridge.
+// With a Wi-Fi uplink the bridge still goes OPERATIONAL (MQTT + BLE relay; BLE
+// locks need no Thread) and picks the attach up later; without one it fails
+// closed as before (the Wi-Fi-failed fallback re-arms and retries).
+enum { OZ_TH_ATTACHED = 0, OZ_TH_RUN_WITHOUT, OZ_TH_FAIL_CLOSED };
+
+static inline int ozThreadAttachOutcome(int attached, int wifi_uplink) {
+  if (attached) return OZ_TH_ATTACHED;
+  return wifi_uplink ? OZ_TH_RUN_WITHOUT : OZ_TH_FAIL_CLOSED;
+}
+
+// The late attach: run the attached tail once, when the bridge runs without
+// Thread and the stack now reports an attached role.
+static inline int ozThreadLateAttachDue(int operational, int watching, int attached_now) {
+  return operational && watching && attached_now;
+}
 #endif

@@ -66,10 +66,23 @@ static void allowlist(void)
     expect("blob: a real id", v.size() == 1 && v[0] == "ozk-568afbc4ba9b", 1);
 }
 
+static void threadfail(void)
+{
+    expect("attached, Wi-Fi up: attached", ozThreadAttachOutcome(1, 1), OZ_TH_ATTACHED);
+    expect("attached, no Wi-Fi (Thread uplink): attached", ozThreadAttachOutcome(1, 0), OZ_TH_ATTACHED);
+    expect("NOT attached, Wi-Fi up: run without Thread (THREADFAIL-1)", ozThreadAttachOutcome(0, 1), OZ_TH_RUN_WITHOUT);
+    expect("NOT attached, no Wi-Fi: fail closed (the re-arm path)", ozThreadAttachOutcome(0, 0), OZ_TH_FAIL_CLOSED);
+    expect("late attach: operational, watching, attached now", ozThreadLateAttachDue(1, 1, 1), 1);
+    expect("late attach: still detached", ozThreadLateAttachDue(1, 1, 0), 0);
+    expect("late attach: not watching (attached at boot)", ozThreadLateAttachDue(1, 0, 1), 0);
+    expect("late attach: not operational (forming / re-armed)", ozThreadLateAttachDue(0, 1, 1), 0);
+}
+
 int main()
 {
     downlink();
     allowlist();
+    threadfail();
     printf("blerules: %d checks, %d failures\n", checks, fails);
     return fails != 0;
 }
