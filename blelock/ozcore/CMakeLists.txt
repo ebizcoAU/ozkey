@@ -216,6 +216,9 @@ endforeach()
 add_executable(test_ak1037_gatt tests/test_ak1037_gatt.c port/ak1037/oz_lockapp_ak1037.c)
 target_link_libraries(test_ak1037_gatt ozport_ak1037_host)
 target_compile_options(test_ak1037_gatt PRIVATE -Wall -Wextra -Werror)
+# INFO-SIZE-1: the chip's version carries a 7-hex commit ("+abc1234"); the host
+# default "+nosha" is 2 bytes shorter and hid a 97-byte INFO in a 96-byte buffer.
+target_compile_definitions(test_ak1037_gatt PRIVATE OZ_BUILD_SHA="5a5a5a5")
 add_test(NAME ak1037_gatt COMMAND test_ak1037_gatt)
 add_test(NAME ak1037_gatt_safe COMMAND test_ak1037_gatt safe)
 add_test(NAME ak1037_gatt_zeroaddr COMMAND test_ak1037_gatt zeroaddr)
@@ -239,6 +242,9 @@ add_executable(test_ak1037_gatt_debug tests/test_ak1037_gatt.c port/ak1037/oz_lo
                port/ak1037/oz_gatt_ak1037.c port/ak1037/oz_port_ak1037.c)   # all debug, as on the chip
 target_link_libraries(test_ak1037_gatt_debug ozport_ak1037_host)
 target_compile_options(test_ak1037_gatt_debug PRIVATE -Wall -Wextra -Werror)
+# INFO-SIZE-1: the chip's version carries a 7-hex commit ("+abc1234"); the host
+# default "+nosha" is 2 bytes shorter and hid a 97-byte INFO in a 96-byte buffer.
+target_compile_definitions(test_ak1037_gatt_debug PRIVATE OZ_BUILD_SHA="5a5a5a5")
 target_compile_definitions(test_ak1037_gatt_debug PRIVATE OZ_DEBUG_HOOKS=1)
 add_test(NAME ak1037_wdthang COMMAND test_ak1037_gatt_debug wdthang)
 add_test(NAME ak1037_wipe COMMAND test_ak1037_gatt_debug wipe)
