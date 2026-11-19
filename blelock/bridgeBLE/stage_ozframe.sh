@@ -30,5 +30,8 @@ architectures=esp32
 P
 cp "$oz"/include/*.h "$oz"/src/*.c "$lib/src/"
 cp "$oz"/third_party/monocypher/monocypher.c "$oz"/third_party/monocypher/monocypher.h "$lib/src/"
+# BRIDGE-CMD-AUTH-1: RFC 8032 Ed25519 (the server signs with it; Monocypher's core
+# crypto_eddsa_* is the BLAKE2b variant).
+cp "$oz"/third_party/monocypher/optional/monocypher-ed25519.c "$oz"/third_party/monocypher/optional/monocypher-ed25519.h "$lib/src/"
 cp "$oz"/port/esp32c6/oz_port_esp32c6.c "$oz"/port/esp32c6/oz_port_esp32c6.h "$lib/src/"
 echo "staged $(ls "$lib/src" | wc -l | tr -d ' ') files into $lib"
