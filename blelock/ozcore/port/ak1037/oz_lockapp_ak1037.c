@@ -50,7 +50,7 @@ static void log_prompt(void *app, int on)
 {
     (void)app;
     oz_gatt_ak1037_pair_prompt(on);
-    oz_port_log("keypad: %s", on ? "enter the pairing code (oz.key NNNNNN#)" : "pairing prompt off");
+    oz_port_log("keypad: %s", on ? "enter the pairing code on the keypad (NNNNNN#)" : "pairing prompt off");
 }
 
 int oz_lockapp_ak1037_start(void)
@@ -115,6 +115,11 @@ static void oz_touch_cmd(char argc, char **argv)
         printf("oz.touch: the lock isn't running (oz.start)\r\n");
 }
 
+#ifdef OZ_DEBUG_HOOKS
+/* REL-SHELL-1 (PM 2026-11-20, security blocker): these three inject keypad
+ * digits, a card UID or the pairing code from the UART, without the keypad or
+ * the card. Bench (_dbg) images only; the release-binary scan (CMake +
+ * link_app_mcu.ps1) fails any image that holds their names. */
 static void oz_code_cmd(char argc, char **argv)
 {
     if (argc != 2) {
@@ -159,6 +164,7 @@ static void oz_card_cmd(char argc, char **argv)
     if (!running || oz_gatt_ak1037_card(id, n) != OZ_OK)
         printf("oz.card: the lock isn't running (oz.start)\r\n");
 }
+#endif /* OZ_DEBUG_HOOKS: REL-SHELL-1 */
 
 /* Two bytes the OZKIE thread writes: a torn read can't happen, a stale one
  * only shows the state a moment late. */
@@ -280,9 +286,11 @@ AK_MSH_CMD_EXPORT(oz_wipe_cmd, oz.wipe, DEBUG BUILD ONLY: erase identity and bon
 
 AK_MSH_CMD_EXPORT(oz_start_cmd, oz.start, start the OZKIE lock with log-only hardware);
 AK_MSH_CMD_EXPORT(oz_touch_cmd, oz.touch, someone is at the door: open the advertising window);
-AK_MSH_CMD_EXPORT(oz_code_cmd, oz.code, the owner typed this pairing code on the keypad);
-AK_MSH_CMD_EXPORT(oz_key_cmd, oz.key, keys pressed on the keypad);
-AK_MSH_CMD_EXPORT(oz_card_cmd, oz.card, a card at the reader: its UID in hex);
+#ifdef OZ_DEBUG_HOOKS   /* REL-SHELL-1: injection, bench images only */
+AK_MSH_CMD_EXPORT(oz_code_cmd, oz.code, DEBUG BUILD ONLY: the owner typed this pairing code on the keypad);
+AK_MSH_CMD_EXPORT(oz_key_cmd, oz.key, DEBUG BUILD ONLY: keys pressed on the keypad);
+AK_MSH_CMD_EXPORT(oz_card_cmd, oz.card, DEBUG BUILD ONLY: a card at the reader: its UID in hex);
+#endif
 AK_MSH_CMD_EXPORT(oz_state_cmd, oz.state, lock state and the last motor move);
 
 /* AUTOSTART-1: the lock starts itself OZ_AUTOSTART_MS after boot (a product

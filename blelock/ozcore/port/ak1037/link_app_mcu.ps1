@@ -53,7 +53,7 @@ try {
     # image. Only an image named *_dbg (built with EXTRA=-DOZ_DEBUG_HOOKS=1)
     # may contain them; any other link fails here.
     $raw = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes("$app\build\$Name.elf"))
-    $hooks = @('oz.wipe', 'oz.wdthang', 'oz.led', 'oz.batt', 'oz.rfidstat', 'oz.flashlat', 'slow poll', 'sense OFF') | Where-Object { $raw.Contains($_) }
+    $hooks = @('oz.wipe', 'oz.wdthang', 'oz.led', 'oz.batt', 'oz.rfidstat', 'oz.flashlat', 'slow poll', 'sense OFF', 'oz.key', 'oz.card', 'oz.code') | Where-Object { $raw.Contains($_) }
     if ($Name -notlike '*_dbg') {
         if ($hooks) { throw "release image $Name contains debug hooks: $($hooks -join ', ')" }
         "debug hooks: none (release image)"
