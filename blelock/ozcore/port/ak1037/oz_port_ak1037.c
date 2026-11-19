@@ -376,8 +376,15 @@ uint64_t oz_port_monotonic_ms(void)
 /* BATT-AIN-1, from Anyka's motor driver schematic V1.0 (2026-11-19): the
  * board's VOL_DET (H1 pin 4) = VIN x 1M / (2M + 1M). On the EVB it is wired
  * to J8 row 2 right = GPIO39 = AIN5 (the old placeholder AIN1 = GPIO14 is not
- * on J8: readings from it were a floating pin). The ADC full scale is still
- * UNCALIBRATED: one multimeter reading of the pack sets OZ_BATT_VREF_MV. */
+ * on J8: readings from it were a floating pin).
+ * BATT-CAL-1 (chip 2026-11-19, 3484f3d): a 6.34 V pack (multimeter) read raw
+ * 2350 (mean of 13, spread 2321-2372); unplugging the pack fell to 533 over
+ * ~23 s (the board's 10 uF through the divider) and returned at once. So
+ * VREF x DIV = 6340 x 4095 / 2350 = 11049 mV. That is above 3 x 3.3 V because
+ * the ADC input loads the 667 k divider (a meter read 1.6 V, not 2.1 V, on
+ * VOL_DET): OZ_BATT_VREF_MV below is an EFFECTIVE full scale for this divider,
+ * not the ADC's reference. One point only: a second point (a tired pack)
+ * would check the offset. */
 #ifndef OZ_BATT_AIN
 #define OZ_BATT_AIN     SARADC_SEL_AIN5
 #endif
@@ -385,7 +392,7 @@ uint64_t oz_port_monotonic_ms(void)
 #define OZ_BATT_DIV     3u              /* 2M over 1M: 6 V pack → 2 V at the pin */
 #endif
 #ifndef OZ_BATT_VREF_MV
-#define OZ_BATT_VREF_MV 2400u           /* full scale; UNCALIBRATED (BGR × 2?) */
+#define OZ_BATT_VREF_MV 3683u           /* effective, 1-point cal (3683 x 3 = 11049) */
 #endif
 
 /* BATT-SENSE-1 (PM): sensing may be OFF only on the bench (the debug image,
