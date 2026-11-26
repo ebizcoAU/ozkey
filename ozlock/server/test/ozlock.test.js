@@ -570,7 +570,11 @@ test('scan-bridges asks every online bridge and ranks by RSSI', async () => {
   assert.equal(res.status, 404);
 });
 
-test('peer_status peer_down marks the peer bridge offline', async () => {
+test('peer_status peer_down marks the peer bridge offline (once its own presence is stale)', async () => {
+  // OZLOCK-PEER-DOWN-1: a fresh own 'online' report outranks a peer's
+  // peer_down (peerdown.test.js). Age B1's report past the fresh window so
+  // this row keeps proving the XF-144 fast path.
+  await fx.query('UPDATE bridges_presence SET presence_at = DATE_SUB(NOW(), INTERVAL 10 MINUTE) WHERE bridge_id = ?', [B1]);
   await step('peer-down-B1', async () => {
     await fx.pub(TB('peer_status', B2), { event: 'peer_down', peer: B1 });
   });
