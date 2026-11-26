@@ -117,8 +117,9 @@ TalkKim ──book + pay + guest_pub──► Nexus/TalkStay ◄══ outbound 
   "extend" verb does it (OPEN Q4).
 - **Cancellation before redemption, early check-out, room move:** these need the lock to cancel an
   unredeemed invite or revoke a guest bond **before** its expiry. **The lock does not let the
-  issuer or service bond do that today (§4.3, gap G1).** Until it does, either a hotel admin device
-  does it (bond #0, over the relay or at the door), or the stay simply runs to its expiry.
+  issuer or service bond do that today (§4.3, gap G1, ruled YES 2026-11-26, firmware pending).**
+  Until the firmware ships, either a hotel admin device does it (bond #0, over the relay or at the
+  door), or the stay simply runs to its expiry. Afterwards OZLODGE does it through its issuer bond.
 
 ## 4. Guest keys: what the lock already does, and two gaps
 
@@ -150,8 +151,12 @@ fraud problem (payment), not a lock break. A stolen mailbox message alone opens 
   and `bond/<n>` DELETE allow `admin` (and a member revoking itself) only (`oz_lock.c` ~1436-1441). A
   hotel needs OZLODGE to cancel a booking, end a stay early, or move a guest **without** a staff admin
   device. **Proposal:** let the `issuer` bond cancel invites it issued and revoke member bonds made
-  from its own invites (the lock already records `iss`). This changes ozkey-48 §6, so it needs the
-  operator's OK.
+  from its own invites. This changes ozkey-48 §6.
+  🟢 **Ruled YES by the operator, 2026-11-26:** its own invites and bonds only, never others. Firmware
+  ticket to ozkey-fw after the G2 merge, red-first. Two firmware facts it must handle: the bond
+  table stores no issuer today (a new stored field), and an unredeemed invite is known to the lock
+  only by its nonce, so the issuer has to prove the invite is its own (e.g. send the invite itself,
+  whose MAC and `iss` the lock can check) rather than a bare nonce.
 - **G2. Expired guest bonds keep their slot.** `free_slot()` only checks `used`, and `bond_live()`
   treats an expired bond as dead but leaves it in the table. A lock has **16 bonds**: admin + issuer +
   service + up to 2 bridges leaves about **11** for guests. After about 11 stays with no clean-up, the
@@ -315,7 +320,7 @@ code. Booking payloads are encrypted end to end to OZLODGE's key when they pass 
 | Q7 | Kiosk card encoder | per property; PIN + phone key need none |
 | Q8 | Link transport (WebSocket vs MQTT/TLS) | Nexus's choice |
 | Q9 | Guest key per stay or per TalkKim install | per stay (unlinkable across hotels) |
-| G1 | Issuer may cancel/revoke what it issued | yes: ozkey-48 §6 change, operator + ozkey-fw |
+| G1 | Issuer may cancel/revoke what it issued | 🟢 **RULED YES (operator, 2026-11-26):** its own invites and bonds only, never others. Firmware ticket after the G2 merge (ozkey-48 §6) |
 | G2 | Lock reuses expired guest slots | yes: firmware, ozkey-fw |
 
 ## Appendix A. OTA and channel-manager facts (checked 2026-11-26)
