@@ -158,6 +158,15 @@ fraud problem (payment), not a lock break. A stolen mailbox message alone opens 
   next guest gets `MEMBER_FULL`. **Proposal:** the lock reuses the slot of a member bond that expired
   more than a grace period ago (and drops its relay contexts), so no server visit is needed. This is a
   firmware change.
+  **Status 2026-11-26:** accepted by ozkey-fw (branch `ozkey-4c/bond-reclaim`, red-first, host
+  only). The lock reclaims expired members lazily, only when it needs a slot, at least 1 h after
+  expiry, oldest first, and never while its clock is unset. The fix ships with **G2b**, an existing
+  bug: a session's rights were checked by slot only, so an open session could inherit a reused slot.
+  The fix checks the slot's key on every request.
+  **Server consequence:** event actor slots (ozkey-48 §5.1, key 5) are reused across guests.
+  OZLODGE's audit maps an actor slot to a guest by (slot, that bond's lifetime), never by slot
+  alone. A `MEMBER_FULL` at the door then means the lock is full of live bonds; OZLODGE shows it to
+  staff.
 
 ## 5. Offline: what keeps working
 
