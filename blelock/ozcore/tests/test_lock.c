@@ -2077,6 +2077,104 @@ static void issuer_g1c(void)
     expect_int("G1c: …B's guest still bonded", slot_of(&rc_y) >= 0, 1);
 }
 
+/* ── NONCE-RING-2 (PM nexus-1b 2026-11-26): a redeemed invite stays used until
+ * its own redeem-by, however many invites follow (a); no invite may be open
+ * for more than 7 days (c). Before: an UNBOUND invite (OZINV1/v2) redeemed by
+ * key A bonded key B after 32 newer redemptions. ────────────────────────── */
+
+static void nonce_held(void)
+{
+    const int64_t T0 = 1790000000, DAY = 86400;
+    char why[32];
+
+    oz_host_kv_reset();
+    boot_lock();
+    app_new(&rc_owner); app_new(&rc_g0); app_new(&rc_y); app_new(&rc_z);
+    claim(&rc_owner);
+    expect_int("nheld: owner sets time", set_time(&rc_owner, T0), OZ_R_TIME_OK);
+
+    /* H1 (the scratch proof): byte-identical unbound invite, A then B. */
+    mint_redeem_by = T0 + 5 * DAY;
+    expect_int("H1: key A redeems the unbound invite", redeem(&rc_g0, &rc_owner, 2, 0, 0x70, NULL), 0);
+    expect_int("H1: key B at once → refused", redeem(&rc_y, &rc_owner, 2, 0, 0x70, NULL), 1);
+    mint_redeem_by = 0;
+    expect_int("H1: 33 redemptions after it", burn_redemptions(33, 0x10), 33);
+    mint_redeem_by = T0 + 5 * DAY;
+    app_new(&rc_y);
+    expect_int("H1: key B after 33 redemptions → refused", redeem(&rc_y, &rc_owner, 2, 0, 0x70, why), 1);
+    expect_int("H1: …as MEMBER_REPLAY", strcmp(why, "MEMBER_REPLAY"), 0);
+
+    /* H4: still after a reboot (kv). */
+    boot_lock();
+    expect_int("H4: owner sets time", set_time(&rc_owner, oz_lock_utc(&L) ? oz_lock_utc(&L) : T0 + 2 * DAY), OZ_R_TIME_OK);
+    mint_redeem_by = 0;
+    expect_int("H4: 33 more redemptions after the reboot", burn_redemptions(33, 0x40), 33);
+    mint_redeem_by = T0 + 5 * DAY;
+    app_new(&rc_y);
+    expect_int("H4: key B after a reboot + 33 more → refused", redeem(&rc_y, &rc_owner, 2, 0, 0x70, why), 1);
+    expect_int("H4: …as MEMBER_REPLAY", strcmp(why, "MEMBER_REPLAY"), 0);
+    mint_redeem_by = 0;
+
+    /* H3 (c): an invite open for more than 7 days is refused; 7 days is fine. */
+    int64_t now = oz_lock_utc(&L);
+    mint_redeem_by = now + 8 * DAY;
+    expect_int("H3: redeem-by 8 days out → refused", redeem(&rc_z, &rc_owner, 2, 0, 0x71, why), 1);
+    expect_int("H3: …as BOND_DENIED", strcmp(why, "BOND_DENIED"), 0);
+    mint_redeem_by = now + 7 * DAY;
+    expect_int("H3: redeem-by 7 days out → OK", redeem(&rc_z, &rc_owner, 2, 0, 0x72, NULL), 0);
+    mint_redeem_by = 0;
+
+    /* H5: a ring saved by older firmware (24-byte entries, no redeem-by) still
+     * loads, and its entries are still honoured until reused. */
+    {
+        uint8_t v1[1 + OZ_LOCK_NONCES * 24];
+        memset(v1, 0, sizeof v1);
+        v1[0] = 1;
+        memset(v1 + 1, 0x7a, 16);          /* entry 0: nonce 7a.., tag 11.. */
+        memset(v1 + 1 + 16, 0x11, 8);
+        oz_port_kv_set("nc", v1, sizeof v1);
+        boot_lock();
+        expect_int("H5: owner sets time", set_time(&rc_owner, oz_lock_utc(&L) ? oz_lock_utc(&L) : T0 + 3 * DAY),
+                   OZ_R_TIME_OK);
+        app_new(&rc_y);
+        expect_int("H5: nonce from an old-format record → refused", redeem(&rc_y, &rc_owner, 2, 0, 0x7a, why), 1);
+        expect_int("H5: …as MEMBER_REPLAY", strcmp(why, "MEMBER_REPLAY"), 0);
+    }
+
+    /* H2 (a): live entries are never overwritten. A ring full of open invites
+     * refuses the next redemption (MEMBER_FULL) and creates no bond; once those
+     * invites' redeem-by passes, it works again. */
+    oz_host_kv_reset();
+    boot_lock();
+    app_new(&rc_owner);
+    claim(&rc_owner);
+    expect_int("H2: owner sets time", set_time(&rc_owner, T0), OZ_R_TIME_OK);
+    mint_redeem_by = T0 + 3 * DAY;
+    int ok = 0;
+    for (int i = 0; i < OZ_LOCK_NONCES; i++) {
+        app_new(&rc_tmp);
+        ok += !redeem(&rc_tmp, &rc_owner, 2, oz_lock_utc(&L) + 60, (uint8_t)(0x20 + i), NULL);
+        oz_host_advance_ms(3720 * 1000);
+    }
+    expect_int("H2: 32 redemptions of open invites", ok, OZ_LOCK_NONCES);
+    app_new(&rc_tmp);
+    int used_before = 0;
+    for (int i = 0; i < OZ_LOCK_MAX_BONDS; i++)
+        used_before += L.bonds[i].used;
+    expect_int("H2: 33rd with the ring full of live entries → refused",
+               redeem(&rc_tmp, &rc_owner, 2, oz_lock_utc(&L) + 60, 0x60, why), 1);
+    expect_int("H2: …as MEMBER_FULL", strcmp(why, "MEMBER_FULL"), 0);
+    int used_after = 0;
+    for (int i = 0; i < OZ_LOCK_MAX_BONDS; i++)
+        used_after += L.bonds[i].used;
+    expect_int("H2: …and the bond table is unchanged (no guest reclaimed for it)", used_after, used_before);
+    expect_int("H2: the first open invite still refuses a new key", redeem(&rc_tmp, &rc_owner, 2, 0, 0x20, NULL), 1);
+    oz_host_advance_ms((uint64_t)(2 * DAY) * 1000);
+    mint_redeem_by = 0;
+    app_new(&rc_tmp);
+    expect_int("H2: after their redeem-by passes, room again", redeem(&rc_tmp, &rc_owner, 2, oz_lock_utc(&L) + 60, 0x61, NULL), 0);
+}
+
 static void run_suite(size_t mtu)
 {
     framed_mtu = mtu;
@@ -2114,6 +2212,7 @@ static void run_suite(size_t mtu)
     nonce_cancel();     /* boots a fresh lock */
     issuer_g1();        /* boots a fresh lock */
     issuer_g1c();       /* boots a fresh lock */
+    nonce_held();       /* boots a fresh lock */
     if (mtu)
         printf("lock over GATT, MTU %u: %ld frames in, %ld out, %d new failures\n",
                (unsigned)mtu, frames_in, frames_out, failures - before);

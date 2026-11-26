@@ -90,7 +90,9 @@ typedef struct {
 typedef struct {
     uint8_t nonce[16];
     uint8_t tag[8];        /* first bytes of the redeemer's key; zero = cancelled */
+    int64_t until;         /* NONCE-RING-2: the invite's redeem-by; 0 = unknown (older record) */
 } oz_nonce_entry;
+#define OZ_INVITE_MAX_OPEN_S (7 * 86400)   /* NONCE-RING-2 (c): no invite open longer (clock set) */
 
 /* A cancelled invite (NONCE-RING-1). `until` is its redeem-by; OZ_CANCEL_FOREVER
  * when the canceller didn't say (bare-nonce cancel): never pruned by time. */

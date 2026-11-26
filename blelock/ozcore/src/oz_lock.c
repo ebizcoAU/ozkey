@@ -113,12 +113,48 @@ static uint32_t load_u32(const char *key)
     return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
 }
 
+/* "nc": next index, then per entry nonce(16) ‖ tag(8) ‖ until(4, unix s,
+ * big-endian; good to 2106). 897 B: kv values are capped at 1024 B. An older
+ * record (24-byte entries, no until) still loads, with until = 0. */
+#define NONCE_REC_V1 (1 + OZ_LOCK_NONCES * 24)
+#define NONCE_REC_V2 (1 + OZ_LOCK_NONCES * 28)
+_Static_assert(NONCE_REC_V2 <= 1024, "kv values are capped at 1024 B (oz_port_host.c KV_VALUE_MAX)");
+
 static int save_nonces(const oz_lock *L)
 {
-    uint8_t buf[1 + OZ_LOCK_NONCES * 24];
+    uint8_t buf[NONCE_REC_V2];
     buf[0] = L->nonce_next;
-    memcpy(buf + 1, L->nonces, sizeof L->nonces);
+    for (int i = 0; i < OZ_LOCK_NONCES; i++) {
+        uint8_t *e = buf + 1 + i * 28;
+        memcpy(e, L->nonces[i].nonce, 16);
+        memcpy(e + 16, L->nonces[i].tag, 8);
+        int64_t v = L->nonces[i].until;
+        uint32_t u = v <= 0 ? 0u : v > (int64_t)UINT32_MAX ? UINT32_MAX : (uint32_t)v;
+        for (int b = 0; b < 4; b++)
+            e[24 + b] = (uint8_t)(u >> (24 - 8 * b));
+    }
     return oz_port_kv_set("nc", buf, sizeof buf);
+}
+
+static void load_nonces(oz_lock *L)
+{
+    uint8_t buf[NONCE_REC_V2];
+    size_t n;
+    memset(L->nonces, 0, sizeof L->nonces);
+    if (oz_port_kv_get("nc", buf, sizeof buf, &n) || (n != NONCE_REC_V1 && n != NONCE_REC_V2))
+        return;
+    size_t step = n == NONCE_REC_V2 ? 28 : 24;
+    L->nonce_next = buf[0] % OZ_LOCK_NONCES;
+    for (int i = 0; i < OZ_LOCK_NONCES; i++) {
+        const uint8_t *e = buf + 1 + (size_t)i * step;
+        memcpy(L->nonces[i].nonce, e, 16);
+        memcpy(L->nonces[i].tag, e + 16, 8);
+        uint32_t u = 0;
+        if (step == 28)
+            for (int b = 0; b < 4; b++)
+                u = (u << 8) | e[24 + b];
+        L->nonces[i].until = (int64_t)u;
+    }
 }
 
 /* "cx": [1, nonce, until, nonce, until, ...] for the used entries. */
@@ -352,11 +388,7 @@ int oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_loc
         load_relay(L, i);
     }
     L->epoch = load_u32("ep");
-    uint8_t nb[1 + OZ_LOCK_NONCES * 24];
-    if (!oz_port_kv_get("nc", nb, sizeof nb, &n) && n == sizeof nb) {
-        L->nonce_next = nb[0] % OZ_LOCK_NONCES;
-        memcpy(L->nonces, nb + 1, sizeof L->nonces);
-    }
+    load_nonces(L);
     load_cancels(L);
     load_creds(L);
     /* A record that is there but unreadable fails closed (oz_limit.h). */
@@ -576,15 +608,32 @@ static int cancel_add(oz_lock *L, const uint8_t nonce[16], int64_t until)
     return OZ_R_REVOKE_OK;
 }
 
-static void nonce_burn(oz_lock *L, const uint8_t nonce[16], const uint8_t *tag8)
+/* NONCE-RING-2 (a): the ring entry a new redemption may take, or −1. Never one
+ * whose invite is still open: only empty, unknown (older record, until 0) or
+ * past its redeem-by with the clock set. Searched from nonce_next, in order. */
+static int nonce_slot(const oz_lock *L)
 {
-    oz_nonce_entry *e = &L->nonces[L->nonce_next];
+    static const uint8_t zero16[16];
+    int64_t now = oz_lock_utc(L);
+    for (int k = 0; k < OZ_LOCK_NONCES; k++) {
+        int i = (L->nonce_next + k) % OZ_LOCK_NONCES;
+        const oz_nonce_entry *e = &L->nonces[i];
+        if (!memcmp(e->nonce, zero16, 16) || e->until == 0 || (now && e->until < now))
+            return i;
+    }
+    return -1;
+}
+
+static void nonce_burn(oz_lock *L, int i, const uint8_t nonce[16], const uint8_t *tag8, int64_t until)
+{
+    oz_nonce_entry *e = &L->nonces[i];
     memcpy(e->nonce, nonce, 16);
     if (tag8)
         memcpy(e->tag, tag8, 8);
     else
         memset(e->tag, 0, 8);
-    L->nonce_next = (uint8_t)((L->nonce_next + 1) % OZ_LOCK_NONCES);
+    e->until = until ? until : 1;   /* 0 means "unknown"; an invite always has a redeem-by */
+    L->nonce_next = (uint8_t)((i + 1) % OZ_LOCK_NONCES);
     save_nonces(L);
 }
 
@@ -690,6 +739,8 @@ static int redeem_invite(oz_lock *L, const uint8_t *val, size_t vlen, const uint
     int64_t now = oz_lock_utc(L);
     if (now && inv.expires && now > inv.expires)
         return OZ_R_MEMBER_EXPIRED;
+    if (now && inv.expires > now + OZ_INVITE_MAX_OPEN_S)
+        return OZ_R_BOND_DENIED;          /* NONCE-RING-2 (c): open at most 7 days */
     if (issuer_role == OZ_ROLE_ISSUER) {
         /* Bounded guest windows (§6): a membership end is required, no further
          * out than max_days. Without a set clock the bound can't be checked. */
@@ -711,6 +762,9 @@ static int redeem_invite(oz_lock *L, const uint8_t *val, size_t vlen, const uint
         }
         return OZ_R_MEMBER_REPLAY;
     }
+    int ni = nonce_slot(L);
+    if (ni < 0)
+        return OZ_R_MEMBER_FULL;          /* NONCE-RING-2 (a): every ring entry holds an open invite */
     int s = free_slot(L);
     if (s < 0)
         return OZ_R_MEMBER_FULL;
@@ -724,7 +778,7 @@ static int redeem_invite(oz_lock *L, const uint8_t *val, size_t vlen, const uint
     b->has_iss = 1;
     memcpy(b->iss_tag, inv.issuer, 8);
     save_bond(L, s);
-    nonce_burn(L, inv.nonce, pub);   /* only successful enrolments are recorded */
+    nonce_burn(L, ni, inv.nonce, pub, inv.expires);   /* only successful enrolments are recorded */
     bump_epoch(L);
     *slot = s;
     return OZ_R_MEMBER_OK;
