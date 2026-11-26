@@ -26,6 +26,7 @@ const db = require('./db');
 const api = require('./api');
 const consoleAuth = require('./console');
 const consolePolicy = require('./console/policy');
+const apiKeys = require('./apikeys');
 
 /**
  * @param {object} deps
@@ -76,4 +77,4 @@ function createCore({ CONFIG, logEvent, mysql, mqtt }) {
   };
 }
 
-module.exports = { createCore, util, consolePolicy };
+module.exports = { createCore, util, consolePolicy, apiKeys };

@@ -9,6 +9,9 @@ const harness = require('../../../ozserver-core/testkit/harness');
 
 const S0_JWT_SECRET = 's0-regression-suite-jwt-secret-not-a-real-one';
 const S0_CONSOLE_TOTP_KEY = '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff';
+// OZLOCK-AUTH-1: two test clients; fx.http() sends the first by default.
+const S0_API_KEY = 's0-regression-api-key-one-not-a-real-one-0001';
+const S0_API_KEY_2 = 's0-regression-api-key-two-not-a-real-one-0002';
 
 harness.configure({
   name: 'ozlock',
@@ -17,7 +20,9 @@ harness.configure({
   basePath: '/ozlockserv/api',
   site: 'lab',
   dbPrefix: 's0_ozlock',
+  apiKey: S0_API_KEY,
   serverEnv: (fx) => ({
+    OZLOCK_API_KEYS: `s0-tests:${S0_API_KEY},s0-second:${S0_API_KEY_2}`,
     OZLOCK_NEXUS_URL: fx.nexusUrl,
     OZLOCK_SERVER_API_KEY: 's0-test-nexus-key',
     OZLOCK_JWT_SECRET: S0_JWT_SECRET,
@@ -35,4 +40,4 @@ harness.configure({
   }),
 });
 
-module.exports = { ...harness, S0_JWT_SECRET, S0_CONSOLE_TOTP_KEY };
+module.exports = { ...harness, S0_JWT_SECRET, S0_CONSOLE_TOTP_KEY, S0_API_KEY, S0_API_KEY_2 };

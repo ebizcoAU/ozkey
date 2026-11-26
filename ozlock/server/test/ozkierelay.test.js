@@ -26,7 +26,7 @@ const net = require('net');
 const fs = require('fs');
 const { spawn, spawnSync } = require('child_process');
 const mqtt = require('mqtt');
-const { Fixture, x25519FromSeed, waitFor, sleep } = require('./harness');
+const { Fixture, x25519FromSeed, waitFor, sleep, S0_API_KEY } = require('./harness');
 
 const WAIT_MS = 3000;
 const fx = new Fixture({ env: { OZLOCK_OZKIE_WAIT_MS: String(WAIT_MS), OZLOCK_OZKIE_M3_WAIT_MS: '500' } });
@@ -157,7 +157,7 @@ test('owner app: door pairing, then EDHOC, read and Echo unlock through ozlock',
     const child = spawn(
       'python3',
       ['-I', path.join(__dirname, 'ozkierelay_app.py'), path.join(OZCORE, 'tools'), String(fx.blePort), fx.base, L, B],
-      { stdio: ['ignore', 'pipe', 'pipe'] }
+      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, OZLOCK_API_KEY: S0_API_KEY } }
     );
     let stdout = '';
     let stderr = '';

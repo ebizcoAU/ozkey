@@ -15,6 +15,8 @@ sys.path.insert(0, sys.argv[1])
 from ozapp import OzApp, LockLink, R, uncbor  # noqa: E402
 
 BLE, BASE, LOCK, BRIDGE = int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+# OZLOCK-AUTH-1: the caller key, from the env (never argv, never printed).
+API_KEY = os.environ.get('OZLOCK_API_KEY', '')
 fails = 0
 
 
@@ -25,7 +27,10 @@ def check(name, ok, **kw):
 
 
 def post(path, body):
-    req = urllib.request.Request(BASE + path, json.dumps(body).encode(), {'content-type': 'application/json'})
+    headers = {'content-type': 'application/json'}
+    if API_KEY:
+        headers['authorization'] = 'Bearer ' + API_KEY
+    req = urllib.request.Request(BASE + path, json.dumps(body).encode(), headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.status, json.loads(r.read())
