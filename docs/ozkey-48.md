@@ -26,6 +26,8 @@
 > Rev 8 (2026-11-26, PM nexus-1b GO, G2 + G2b from the server lane): an expired member's slot is
 > reclaimed when a slot is needed (§6.2), and a session is bound to its bond's key, not its slot
 > number (§6.2). Known risk: the clock that ends a membership (§6.2). No wire change.
+> Rev 9 (2026-11-26, PM nexus-1b, NONCE-RING-1): a cancelled invite stays refused until its
+> redeem-by, in its own list. Admin cancel takes an optional body `{1: redeem_by}` (App. A).
 
 ## 0. What changes from v1, in one table
 
@@ -494,7 +496,7 @@ operation source, alarm code and similar are taken from Matter so we don't inven
 | `cred/sync` | PUT | `cred.sync` | admin, service | full set, replaces |
 | `bond` | GET | `bond.list` / `bond.query` | admin | → roster + epoch |
 | `bond/<slot>` | DELETE | `bond.revoke` | admin | — |
-| `bond/invite/<nonce>` | DELETE | `bond.invite.cancel` | admin | — |
+| `bond/invite/<nonce>` | DELETE | `bond.invite.cancel` | admin | optional `{1: redeem_by}` (App. A, rev 9) |
 | `time` | PUT / GET | `time.set` / `time.get` | bridge, admin | `{1: utc_s}`, monotonic-forward rule unchanged |
 | `dev/info` | GET | `device.info` | member+ | → `{1: fw, 2: profile, 3: caps}` |
 | `dev/reset` | POST | `device.reset` | admin | — (Echo on relay) |
@@ -729,6 +731,18 @@ lock holds the response until the keypad answers:
 
 Any other request during pairing gets `4.03 {0: PAIR_PENDING}`. The owner's later sessions use
 `ID_CRED_I = {4: h'00'}`.
+
+**Invite cancel (rev 9, NONCE-RING-1).** `DELETE bond/invite/<nonce>`, with an optional body
+`{1: redeem_by}` (the invite's `expires`, unix s). The lock keeps a cancelled nonce in its own list of
+16 (`OZ_LOCK_CANCELS`, kv `cx`), apart from the 32-entry redemption ring. Before rev 9 a cancel was burnt
+into that ring and forgotten after 32 newer burns, so a cancelled invite could be redeemed again.
+- A redemption checks the list first, with or without a clock, and is refused as `MEMBER_REPLAY`.
+- An entry is reused only when the clock is set and its `redeem_by` has passed. A cancel sent without
+  `redeem_by` is kept for good. **Apps should send it.**
+- A cancel whose `redeem_by` is already past answers `REVOKE_OK` and stores nothing.
+- A full list of live entries answers `NO_SLOT` (19). The invite is then **not** cancelled: the app
+  must say so. Nothing live is ever evicted.
+- Unchanged: cancelling an invite that was already redeemed answers `REVOKE_DENIED` (revoke the bond).
 
 **Extra verb.** `POST bond {0: epoch, 1: role (3 service, 4 bridge, 5 issuer), 2: pub (32 B),
 3: label, 4: max_days (issuer, 1–90, default 30)}`, admin only, answers

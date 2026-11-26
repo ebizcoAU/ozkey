@@ -453,6 +453,9 @@ static void claim(app_t *a)
     a->slot = 0;
 }
 
+/* Redeem-by of the next minted invites; 0 = the default (now + 10 min). */
+static int64_t mint_redeem_by;
+
 static size_t mint_invite(const app_t *iss_app, int iss_slot, uint8_t version, const app_t *for_app,
                           int64_t me, uint8_t nonce_byte, uint8_t *ead, size_t cap)
 {
@@ -464,7 +467,7 @@ static size_t mint_invite(const app_t *iss_app, int iss_slot, uint8_t version, c
     inv.role = OZ_INVITE_ROLE_MEMBER;
     strcpy(inv.label, "Ba Ngoai");
     memset(inv.nonce, nonce_byte, 16);
-    inv.expires = oz_lock_utc(&L) ? oz_lock_utc(&L) + 600 : 1789000000;
+    inv.expires = mint_redeem_by ? mint_redeem_by : oz_lock_utc(&L) ? oz_lock_utc(&L) + 600 : 1789000000;
     inv.membership_expires = me;
     if (version >= 3) {
         oz_invite_bind_of(for_app->pub, inv.bind);
@@ -1721,6 +1724,107 @@ static void bond_reclaim(void)
     expect_int("R3: with a clock it reclaims", redeem(&rc_z, &rc_owner, 2, 0, 0x74, NULL), 0);
 }
 
+/* ── NONCE-RING-1 (PM nexus-1b 2026-11-26): a cancelled invite stays refused
+ * until its own redeem-by passes, however many invites are redeemed after it.
+ * Before: the cancel burnt the nonce into the 32-entry redemption ring and was
+ * forgotten after 32 newer burns. ────────────────────────────────────────── */
+
+/* DELETE bond/invite/<nonce> as the owner; redeem_by 0 = the bare (old) form. */
+static int cancel_invite(uint8_t nonce_byte, int64_t redeem_by)
+{
+    char path[48];
+    snprintf(path, sizeof path, "bond/invite/");
+    for (int i = 0; i < 16; i++)
+        snprintf(path + 12 + 2 * i, 3, "%02x", nonce_byte);
+    uint8_t b[32];
+    oz_cbor_w w;
+    oz_cbor_w_init(&w, b, sizeof b);
+    if (redeem_by) {
+        oz_cbor_put_map(&w, 1); oz_cbor_put_uint(&w, 1); oz_cbor_put_int(&w, redeem_by);
+    }
+    oz_link_open(&ble, 0);
+    handshake(&rc_owner, &ble, NULL, 0, NULL);
+    return call(&rc_owner, &ble, OZ_COAP_DELETE, path, redeem_by ? b : NULL, w.len);
+}
+
+/* n real redemptions (admin invites, fresh keys, 1-minute memberships), each
+ * burning one ring entry. The clock moves 1 h 2 min per redemption, so the
+ * one before is past expiry + grace and its slot is reclaimed (G2). */
+static int burn_redemptions(int n, uint8_t first_nonce)
+{
+    int ok = 0;
+    for (int i = 0; i < n; i++) {
+        app_new(&rc_tmp);
+        ok += !redeem(&rc_tmp, &rc_owner, 2, oz_lock_utc(&L) + 60, (uint8_t)(first_nonce + i), NULL);
+        oz_host_advance_ms(3720 * 1000);
+    }
+    return ok;
+}
+
+static void nonce_cancel(void)
+{
+    const int64_t T0 = 1790000000, DAY = 86400;
+    char why[32];
+
+    oz_host_kv_reset();
+    boot_lock();
+    app_new(&rc_owner); app_new(&rc_g0); app_new(&rc_y); app_new(&rc_z);
+    claim(&rc_owner);
+    expect_int("ncancel: owner sets time", set_time(&rc_owner, T0), OZ_R_TIME_OK);
+
+    /* N1 (PM row): cancel with a redeem-by a week out; 33 redemptions later the
+     * cancelled invite is still refused. N2: the same for a bare-nonce cancel. */
+    expect_int("N1: cancel with redeem-by", cancel_invite(0xe1, T0 + 7 * DAY), OZ_R_REVOKE_OK);
+    expect_int("N2: bare-nonce cancel", cancel_invite(0xe2, 0), OZ_R_REVOKE_OK);
+    expect_int("N1: 33 redemptions after the cancels", burn_redemptions(33, 0x10), 33);
+    mint_redeem_by = T0 + 7 * DAY;
+    expect_int("N1: cancelled invite refused after 33 burns", redeem(&rc_g0, &rc_owner, 2, 0, 0xe1, why), 1);
+    expect_int("N1: …as MEMBER_REPLAY", strcmp(why, "MEMBER_REPLAY"), 0);
+    expect_int("N2: bare-cancelled invite refused after 33 burns", redeem(&rc_y, &rc_owner, 2, 0, 0xe2, why), 1);
+    expect_int("N2: …as MEMBER_REPLAY", strcmp(why, "MEMBER_REPLAY"), 0);
+
+    /* N3: persists across a reboot, and holds with no clock. */
+    boot_lock();
+    expect_int("N3: still refused after reboot, no clock", redeem(&rc_g0, &rc_owner, 2, 0, 0xe1, why), 1);
+    expect_int("N3: …as MEMBER_REPLAY (not MEMBER_FULL)", strcmp(why, "MEMBER_REPLAY"), 0);
+    expect_int("N3: owner sets the clock", set_time(&rc_owner, T0 + 2 * DAY), OZ_R_TIME_OK);
+
+#ifdef OZ_LOCK_CANCELS
+    /* N4: the list is bounded. Live entries are never evicted: with every entry
+     * live, a further cancel gets NO_SLOT, and the earlier cancels still hold. */
+    int64_t now = oz_lock_utc(&L);
+    int ok = 0;
+    for (int i = 0; i < OZ_LOCK_CANCELS - 2; i++)
+        ok += cancel_invite((uint8_t)(0x40 + i), now + 3600) == OZ_R_REVOKE_OK;
+    expect_int("N4: the list fills", ok, OZ_LOCK_CANCELS - 2);
+    expect_int("N4: full of live entries → NO_SLOT", cancel_invite(0x60, now + 7 * DAY), OZ_R_NO_SLOT);
+    expect_int("N4: an earlier cancel still holds", redeem(&rc_g0, &rc_owner, 2, 0, 0xe1, NULL), 1);
+
+    /* N5: entries whose redeem-by has passed are pruned to make room; the bare
+     * entry (no redeem-by known) is never pruned. */
+    oz_host_advance_ms(7200 * 1000);
+    expect_int("N5: room after the short entries expire", cancel_invite(0x60, oz_lock_utc(&L) + 7 * DAY),
+               OZ_R_REVOKE_OK);
+    expect_int("N5: the bare entry is kept", redeem(&rc_y, &rc_owner, 2, 0, 0xe2, NULL), 1);
+
+    /* N6: cancelling an invite already past its redeem-by stores nothing. */
+    expect_int("N6: dead invite's cancel is OK", cancel_invite(0x61, oz_lock_utc(&L) - 10), OZ_R_REVOKE_OK);
+    int held = 0;
+    for (int i = 0; i < OZ_LOCK_CANCELS; i++)
+        held += L.cancels[i].used && L.cancels[i].nonce[0] == 0x61;
+    expect_int("N6: …and takes no entry", held, 0);
+
+#else
+    expect_int("N4-N6: a bounded cancel list exists (OZ_LOCK_CANCELS)", 0, 1);
+#endif
+
+    /* N7: a redeemed invite can't be cancelled (revoke the bond instead), as before. */
+    mint_redeem_by = 0;
+    app_new(&rc_z);
+    expect_int("N7: redeem", redeem(&rc_z, &rc_owner, 2, 0, 0x62, NULL), 0);
+    expect_int("N7: cancel after redeem → REVOKE_DENIED", cancel_invite(0x62, 0), OZ_R_REVOKE_DENIED);
+}
+
 static void run_suite(size_t mtu)
 {
     framed_mtu = mtu;
@@ -1754,7 +1858,8 @@ static void run_suite(size_t mtu)
     bridge_bonds();
     events();
     pair_lockout();
-    bond_reclaim();     /* last: boots a fresh lock */
+    bond_reclaim();     /* boots a fresh lock */
+    nonce_cancel();     /* boots a fresh lock */
     if (mtu)
         printf("lock over GATT, MTU %u: %ld frames in, %ld out, %d new failures\n",
                (unsigned)mtu, frames_in, frames_out, failures - before);

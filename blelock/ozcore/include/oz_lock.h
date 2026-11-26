@@ -37,6 +37,7 @@ extern "C" {
 #define OZ_LOCK_MAX_BRIDGE_BONDS 2   /* `bridge`-role bonds; a 3rd is NO_SLOT (F1-BRIDGE-BOND-1) */
 #define OZ_LOCK_MAX_CREDS   32
 #define OZ_LOCK_NONCES      32
+#define OZ_LOCK_CANCELS     16   /* NONCE-RING-1: cancelled invites, kept until their redeem-by */
 #define OZ_LOCK_LABEL       24
 #define OZ_LOCK_CRED_SECRET 16
 #define OZ_CCS_LEN          44
@@ -88,6 +89,15 @@ typedef struct {
     uint8_t nonce[16];
     uint8_t tag[8];        /* first bytes of the redeemer's key; zero = cancelled */
 } oz_nonce_entry;
+
+/* A cancelled invite (NONCE-RING-1). `until` is its redeem-by; OZ_CANCEL_FOREVER
+ * when the canceller didn't say (bare-nonce cancel): never pruned by time. */
+#define OZ_CANCEL_FOREVER INT64_MAX
+typedef struct {
+    uint8_t  used;
+    uint8_t  nonce[16];
+    int64_t  until;
+} oz_cancel_entry;
 
 struct oz_lock;
 
@@ -149,6 +159,7 @@ typedef struct oz_lock {
     uint32_t       epoch;
     oz_nonce_entry nonces[OZ_LOCK_NONCES];
     uint8_t        nonce_next;
+    oz_cancel_entry cancels[OZ_LOCK_CANCELS];
     oz_cred        creds[OZ_LOCK_MAX_CREDS];
     uint16_t       next_cred_id;
     uint8_t        lock_state;

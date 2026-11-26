@@ -110,6 +110,56 @@ static int save_nonces(const oz_lock *L)
     return oz_port_kv_set("nc", buf, sizeof buf);
 }
 
+/* "cx": [1, nonce, until, nonce, until, ...] for the used entries. */
+static int save_cancels(const oz_lock *L)
+{
+    uint8_t buf[8 + OZ_LOCK_CANCELS * 28];
+    oz_cbor_w w;
+    oz_cbor_w_init(&w, buf, sizeof buf);
+    size_t n = 0;
+    for (int i = 0; i < OZ_LOCK_CANCELS; i++)
+        n += L->cancels[i].used;
+    if (!n) {
+        (void)oz_port_kv_erase("cx");
+        return OZ_OK;
+    }
+    oz_cbor_put_array(&w, 1 + 2 * n);
+    oz_cbor_put_uint(&w, 1);
+    for (int i = 0; i < OZ_LOCK_CANCELS; i++) {
+        if (!L->cancels[i].used)
+            continue;
+        oz_cbor_put_bstr(&w, L->cancels[i].nonce, 16);
+        oz_cbor_put_int(&w, L->cancels[i].until);
+    }
+    return w.err ? w.err : oz_port_kv_set("cx", buf, w.len);
+}
+
+static void load_cancels(oz_lock *L)
+{
+    uint8_t buf[8 + OZ_LOCK_CANCELS * 28];
+    size_t n;
+    memset(L->cancels, 0, sizeof L->cancels);
+    if (oz_port_kv_get("cx", buf, sizeof buf, &n))
+        return;
+    oz_cbor_r r;
+    oz_cbor_r_init(&r, buf, n);
+    size_t items = oz_cbor_get_array(&r);
+    if (r.err || items < 1 || !(items & 1) || (items - 1) / 2 > OZ_LOCK_CANCELS || oz_cbor_get_uint(&r) != 1) {
+        oz_port_log("lock: cancelled-invite list unreadable");
+        return;
+    }
+    for (size_t i = 0; i < (items - 1) / 2 && !r.err; i++) {
+        size_t nl;
+        const uint8_t *nonce = oz_cbor_get_bstr(&r, &nl);
+        int64_t until = oz_cbor_get_int(&r);
+        if (r.err || !nonce || nl != 16)
+            break;
+        L->cancels[i].used = 1;
+        memcpy(L->cancels[i].nonce, nonce, 16);
+        L->cancels[i].until = until;
+    }
+}
+
 static int save_creds(const oz_lock *L)
 {
     uint8_t buf[1024];
@@ -296,6 +346,7 @@ int oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_loc
         L->nonce_next = nb[0] % OZ_LOCK_NONCES;
         memcpy(L->nonces, nb + 1, sizeof L->nonces);
     }
+    load_cancels(L);
     load_creds(L);
     /* A record that is there but unreadable fails closed (oz_limit.h). */
     uint8_t pl[OZ_LIMIT_SAVED_LEN];
@@ -477,6 +528,43 @@ static int nonce_seen(const oz_lock *L, const uint8_t nonce[16], const uint8_t *
     return 0;
 }
 
+static int nonce_cancelled(const oz_lock *L, const uint8_t nonce[16])
+{
+    for (int i = 0; i < OZ_LOCK_CANCELS; i++)
+        if (L->cancels[i].used && oz_ct_equal(L->cancels[i].nonce, nonce, 16) == 0)
+            return 1;
+    return 0;
+}
+
+/* NONCE-RING-1: remember a cancelled invite until its redeem-by has passed.
+ * An entry is reused only when the clock is set and its redeem-by is behind
+ * it. A live entry is never evicted: a full list answers NO_SLOT. */
+static int cancel_add(oz_lock *L, const uint8_t nonce[16], int64_t until)
+{
+    int64_t now = oz_lock_utc(L);
+    if (now && until != OZ_CANCEL_FOREVER && until < now)
+        return OZ_R_REVOKE_OK;            /* past its redeem-by already: nothing to hold */
+    int free_i = -1;
+    for (int i = 0; i < OZ_LOCK_CANCELS; i++) {
+        oz_cancel_entry *e = &L->cancels[i];
+        if (e->used && oz_ct_equal(e->nonce, nonce, 16) == 0) {
+            if (until > e->until)
+                e->until = until;
+            save_cancels(L);
+            return OZ_R_REVOKE_OK;
+        }
+        if (free_i < 0 && (!e->used || (now && e->until != OZ_CANCEL_FOREVER && e->until < now)))
+            free_i = i;
+    }
+    if (free_i < 0)
+        return OZ_R_NO_SLOT;
+    L->cancels[free_i].used = 1;
+    memcpy(L->cancels[free_i].nonce, nonce, 16);
+    L->cancels[free_i].until = until;
+    save_cancels(L);
+    return OZ_R_REVOKE_OK;
+}
+
 static void nonce_burn(oz_lock *L, const uint8_t nonce[16], const uint8_t *tag8)
 {
     oz_nonce_entry *e = &L->nonces[L->nonce_next];
@@ -599,6 +687,8 @@ static int redeem_invite(oz_lock *L, const uint8_t *val, size_t vlen, const uint
             inv.expires < now - ISSUER_START_SLACK)
             return OZ_R_BOND_DENIED;
     }
+    if (nonce_cancelled(L, inv.nonce))
+        return OZ_R_MEMBER_REPLAY;       /* cancelled (NONCE-RING-1), with or without a clock */
     const uint8_t *tag;
     if (nonce_seen(L, inv.nonce, &tag)) {
         /* Idempotent retry by the same key: hand back its existing bond. */
@@ -1055,13 +1145,18 @@ static void v_invite_cancel(req_ctx *q, const char *hex)
     }
     const uint8_t *tag;
     static const uint8_t zero8[8];
-    if (nonce_seen(q->L, nonce, &tag)) {
-        /* Already redeemed: revoke the bond instead. Already cancelled: fine. */
-        result(q, memcmp(tag, zero8, 8) ? OZ_R_REVOKE_DENIED : OZ_R_REVOKE_OK, 0);
+    if (nonce_seen(q->L, nonce, &tag) && memcmp(tag, zero8, 8)) {
+        result(q, OZ_R_REVOKE_DENIED, 0);   /* already redeemed: revoke the bond instead */
         return;
     }
-    nonce_burn(q->L, nonce, NULL);
-    result(q, OZ_R_REVOKE_OK, 0);
+    /* NONCE-RING-1: a cancel goes to its own list, kept until the invite's
+     * redeem-by (body key 1, optional; absent = kept for good), never into the
+     * redemption ring, which forgets after OZ_LOCK_NONCES newer burns. An old
+     * cancel still in the ring (zero tag) moves to the list here too. */
+    int64_t until;
+    if (!body_int(q, 1, &until))
+        until = OZ_CANCEL_FOREVER;
+    result(q, cancel_add(q->L, nonce, until), 0);
 }
 
 static int cred_from_body(req_ctx *q, oz_cbor_r *r, oz_cred *c)
@@ -1217,6 +1312,7 @@ static void factory_reset(void)
     }
     oz_port_kv_erase("ep");
     oz_port_kv_erase("nc");
+    oz_port_kv_erase("cx");
     oz_port_kv_erase("cr");
     oz_port_kv_erase("pl");
     oz_port_kv_erase("rl");
