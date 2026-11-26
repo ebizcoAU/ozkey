@@ -31,6 +31,8 @@
 > Rev 10 (2026-11-26, operator ruling via PM nexus-1b, G1 option (A)): the `issuer` may cancel
 > invites and revoke member bonds **it** issued, never others, and may use the relay for that
 > only (§2.3, §4.1, §6, App. A). Its invites' redeem-by may not outlast the stay.
+> Rev 11 (2026-11-26, PM nexus-1b GO, G1c from the server lane): the issuer may also revoke its guest
+> by the guest's exact key, `DELETE bond/member` (§5 table, App. A). OZLODGE knows the key, not the slot.
 
 ## 0. What changes from v1, in one table
 
@@ -500,6 +502,7 @@ operation source, alarm code and similar are taken from Matter so we don't inven
 | `bond` | GET | `bond.list` / `bond.query` | admin | → roster + epoch |
 | `bond/<slot>` | DELETE | `bond.revoke` | admin | — |
 | `bond/invite/<nonce>` | DELETE | `bond.invite.cancel` | admin | optional `{1: redeem_by}` (App. A, rev 9) |
+| `bond/member` | DELETE | (new, rev 11) | issuer | `{0: epoch, 1: guest key (32 B)}`: revoke its own guest by key (App. A, G1c) |
 | `time` | PUT / GET | `time.set` / `time.get` | bridge, admin | `{1: utc_s}`, monotonic-forward rule unchanged |
 | `dev/info` | GET | `device.info` | member+ | → `{1: fw, 2: profile, 3: caps}` |
 | `dev/reset` | POST | `device.reset` | admin | — (Echo on relay) |
@@ -761,6 +764,11 @@ nonce, so the issuer proves it is its own:
   made from an invite whose issuer key starts with the caller's key (8-byte tag stored on the member
   at redemption, matched by key, never by slot, since slots are reused). Any other target, including
   bond #0, another issuer or an admin-made member, answers `REVOKE_DENIED`.
+- `DELETE bond/member` with body `{0: epoch, 1: key}` (rev 11, G1c), **issuer only** (anyone else:
+  `FORBIDDEN`; the admin uses `bond/<slot>`). It revokes the member (live or expired) whose key is
+  exactly `key` and whose issuer tag matches the caller's key. Not found, or not the caller's guest:
+  the same `REVOKE_DENIED`, so the issuer learns nothing about other bonds, and nothing changes. A key
+  that isn't 32 bytes: `BAD_REQUEST`. The epoch is checked after the ownership check, as for `bond/<slot>`.
 - Bond record: a member made from an invite stores the issuer tag as a 7th element (kv `b<n>`);
   records without it (6 elements) still load. Firmware from before rev 10 drops 7-element records on
   a downgrade (accepted: nothing has shipped).
