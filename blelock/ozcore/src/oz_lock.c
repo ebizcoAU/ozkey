@@ -49,13 +49,15 @@ static int save_bond(const oz_lock *L, int i)
     uint8_t buf[96];
     oz_cbor_w w;
     oz_cbor_w_init(&w, buf, sizeof buf);
-    oz_cbor_put_array(&w, 6);
+    oz_cbor_put_array(&w, b->has_iss ? 7 : 6);   /* G1: 7th = issuer tag, members only */
     oz_cbor_put_uint(&w, 1);
     oz_cbor_put_uint(&w, b->role);
     oz_cbor_put_bstr(&w, b->pub, 32);
     oz_cbor_put_tstr(&w, b->label, strlen(b->label));
     oz_cbor_put_int(&w, b->expires);
     oz_cbor_put_uint(&w, b->max_days);
+    if (b->has_iss)
+        oz_cbor_put_bstr(&w, b->iss_tag, 8);
     return w.err ? w.err : oz_port_kv_set(k, buf, w.len);
 }
 
@@ -72,13 +74,22 @@ static void load_bond(oz_lock *L, int i)
     oz_cbor_r_init(&r, buf, n);
     oz_bond b = { 0 };
     size_t pl, ll;
-    if (oz_cbor_get_array(&r) != 6 || oz_cbor_get_uint(&r) != 1)
+    size_t items = oz_cbor_get_array(&r);
+    if ((items != 6 && items != 7) || oz_cbor_get_uint(&r) != 1)
         return;
     b.role = (uint8_t)oz_cbor_get_uint(&r);
     const uint8_t *p = oz_cbor_get_bstr(&r, &pl);
     const uint8_t *lab = oz_cbor_get_tstr(&r, &ll);
     b.expires = oz_cbor_get_int(&r);
     b.max_days = (uint16_t)oz_cbor_get_uint(&r);
+    if (items == 7) {
+        size_t tl;
+        const uint8_t *t = oz_cbor_get_bstr(&r, &tl);
+        if (!t || tl != 8)
+            return;
+        memcpy(b.iss_tag, t, 8);
+        b.has_iss = 1;
+    }
     if (r.err || !p || pl != 32 || ll > OZ_LOCK_LABEL)
         return;
     memcpy(b.pub, p, 32);
@@ -684,6 +695,7 @@ static int redeem_invite(oz_lock *L, const uint8_t *val, size_t vlen, const uint
          * out than max_days. Without a set clock the bound can't be checked. */
         if (!inv.membership_expires || !now ||
             inv.membership_expires > now + (int64_t)L->bonds[is].max_days * 86400 ||
+            inv.expires > inv.membership_expires ||       /* G1: redeem-by within the stay */
             inv.expires < now - ISSUER_START_SLACK)
             return OZ_R_BOND_DENIED;
     }
@@ -709,6 +721,8 @@ static int redeem_invite(oz_lock *L, const uint8_t *val, size_t vlen, const uint
     memcpy(b->pub, pub, 32);
     strncpy(b->label, inv.label, OZ_LOCK_LABEL);
     b->expires = inv.membership_expires;
+    b->has_iss = 1;
+    memcpy(b->iss_tag, inv.issuer, 8);
     save_bond(L, s);
     nonce_burn(L, inv.nonce, pub);   /* only successful enrolments are recorded */
     bump_epoch(L);
@@ -753,8 +767,9 @@ static int after_msg3(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, s
     } else if (slot >= 0) {
         if (!bond_live(L, slot))
             verdict = OZ_R_EXPIRED;
-        else if (k->relay && L->bonds[slot].role != OZ_ROLE_ADMIN && L->bonds[slot].role != OZ_ROLE_SERVICE)
-            verdict = OZ_R_BOND_DENIED;          /* members on premises only (§4.1) */
+        else if (k->relay && L->bonds[slot].role != OZ_ROLE_ADMIN && L->bonds[slot].role != OZ_ROLE_SERVICE &&
+                 L->bonds[slot].role != OZ_ROLE_ISSUER)
+            verdict = OZ_R_BOND_DENIED;          /* members on premises only (§4.1); issuer: G1 verbs (rev 10) */
     } else {
         const uint8_t *val;
         size_t vlen;
@@ -1105,7 +1120,16 @@ static void v_bond_revoke(req_ctx *q, long target)
         result(q, OZ_R_REVOKE_DENIED, 0);
         return;
     }
-    if (q->role != OZ_ROLE_ADMIN && target != q->slot) {
+    if (q->role == OZ_ROLE_ISSUER) {
+        /* G1: only a member made from this issuer's own invite, matched by
+         * KEY tag (slots are reused). Every other target answers the same. */
+        const oz_bond *t = target > 0 && target < OZ_LOCK_MAX_BONDS ? &q->L->bonds[target] : NULL;
+        if (!t || !t->used || t->role != OZ_ROLE_MEMBER || !t->has_iss ||
+            oz_ct_equal(t->iss_tag, q->L->bonds[q->slot].pub, 8)) {
+            result(q, OZ_R_REVOKE_DENIED, 0);
+            return;
+        }
+    } else if (q->role != OZ_ROLE_ADMIN && target != q->slot) {
         result(q, OZ_R_REVOKE_DENIED, 0);
         return;
     }
@@ -1157,6 +1181,41 @@ static void v_invite_cancel(req_ctx *q, const char *hex)
     if (!body_int(q, 1, &until))
         until = OZ_CANCEL_FOREVER;
     result(q, cancel_add(q->L, nonce, until), 0);
+}
+
+/* G1: the issuer cancels an invite it issued. Its unredeemed invite is known to
+ * the lock only by nonce, so the issuer sends the invite itself (body key 2, the
+ * CBOR as in EAD_3); the lock checks it is genuinely this issuer's (its MAC
+ * under this issuer's pairing secret, `iss` = its slot, the path nonce) and
+ * holds it until the invite's own redeem-by (NONCE-RING-1). */
+static void v_invite_cancel_issuer(req_ctx *q, const char *hex)
+{
+    uint8_t nonce[16];
+    oz_cbor_r at;
+    size_t vl;
+    const uint8_t *v = NULL;
+    if (strlen(hex) != 32 || unhex16(hex, nonce) || !body_find(q, 2, &at) ||
+        !(v = oz_cbor_get_bstr(&at, &vl)) || at.err) {
+        result(q, OZ_R_BAD_REQUEST, 0);
+        return;
+    }
+    const oz_bond *me = &q->L->bonds[q->slot];
+    oz_invite inv;
+    uint8_t secret[32];
+    int ok = !oz_invite_from_cbor(&inv, v, vl) && inv.role == OZ_INVITE_ROLE_MEMBER && inv.version >= 3 &&
+             !strcmp(inv.device_id, q->L->device_id) && inv.iss == (uint32_t)q->slot &&
+             !oz_ct_equal(inv.issuer, me->pub, 32) && !oz_ct_equal(inv.nonce, nonce, 16);
+    if (ok) {
+        ok = !oz_port_x25519(secret, q->L->priv, inv.issuer) && !oz_invite_verify(&inv, secret);
+        oz_wipe(secret, sizeof secret);
+    }
+    const uint8_t *tag;
+    static const uint8_t zero8[8];
+    if (!ok || (nonce_seen(q->L, nonce, &tag) && memcmp(tag, zero8, 8))) {
+        result(q, OZ_R_REVOKE_DENIED, 0);   /* not its invite, or already redeemed (revoke the bond) */
+        return;
+    }
+    result(q, cancel_add(q->L, nonce, inv.expires), 0);
 }
 
 static int cred_from_body(req_ctx *q, oz_cbor_r *r, oz_cred *c)
@@ -1325,6 +1384,7 @@ static void factory_reset(void)
 #define R_MEMBER  (1u << OZ_ROLE_MEMBER)
 #define R_SERVICE (1u << OZ_ROLE_SERVICE)
 #define R_BRIDGE  (1u << OZ_ROLE_BRIDGE)
+#define R_ISSUER  (1u << OZ_ROLE_ISSUER)
 
 static int allowed(unsigned mask, int role) { return (mask >> role) & 1u; }
 
@@ -1567,9 +1627,10 @@ static int dispatch(req_ctx *q, uint8_t *out, size_t cap, size_t *out_len)
         else { q->code = OZ_COAP_FORBIDDEN; result(q, OZ_R_FORBIDDEN, 0); }
     } else if (!strncmp(p, "bond/invite/", 12)) {
         if (meth == OZ_COAP_DELETE && role == OZ_ROLE_ADMIN) v_invite_cancel(q, p + 12);
+        else if (meth == OZ_COAP_DELETE && role == OZ_ROLE_ISSUER) v_invite_cancel_issuer(q, p + 12);
         else { q->code = OZ_COAP_FORBIDDEN; result(q, OZ_R_FORBIDDEN, 0); }
     } else if (parse_tail_int(p, "bond/", &id)) {
-        if (meth == OZ_COAP_DELETE && allowed(R_ADMIN | R_MEMBER, role)) v_bond_revoke(q, id);
+        if (meth == OZ_COAP_DELETE && allowed(R_ADMIN | R_MEMBER | R_ISSUER, role)) v_bond_revoke(q, id);
         else { q->code = OZ_COAP_FORBIDDEN; result(q, OZ_R_FORBIDDEN, 0); }
     } else if (!strcmp(p, "cred")) {
         if (meth == OZ_COAP_POST && allowed(R_ADMIN | R_SERVICE, role)) v_cred_add(q);
