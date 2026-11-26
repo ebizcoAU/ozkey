@@ -102,7 +102,13 @@ TalkKim ──book + pay + guest_pub──► Nexus/TalkStay ◄══ outbound 
    - `bind` = SHA-256(`guest_pub`)[0..16]: only that TalkKim can redeem it;
    - membership expiry = check-out (plus a grace period, OPEN Q3), within the lock's `max_days` for
      this issuer;
-   - start ≥ now − 1 h (the lock's `ISSUER_START_SLACK`), so a key can't be issued backdated.
+   - start ≥ now − 1 h (the lock's `ISSUER_START_SLACK`), so a key can't be issued backdated;
+   - **issued late:** no earlier than **3 days before arrival** (OPEN Q10), with redeem-by ≤ arrival
+     day + 1. A booking made months ahead gets its key close to arrival. Reason: the lock remembers
+     only the last 32 used or cancelled invite nonces. A cancelled invite still inside its redeem-by
+     window would become redeemable again after 32 newer burns on that lock (ozkey-fw, 2026-11-26).
+     A short window makes that unrealistic for one room's lock. The firmware adds a bound and a
+     ring-wrap test as defence in depth.
 6. OZLODGE sends `key.deliver {booking_id, room, lock_id, invite}` over the link. Nexus stores it in the
    guest's **mailbox** and TalkKim fetches it. To Nexus it is opaque: without the guest's private key
    it opens nothing (§4.2).
@@ -320,6 +326,8 @@ code. Booking payloads are encrypted end to end to OZLODGE's key when they pass 
 | Q7 | Kiosk card encoder | per property; PIN + phone key need none |
 | Q8 | Link transport (WebSocket vs MQTT/TLS) | Nexus's choice |
 | Q9 | Guest key per stay or per TalkKim install | per stay (unlinkable across hotels) |
+| Q10 | How early OZLODGE issues a guest invite | ≤ 3 days before arrival, redeem-by ≤ arrival + 1 day (closes the 32-nonce ring wrap in practice) |
+| G1b | G1 needs the issuer on the RELAY (the lock allows only admin + service there today, ozkey-48 §2.3/§4.1) | **(A)** allow `issuer` on the relay with G1 verbs only; ruling pending (operator, via PM) |
 | G1 | Issuer may cancel/revoke what it issued | 🟢 **RULED YES (operator, 2026-11-26):** its own invites and bonds only, never others. Firmware ticket after the G2 merge (ozkey-48 §6) |
 | G2 | Lock reuses expired guest slots | yes: firmware, ozkey-fw |
 
