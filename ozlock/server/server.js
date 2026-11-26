@@ -101,7 +101,7 @@ const path = require('path');
 const jwt = require('jsonwebtoken'); // ozkey-24: app broker-auth JWT issuance
 // S0b (ozkey-50 §7): the lock side lives in ozserver-core now; this file is
 // the ozlock profile (pairing, apps/auth, grants HTTP layer, Nexus, routes).
-const { createCore, util: coreUtil, consolePolicy } = require('../../ozserver-core');
+const { createCore, util: coreUtil, consolePolicy, apiKeys } = require('../../ozserver-core');
 const {
   detectLanIp,
   SECRET_MIN_PROD_LEN,
@@ -130,6 +130,9 @@ const SECRETS = {
 // OZLOCK_PUBLIC_URL (https://, or http with OZ_LAB_INSECURE=1 outside
 // production) are required; boot refuses without them (enforceSecrets).
 const CONSOLE_CONFIG = consolePolicy.resolveConsoleConfig('OZLOCK');
+// OZLOCK-AUTH-1: the REST API's caller keys (OZLOCK_API_KEYS, or
+// OZLOCK_API_OPEN=1 in the lab). Missing/malformed = boot refused.
+const API_KEYS = apiKeys.resolveApiKeys('OZLOCK');
 
 /* ---------------------------------------------------------------------------
  * Configuration
@@ -137,6 +140,9 @@ const CONSOLE_CONFIG = consolePolicy.resolveConsoleConfig('OZLOCK');
 const CONFIG = {
   // Override to spin a verification instance beside the watcher-run :4400 one.
   HTTP_PORT: Number(process.env.OZLOCK_HTTP_PORT) || 4400,
+  // OZLOCK-AUTH-1 (CN-LAB-1 R2): listen address. Unset = all interfaces
+  // (unchanged); 127.0.0.1 behind a reverse proxy.
+  BIND: process.env.OZLOCK_BIND || null,
   SERVER_IP: process.env.OZLOCK_SERVER_IP || detectLanIp(),
   SITE_ID: 'lab', // single-tenant lab deployment (ozkey-05 §1.3)
   // ozkey-24: HMAC secret ozlockserv signs app broker-auth JWTs with; EMQX's
@@ -184,7 +190,8 @@ const CONFIG = {
   NEXUS_SERVER_KEY: process.env.OZLOCK_SERVER_API_KEY || null,
   DB: {
     host: 'localhost',
-    user: 'root',
+    // OZLOCK-AUTH-1 (CN-LAB-1 R2): a dedicated DB user; unset = root (unchanged).
+    user: process.env.OZLOCK_DB_USER || 'root',
     password: SECRETS.DB_PASSWORD, // S−1: OZLOCK_DB_PASSWORD, required in every mode
     // S0a: the regression suite points these at a throwaway DB and a local
     // broker; unset = the lab values, unchanged.
@@ -585,6 +592,13 @@ api.get('/health', (req, res) => {
   });
 });
 
+/* -- OZLOCK-AUTH-1: every route below needs a caller key --------------------
+ * Router-level, so it runs before routing: an unknown path is 401, not 404,
+ * and no handler (so no DB access) runs without a key. GET /health above is
+ * the one exemption (the proxy's liveness probe; it holds no lock data).
+ */
+api.use(apiKeys.requireApiKey(API_KEYS, { realm: 'ozlock', logEvent: (l, m) => logEvent(l, m) }));
+
 
 /* -- The lock API (ozserver-core/api.js, S1b) --------------------------------
  * Pairing, registry reads, settings, sealed grants/unlock/bond verbs, bridge
@@ -592,7 +606,9 @@ api.get('/health', (req, res) => {
  * header, "Lab simplifications"), so the auth hook is an explicit open pass;
  * the core refuses to mount without one.
  */
-const ozlockOpenAccess = (_req, _res, next) => next();
+// OZLOCK-AUTH-1: the caller key is checked by the router-level middleware
+// above, before these routes; this per-route hook adds nothing on top.
+const ozlockRouterKeyChecked = (_req, _res, next) => next();
 if (CONSOLE_CONFIG.totpKey && CONSOLE_CONFIG.publicUrl) {
   core.mountConsole(consoleRouter, {
     product: 'ozlock',
@@ -603,7 +619,7 @@ if (CONSOLE_CONFIG.totpKey && CONSOLE_CONFIG.publicUrl) {
 } // else enforceSecrets() refuses to boot before anything listens.
 
 core.mountLockApi(api, {
-  auth: ozlockOpenAccess,
+  auth: ozlockRouterKeyChecked,
   onLockRemoved: (lock) => {
     if (lock.mac) nexusDecommission(lock.mac);
   },
@@ -825,9 +841,12 @@ async function boot() {
   await purgeOldAuditLog();
   setInterval(purgeOldAuditLog, CONFIG.AUDIT_LOG_PURGE_INTERVAL_MS);
 
-  app.listen(CONFIG.HTTP_PORT, () => {
-    logEvent('info', `HTTP directory listening on http://localhost:${CONFIG.HTTP_PORT}/ozlockserv/api`);
-  });
+  logEvent('info', `OZLOCK-AUTH-1: ${apiKeys.describe(API_KEYS)}`);
+  const onListen = () => {
+    logEvent('info', `HTTP directory listening on http://${CONFIG.BIND || 'localhost'}:${CONFIG.HTTP_PORT}/ozlockserv/api`);
+  };
+  if (CONFIG.BIND) app.listen(CONFIG.HTTP_PORT, CONFIG.BIND, onListen);
+  else app.listen(CONFIG.HTTP_PORT, onListen);
 }
 
 process.on('unhandledRejection', (err) => {

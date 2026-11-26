@@ -513,10 +513,14 @@ class Fixture {
     return this.published.slice(mark).filter((m) => m.topic !== `ozkie/${P.site}/time`);
   }
 
-  async http(method, p, body) {
+  /** `apiKey`: sent as `Authorization: Bearer`; defaults to the profile's
+   *  (OZLOCK-AUTH-1). Pass null to send none. */
+  async http(method, p, body, { apiKey = P.apiKey } = {}) {
+    const headers = body === undefined ? {} : { 'content-type': 'application/json' };
+    if (apiKey) headers.authorization = `Bearer ${apiKey}`;
     const res = await fetch(this.base + p, {
       method,
-      headers: body === undefined ? {} : { 'content-type': 'application/json' },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     let json = null;
