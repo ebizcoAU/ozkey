@@ -33,6 +33,8 @@
 > only (§2.3, §4.1, §6, App. A). Its invites' redeem-by may not outlast the stay.
 > Rev 11 (2026-11-26, PM nexus-1b GO, G1c from the server lane): the issuer may also revoke its guest
 > by the guest's exact key, `DELETE bond/member` (§5 table, App. A). OZLODGE knows the key, not the slot.
+> Rev 12 (2026-11-26, PM nexus-1b, NONCE-RING-2): a redeemed invite stays used until its own redeem-by,
+> and no invite may be open more than 7 days (App. A "Redeemed invites").
 
 ## 0. What changes from v1, in one table
 
@@ -749,6 +751,23 @@ into that ring and forgotten after 32 newer burns, so a cancelled invite could b
 - A full list of live entries answers `NO_SLOT` (19). The invite is then **not** cancelled: the app
   must say so. Nothing live is ever evicted.
 - Unchanged: cancelling an invite that was already redeemed answers `REVOKE_DENIED` (revoke the bond).
+
+**Redeemed invites (rev 12, NONCE-RING-2).** The lock remembers each redeemed invite's nonce (and
+the redeemer's key tag) in a ring of 32 (`OZ_LOCK_NONCES`, kv `nc`). Before rev 12 a new redemption
+overwrote the oldest entry, so after 32 newer redemptions an **unbound** invite (OZINV1, or OZINV2
+without `bind`) that was already redeemed bonded a **second key**, while its redeem-by was open.
+- Each entry now keeps the invite's redeem-by. A new redemption takes only an entry that is empty, from
+  an older record (redeem-by unknown), or past its redeem-by with the clock set. **An entry whose invite
+  is still open is never overwritten.**
+- If all 32 hold open invites, the redemption is refused as `MEMBER_FULL`, before any bond is made or
+  any expired member is reclaimed (§6.2). It works again once the oldest open invite's redeem-by passes.
+  Without a clock nothing can be shown past its redeem-by, so a full ring stays full until the clock is
+  set (the bridge sets it).
+- **(c)** With the clock set, an invite whose redeem-by is more than **7 days** away is refused
+  (`BOND_DENIED`). The owner app mints invites open for 10 minutes by default (ftpos
+  `MemberInvite.defaultTtlSeconds = 600`); OZLODGE's are ≤ 1 day.
+- Record: per entry nonce(16) ‖ tag(8) ‖ redeem-by(4, unix s, big-endian), 897 B (kv values ≤ 1024 B).
+  The older 24-byte-entry record still loads.
 
 **Issuer cancel and revoke (rev 10, G1).** An unredeemed invite is known to the lock only by its
 nonce, so the issuer proves it is its own:
