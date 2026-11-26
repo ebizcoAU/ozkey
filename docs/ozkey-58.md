@@ -103,8 +103,9 @@ TalkKim ──book + pay + guest_pub──► Nexus/TalkStay ◄══ outbound 
    - membership expiry = check-out (plus a grace period, OPEN Q3), within the lock's `max_days` for
      this issuer;
    - start ≥ now − 1 h (the lock's `ISSUER_START_SLACK`), so a key can't be issued backdated;
-   - **issued late:** no earlier than **3 days before arrival** (OPEN Q10), with redeem-by ≤ arrival
-     day + 1. A booking made months ahead gets its key close to arrival. Reason: the lock remembers
+   - **issued late:** no earlier than **3 days before arrival** (OPEN Q10), with redeem-by =
+     min(arrival + 1 day, check-out). The lock refuses an issuer invite whose redeem-by is later than
+     its membership end (ozkey-48 rev 10). A booking made months ahead gets its key close to arrival. Reason: the lock remembers
      only the last 32 used or cancelled invite nonces. A cancelled invite still inside its redeem-by
      window would become redeemable again after 32 newer burns on that lock (ozkey-fw, 2026-11-26).
      A short window makes that unrealistic for one room's lock. The firmware adds a bound and a
@@ -126,6 +127,16 @@ TalkKim ──book + pay + guest_pub──► Nexus/TalkStay ◄══ outbound 
   issuer or service bond do that today (§4.3, gap G1, ruled YES 2026-11-26, firmware pending).**
   Until the firmware ships, either a hotel admin device does it (bond #0, over the relay or at the
   door), or the stay simply runs to its expiry. Afterwards OZLODGE does it through its issuer bond.
+  **G1 wire as built by ozkey-fw (ozkey-48 rev 10, branch `ozkey-4c/issuer-g1`, not merged yet):**
+  - the issuer runs a relay EDHOC (a persisted context like the service bond's) and, over the relay,
+    may only cancel its own invites and revoke its own guests;
+  - **cancel:** `DELETE bond/invite/<nonce>` with body `{2: invite CBOR}`. So OZLODGE **keeps each
+    issued invite's CBOR until its redeem-by**. `NO_SLOT` (the lock's 16-entry cancel list is full)
+    means *not cancelled*: OZLODGE shows it to staff and retries;
+  - **revoke a guest:** `DELETE bond/<slot>` with body `{0: epoch}`, only for a member made from
+    its own invite. OZLODGE doesn't know the slot, so it has asked ozkey-fw for `DELETE
+    bond/by-bind/<bind>` (it knows `guest_pub`). **Pending.** `STALE_EPOCH` costs one extra round
+    trip: OZLODGE resends with the epoch the lock returns.
 
 ## 4. Guest keys: what the lock already does, and two gaps
 
