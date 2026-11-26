@@ -82,7 +82,9 @@ static const char *kv_path;         /* optional backing file (host lock) */
  * any key; n < 0 = until cleared with n = 0) fail with OZ_E_HW, as a worn or
  * full flash would. Nothing is changed by a failed call. */
 static char kv_fail_key[KV_KEY_MAX];
-static int  kv_fail_any, kv_fail_n;
+static int  kv_fail_any, kv_fail_n, kv_fail_reads;
+
+void oz_host_kv_fail_reads(int on) { kv_fail_reads = on; }
 
 void oz_host_kv_fail(const char *key, int n)
 {
@@ -100,7 +102,7 @@ static int kv_fault(const char *key)
     return 1;
 }
 
-void oz_host_kv_reset(void) { memset(kv, 0, sizeof kv); kv_fail_n = 0; }
+void oz_host_kv_reset(void) { memset(kv, 0, sizeof kv); kv_fail_n = 0; kv_fail_reads = 0; }
 
 /* Write the whole table to <path>.tmp, then rename: a crash leaves either
  * the old file or the new one, the same atomicity a real port must give. */
@@ -142,6 +144,7 @@ static int kv_find(const char *key)
 
 int oz_port_kv_get(const char *key, uint8_t *buf, size_t cap, size_t *len)
 {
+    if (kv_fail_reads && kv_fault(key)) return OZ_E_HW;
     int i = kv_find(key);
     if (i < 0) return OZ_E_NOT_FOUND;
     if (kv[i].len > cap) return OZ_E_NO_SPACE;

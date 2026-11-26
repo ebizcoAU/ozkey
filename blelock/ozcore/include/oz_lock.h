@@ -190,7 +190,15 @@ typedef struct oz_lock {
     uint8_t        safe;           /* SAFE mode this boot (F-AK-WDT-2), RAM only */
     uint8_t        defer_saves;    /* KV-LAT-1: limit writes wait for oz_lock_flush() */
     uint8_t        dirty;          /* KV-LAT-1: limit records not yet written */
+    uint8_t        owner_fault;    /* KV-OVERSIZE-1: b0 there but unreadable: no claim at the door */
+    uint32_t       kv_faults;      /* KV-OVERSIZE-1: kv writes that failed since boot (dev/info) */
 } oz_lock;
+
+/* Hands-on factory reset (a reset button; the owner's dev/reset uses the same
+ * steps). The owner bond is erased first: if that fails nothing changes and
+ * OZ_R_STORAGE_FAILED is returned. Once it is gone the reset is durable: a
+ * boot with no owner bond finishes the erase (KV-OVERSIZE-1, ozkey-48 rev 14). */
+int oz_lock_factory_reset(oz_lock *L);
 
 /* Load state from kv, or mint a new identity (factory-fresh, unclaimed). */
 int  oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_lock_hooks *hooks);

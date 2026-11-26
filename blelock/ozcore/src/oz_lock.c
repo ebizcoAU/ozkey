@@ -37,15 +37,20 @@ int64_t oz_lock_utc(const oz_lock *L)
 
 static void kv_name(char *buf, char c, int i) { snprintf(buf, 4, "%c%d", c, i); }
 
+/* KV-OVERSIZE-1: an erase succeeded if the key is gone, whether or not it was there. */
+static int kv_erase_ok(const char *key)
+{
+    int rc = oz_port_kv_erase(key);
+    return rc == OZ_E_NOT_FOUND ? OZ_OK : rc;
+}
+
 static int save_bond(const oz_lock *L, int i)
 {
     char k[4];
     kv_name(k, 'b', i);
     const oz_bond *b = &L->bonds[i];
-    if (!b->used) {
-        (void)oz_port_kv_erase(k);   /* absent already is fine */
-        return OZ_OK;
-    }
+    if (!b->used)
+        return kv_erase_ok(k);
     uint8_t buf[96];
     oz_cbor_w w;
     oz_cbor_w_init(&w, buf, sizeof buf);
@@ -166,10 +171,8 @@ static int save_cancels(const oz_lock *L)
     size_t n = 0;
     for (int i = 0; i < OZ_LOCK_CANCELS; i++)
         n += L->cancels[i].used;
-    if (!n) {
-        (void)oz_port_kv_erase("cx");
-        return OZ_OK;
-    }
+    if (!n)
+        return kv_erase_ok("cx");
     oz_cbor_put_array(&w, 1 + 2 * n);
     oz_cbor_put_uint(&w, 1);
     for (int i = 0; i < OZ_LOCK_CANCELS; i++) {
@@ -275,10 +278,8 @@ static int save_relay(oz_lock *L, int i, uint64_t ssn_to_store)
 {
     char k[4];
     kv_name(k, 'r', i);
-    if (!L->relay_used[i]) {
-        (void)oz_port_kv_erase(k);
-        return OZ_OK;
-    }
+    if (!L->relay_used[i])
+        return kv_erase_ok(k);
     const oz_oscore_ctx *c = &L->relay[i];
     uint8_t buf[96];
     oz_cbor_w w;
@@ -348,12 +349,20 @@ static void load_relay(oz_lock *L, int i)
     L->relay_used[i] = 1;
 }
 
-static void drop_relay(oz_lock *L, int i)
+/* The record goes first: if it can't be erased, the context stays (KV-OVERSIZE-1). */
+static int drop_relay(oz_lock *L, int i)
 {
+    char k[4];
+    kv_name(k, 'r', i);
+    int rc = kv_erase_ok(k);
+    if (rc)
+        return rc;
     oz_oscore_wipe(&L->relay[i]);
     L->relay_used[i] = 0;
-    save_relay(L, i, 0);
+    return OZ_OK;
 }
+
+static int reset_owner_data(void);   /* KV-OVERSIZE-1, with the factory reset below */
 
 /* ── setup ──────────────────────────────────────────────────────────────── */
 
@@ -376,6 +385,13 @@ int oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_loc
         L->hooks = *hooks;
     size_t n;
     int rc = oz_port_kv_get("lk", L->priv, 32, &n);
+    /* KV-OVERSIZE-1: a NEW identity only when there is none. A read error is
+     * not "none": minting then would replace the lock's key under every bond. */
+    if (rc && rc != OZ_E_NOT_FOUND) {
+        oz_wipe(L->priv, sizeof L->priv);
+        oz_port_log("lock: identity unreadable (%d), not starting", rc);
+        return rc;
+    }
     if (rc || n != 32)
         rc = mint_identity(L);
     else
@@ -383,14 +399,39 @@ int oz_lock_init(oz_lock *L, const char *device_id, const char *fw, const oz_loc
     if (rc)
         return rc;
     oz_ccs_for(L->pub, L->ccs);
+    /* KV-OVERSIZE-1: no owner bond at all = unclaimed, or a reset that didn't
+     * finish: erase whatever an owner set up before loading anything. An owner
+     * bond that is there but can't be read is an OWNER RECORD FAULT: nothing is
+     * erased, the rest loads, and the lock can't be claimed at the door. */
+    {
+        uint8_t b0[96];
+        size_t n0;
+        int rc0 = oz_port_kv_get("b0", b0, sizeof b0, &n0);
+        oz_wipe(b0, sizeof b0);
+        if (rc0 == OZ_E_NOT_FOUND) {
+            /* Nothing an owner set up is loaded, erased or not. */
+            if (reset_owner_data())
+                oz_port_log("lock: no owner: some old records could not be erased");
+            goto device_data;
+        } else {
+            load_bond(L, 0);
+            if (rc0 || !oz_lock_claimed(L)) {
+                memset(&L->bonds[0], 0, sizeof L->bonds[0]);
+                L->owner_fault = 1;
+                oz_port_log("lock: OWNER RECORD FAULT: b0 unreadable, claiming refused");
+            }
+        }
+    }
     for (int i = 0; i < OZ_LOCK_MAX_BONDS; i++) {
-        load_bond(L, i);
+        if (i)
+            load_bond(L, i);
         load_relay(L, i);
     }
     L->epoch = load_u32("ep");
     load_nonces(L);
     load_cancels(L);
     load_creds(L);
+device_data:;
     /* A record that is there but unreadable fails closed (oz_limit.h). */
     uint8_t pl[OZ_LIMIT_SAVED_LEN];
     if (!oz_port_kv_get("pl", pl, sizeof pl, &n) &&
@@ -517,7 +558,7 @@ static int bond_by_pub(const oz_lock *L, const uint8_t pub[32])
     return -1;
 }
 
-static void revoke(oz_lock *L, int i);
+static int revoke(oz_lock *L, int i);
 
 /* A free bond slot, or −1. G2 (PM nexus-1b 2026-11-26): when none is free,
  * reclaim the member whose membership ended longest ago, but only once it
@@ -537,25 +578,51 @@ static int free_slot(oz_lock *L)
             pick = i;
     }
     if (pick >= 0) {
+        if (revoke(L, pick))
+            return -1;                    /* KV-OVERSIZE-1: not reclaimed, slot stays taken */
         oz_port_log("lock: reclaimed expired member slot %d", pick);
-        revoke(L, pick);
     }
     return pick;
 }
 
-static void bump_epoch(oz_lock *L)
+static void kv_fault(oz_lock *L, const char *what)
 {
-    L->epoch++;
-    save_u32("ep", L->epoch);
+    L->kv_faults++;
+    oz_port_log("lock: %s not saved (kv fault %u)", what, (unsigned)L->kv_faults);
 }
 
-static void revoke(oz_lock *L, int i)
+/* KV-OVERSIZE-1: the new epoch is saved BEFORE the change it guards. If it
+ * can't be, nothing changes. A saved epoch whose change then fails is harmless:
+ * clients see STALE_EPOCH and read again. */
+static int bump_epoch(oz_lock *L)
 {
+    int rc = save_u32("ep", L->epoch + 1);
+    if (rc) {
+        kv_fault(L, "epoch");
+        return rc;
+    }
+    L->epoch++;
+    return OZ_OK;
+}
+
+/* The relay record, then the bond. A failure leaves RAM as the kv has it. */
+static int revoke(oz_lock *L, int i)
+{
+    if (L->relay_used[i] && drop_relay(L, i)) {
+        kv_fault(L, "relay context erase");
+        return OZ_R_STORAGE_FAILED;
+    }
+    oz_bond old = L->bonds[i];
     memset(&L->bonds[i], 0, sizeof L->bonds[i]);
-    save_bond(L, i);
+    if (save_bond(L, i)) {
+        L->bonds[i] = old;
+        oz_wipe(&old, sizeof old);
+        kv_fault(L, "bond erase");
+        return OZ_R_STORAGE_FAILED;
+    }
+    oz_wipe(&old, sizeof old);
     memset(&L->relay_obs[i], 0, sizeof L->relay_obs[i]);
-    if (L->relay_used[i])
-        drop_relay(L, i);
+    return OZ_OK;
 }
 
 static int nonce_seen(const oz_lock *L, const uint8_t nonce[16], const uint8_t **tag)
@@ -591,9 +658,14 @@ static int cancel_add(oz_lock *L, const uint8_t nonce[16], int64_t until)
     for (int i = 0; i < OZ_LOCK_CANCELS; i++) {
         oz_cancel_entry *e = &L->cancels[i];
         if (e->used && oz_ct_equal(e->nonce, nonce, 16) == 0) {
+            int64_t was = e->until;
             if (until > e->until)
                 e->until = until;
-            save_cancels(L);
+            if (save_cancels(L)) {
+                e->until = was;
+                kv_fault(L, "invite cancel");
+                return OZ_R_STORAGE_FAILED;
+            }
             return OZ_R_REVOKE_OK;
         }
         if (free_i < 0 && (!e->used || (now && e->until != OZ_CANCEL_FOREVER && e->until < now)))
@@ -601,10 +673,15 @@ static int cancel_add(oz_lock *L, const uint8_t nonce[16], int64_t until)
     }
     if (free_i < 0)
         return OZ_R_NO_SLOT;
+    oz_cancel_entry was = L->cancels[free_i];
     L->cancels[free_i].used = 1;
     memcpy(L->cancels[free_i].nonce, nonce, 16);
     L->cancels[free_i].until = until;
-    save_cancels(L);
+    if (save_cancels(L)) {
+        L->cancels[free_i] = was;
+        kv_fault(L, "invite cancel");
+        return OZ_R_STORAGE_FAILED;
+    }
     return OZ_R_REVOKE_OK;
 }
 
@@ -624,9 +701,10 @@ static int nonce_slot(const oz_lock *L)
     return -1;
 }
 
-static void nonce_burn(oz_lock *L, int i, const uint8_t nonce[16], const uint8_t *tag8, int64_t until)
+static int nonce_burn(oz_lock *L, int i, const uint8_t nonce[16], const uint8_t *tag8, int64_t until)
 {
-    oz_nonce_entry *e = &L->nonces[i];
+    oz_nonce_entry *e = &L->nonces[i], old = *e;
+    uint8_t old_next = L->nonce_next;
     memcpy(e->nonce, nonce, 16);
     if (tag8)
         memcpy(e->tag, tag8, 8);
@@ -634,7 +712,12 @@ static void nonce_burn(oz_lock *L, int i, const uint8_t nonce[16], const uint8_t
         memset(e->tag, 0, 8);
     e->until = until ? until : 1;   /* 0 means "unknown"; an invite always has a redeem-by */
     L->nonce_next = (uint8_t)((i + 1) % OZ_LOCK_NONCES);
-    save_nonces(L);
+    if (save_nonces(L)) {
+        *e = old;
+        L->nonce_next = old_next;
+        return OZ_E_HW;
+    }
+    return OZ_OK;
 }
 
 /* ── EDHOC (lock = responder) ───────────────────────────────────────────── */
@@ -768,6 +851,15 @@ static int redeem_invite(oz_lock *L, const uint8_t *val, size_t vlen, const uint
     int s = free_slot(L);
     if (s < 0)
         return OZ_R_MEMBER_FULL;
+    /* KV-OVERSIZE-1 order: epoch, then the nonce, then the bond. A bond that
+     * can't be saved leaves the invite spent (fail closed: a new invite is
+     * needed), never a bond whose invite could be redeemed again. */
+    if (bump_epoch(L))
+        return OZ_R_STORAGE_FAILED;
+    if (nonce_burn(L, ni, inv.nonce, pub, inv.expires)) {
+        kv_fault(L, "redeemed invite");
+        return OZ_R_STORAGE_FAILED;
+    }
     oz_bond *b = &L->bonds[s];
     memset(b, 0, sizeof *b);
     b->used = 1;
@@ -777,9 +869,11 @@ static int redeem_invite(oz_lock *L, const uint8_t *val, size_t vlen, const uint
     b->expires = inv.membership_expires;
     b->has_iss = 1;
     memcpy(b->iss_tag, inv.issuer, 8);
-    save_bond(L, s);
-    nonce_burn(L, ni, inv.nonce, pub, inv.expires);   /* only successful enrolments are recorded */
-    bump_epoch(L);
+    if (save_bond(L, s)) {
+        memset(b, 0, sizeof *b);
+        kv_fault(L, "member bond");
+        return OZ_R_STORAGE_FAILED;
+    }
     *slot = s;
     return OZ_R_MEMBER_OK;
 }
@@ -809,6 +903,8 @@ static int after_msg3(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, s
     if (!oz_lock_claimed(L)) {
         if (k->relay)
             verdict = OZ_R_BOND_DENIED;          /* custodial claim: ozkey-51, later */
+        else if (L->owner_fault)
+            verdict = OZ_R_STORAGE_FAILED;       /* b0 unreadable: never claimable (KV-OVERSIZE-1) */
         else if (now_ms < L->pair_lockout_until_ms)
             verdict = OZ_R_PAIR_LOCKED_OUT;
         else {
@@ -974,6 +1070,13 @@ static void result(req_ctx *q, int r, size_t extra_pairs)
     oz_cbor_put_uint(&q->w, (uint64_t)r);
 }
 
+/* KV-OVERSIZE-1: the lock couldn't save the change; nothing changed. */
+static void storage_failed(req_ctx *q)
+{
+    q->code = OZ_COAP_INTERNAL_ERROR;
+    result(q, OZ_R_STORAGE_FAILED, 0);
+}
+
 /* Body map helpers: find integer key in the request's CBOR map. */
 static int body_find(const req_ctx *q, int64_t key, oz_cbor_r *at)
 {
@@ -1071,11 +1174,13 @@ static void v_state(req_ctx *q)
 
 static void v_info(req_ctx *q)
 {
-    result(q, OZ_R_OK, 3);
+    result(q, OZ_R_OK, 5);
     oz_cbor_put_uint(&q->w, 1); oz_cbor_put_tstr(&q->w, q->L->fw, strlen(q->L->fw));
     oz_cbor_put_uint(&q->w, 2); oz_cbor_put_tstr(&q->w, model_of(q->L), strlen(model_of(q->L)));
     oz_cbor_put_uint(&q->w, 3); oz_cbor_put_array(&q->w, 2);
     oz_cbor_put_uint(&q->w, OZ_CRED_PIN); oz_cbor_put_uint(&q->w, OZ_CRED_RFID);
+    oz_cbor_put_uint(&q->w, 4); oz_cbor_put_uint(&q->w, q->L->owner_fault);   /* KV-OVERSIZE-1 */
+    oz_cbor_put_uint(&q->w, 5); oz_cbor_put_uint(&q->w, q->L->kv_faults);
 }
 
 static void v_time_put(req_ctx *q)
@@ -1165,6 +1270,10 @@ static void v_bond_add(req_ctx *q)
         result(q, OZ_R_NO_SLOT, 0);
         return;
     }
+    if (bump_epoch(q->L)) {
+        storage_failed(q);
+        return;
+    }
     oz_bond *b = &q->L->bonds[s];
     memset(b, 0, sizeof *b);
     b->used = 1;
@@ -1173,8 +1282,12 @@ static void v_bond_add(req_ctx *q)
     if (label)
         memcpy(b->label, label, ll);
     b->max_days = (uint16_t)max_days;
-    save_bond(q->L, s);
-    bump_epoch(q->L);
+    if (save_bond(q->L, s)) {
+        memset(b, 0, sizeof *b);
+        kv_fault(q->L, "bond");
+        storage_failed(q);
+        return;
+    }
     ok_with_epoch(q, OZ_R_BOND_OK, s, 1);
 }
 
@@ -1219,8 +1332,10 @@ static void v_bond_revoke(req_ctx *q, long target)
         result(q, OZ_R_NOT_FOUND, 0);
         return;
     }
-    revoke(q->L, (int)target);
-    bump_epoch(q->L);
+    if (bump_epoch(q->L) || revoke(q->L, (int)target)) {
+        storage_failed(q);
+        return;
+    }
     ok_with_epoch(q, OZ_R_REVOKE_OK, 0, 0);
 }
 
@@ -1251,8 +1366,10 @@ static void v_bond_revoke_by_key(req_ctx *q)
     }
     if (!epoch_ok(q))
         return;
-    revoke(q->L, target);
-    bump_epoch(q->L);
+    if (bump_epoch(q->L) || revoke(q->L, target)) {
+        storage_failed(q);
+        return;
+    }
     ok_with_epoch(q, OZ_R_REVOKE_OK, 0, 0);
 }
 
@@ -1387,12 +1504,22 @@ static void v_cred_add(req_ctx *q)
     for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
         if (q->L->creds[i].used)
             continue;
+        if (bump_epoch(q->L)) {
+            storage_failed(q);
+            return;
+        }
         c.used = 1;
         c.id = q->L->next_cred_id++;
         q->L->creds[i] = c;
-        save_creds(q->L);
-        bump_epoch(q->L);
-        ok_with_epoch(q, OZ_R_CRED_OK, c.id, 1);
+        oz_wipe(&c, sizeof c);
+        if (save_creds(q->L)) {
+            oz_wipe(&q->L->creds[i], sizeof q->L->creds[i]);
+            q->L->next_cred_id--;
+            kv_fault(q->L, "credential");
+            storage_failed(q);
+            return;
+        }
+        ok_with_epoch(q, OZ_R_CRED_OK, q->L->creds[i].id, 1);
         return;
     }
     result(q, OZ_R_NO_SLOT, 0);
@@ -1404,9 +1531,21 @@ static void v_cred_delete(req_ctx *q, long id)
         return;
     for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
         if (q->L->creds[i].used && q->L->creds[i].id == id) {
+            if (bump_epoch(q->L)) {
+                storage_failed(q);
+                return;
+            }
+            oz_cred old = q->L->creds[i];
             oz_wipe(&q->L->creds[i], sizeof q->L->creds[i]);
-            save_creds(q->L);
-            bump_epoch(q->L);
+            int rc = save_creds(q->L);
+            if (rc)
+                q->L->creds[i] = old;      /* not deleted: it would come back at the next boot */
+            oz_wipe(&old, sizeof old);
+            if (rc) {
+                kv_fault(q->L, "credential delete");
+                storage_failed(q);
+                return;
+            }
             ok_with_epoch(q, OZ_R_CRED_OK, 0, 0);
             return;
         }
@@ -1463,32 +1602,91 @@ static void v_cred_sync(req_ctx *q)
         fresh[i].used = 1;
         fresh[i].id = (uint16_t)(q->L->next_cred_id + i);
     }
-    q->L->next_cred_id = (uint16_t)(q->L->next_cred_id + n);
-    oz_wipe(q->L->creds, sizeof q->L->creds);
-    memcpy(q->L->creds, fresh, sizeof fresh);
+    if (bump_epoch(q->L)) {
+        oz_wipe(fresh, sizeof fresh);
+        storage_failed(q);
+        return;
+    }
+    /* Swap in place (no second 32-cred array on the stack): fresh holds the
+     * old set until the new one is saved (KV-OVERSIZE-1). */
+    for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
+        oz_cred t = q->L->creds[i];
+        q->L->creds[i] = fresh[i];
+        fresh[i] = t;
+    }
+    if (save_creds(q->L)) {
+        for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
+            oz_cred t = q->L->creds[i];
+            q->L->creds[i] = fresh[i];
+            fresh[i] = t;
+        }
+        oz_wipe(fresh, sizeof fresh);
+        kv_fault(q->L, "credential sync");
+        storage_failed(q);
+        return;
+    }
     oz_wipe(fresh, sizeof fresh);
-    save_creds(q->L);
-    bump_epoch(q->L);
+    q->L->next_cred_id = (uint16_t)(q->L->next_cred_id + n);
     ok_with_epoch(q, OZ_R_CRED_OK, (int64_t)n, 1);
 }
 
-static void factory_reset(void)
+/* KV-OVERSIZE-1 (ozkey-48 rev 14). A factory reset commits when the owner
+ * bond "b0" is gone. Everything the owner set up goes after it: a boot that
+ * finds no b0 finishes this part itself, so a power cut or a flash fault
+ * mid-reset never leaves a guest's PIN working on an unclaimed lock. */
+static int reset_commit(void) { return kv_erase_ok("b0"); }
+
+static int reset_owner_data(void)
 {
     char k[4];
+    int bad = 0;
+    bad |= kv_erase_ok("cr") != OZ_OK;    /* door access first */
     for (int i = 0; i < OZ_LOCK_MAX_BONDS; i++) {
-        kv_name(k, 'b', i);
-        oz_port_kv_erase(k);
         kv_name(k, 'r', i);
-        oz_port_kv_erase(k);
+        bad |= kv_erase_ok(k) != OZ_OK;
+        if (i) {
+            kv_name(k, 'b', i);
+            bad |= kv_erase_ok(k) != OZ_OK;
+        }
     }
-    oz_port_kv_erase("ep");
-    oz_port_kv_erase("nc");
-    oz_port_kv_erase("cx");
-    oz_port_kv_erase("cr");
-    oz_port_kv_erase("pl");
-    oz_port_kv_erase("rl");
-    oz_port_kv_erase("es");
-    oz_port_kv_erase("lk");
+    bad |= kv_erase_ok("nc") != OZ_OK;
+    bad |= kv_erase_ok("cx") != OZ_OK;
+    bad |= kv_erase_ok("ep") != OZ_OK;
+    return bad ? OZ_E_HW : OZ_OK;
+}
+
+/* The device's own records: only a real reset clears them, never a boot. */
+static void reset_device_data(void)
+{
+    (void)kv_erase_ok("pl");
+    (void)kv_erase_ok("rl");
+    (void)kv_erase_ok("es");
+    (void)kv_erase_ok("lk");
+}
+
+static void reset_finish(oz_lock *L)
+{
+    /* oz_lock_init clears L, so keep what it needs first. */
+    char dev[OZ_INVITE_MAX_DEVICE_ID + 1];
+    const char *fw = L->fw;
+    oz_lock_hooks hooks = L->hooks;
+    uint8_t safe = L->safe;               /* this boot's, not the bond table's */
+    strcpy(dev, L->device_id);
+    if (reset_owner_data())
+        oz_port_log("lock: reset: some records not erased yet, the next boot finishes");
+    reset_device_data();
+    oz_lock_init(L, dev, fw, &hooks);
+    L->safe = safe;
+}
+
+int oz_lock_factory_reset(oz_lock *L)
+{
+    if (reset_commit()) {
+        kv_fault(L, "factory reset (owner bond)");
+        return OZ_R_STORAGE_FAILED;
+    }
+    reset_finish(L);
+    return OZ_R_OK;
 }
 
 /* Roles that may use each verb (§5, §6). Members get relay refused at EDHOC. */
@@ -1761,18 +1959,14 @@ static int dispatch(req_ctx *q, uint8_t *out, size_t cap, size_t *out_len)
         if (meth != OZ_COAP_POST || role != OZ_ROLE_ADMIN) { q->code = OZ_COAP_FORBIDDEN; result(q, OZ_R_FORBIDDEN, 0); }
         else if (q->k->relay && !echo_ok(q->k, q->req))
             return send_echo(q, out, cap, out_len, 0);
-        else {
+        else if (reset_commit()) {
+            kv_fault(q->L, "factory reset (owner bond)");
+            storage_failed(q);            /* nothing changed */
+        } else {
+            /* Committed. Answer while this link's context still exists. */
             result(q, OZ_R_OK, 0);
             int rc = respond(q, 0, out, cap, out_len);
-            /* oz_lock_init clears L, so keep what it needs first. */
-            char dev[OZ_INVITE_MAX_DEVICE_ID + 1];
-            const char *fw = q->L->fw;
-            oz_lock_hooks hooks = q->L->hooks;
-            uint8_t safe = q->L->safe;      /* this boot's, not the bond table's */
-            strcpy(dev, q->L->device_id);
-            factory_reset();
-            oz_lock_init(q->L, dev, fw, &hooks);
-            q->L->safe = safe;
+            reset_finish(q->L);
             return rc;
         }
     } else {
@@ -1896,6 +2090,7 @@ static int pair_finish(oz_lock *L, oz_link *k, int ok,
     if (L->hooks.pair_prompt)
         L->hooks.pair_prompt(L->hooks.app, 0);
     k->pairing = 0;
+    int unsaved = 0;
     if (ok) {
         oz_bond *b = &L->bonds[0];
         memset(b, 0, sizeof *b);
@@ -1903,10 +2098,17 @@ static int pair_finish(oz_lock *L, oz_link *k, int ok,
         b->role = OZ_ROLE_ADMIN;
         memcpy(b->pub, k->pair_pub, 32);
         strcpy(b->label, "owner");
-        save_bond(L, 0);
-        bump_epoch(L);
-        L->pair_failures = 0;
-        k->slot = 0;
+        /* KV-OVERSIZE-1: an owner that only exists in RAM would be gone at the
+         * next boot, and the lock claimable again by anyone at the door. */
+        if (bump_epoch(L) || save_bond(L, 0)) {
+            memset(b, 0, sizeof *b);
+            kv_fault(L, "owner bond");
+            ok = 0;
+            unsaved = 1;                   /* not the code's fault: no pairing failure counted */
+        } else {
+            L->pair_failures = 0;
+            k->slot = 0;
+        }
     } else if (++L->pair_failures >= PAIR_MAX_FAILURES) {
         L->pair_lockout_until_ms = oz_port_monotonic_ms() + PAIR_LOCKOUT_MS;
         L->pair_failures = 0;
@@ -1927,7 +2129,7 @@ static int pair_finish(oz_lock *L, oz_link *k, int ok,
             oz_cbor_put_uint(&q.w, 1);
             oz_cbor_put_uint(&q.w, 0);
         } else {
-            result(&q, OZ_R_PAIR_FAILED, 0);
+            result(&q, unsaved ? OZ_R_STORAGE_FAILED : OZ_R_PAIR_FAILED, 0);
         }
         rc = respond(&q, 0, out, cap, out_len);
         k->pair_req_pending = 0;
@@ -1983,15 +2185,22 @@ static int save_limit(const oz_limit *l, const char *key)
  * the next attempt's gate) tries again. */
 #define DIRTY_PIN_LIMIT  0x01u
 #define DIRTY_CARD_LIMIT 0x02u
+/* A limit write that fails keeps the RAM state (lockout stays) and its dirty
+ * bit (retried at the next flush); refusing the keypad would lock residents
+ * out, so the only other action is to count it (KV-OVERSIZE-1 class 5). */
 static void save_pin_limit(oz_lock *L)
 {
     if (!save_limit(&L->pin_limit, "pl"))
         L->dirty &= (uint8_t)~DIRTY_PIN_LIMIT;
+    else
+        kv_fault(L, "keypad limit");
 }
 static void save_card_limit(oz_lock *L)
 {
     if (!save_limit(&L->card_limit, "rl"))
         L->dirty &= (uint8_t)~DIRTY_CARD_LIMIT;
+    else
+        kv_fault(L, "card limit");
 }
 
 /* Mark a limit record changed: written now, or (deferral on) by the port's
