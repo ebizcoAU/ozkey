@@ -1552,6 +1552,175 @@ static void safe_mode(void)
     expect_int("…driven", locks, l0 + 1);
 }
 
+/* ── G2 + G2b (PM nexus-1b 2026-11-26): an expired member's slot is reclaimed
+ * when a slot is needed, ≥ 1 h after expiry, oldest expiry first; never
+ * without a clock; never a permanent member or a non-member role. A session
+ * is bound to its bond's KEY, not its slot number: a reused slot gives an old
+ * session nothing (G2b, existed before G2 via revoke + re-enrol). ────────── */
+
+/* No new app_t here: test_lock is in the AK1037 self-test image (SRAM, see
+ * feedback "on-target link after ANY test change"). This scenario runs last on
+ * a fresh lock, so it re-keys the suite's apps; the filler guests share one. */
+#define rc_owner  owner
+#define rc_issuer issuer
+#define rc_perm   member
+#define rc_y      stranger
+#define rc_m      service
+#define rc_g0     guest
+#define rc_x0     bridge1
+#define rc_z      bridge2
+#define rc_tmp    bridge3
+
+static int slot_of(const app_t *a)
+{
+    for (int i = 0; i < OZ_LOCK_MAX_BONDS; i++)
+        if (L.bonds[i].used && !memcmp(L.bonds[i].pub, a->pub, 32))
+            return i;
+    return -1;
+}
+
+static int set_time(app_t *a, int64_t utc)
+{
+    uint8_t b[32];
+    oz_cbor_w w;
+    oz_cbor_w_init(&w, b, sizeof b);
+    oz_cbor_put_map(&w, 1); oz_cbor_put_uint(&w, 1); oz_cbor_put_uint(&w, (uint64_t)utc);
+    oz_link_open(&ble, 0);
+    handshake(a, &ble, NULL, 0, NULL);
+    return call(a, &ble, OZ_COAP_PUT, "time", b, w.len);
+}
+
+/* Redeem an invite on `ble`: 0 = bonded, 1 = refused (reason in why). */
+static int redeem(app_t *a, const app_t *iss, int version, int64_t me, uint8_t nonce, char *why)
+{
+    uint8_t ead[256];
+    size_t el = mint_invite(iss, iss->slot, (uint8_t)version, a, me, nonce, ead, sizeof ead);
+    a->slot = -1;
+    oz_link_open(&ble, 0);
+    int r = handshake(a, &ble, ead, el, why);
+    if (!r)
+        a->slot = slot_of(a);
+    return r;
+}
+
+/* A fresh filler guest (shared app_t, new key each time). */
+static int redeem_new(int64_t me, uint8_t nonce, char *why)
+{
+    app_new(&rc_tmp);
+    return redeem(&rc_tmp, &rc_issuer, 3, me, nonce, why);
+}
+
+static void bond_reclaim(void)
+{
+    const int64_t T0 = 1790000000, DAY = 86400;
+    char why[32], p[16];
+    uint8_t b[96];
+    oz_cbor_w w;
+
+    oz_host_kv_reset();
+    boot_lock();
+    app_new(&rc_owner); app_new(&rc_issuer); app_new(&rc_perm); app_new(&rc_y);
+    app_new(&rc_m); app_new(&rc_g0); app_new(&rc_x0); app_new(&rc_z);
+    claim(&rc_owner);
+    expect_int("reclaim: owner sets time", set_time(&rc_owner, T0), OZ_R_TIME_OK);
+
+    /* Issuer (max 3 days) in slot 1, a permanent admin-made member in slot 2. */
+    size_t bl = body_epoch(b, sizeof b, 3);
+    oz_cbor_w_init(&w, b + bl, sizeof b - bl);
+    oz_cbor_put_uint(&w, 1); oz_cbor_put_uint(&w, OZ_ROLE_ISSUER);
+    oz_cbor_put_uint(&w, 2); oz_cbor_put_bstr(&w, rc_issuer.pub, 32);
+    oz_cbor_put_uint(&w, 4); oz_cbor_put_uint(&w, 3);
+    bl += w.len;
+    expect_int("reclaim: enrol issuer", call(&rc_owner, &ble, OZ_COAP_POST, "bond", b, bl), OZ_R_BOND_OK);
+    rc_issuer.slot = (int)resp_int(&rc_owner, 1);
+    expect_int("reclaim: permanent member", redeem(&rc_perm, &rc_owner, 2, 0, 0x70, NULL), 0);
+
+    /* 13 hotel guests fill every other slot; guest i checks out at T0 + 1 day + i min. */
+    int filled = !redeem(&rc_g0, &rc_issuer, 3, T0 + DAY, 0x80, NULL);
+    for (int i = 1; i < 13; i++)
+        filled += !redeem_new(T0 + DAY + i * 60, (uint8_t)(0x80 + i), NULL);
+    expect_int("reclaim: 13 guests bonded", filled, 13);
+    expect_int("reclaim: lock full → MEMBER_FULL", redeem_new(T0 + DAY, 0xa0, why), 1);
+    expect_int("…reason MEMBER_FULL", strcmp(why, "MEMBER_FULL"), 0);
+
+    /* R7 setup (PM row): guest 0 opens a session BEFORE its slot is reclaimed. */
+    int s0 = rc_g0.slot;
+    oz_link_open(&conn2, 0);
+    expect_int("R7: guest 0 session on conn2", handshake(&rc_g0, &conn2, NULL, 0, NULL), 0);
+    expect_int("R7: guest 0 unlocks", call(&rc_g0, &conn2, OZ_COAP_POST, "lock/unlock", NULL, 0), OZ_R_UNLOCK_OK);
+
+    /* R2: 30 min after the last check-out, inside the 1 h grace: nothing reclaimed. */
+    oz_host_advance_ms((uint64_t)(DAY + 1800) * 1000);
+    expect_int("R2: inside the grace → MEMBER_FULL", redeem_new(oz_lock_utc(&L) + DAY, 0xa1, why), 1);
+    expect_int("R2: …reason MEMBER_FULL", strcmp(why, "MEMBER_FULL"), 0);
+
+    /* R1 + R5: past the grace, the next guest bonds, into the oldest-expired slot. */
+    oz_host_advance_ms(3600 * 1000);
+    expect_int("R1: expired + grace → next guest bonds",
+               redeem(&rc_x0, &rc_issuer, 3, oz_lock_utc(&L) + DAY, 0xa2, NULL), 0);
+    expect_int("R5: it takes the oldest-expired slot (guest 0's)", rc_x0.slot, s0);
+
+    /* R7 (PM): the session opened before the reclaim gets nothing after it. */
+    int before = unlocks;
+    expect_int("R7: pre-reclaim session can't unlock",
+               call(&rc_g0, &conn2, OZ_COAP_POST, "lock/unlock", NULL, 0) == OZ_R_UNLOCK_OK, 0);
+    expect_int("R7: …motor not driven", unlocks, before);
+    expect_int("R7: pre-reclaim session can't read", call(&rc_g0, &conn2, OZ_COAP_GET, "lock/state", NULL, 0),
+               OZ_R_DENIED);
+
+    /* R6: the old guest can't come back, by slot or by its old invite. */
+    oz_link_open(&ble, 0);
+    expect_int("R6: old guest by slot refused", handshake(&rc_g0, &ble, NULL, 0, NULL), 1);
+    expect_int("R6: old guest's invite refused", redeem(&rc_g0, &rc_issuer, 3, T0 + DAY, 0x80, NULL), 1);
+
+    /* G2b, admin path (existed before G2): member m (it takes the next
+     * reclaimed slot) keeps a session open on conn2; the owner revokes m and y
+     * enrols into the same slot. The old session must get nothing, above all
+     * not "revoke own slot". */
+    expect_int("G2b: member m enrols", redeem(&rc_m, &rc_owner, 2, oz_lock_utc(&L) + DAY, 0x71, NULL), 0);
+    int sm = rc_m.slot;
+    oz_link_open(&conn2, 0);
+    expect_int("G2b: m session on conn2", handshake(&rc_m, &conn2, NULL, 0, NULL), 0);
+    expect_int("G2b: m reads state", call(&rc_m, &conn2, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+    snprintf(p, sizeof p, "bond/%d", sm);
+    oz_link_open(&ble, 0);
+    handshake(&rc_owner, &ble, NULL, 0, NULL);
+    bl = body_epoch(b, sizeof b, 0);
+    expect_int("G2b: owner revokes m", call(&rc_owner, &ble, OZ_COAP_DELETE, p, b, bl), OZ_R_REVOKE_OK);
+    expect_int("G2b: y enrols", redeem(&rc_y, &rc_owner, 2, oz_lock_utc(&L) + DAY, 0x72, NULL), 0);
+    expect_int("G2b: …into m's old slot", rc_y.slot, sm);
+    expect_int("G2b: old session refused after its slot is reused",
+               call(&rc_m, &conn2, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_DENIED);
+    bl = body_epoch(b, sizeof b, 0);
+    expect_int("G2b: old session can't revoke the new holder",
+               call(&rc_m, &conn2, OZ_COAP_DELETE, p, b, bl) == OZ_R_REVOKE_OK, 0);
+    expect_int("G2b: new holder still bonded", slot_of(&rc_y), sm);
+
+    /* R4: the other 11 expired guests are reclaimable; then the lock is full
+     * again. Owner, issuer, the permanent member and y (live) are never taken. */
+    int ok = 0;
+    for (int i = 0; i < 11; i++)
+        ok += !redeem_new(oz_lock_utc(&L) + DAY, (uint8_t)(0xb0 + i), NULL);
+    expect_int("R4: 11 more guests bond", ok, 11);
+    expect_int("R4: then MEMBER_FULL", redeem_new(oz_lock_utc(&L) + DAY, 0xc0, why), 1);
+    expect_int("R4: live member y kept", slot_of(&rc_y), sm);
+    expect_int("R4: owner kept", slot_of(&rc_owner), 0);
+    expect_int("R4: issuer kept", slot_of(&rc_issuer), rc_issuer.slot);
+    expect_int("R4: permanent member kept", slot_of(&rc_perm), rc_perm.slot);
+
+    /* R8 + R3: reboot after every guest has expired. The reclaims persisted; with
+     * no clock nothing is reclaimed; once the clock is set again it is. */
+    oz_host_advance_ms((uint64_t)(DAY + 7200) * 1000);
+    int sx = rc_x0.slot;
+    boot_lock();
+    expect_int("R8: reclaimed slot persists (new guest)", slot_of(&rc_x0), sx);
+    expect_int("R8: old guest gone after reboot", slot_of(&rc_g0), -1);
+    expect_int("R3: no clock → MEMBER_FULL", redeem(&rc_z, &rc_owner, 2, 0, 0x73, why), 1);
+    expect_int("R3: …reason MEMBER_FULL", strcmp(why, "MEMBER_FULL"), 0);
+    expect_int("R3: owner sets the clock", set_time(&rc_owner, T0 + 3 * DAY), OZ_R_TIME_OK);
+    expect_int("R3: with a clock it reclaims", redeem(&rc_z, &rc_owner, 2, 0, 0x74, NULL), 0);
+}
+
 static void run_suite(size_t mtu)
 {
     framed_mtu = mtu;
@@ -1585,6 +1754,7 @@ static void run_suite(size_t mtu)
     bridge_bonds();
     events();
     pair_lockout();
+    bond_reclaim();     /* last: boots a fresh lock */
     if (mtu)
         printf("lock over GATT, MTU %u: %ld frames in, %ld out, %d new failures\n",
                (unsigned)mtu, frames_in, frames_out, failures - before);

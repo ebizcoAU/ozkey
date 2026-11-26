@@ -23,6 +23,9 @@
 > Rev 7 (2026-11-07, PM nexus-6e accepted, F-AK-WDT-2): SAFE mode after a watchdog reset loop
 > (§6.1): unlock never refused, LOCK refused, the rest owner only. Result 36 `SAFE_MODE` (App. A),
 > event type 4 `safe mode` (§5.1). 36 is sealed: only OSCORE context holders see it (§6.1).
+> Rev 8 (2026-11-26, PM nexus-1b GO, G2 + G2b from the server lane): an expired member's slot is
+> reclaimed when a slot is needed (§6.2), and a session is bound to its bond's key, not its slot
+> number (§6.2). Known risk: the clock that ends a membership (§6.2). No wire change.
 
 ## 0. What changes from v1, in one table
 
@@ -566,7 +569,7 @@ filtering add roles, not fields):**
 | Role | Gets it how | May |
 |---|---|---|
 | `admin` (bond #0) | first pairing of an unclaimed lock | everything |
-| `member` | invite from admin | unlock/lock, state, info, own events, **on premises only** (direct BLE session, never via the bridge, §4.1). Expiry enforced, as since v1 1.58 |
+| `member` | invite from admin | unlock/lock, state, info, own events, **on premises only** (direct BLE session, never via the bridge, §4.1). Expiry enforced, as since v1 1.58. An expired member's slot is reclaimed when a slot is needed, at least 1 h after expiry (§6.2) |
 | `service` | admin enrolls the operator's own ozpms / ozlodge key | credential put/delete/sync, **event observe**. **No actuation**: it cannot unlock (the audit source, §5.1). **Never** bonds or bond #0 (CONTRACT.md "Service bond") |
 | `bridge` | admin enrolls the bridge's key during bridge pairing | **time set only**. No events, nothing that opens a door |
 | `issuer` | admin enrolls the hotel server's (ozlodge's) key. 🟢 **Operator approved 2026-10-18** (ozkey-50 §3) | **Create member invites only**, each with: a validity window ≤ `max_days` (set by admin at enrolment; default 30, range 1–90); `start` ≥ now − 1 h; a guest-key binding (§3.3), which is required. **No actuation, no credentials, no events, no bond or admin verbs.** The lock rejects anything else with `FORBIDDEN`. Admin can revoke it like any bond, and revocation voids the unredeemed invites it issued (by the issuer's bond id in the invite) |
@@ -610,6 +613,34 @@ stays up 2 minutes clears it too, but never while in SAFE mode. While SAFE:
 - **No plaintext SAFE flag** in presence or advertising (PM nexus-6e, 2026-11-07): it would tell anyone
   who reads it that this door can't lock. For now the owner app is the signal (36, event type 4). The
   server and console signal waits for the v2 server-side OSCORE client.
+
+### 6.2 Expired members and slot reuse (rev 8, G2 + G2b, PM nexus-1b 2026-11-26)
+
+16 bond slots hold admin, issuer, service and up to 2 bridges, which leaves about 11 for members. A
+hotel room gets one member bond per stay (ozkey-58), and nobody visits the lock between stays.
+
+- **Reclaim (G2).** When no slot is free, the lock takes the slot of the member whose membership
+  ended longest ago, but only when it ended **more than 1 h ago** (`RECLAIM_GRACE_S`, issuer/lock clock
+  skew) and only while the lock's clock is set. With no clock it reclaims nothing and answers
+  `MEMBER_FULL` (or `NO_SLOT` for `POST bond`), as before. It applies to every expired member, admin- or
+  issuer-made. Never bond #0, a permanent member (no expiry) or a non-member role. It happens lazily,
+  inside the enrolment that needs the slot, so there is no flash write before then and `bond` GET still
+  lists the expired members until their slot is taken. It is a revoke: the bond is wiped, its relay
+  observation and any relay context are dropped, and the epoch moves on.
+- The invite nonce ring is **not** cleared: the old guest's invite stays used. It can't bond again.
+- **A session is bound to its bond's key (G2b).** On every request, the lock checks that the slot still
+  holds the X25519 key the session authenticated with. The check also covers the bridge check and the
+  session's `events` observation. A session whose slot was revoked and then reused (a reclaim, or the
+  admin's revoke + re-enrol) gets `DENIED` and nothing else. Before rev 8 the check was by slot number
+  only, and such a session acted with the new holder's rights, including "revoke own slot" on the new
+  holder (`test_lock` G2b rows; negative control M3). Relay contexts are per bond and dropped with it, so
+  they can't go stale this way.
+- **Audit:** an event's actor is a slot (§5.1). A slot can now hold several members over time, so a
+  receiver maps the actor by (slot, bond lifetime), not by slot alone (ozkey-58).
+- ⚠ **Known risk (not fixed):** a membership ends by the lock's clock. That clock is set by the `bridge`
+  bond and the admin (`time` PUT, monotonic forward only). A clock pushed forward by mistake or by a
+  compromised bridge ends guest memberships early. That was already true before rev 8; with reclaim, the
+  guests also lose their slots and need new invites. It can't be undone, because the clock never goes back.
 
 **No server ever holds bond #0** (ozkey-50 §3, server review). The servers hold only `service`,
 `issuer` and the ozpms custodian, whose limits the lock enforces (ozkey-51). Server-side remote unlock

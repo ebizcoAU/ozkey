@@ -12,6 +12,7 @@
 #define RELAY_SSN_BLOCK    32
 #define EV_SEQ_BLOCK       32      /* event seqs reserved per kv write */
 #define ISSUER_START_SLACK 3600     /* invite may start ≤ 1 h before now (§6) */
+#define RECLAIM_GRACE_S    3600     /* G2: an expired member's slot is reusable 1 h after expiry */
 #define LOCK_KID           0x00
 
 static const uint8_t CCS_PREFIX[11] = { 0xa1, 0x08, 0xa1, 0x01, 0xa3, 0x01, 0x01, 0x20, 0x04, 0x21, 0x58 };
@@ -322,11 +323,28 @@ int oz_lock_has_bridge_bond(const oz_lock *L)
     return 0;
 }
 
+/* G2b: a session is bound to its bond's KEY, not its slot number. A slot can be
+ * revoked and reused (admin re-enrol, G2 reclaim) while the old holder's BLE
+ * session is still open; that session must then get nothing. The slot of a
+ * session link whose bond is still the key it authenticated with, else −1.
+ * (A relay context is per bond and is dropped with it, so it can't go stale.) */
+static int session_slot(const oz_lock *L, const oz_link *k)
+{
+    int s = k->slot;
+    if (s < 0 || s >= OZ_LOCK_MAX_BONDS || !L->bonds[s].used)
+        return -1;
+    if (memcmp(k->peer_ccs + OZ_CCS_LEN - 32, L->bonds[s].pub, 32))
+        return -1;
+    return s;
+}
+
 int oz_lock_link_is_bridge(const oz_lock *L, const oz_link *s)
 {
     /* Read live from the bond table: a revoked bridge stops counting at once. */
-    return s && !s->relay && s->ctx_ready && s->slot >= 0 && s->slot < OZ_LOCK_MAX_BONDS &&
-           L->bonds[s->slot].used && L->bonds[s->slot].role == OZ_ROLE_BRIDGE;
+    if (!s || s->relay || !s->ctx_ready)
+        return 0;
+    int slot = session_slot(L, s);
+    return slot >= 0 && L->bonds[slot].role == OZ_ROLE_BRIDGE;
 }
 
 int oz_lock_relay_may_own(const oz_lock *L, const oz_link *s)
@@ -405,12 +423,30 @@ static int bond_by_pub(const oz_lock *L, const uint8_t pub[32])
     return -1;
 }
 
-static int free_slot(const oz_lock *L)
+static void revoke(oz_lock *L, int i);
+
+/* A free bond slot, or −1. G2 (PM nexus-1b 2026-11-26): when none is free,
+ * reclaim the member whose membership ended longest ago, but only once it
+ * ended more than RECLAIM_GRACE_S ago (issuer/lock clock skew) and only with a
+ * set clock. Never bond #0, a permanent member or a non-member role. */
+static int free_slot(oz_lock *L)
 {
     for (int i = 1; i < OZ_LOCK_MAX_BONDS; i++)
         if (!L->bonds[i].used)
             return i;
-    return -1;
+    int64_t now = oz_lock_utc(L);
+    int pick = -1;
+    for (int i = 1; now && i < OZ_LOCK_MAX_BONDS; i++) {
+        const oz_bond *b = &L->bonds[i];
+        if (b->used && b->role == OZ_ROLE_MEMBER && b->expires && now - b->expires > RECLAIM_GRACE_S &&
+            (pick < 0 || b->expires < L->bonds[pick].expires))
+            pick = i;
+    }
+    if (pick >= 0) {
+        oz_port_log("lock: reclaimed expired member slot %d", pick);
+        revoke(L, pick);
+    }
+    return pick;
 }
 
 static void bump_epoch(oz_lock *L)
@@ -1380,7 +1416,7 @@ int oz_lock_events_poll(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out,
     *out_type = OZ_FRAME_OSCORE;
     *out_len = 0;
     if (!k->relay)
-        return k->obs.active && k->ctx_ready && observer_ok(L, k->slot)
+        return k->obs.active && k->ctx_ready && observer_ok(L, session_slot(L, k))
                ? notify_one(L, &k->osc, &k->obs, out, cap, out_len) : OZ_OK;
     for (int i = 0; i < OZ_LOCK_MAX_BONDS; i++) {
         if (!L->relay_obs[i].active || !L->relay_used[i] || !observer_ok(L, i))
@@ -1508,7 +1544,7 @@ static int rx_oscore(oz_lock *L, oz_link *k, const uint8_t *in, size_t len,
             return OZ_OK;
         }
         q.ctx = &k->osc;
-        q.slot = k->slot;
+        q.slot = session_slot(L, k);   /* G2b: −1 if the slot now holds another key */
     }
     int vrc = oz_oscore_verify_req(q.ctx, in, len, pt, sizeof pt, &req, &x);
     if (vrc) {
