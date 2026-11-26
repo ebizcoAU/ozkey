@@ -327,7 +327,7 @@ code. Booking payloads are encrypted end to end to OZLODGE's key when they pass 
 | Q8 | Link transport (WebSocket vs MQTT/TLS) | Nexus's choice |
 | Q9 | Guest key per stay or per TalkKim install | per stay (unlinkable across hotels) |
 | Q10 | How early OZLODGE issues a guest invite | ≤ 3 days before arrival, redeem-by ≤ arrival + 1 day (closes the 32-nonce ring wrap in practice) |
-| G1b | G1 needs the issuer on the RELAY (the lock allows only admin + service there today, ozkey-48 §2.3/§4.1) | **(A)** allow `issuer` on the relay with G1 verbs only; ruling pending (operator, via PM) |
+| G1b | G1 needs the issuer on the RELAY (the lock allows only admin + service there today, ozkey-48 §2.3/§4.1) | 🟢 **RULED (A), operator 2026-11-26:** `issuer` on the relay with G1 verbs only. Firmware after the G2 merge, red-first. Server: OZLODGE then holds two relay contexts per lock (service + issuer), one active sender each |
 | G1 | Issuer may cancel/revoke what it issued | 🟢 **RULED YES (operator, 2026-11-26):** its own invites and bonds only, never others. Firmware ticket after the G2 merge (ozkey-48 §6) |
 | G2 | Lock reuses expired guest slots | yes: firmware, ozkey-fw |
 
