@@ -50,7 +50,10 @@ int  oz_port_x25519(uint8_t shared[32], const uint8_t priv[32],
 int  oz_port_random(uint8_t *out, size_t len);
 
 /* ── Key-value storage. A set must be atomic: after power loss the key holds
- *    either the old value or the new one, never a mix. ─────────────────── */
+ *    either the old value or the new one, never a mix. Every port refuses a
+ *    value longer than OZ_KV_VALUE_MAX with OZ_E_ARG (KV-OVERSIZE-1: the host
+ *    port did, the AK1037 littlefs port took any length). ───────────────── */
+#define OZ_KV_VALUE_MAX 1024
 int  oz_port_kv_get(const char *key, uint8_t *buf, size_t cap, size_t *len);
 int  oz_port_kv_set(const char *key, const uint8_t *buf, size_t len);
 int  oz_port_kv_erase(const char *key);

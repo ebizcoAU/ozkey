@@ -67,7 +67,7 @@ int oz_port_random(uint8_t *out, size_t len)
 
 #define KV_SLOTS     48              /* the lock engine uses up to 36 keys */
 #define KV_KEY_MAX   32
-#define KV_VALUE_MAX 1024
+#define KV_VALUE_MAX OZ_KV_VALUE_MAX
 
 static struct {
     char    key[KV_KEY_MAX];
@@ -78,7 +78,29 @@ static struct {
 
 static const char *kv_path;         /* optional backing file (host lock) */
 
-void oz_host_kv_reset(void) { memset(kv, 0, sizeof kv); }
+/* KV-OVERSIZE-1 fault injector: the next `n` sets or erases of `key` (NULL =
+ * any key; n < 0 = until cleared with n = 0) fail with OZ_E_HW, as a worn or
+ * full flash would. Nothing is changed by a failed call. */
+static char kv_fail_key[KV_KEY_MAX];
+static int  kv_fail_any, kv_fail_n;
+
+void oz_host_kv_fail(const char *key, int n)
+{
+    kv_fail_any = key == NULL;
+    snprintf(kv_fail_key, sizeof kv_fail_key, "%s", key ? key : "");
+    kv_fail_n = n;
+}
+
+static int kv_fault(const char *key)
+{
+    if (!kv_fail_n || (!kv_fail_any && strcmp(key, kv_fail_key)))
+        return 0;
+    if (kv_fail_n > 0)
+        kv_fail_n--;
+    return 1;
+}
+
+void oz_host_kv_reset(void) { memset(kv, 0, sizeof kv); kv_fail_n = 0; }
 
 /* Write the whole table to <path>.tmp, then rename: a crash leaves either
  * the old file or the new one, the same atomicity a real port must give. */
@@ -131,6 +153,7 @@ int oz_port_kv_get(const char *key, uint8_t *buf, size_t cap, size_t *len)
 int oz_port_kv_set(const char *key, const uint8_t *buf, size_t len)
 {
     if (strlen(key) >= KV_KEY_MAX || len > KV_VALUE_MAX) return OZ_E_ARG;
+    if (kv_fault(key)) return OZ_E_HW;
     int i = kv_find(key);
     for (int j = 0; i < 0 && j < KV_SLOTS; j++)
         if (!kv[j].used) i = j;
@@ -145,6 +168,7 @@ int oz_port_kv_set(const char *key, const uint8_t *buf, size_t len)
 
 int oz_port_kv_erase(const char *key)
 {
+    if (kv_fault(key)) return OZ_E_HW;
     int i = kv_find(key);
     if (i < 0) return OZ_E_NOT_FOUND;
     memset(&kv[i], 0, sizeof kv[i]);

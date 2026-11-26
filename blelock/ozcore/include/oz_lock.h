@@ -60,6 +60,7 @@ enum {
     OZ_R_PAIR_LOCKED_OUT = 30, OZ_R_NOT_FOUND = 31, OZ_R_REVOKE_DENIED = 32,
     OZ_R_TIME_REJECTED = 33, OZ_R_BATTERY_LOW = 34, OZ_R_PIN_TOO_SHORT = 35,
     OZ_R_SAFE_MODE = 36,
+    OZ_R_STORAGE_FAILED = 37,   /* KV-OVERSIZE-1: the lock couldn't save the change, nothing changed */
 };
 
 /* Matter DoorLock vocabulary (🟡 values to be checked against Matter 1.x, ozkey-48 §5). */

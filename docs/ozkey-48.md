@@ -35,6 +35,8 @@
 > by the guest's exact key, `DELETE bond/member` (§5 table, App. A). OZLODGE knows the key, not the slot.
 > Rev 12 (2026-11-26, PM nexus-1b, NONCE-RING-2): a redeemed invite stays used until its own redeem-by,
 > and no invite may be open more than 7 days (App. A "Redeemed invites").
+> Rev 13 (2026-11-27, PM nexus-1b, KV-OVERSIZE-1 part 1): failed flash writes, App. A "Storage
+> failures". New result 37 `STORAGE_FAILED`. Found defect: the AK1037 kv took values of any length.
 
 ## 0. What changes from v1, in one table
 
@@ -826,6 +828,24 @@ value is 8 random bytes, good for one use within 10 s.
 | | | 34 | BATTERY_LOW |
 | | | 35 | PIN_TOO_SHORT |
 | | | 36 | SAFE_MODE |
+| | | 37 | STORAGE_FAILED |
+
+**Storage failures (rev 13, KV-OVERSIZE-1 part 1).** A change the lock can't save to flash must not
+take effect in RAM only, since a reboot would undo it.
+- **Found defect.** Every kv value is capped at `OZ_KV_VALUE_MAX` = 1024 B. The host port refused
+  longer values with `OZ_E_ARG`; the AK1037 littlefs port took any length. A record over 1024 B would
+  have worked on the chip and failed only in host tests. Both ports now refuse it the same way.
+- **Relay context** (§2.3). If the new context can't be saved, the handshake is refused with an EDHOC
+  error `STORAGE_FAILED` and the bond's previous relay context (if any) stays in use. Before: the new
+  context ran from RAM and was gone after the next reboot. (Sequence numbers were already safe: a
+  B.1.1 block that can't be saved stops the response, §4.)
+- **Counted credentials** (a PIN or card with a use count). If the spent use can't be saved, that
+  credential doesn't open the door, its use is given back, and no keypad or card miss is counted (the
+  lock's fault, not a guess). Before: the door opened, and after a reboot the use came back.
+- **Never a lockout.** A flash fault never stops a permanent credential (`uses` = −1), the app
+  unlock, the exit button or the mechanical key from opening the door (PM ruling 2026-11-27).
+- Part 2 (not built yet): bond enrol and revoke, nonce and cancel records, the epoch, the keypad and
+  card limits, and factory reset.
 
 `PIN_TOO_SHORT` (2026-11-05, PM ruling): a `cred` POST or a `cred/sync` entry of type PIN with fewer
 than `OZ_LOCK_PIN_MIN` = 6 digits. A sync with one such entry is refused whole and changes nothing.

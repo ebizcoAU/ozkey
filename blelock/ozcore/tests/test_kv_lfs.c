@@ -183,6 +183,10 @@ static void basics(void)
     expect_int("bad key empty", oz_kv_lfs_set("", v, 1), OZ_E_ARG);
     expect_int("key 15 ok", oz_kv_lfs_set("abcdefghijklmno", v, 1), OZ_OK);
     expect_int("key 16 bad", oz_kv_lfs_set("abcdefghijklmnop", v, 1), OZ_E_ARG);
+    /* KV-OVERSIZE-1: one byte over the cap is refused, as on the host port.
+     * The source is never read, so the RAM flash serves without a new buffer. */
+    expect_int("value OZ_KV_VALUE_MAX+1 bad", oz_kv_lfs_set("ov", flash, OZ_KV_VALUE_MAX + 1), OZ_E_ARG);
+    expect_int("…and nothing stored", oz_kv_lfs_get("ov", out, sizeof out, &n), OZ_E_NOT_FOUND);
     expect_int("erase", oz_kv_lfs_erase("b0"), OZ_OK);
     expect_int("gone", oz_kv_lfs_get("b0", out, sizeof out, &n), OZ_E_NOT_FOUND);
     /* Survives a clean reboot. */
