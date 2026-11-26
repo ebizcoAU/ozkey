@@ -455,6 +455,9 @@ static void claim(app_t *a)
 
 /* Redeem-by of the next minted invites; 0 = the default (now + 10 min). */
 static int64_t mint_redeem_by;
+/* The invite CBOR (as carried in EAD_3) of the last mint_invite call. */
+static uint8_t last_invite[200];
+static size_t last_invite_len;
 
 static size_t mint_invite(const app_t *iss_app, int iss_slot, uint8_t version, const app_t *for_app,
                           int64_t me, uint8_t nonce_byte, uint8_t *ead, size_t cap)
@@ -479,6 +482,8 @@ static size_t mint_invite(const app_t *iss_app, int iss_slot, uint8_t version, c
     uint8_t cb[200];
     size_t cl;
     oz_invite_to_cbor(&inv, cb, sizeof cb, &cl);
+    memcpy(last_invite, cb, cl);
+    last_invite_len = cl;
     oz_cbor_w w;
     oz_cbor_w_init(&w, ead, cap);
     oz_cbor_put_int(&w, -OZ_EAD_INVITE);
@@ -1825,6 +1830,175 @@ static void nonce_cancel(void)
     expect_int("N7: cancel after redeem → REVOKE_DENIED", cancel_invite(0x62, 0), OZ_R_REVOKE_DENIED);
 }
 
+/* ── G1 (operator 2026-11-26, PM nexus-1b; ozkey-48 rev 10): the issuer may
+ * cancel invites and revoke member bonds IT issued, never others; it may do
+ * so over the relay (ruling (A)), and nothing else there. ─────────────────── */
+
+static int enrol_issuer(app_t *a)
+{
+    uint8_t b[96];
+    oz_cbor_w w;
+    size_t bl = body_epoch(b, sizeof b, 3);
+    oz_cbor_w_init(&w, b + bl, sizeof b - bl);
+    oz_cbor_put_uint(&w, 1); oz_cbor_put_uint(&w, OZ_ROLE_ISSUER);
+    oz_cbor_put_uint(&w, 2); oz_cbor_put_bstr(&w, a->pub, 32);
+    oz_cbor_put_uint(&w, 4); oz_cbor_put_uint(&w, 3);
+    bl += w.len;
+    oz_link_open(&ble, 0);
+    handshake(&rc_owner, &ble, NULL, 0, NULL);
+    int r = call(&rc_owner, &ble, OZ_COAP_POST, "bond", b, bl);
+    if (r == OZ_R_BOND_OK)
+        a->slot = (int)resp_int(&rc_owner, 1);
+    return r;
+}
+
+/* Mint an invite from iss for `who` and keep its CBOR in inv/inv_len. */
+static void mint_keep(const app_t *iss, const app_t *who, int64_t me, uint8_t nonce,
+                      uint8_t *inv, size_t *inv_len)
+{
+    uint8_t ead[256];
+    (void)mint_invite(iss, iss->slot, 3, who, me, nonce, ead, sizeof ead);
+    memcpy(inv, last_invite, last_invite_len);
+    *inv_len = last_invite_len;
+}
+
+/* Redeem a kept invite CBOR on `ble`: 0 = bonded. */
+static int redeem_kept(app_t *a, const uint8_t *inv, size_t inv_len, char *why)
+{
+    uint8_t ead[256];
+    oz_cbor_w w;
+    oz_cbor_w_init(&w, ead, sizeof ead);
+    oz_cbor_put_int(&w, -OZ_EAD_INVITE);
+    oz_cbor_put_bstr(&w, inv, inv_len);
+    a->slot = -1;
+    oz_link_open(&ble, 0);
+    int r = handshake(a, &ble, ead, w.len, why);
+    if (!r)
+        a->slot = slot_of(a);
+    return r;
+}
+
+/* DELETE bond/invite/<path nonce> with body {2: invite} (the issuer form). */
+static int cancel_with_invite(app_t *a, oz_link *k, uint8_t path_nonce, const uint8_t *inv, size_t inv_len)
+{
+    char path[48];
+    snprintf(path, sizeof path, "bond/invite/");
+    for (int i = 0; i < 16; i++)
+        snprintf(path + 12 + 2 * i, 3, "%02x", path_nonce);
+    uint8_t b[256];
+    oz_cbor_w w;
+    oz_cbor_w_init(&w, b, sizeof b);
+    oz_cbor_put_map(&w, 1); oz_cbor_put_uint(&w, 2); oz_cbor_put_bstr(&w, inv, inv_len);
+    return call(a, k, OZ_COAP_DELETE, path, b, w.len);
+}
+
+static int revoke_as(app_t *a, oz_link *k, int slot)
+{
+    uint8_t b[32];
+    char p[16];
+    snprintf(p, sizeof p, "bond/%d", slot);
+    size_t bl = body_epoch(b, sizeof b, 0);
+    return call(a, k, OZ_COAP_DELETE, p, b, bl);
+}
+
+#define rc_issuer_b service
+
+static void issuer_g1(void)
+{
+    const int64_t T0 = 1790000000, DAY = 86400;
+    char why[32];
+    uint8_t inv[200], inv2[200];
+    size_t il, il2;
+
+    oz_host_kv_reset();
+    boot_lock();
+    app_new(&rc_owner); app_new(&rc_issuer); app_new(&rc_issuer_b); app_new(&rc_perm);
+    app_new(&rc_g0); app_new(&rc_x0); app_new(&rc_y); app_new(&rc_z);
+    claim(&rc_owner);
+    expect_int("G1: owner sets time", set_time(&rc_owner, T0), OZ_R_TIME_OK);
+    expect_int("G1: enrol issuer A", enrol_issuer(&rc_issuer), OZ_R_BOND_OK);
+    expect_int("G1: enrol issuer B", enrol_issuer(&rc_issuer_b), OZ_R_BOND_OK);
+    expect_int("G1: admin-made member", redeem(&rc_perm, &rc_owner, 2, 0, 0x90, NULL), 0);
+
+    /* (h) ruling (A): the issuer reaches the lock over the relay. */
+    oz_link_open(&relay, 1);
+    expect_int("G1h: issuer A handshake over the relay", handshake(&rc_issuer, &relay, NULL, 0, NULL), 0);
+
+    /* (a) A cancels its own invite, over the relay; the guest is then refused. */
+    mint_keep(&rc_issuer, &rc_g0, T0 + DAY, 0x91, inv, &il);
+    expect_int("G1a: A cancels its own invite (relay)", cancel_with_invite(&rc_issuer, &relay, 0x91, inv, il),
+               OZ_R_REVOKE_OK);
+    expect_int("G1a: the guest is refused", redeem_kept(&rc_g0, inv, il, why), 1);
+    expect_int("G1a: …as MEMBER_REPLAY", strcmp(why, "MEMBER_REPLAY"), 0);
+
+    /* (e) a forged body or a mismatched path is refused, and nothing is stored. */
+    mint_keep(&rc_issuer, &rc_x0, T0 + DAY, 0x92, inv, &il);
+    memcpy(inv2, inv, il);
+    il2 = il;
+    for (size_t i = 0; i + 8 <= il2; i++)
+        if (!memcmp(inv2 + i, "Ba Ngoai", 8)) { inv2[i] = 'X'; break; }
+    expect_int("G1e: altered invite body refused", cancel_with_invite(&rc_issuer, &relay, 0x92, inv2, il2) == OZ_R_REVOKE_OK, 0);
+    expect_int("G1e: path nonce ≠ invite nonce refused", cancel_with_invite(&rc_issuer, &relay, 0x93, inv, il) == OZ_R_REVOKE_OK, 0);
+    expect_int("G1e: …and the invite still works", redeem_kept(&rc_x0, inv, il, NULL), 0);
+
+    /* (c) A can't cancel B's invite, nor revoke B's guest. */
+    mint_keep(&rc_issuer_b, &rc_y, T0 + DAY, 0x95, inv, &il);
+    oz_link_open(&relay, 1);
+    handshake(&rc_issuer, &relay, NULL, 0, NULL);
+    expect_int("G1c: A cancels B's invite → REVOKE_DENIED", cancel_with_invite(&rc_issuer, &relay, 0x95, inv, il),
+               OZ_R_REVOKE_DENIED);
+    expect_int("G1c: B's invite still works", redeem_kept(&rc_y, inv, il, NULL), 0);
+    oz_link_open(&relay, 1);
+    handshake(&rc_issuer, &relay, NULL, 0, NULL);
+    expect_int("G1c: A revokes B's guest → REVOKE_DENIED", revoke_as(&rc_issuer, &relay, rc_y.slot), OZ_R_REVOKE_DENIED);
+    expect_int("G1c: B's guest still bonded", slot_of(&rc_y) >= 0, 1);
+
+    /* (b) A can't revoke an admin-made member, the owner or another issuer. */
+    expect_int("G1b: A revokes an admin-made member → REVOKE_DENIED", revoke_as(&rc_issuer, &relay, rc_perm.slot),
+               OZ_R_REVOKE_DENIED);
+    expect_int("G1b: A revokes bond #0 → REVOKE_DENIED", revoke_as(&rc_issuer, &relay, 0), OZ_R_REVOKE_DENIED);
+    expect_int("G1b: A revokes issuer B → REVOKE_DENIED", revoke_as(&rc_issuer, &relay, rc_issuer_b.slot),
+               OZ_R_REVOKE_DENIED);
+    expect_int("G1b: admin-made member still bonded", slot_of(&rc_perm), rc_perm.slot);
+
+    /* (d) A revokes the member made from its own invite. */
+    int sx = rc_x0.slot;
+    expect_int("G1d: A revokes its own guest", revoke_as(&rc_issuer, &relay, sx), OZ_R_REVOKE_OK);
+    expect_int("G1d: …gone", slot_of(&rc_x0), -1);
+
+    /* (h) nothing else for the issuer over the relay. */
+    int before = unlocks;
+    expect_int("G1h: issuer can't unlock over the relay",
+               call(&rc_issuer, &relay, OZ_COAP_POST, "lock/unlock", NULL, 0), OZ_R_FORBIDDEN);
+    expect_int("G1h: …motor not driven", unlocks, before);
+    expect_int("G1h: issuer can't list bonds", call(&rc_issuer, &relay, OZ_COAP_GET, "bond", NULL, 0), OZ_R_FORBIDDEN);
+    expect_int("G1h: issuer can't read creds", call(&rc_issuer, &relay, OZ_COAP_GET, "cred", NULL, 0), OZ_R_FORBIDDEN);
+    expect_int("G1h: issuer can't observe events", call(&rc_issuer, &relay, OZ_COAP_GET, "events", NULL, 0),
+               OZ_R_FORBIDDEN);
+    expect_int("G1h: issuer can't reset", call(&rc_issuer, &relay, OZ_COAP_POST, "dev/reset", NULL, 0) == OZ_R_OK, 0);
+
+    /* (f) an issuer invite's redeem-by may not outlast the stay. */
+    mint_redeem_by = T0 + 2 * DAY;
+    expect_int("G1f: redeem-by after membership end → refused",
+               redeem(&rc_z, &rc_issuer, 3, T0 + DAY, 0x96, why), 1);
+    mint_redeem_by = 0;
+
+    /* (g) the issuer tag survives a reboot (kv); the issuer still revokes its own. */
+    expect_int("G1g: A's guest z bonds", redeem(&rc_z, &rc_issuer, 3, T0 + DAY, 0x97, NULL), 0);
+    int sz = rc_z.slot;
+    boot_lock();
+    expect_int("G1g: owner sets time again", set_time(&rc_owner, T0 + 600), OZ_R_TIME_OK);
+    oz_link_open(&relay, 1);
+    expect_int("G1g: A revokes z after reboot (relay, Echo first)", revoke_as(&rc_issuer, &relay, sz), OZ_R_REVOKE_OK);
+    expect_int("G1g: old-format bonds still load (owner, member)", slot_of(&rc_perm), rc_perm.slot);
+
+    /* (j) a member can't use the cancel verb. */
+    mint_keep(&rc_issuer, &rc_g0, T0 + DAY, 0x98, inv, &il);
+    oz_link_open(&ble, 0);
+    handshake(&rc_y, &ble, NULL, 0, NULL);
+    expect_int("G1j: member can't cancel", cancel_with_invite(&rc_y, &ble, 0x98, inv, il), OZ_R_FORBIDDEN);
+}
+
 static void run_suite(size_t mtu)
 {
     framed_mtu = mtu;
@@ -1860,6 +2034,7 @@ static void run_suite(size_t mtu)
     pair_lockout();
     bond_reclaim();     /* boots a fresh lock */
     nonce_cancel();     /* boots a fresh lock */
+    issuer_g1();        /* boots a fresh lock */
     if (mtu)
         printf("lock over GATT, MTU %u: %ld frames in, %ld out, %d new failures\n",
                (unsigned)mtu, frames_in, frames_out, failures - before);

@@ -28,6 +28,9 @@
 > number (§6.2). Known risk: the clock that ends a membership (§6.2). No wire change.
 > Rev 9 (2026-11-26, PM nexus-1b, NONCE-RING-1): a cancelled invite stays refused until its
 > redeem-by, in its own list. Admin cancel takes an optional body `{1: redeem_by}` (App. A).
+> Rev 10 (2026-11-26, operator ruling via PM nexus-1b, G1 option (A)): the `issuer` may cancel
+> invites and revoke member bonds **it** issued, never others, and may use the relay for that
+> only (§2.3, §4.1, §6, App. A). Its invites' redeem-by may not outlast the stay.
 
 ## 0. What changes from v1, in one table
 
@@ -140,7 +143,7 @@ The lock has two kinds of link, and the characteristic decides which one a write
 | | `ozkie` (session) | `relay` |
 |---|---|---|
 | Who | the app at the door, **and the bridge's own `bridge` bond** (time), on the bridge's connection | the bridge, carrying the remote senders: the owner's app via ozlock, ozpms, ozlodge |
-| Roles | all, as §6 allows | **admin and service only** (`oz_lock.c`: other roles are refused at message_3) |
+| Roles | all, as §6 allows | **admin, service and issuer only** (`oz_lock.c`: other roles are refused at message_3). The issuer gets its G1 verbs there and nothing else (§6, rev 10) |
 | OSCORE context | one, made by EDHOC on this connection, **gone on disconnect** | one per bond, **persisted** (`r0`..`r15`), found by `kid` |
 | Echo | not needed | required for `lock/unlock`, `lock/lock`, `dev/reset`, and after a reboot (§4.2, App. A) |
 | Members (§4.1) | allowed | refused (on premises only) |
@@ -407,7 +410,7 @@ Every request is a CoAP message (RFC 7252 header, no UDP) protected by OSCORE:
 | Context | Lives | Used for |
 |---|---|---|
 | **Session** | one BLE connection, destroyed on disconnect | direct phone ↔ lock |
-| **Relay** | persisted per bond, in lock flash and in the sender | commands via bridge + MQTT. Exists **only for bond #0 (owner) and `service` bonds**: a member never gets one (§6) |
+| **Relay** | persisted per bond, in lock flash and in the sender | commands via bridge + MQTT. Exists **only for bond #0 (owner), `service` and `issuer` bonds** (issuer: rev 10, G1 verbs only): a member never gets one (§6) |
 
 A relay context is created by a normal EDHOC run (over BLE, or relayed through the bridge) and
 marked persistent. Persistence follows **RFC 8613 Appendix B.1.1**: the sender's sequence number
@@ -574,7 +577,7 @@ filtering add roles, not fields):**
 | `member` | invite from admin | unlock/lock, state, info, own events, **on premises only** (direct BLE session, never via the bridge, §4.1). Expiry enforced, as since v1 1.58. An expired member's slot is reclaimed when a slot is needed, at least 1 h after expiry (§6.2) |
 | `service` | admin enrolls the operator's own ozpms / ozlodge key | credential put/delete/sync, **event observe**. **No actuation**: it cannot unlock (the audit source, §5.1). **Never** bonds or bond #0 (CONTRACT.md "Service bond") |
 | `bridge` | admin enrolls the bridge's key during bridge pairing | **time set only**. No events, nothing that opens a door |
-| `issuer` | admin enrolls the hotel server's (ozlodge's) key. 🟢 **Operator approved 2026-10-18** (ozkey-50 §3) | **Create member invites only**, each with: a validity window ≤ `max_days` (set by admin at enrolment; default 30, range 1–90); `start` ≥ now − 1 h; a guest-key binding (§3.3), which is required. **No actuation, no credentials, no events, no bond or admin verbs.** The lock rejects anything else with `FORBIDDEN`. Admin can revoke it like any bond, and revocation voids the unredeemed invites it issued (by the issuer's bond id in the invite) |
+| `issuer` | admin enrolls the hotel server's (ozlodge's) key. 🟢 **Operator approved 2026-10-18** (ozkey-50 §3) | **Create member invites only**, each with: a validity window ≤ `max_days` (set by admin at enrolment; default 30, range 1–90); `start` ≥ now − 1 h; a guest-key binding (§3.3), which is required. **No actuation, no credentials, no events, no admin verbs.** Rev 10 (G1): it may also **cancel its own unredeemed invites** and **revoke member bonds made from its own invites**, never anyone else's, at the door or over the relay (App. A). The redeem-by of its invites must be ≤ the membership end. The lock rejects anything else with `FORBIDDEN` or `REVOKE_DENIED`. Admin can revoke it like any bond, and revocation voids the unredeemed invites it issued (by the issuer's bond id in the invite) |
 
 ### 6.1 SAFE mode (F-AK-WDT-2, PM rulings 2026-11-06)
 
@@ -743,6 +746,25 @@ into that ring and forgotten after 32 newer burns, so a cancelled invite could b
 - A full list of live entries answers `NO_SLOT` (19). The invite is then **not** cancelled: the app
   must say so. Nothing live is ever evicted.
 - Unchanged: cancelling an invite that was already redeemed answers `REVOKE_DENIED` (revoke the bond).
+
+**Issuer cancel and revoke (rev 10, G1).** An unredeemed invite is known to the lock only by its
+nonce, so the issuer proves it is its own:
+- `DELETE bond/invite/<nonce>` with body `{2: invite}`, where `invite` is the invite's CBOR exactly as
+  carried in EAD_3 (§3.3). The lock checks: a member invite, version ≥ 3, this lock's device_id,
+  `iss` = the caller's slot, the issuer key = the caller's key, the nonce = the path nonce, and the
+  MAC under the caller's pairing secret. Then it holds the nonce until the invite's own redeem-by,
+  as for an admin cancel (key 1 isn't needed: the redeem-by comes from the invite). Not its invite,
+  or a bad MAC: `REVOKE_DENIED`, and nothing is stored. Already redeemed: `REVOKE_DENIED` (revoke the
+  bond). A body that doesn't parse: `BAD_REQUEST`.
+- `DELETE bond/<slot>` (with the epoch, as for admin; the issuer can't read `bond`, so it learns the
+  epoch from a `STALE_EPOCH` reply, which carries the current one, §4.3): allowed only when the slot holds a **member**
+  made from an invite whose issuer key starts with the caller's key (8-byte tag stored on the member
+  at redemption, matched by key, never by slot, since slots are reused). Any other target, including
+  bond #0, another issuer or an admin-made member, answers `REVOKE_DENIED`.
+- Bond record: a member made from an invite stores the issuer tag as a 7th element (kv `b<n>`);
+  records without it (6 elements) still load. Firmware from before rev 10 drops 7-element records on
+  a downgrade (accepted: nothing has shipped).
+- Issuer invites are refused (`BOND_DENIED`) when their redeem-by is later than their membership end.
 
 **Extra verb.** `POST bond {0: epoch, 1: role (3 service, 4 bridge, 5 issuer), 2: pub (32 B),
 3: label, 4: max_days (issuer, 1–90, default 30)}`, admin only, answers

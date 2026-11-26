@@ -73,6 +73,8 @@ typedef struct {
     char     label[OZ_LOCK_LABEL + 1];
     int64_t  expires;      /* unix s, 0 = never */
     uint16_t max_days;     /* issuer: longest guest invite it may mint */
+    uint8_t  has_iss;      /* member: made from an invite (G1) */
+    uint8_t  iss_tag[8];   /* member: first 8 bytes of the inviting bond's KEY (not its slot) */
 } oz_bond;
 
 typedef struct {
