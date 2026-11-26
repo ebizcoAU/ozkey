@@ -1144,6 +1144,38 @@ static void v_bond_revoke(req_ctx *q, long target)
     ok_with_epoch(q, OZ_R_REVOKE_OK, 0, 0);
 }
 
+/* G1c (ozkey-48 rev 11): the issuer revokes its guest by the guest's exact KEY,
+ * body {0: epoch, 1: key (32 B)}. Only a member (live or expired) made from
+ * this issuer's own invite; anything else, found or not, answers the same
+ * REVOKE_DENIED and changes nothing. */
+static void v_bond_revoke_by_key(req_ctx *q)
+{
+    oz_cbor_r at;
+    size_t kl = 0;
+    const uint8_t *key = NULL;
+    if (!body_find(q, 1, &at) || !(key = oz_cbor_get_bstr(&at, &kl)) || at.err || kl != 32) {
+        result(q, OZ_R_BAD_REQUEST, 0);
+        return;
+    }
+    const uint8_t *mine = q->L->bonds[q->slot].pub;
+    int target = -1;
+    for (int i = 1; i < OZ_LOCK_MAX_BONDS; i++) {
+        const oz_bond *t = &q->L->bonds[i];
+        if (t->used && t->role == OZ_ROLE_MEMBER && t->has_iss && !oz_ct_equal(t->iss_tag, mine, 8) &&
+            !oz_ct_equal(t->pub, key, 32))
+            target = i;
+    }
+    if (target < 0) {
+        result(q, OZ_R_REVOKE_DENIED, 0);
+        return;
+    }
+    if (!epoch_ok(q))
+        return;
+    revoke(q->L, target);
+    bump_epoch(q->L);
+    ok_with_epoch(q, OZ_R_REVOKE_OK, 0, 0);
+}
+
 static int unhex16(const char *s, uint8_t out[16])
 {
     for (int i = 0; i < 16; i++) {
@@ -1628,6 +1660,9 @@ static int dispatch(req_ctx *q, uint8_t *out, size_t cap, size_t *out_len)
     } else if (!strncmp(p, "bond/invite/", 12)) {
         if (meth == OZ_COAP_DELETE && role == OZ_ROLE_ADMIN) v_invite_cancel(q, p + 12);
         else if (meth == OZ_COAP_DELETE && role == OZ_ROLE_ISSUER) v_invite_cancel_issuer(q, p + 12);
+        else { q->code = OZ_COAP_FORBIDDEN; result(q, OZ_R_FORBIDDEN, 0); }
+    } else if (!strcmp(p, "bond/member")) {
+        if (meth == OZ_COAP_DELETE && role == OZ_ROLE_ISSUER) v_bond_revoke_by_key(q);
         else { q->code = OZ_COAP_FORBIDDEN; result(q, OZ_R_FORBIDDEN, 0); }
     } else if (parse_tail_int(p, "bond/", &id)) {
         if (meth == OZ_COAP_DELETE && allowed(R_ADMIN | R_MEMBER | R_ISSUER, role)) v_bond_revoke(q, id);

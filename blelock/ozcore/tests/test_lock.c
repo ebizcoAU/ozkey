@@ -1999,6 +1999,84 @@ static void issuer_g1(void)
     expect_int("G1j: member can't cancel", cancel_with_invite(&rc_y, &ble, 0x98, inv, il), OZ_R_FORBIDDEN);
 }
 
+/* ── G1c (PM nexus-1b 2026-11-26, from ozkey-srv): the issuer revokes its guest
+ * by the guest's exact KEY (OZLODGE knows the key, not the slot). Issuer only;
+ * not-found and not-yours answer the same REVOKE_DENIED. ─────────────────── */
+
+/* DELETE bond/member {0: epoch, 1: key}; epoch < 0 = the lock's current one. */
+static int revoke_by_key(app_t *a, oz_link *k, const uint8_t *key, size_t key_len, int64_t epoch)
+{
+    uint8_t b[64];
+    oz_cbor_w w;
+    oz_cbor_w_init(&w, b, sizeof b);
+    oz_cbor_put_map(&w, 2);
+    oz_cbor_put_uint(&w, 0); oz_cbor_put_uint(&w, (uint64_t)(epoch < 0 ? (int64_t)L.epoch : epoch));
+    oz_cbor_put_uint(&w, 1); oz_cbor_put_bstr(&w, key, key_len);
+    return call(a, k, OZ_COAP_DELETE, "bond/member", b, w.len);
+}
+
+static void issuer_g1c(void)
+{
+    const int64_t T0 = 1790000000, DAY = 86400;
+    uint8_t unknown[32];
+    memset(unknown, 0x5a, sizeof unknown);
+
+    oz_host_kv_reset();
+    boot_lock();
+    app_new(&rc_owner); app_new(&rc_issuer); app_new(&rc_issuer_b); app_new(&rc_perm);
+    app_new(&rc_g0); app_new(&rc_x0); app_new(&rc_y);
+    claim(&rc_owner);
+    expect_int("G1c: owner sets time", set_time(&rc_owner, T0), OZ_R_TIME_OK);
+    expect_int("G1c: enrol issuer A", enrol_issuer(&rc_issuer), OZ_R_BOND_OK);
+    expect_int("G1c: enrol issuer B", enrol_issuer(&rc_issuer_b), OZ_R_BOND_OK);
+    expect_int("G1c: admin-made member", redeem(&rc_perm, &rc_owner, 2, 0, 0xa0, NULL), 0);
+    expect_int("G1c: A's guest g", redeem(&rc_g0, &rc_issuer, 3, T0 + DAY, 0xa1, NULL), 0);
+    expect_int("G1c: A's guest x", redeem(&rc_x0, &rc_issuer, 3, T0 + DAY, 0xa2, NULL), 0);
+    expect_int("G1c: B's guest y", redeem(&rc_y, &rc_issuer_b, 3, T0 + DAY, 0xa3, NULL), 0);
+
+    oz_link_open(&relay, 1);
+    expect_int("G1c: A over the relay", handshake(&rc_issuer, &relay, NULL, 0, NULL), 0);
+
+    /* Not yours or not there: one answer, nothing changes. */
+    uint32_t ep = L.epoch;
+    expect_int("G1c: B's guest's key → REVOKE_DENIED", revoke_by_key(&rc_issuer, &relay, rc_y.pub, 32, -1),
+               OZ_R_REVOKE_DENIED);
+    expect_int("G1c: …B's guest kept", slot_of(&rc_y) >= 0, 1);
+    expect_int("G1c: admin-made member's key → REVOKE_DENIED", revoke_by_key(&rc_issuer, &relay, rc_perm.pub, 32, -1),
+               OZ_R_REVOKE_DENIED);
+    expect_int("G1c: owner's key → REVOKE_DENIED", revoke_by_key(&rc_issuer, &relay, rc_owner.pub, 32, -1),
+               OZ_R_REVOKE_DENIED);
+    expect_int("G1c: issuer B's key → REVOKE_DENIED", revoke_by_key(&rc_issuer, &relay, rc_issuer_b.pub, 32, -1),
+               OZ_R_REVOKE_DENIED);
+    expect_int("G1c: unknown key → REVOKE_DENIED", revoke_by_key(&rc_issuer, &relay, unknown, 32, -1),
+               OZ_R_REVOKE_DENIED);
+    expect_int("G1c: …epoch unchanged by refusals", (int)(L.epoch - ep), 0);
+    expect_int("G1c: short key → BAD_REQUEST", revoke_by_key(&rc_issuer, &relay, rc_g0.pub, 31, -1), OZ_R_BAD_REQUEST);
+
+    /* Own guest, by key. */
+    expect_int("G1c: A revokes its guest g by key", revoke_by_key(&rc_issuer, &relay, rc_g0.pub, 32, -1),
+               OZ_R_REVOKE_OK);
+    expect_int("G1c: …g gone", slot_of(&rc_g0), -1);
+    expect_int("G1c: …again → REVOKE_DENIED (gone)", revoke_by_key(&rc_issuer, &relay, rc_g0.pub, 32, -1),
+               OZ_R_REVOKE_DENIED);
+
+    /* Stale epoch: the reply carries the current one; a retry with it works. */
+    expect_int("G1c: stale epoch → STALE_EPOCH", revoke_by_key(&rc_issuer, &relay, rc_x0.pub, 32, 0), OZ_R_STALE_EPOCH);
+    int64_t cur = resp_int(&rc_issuer, 1);
+    expect_int("G1c: …carries the current epoch", (int)(cur == (int64_t)L.epoch), 1);
+    expect_int("G1c: retry with it → REVOKE_OK", revoke_by_key(&rc_issuer, &relay, rc_x0.pub, 32, cur), OZ_R_REVOKE_OK);
+
+    /* Issuer only. */
+    oz_link_open(&ble, 0);
+    handshake(&rc_owner, &ble, NULL, 0, NULL);
+    expect_int("G1c: owner can't use it (has bond/<slot>)", revoke_by_key(&rc_owner, &ble, rc_y.pub, 32, -1),
+               OZ_R_FORBIDDEN);
+    oz_link_open(&ble, 0);
+    handshake(&rc_y, &ble, NULL, 0, NULL);
+    expect_int("G1c: member can't use it", revoke_by_key(&rc_y, &ble, rc_y.pub, 32, -1), OZ_R_FORBIDDEN);
+    expect_int("G1c: …B's guest still bonded", slot_of(&rc_y) >= 0, 1);
+}
+
 static void run_suite(size_t mtu)
 {
     framed_mtu = mtu;
@@ -2035,6 +2113,7 @@ static void run_suite(size_t mtu)
     bond_reclaim();     /* boots a fresh lock */
     nonce_cancel();     /* boots a fresh lock */
     issuer_g1();        /* boots a fresh lock */
+    issuer_g1c();       /* boots a fresh lock */
     if (mtu)
         printf("lock over GATT, MTU %u: %ld frames in, %ld out, %d new failures\n",
                (unsigned)mtu, frames_in, frames_out, failures - before);
