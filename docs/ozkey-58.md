@@ -134,9 +134,11 @@ TalkKim ──book + pay + guest_pub──► Nexus/TalkStay ◄══ outbound 
     issued invite's CBOR until its redeem-by**. `NO_SLOT` (the lock's 16-entry cancel list is full)
     means *not cancelled*: OZLODGE shows it to staff and retries;
   - **revoke a guest:** `DELETE bond/<slot>` with body `{0: epoch}`, only for a member made from
-    its own invite. OZLODGE doesn't know the slot, so it has asked ozkey-fw for `DELETE
-    bond/by-bind/<bind>` (it knows `guest_pub`). **Pending.** `STALE_EPOCH` costs one extra round
-    trip: OZLODGE resends with the epoch the lock returns.
+    its own invite. OZLODGE doesn't know the slot, so it uses **G1c** (PM GO 2026-11-26, firmware
+    after G1 merges, ozkey-48 rev 11): `DELETE bond/member` with body `{0: epoch, 1: guest_pub}`,
+    issuer only. The lock revokes the live member with exactly that key if this issuer made it,
+    otherwise `REVOKE_DENIED` (the same for not-found and not-yours). `STALE_EPOCH` costs one extra
+    round trip: OZLODGE resends with the epoch the lock returns.
 
 ## 4. Guest keys: what the lock already does, and two gaps
 
@@ -340,6 +342,7 @@ code. Booking payloads are encrypted end to end to OZLODGE's key when they pass 
 | Q10 | How early OZLODGE issues a guest invite | ≤ 3 days before arrival, redeem-by ≤ arrival + 1 day (closes the 32-nonce ring wrap in practice) |
 | G1b | G1 needs the issuer on the RELAY (the lock allows only admin + service there today, ozkey-48 §2.3/§4.1) | 🟢 **RULED (A), operator 2026-11-26:** `issuer` on the relay with G1 verbs only. Firmware after the G2 merge, red-first. Server: OZLODGE then holds two relay contexts per lock (service + issuer), one active sender each |
 | G1 | Issuer may cancel/revoke what it issued | 🟢 **RULED YES (operator, 2026-11-26):** its own invites and bonds only, never others. Firmware ticket after the G2 merge (ozkey-48 §6) |
+| G1c | Revoke a guest by its key, not its slot | 🟢 **GO (PM 2026-11-26):** `DELETE bond/member {0: epoch, 1: guest_pub}`, issuer only; firmware after G1 merges |
 | G2 | Lock reuses expired guest slots | yes: firmware, ozkey-fw |
 
 ## Appendix A. OTA and channel-manager facts (checked 2026-11-26)
