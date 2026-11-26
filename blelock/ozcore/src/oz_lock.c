@@ -788,6 +788,7 @@ static const char *rname(int r)
 {
     switch (r) {
     case OZ_R_BOND_DENIED: return "BOND_DENIED";
+    case OZ_R_STORAGE_FAILED: return "STORAGE_FAILED";
     case OZ_R_MEMBER_REPLAY: return "MEMBER_REPLAY";
     case OZ_R_MEMBER_FULL: return "MEMBER_FULL";
     case OZ_R_MEMBER_EXPIRED: return "MEMBER_EXPIRED";
@@ -844,21 +845,46 @@ static int after_msg3(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, s
     uint8_t secret[16], salt[8];
     oz_edhoc_cid sid, rid;
     oz_oscore_ctx *c = k->relay ? &L->relay[slot] : &k->osc;
+    /* KV-OVERSIZE-1: the slot's current relay context, kept until the new one
+     * is saved. If the save fails, it is restored and the handshake refused:
+     * a context running only from RAM would vanish at the next reboot. */
+    oz_oscore_ctx old;
+    uint8_t old_used = 0;
+    if (k->relay) {
+        old = *c;
+        old_used = L->relay_used[slot];
+    }
     int rc = oz_edhoc_oscore(&k->edhoc, secret, salt, &sid, &rid);
     if (!rc) rc = oz_oscore_derive(c, secret, 16, salt, 8, sid.b, sid.len, rid.b, rid.len, NULL, 0);
     oz_wipe(secret, sizeof secret);
     oz_edhoc_wipe(&k->edhoc);
     k->edhoc_active = 0;
-    if (rc)
-        return rc;
     if (k->relay) {
+        int unsaved = 0;
+        if (!rc) {
+            relay_hook(L, slot);
+            L->relay_used[slot] = 1;
+            unsaved = save_relay(L, slot, c->ssn + RELAY_SSN_BLOCK) != OZ_OK;
+        }
+        if (rc || unsaved) {
+            *c = old;
+            L->relay_used[slot] = old_used;
+            oz_wipe(&old, sizeof old);
+            if (!unsaved)
+                return rc;
+            oz_port_log("lock: relay context for bond %d not saved, refused", slot);
+            *out_type = OZ_FRAME_EDHOC;
+            *out_len = edhoc_refuse(k, rname(OZ_R_STORAGE_FAILED), out, cap);
+            return OZ_OK;
+        }
+        oz_wipe(&old, sizeof old);
         /* A new context: a registration bound to the old one can't continue. */
         memset(&L->relay_obs[slot], 0, sizeof L->relay_obs[slot]);
-        relay_hook(L, slot);
-        L->relay_used[slot] = 1;
-        save_relay(L, slot, c->ssn + RELAY_SSN_BLOCK);
         c->ssn_limit = c->ssn + RELAY_SSN_BLOCK;
-    } else {
+    }
+    if (rc)
+        return rc;
+    if (!k->relay) {
         k->ctx_ready = 1;
         k->slot = k->pairing ? -1 : slot;
     }
@@ -2052,7 +2078,7 @@ int oz_lock_keypad_pin(oz_lock *L, const char *digits)
      * outside its window or out of uses is a miss like any other: the door
      * answers the same, and the limiter must not tell them apart either. */
     int64_t now = oz_lock_utc(L);
-    int hit[OZ_LOCK_MAX_CREDS];
+    int hit[OZ_LOCK_MAX_CREDS], fault = 0;
     for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
         const oz_cred *c = &L->creds[i];
         hit[i] = ok && c->used && c->type == OZ_CRED_PIN && pin_in_entry(c, digits, n);
@@ -2063,7 +2089,15 @@ int oz_lock_keypad_pin(oz_lock *L, const char *digits)
             continue;
         if (c->uses > 0) {
             c->uses--;
-            save_creds(L);              /* before the door opens: a lost write would be a free use */
+            /* Before the door opens: a lost write would be a free use. A write
+             * that fails keeps the door shut for THIS credential only and gives
+             * the use back (KV-OVERSIZE-1); a permanent match still opens. */
+            if (save_creds(L)) {
+                c->uses++;
+                fault = 1;
+                oz_port_log("lock: counted credential %d: use not saved, refused", i);
+                continue;
+            }
         }
         int reset = oz_limit_success(&L->pin_limit);
         if (L->hooks.actuate)
@@ -2073,6 +2107,8 @@ int oz_lock_keypad_pin(oz_lock *L, const char *digits)
             limit_changed(L, DIRTY_PIN_LIMIT);  /* after: a lost reset fails safe (KV-LAT-1) */
         return OZ_PIN_OPEN;
     }
+    if (fault)
+        return OZ_PIN_WRONG;            /* the lock's own write failed: not a guess, no miss */
     uint32_t ms = oz_limit_miss(&L->pin_limit, mono);
     limit_changed(L, DIRTY_PIN_LIMIT);
     if (ms) {
@@ -2100,7 +2136,7 @@ int oz_lock_card(oz_lock *L, const uint8_t *id, size_t len)
      * then the first live match opens. A known card out of its window or
      * uses is a miss like any other, as for PINs. */
     int64_t now = oz_lock_utc(L);
-    int hit[OZ_LOCK_MAX_CREDS];
+    int hit[OZ_LOCK_MAX_CREDS], fault = 0;
     for (int i = 0; i < OZ_LOCK_MAX_CREDS; i++) {
         const oz_cred *c = &L->creds[i];
         hit[i] = len >= 1 && len <= OZ_LOCK_CRED_SECRET && c->used && c->type == OZ_CRED_RFID &&
@@ -2112,7 +2148,15 @@ int oz_lock_card(oz_lock *L, const uint8_t *id, size_t len)
             continue;
         if (c->uses > 0) {
             c->uses--;
-            save_creds(L);              /* before the door opens: a lost write would be a free use */
+            /* Before the door opens: a lost write would be a free use. A write
+             * that fails keeps the door shut for THIS credential only and gives
+             * the use back (KV-OVERSIZE-1); a permanent match still opens. */
+            if (save_creds(L)) {
+                c->uses++;
+                fault = 1;
+                oz_port_log("lock: counted credential %d: use not saved, refused", i);
+                continue;
+            }
         }
         int reset = oz_limit_success(&L->card_limit);
         if (L->hooks.actuate)
@@ -2122,6 +2166,8 @@ int oz_lock_card(oz_lock *L, const uint8_t *id, size_t len)
             limit_changed(L, DIRTY_CARD_LIMIT); /* after: a lost reset fails safe (KV-LAT-1) */
         return OZ_CARD_OPEN;
     }
+    if (fault)
+        return OZ_CARD_WRONG;           /* the lock's own write failed: not a guess, no miss */
     uint32_t ms = oz_limit_miss(&L->card_limit, mono);
     limit_changed(L, DIRTY_CARD_LIMIT);
     if (ms) {

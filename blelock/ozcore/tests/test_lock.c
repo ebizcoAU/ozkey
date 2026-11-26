@@ -2175,6 +2175,116 @@ static void nonce_held(void)
     expect_int("H2: after their redeem-by passes, room again", redeem(&rc_tmp, &rc_owner, 2, oz_lock_utc(&L) + 60, 0x61, NULL), 0);
 }
 
+/* ── KV-OVERSIZE-1 part 1 (PM nexus-1b 2026-11-27): a kv write that fails is
+ * never ignored where it matters. Host only: the fault injector is a host-port
+ * hook; the chip self-test runs on real flash. ──────────────────────────── */
+#ifndef OZ_SELFTEST_TARGET
+static size_t body_pin_uses(uint8_t *b, size_t cap, const char *pin, int uses)
+{
+    oz_cbor_w w;
+    size_t bl = body_epoch(b, cap, 3);
+    oz_cbor_w_init(&w, b + bl, cap - bl);
+    oz_cbor_put_uint(&w, 1); oz_cbor_put_uint(&w, OZ_CRED_PIN);
+    oz_cbor_put_uint(&w, 3); oz_cbor_put_bstr(&w, (const uint8_t *)pin, strlen(pin));
+    oz_cbor_put_uint(&w, 6); oz_cbor_put_uint(&w, (uint64_t)uses);
+    return bl + w.len;
+}
+
+static void kv_faults(void)
+{
+    static const uint8_t CARD[4] = { 0x31, 0x32, 0x33, 0x34 };
+    static const uint8_t CARD1[4] = { 0x41, 0x42, 0x43, 0x44 };
+    uint8_t b[96];
+    size_t bl;
+    int before;
+
+    oz_host_kv_reset();
+    boot_lock();
+    app_new(&owner);
+    claim(&owner);
+
+    /* K1 (class 1): a relay context whose record can't be saved is not
+     * installed. Before: it ran from RAM and vanished at the next reboot. */
+    oz_link_open(&relay, 1);
+    oz_host_kv_fail("r0", 1);
+    char why[32] = "";
+    expect_int("K1: relay handshake with its record unsaved → refused",
+               handshake(&owner, &relay, NULL, 0, why) != 0, 1);
+    expect_int("K1: …as STORAGE_FAILED", strcmp(why, "STORAGE_FAILED"), 0);
+    expect_int("K1: …no relay context installed", L.relay_used[0], 0);
+    oz_host_kv_fail(NULL, 0);
+    oz_link_open(&relay, 1);
+    expect_int("K1: retry once the fault clears → OK", handshake(&owner, &relay, NULL, 0, NULL), 0);
+    boot_lock();
+    oz_link_open(&relay, 1);
+    {
+        uint8_t req[200];
+        oz_oscore_xchg x;
+        size_t n = make_req(&owner, OZ_COAP_GET, "lock/state", NULL, 0, NULL, req, sizeof req, &x);
+        deliver(&owner, &relay, req, n, &x);
+        expect_int("K1: the context survives a reboot (Echo first)", owner.has_echo, 1);
+        expect_int("K1: …then works", call(&owner, &relay, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+    }
+    /* A re-key whose record can't be saved leaves the current context working. */
+    oz_link_open(&relay, 1);
+    oz_host_kv_fail("r0", 1);
+    expect_int("K1: re-key with its record unsaved → refused", handshake(&owner, &relay, NULL, 0, NULL) != 0, 1);
+    oz_link_open(&relay, 1);
+    expect_int("K1: …the current context still works", call(&owner, &relay, OZ_COAP_GET, "lock/state", NULL, 0),
+               OZ_R_OK);
+    boot_lock();
+    oz_link_open(&relay, 1);
+    {
+        uint8_t req[200];
+        oz_oscore_xchg x;
+        size_t n = make_req(&owner, OZ_COAP_GET, "lock/state", NULL, 0, NULL, req, sizeof req, &x);
+        deliver(&owner, &relay, req, n, &x);
+        expect_int("K1: …and after a reboot", call(&owner, &relay, OZ_COAP_GET, "lock/state", NULL, 0), OZ_R_OK);
+    }
+
+    /* K2 (class 2): a counted credential whose use can't be saved doesn't open. */
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+    bl = body_pin(b, sizeof b, "135790");
+    expect_int("K2: add permanent PIN", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    bl = body_pin_uses(b, sizeof b, "246813", 1);
+    expect_int("K2: add one-use PIN", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    bl = body_card(b, sizeof b, CARD, sizeof CARD, 0);
+    expect_int("K2: add permanent card", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    bl = body_card(b, sizeof b, CARD1, sizeof CARD1, 1);
+    expect_int("K2: add one-use card", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+
+    oz_host_kv_fail(NULL, -1);                     /* every write fails from here */
+    uint8_t pm = L.pin_limit.misses, cm = L.card_limit.misses;
+    before = unlocks;
+    expect_int("K2: one-use PIN, use unsaved → door stays shut", oz_lock_keypad_pin(&L, "246813"), OZ_PIN_WRONG);
+    expect_int("K2: one-use card, use unsaved → door stays shut", oz_lock_card(&L, CARD1, sizeof CARD1),
+               OZ_CARD_WRONG);
+    expect_int("K2: …not actuated", unlocks, before);
+    expect_int("K2: …no keypad miss counted (the lock's fault)", L.pin_limit.misses, pm);
+    expect_int("K2: …no card miss counted", L.card_limit.misses, cm);
+
+    /* G (PM condition): a flash fault never locks a resident out. */
+    before = unlocks;
+    expect_int("G: permanent PIN opens with flash failing", oz_lock_keypad_pin(&L, "135790"), OZ_PIN_OPEN);
+    expect_int("G: permanent card opens with flash failing", oz_lock_card(&L, CARD, sizeof CARD), OZ_CARD_OPEN);
+    expect_int("G: app unlock opens with flash failing", call(&owner, &ble, OZ_COAP_POST, "lock/unlock", NULL, 0),
+               OZ_R_UNLOCK_OK);
+    oz_lock_exit_button(&L);
+    expect_int("G: …PIN, card, app and exit button all actuated", unlocks, before + 4);
+
+    oz_host_kv_fail(NULL, 0);
+    before = unlocks;
+    expect_int("K2: fault cleared: the one-use PIN still has its use", oz_lock_keypad_pin(&L, "246813"), OZ_PIN_OPEN);
+    expect_int("K2: fault cleared: the one-use card still has its use", oz_lock_card(&L, CARD1, sizeof CARD1),
+               OZ_CARD_OPEN);
+    expect_int("K2: …both actuated", unlocks, before + 2);
+    boot_lock();
+    expect_int("K2: spent PIN after a reboot → refused", oz_lock_keypad_pin(&L, "246813"), OZ_PIN_WRONG);
+    expect_int("K2: spent card after a reboot → refused", oz_lock_card(&L, CARD1, sizeof CARD1), OZ_CARD_WRONG);
+}
+#endif
+
 static void run_suite(size_t mtu)
 {
     framed_mtu = mtu;
@@ -2213,6 +2323,9 @@ static void run_suite(size_t mtu)
     issuer_g1();        /* boots a fresh lock */
     issuer_g1c();       /* boots a fresh lock */
     nonce_held();       /* boots a fresh lock */
+#ifndef OZ_SELFTEST_TARGET
+    kv_faults();        /* boots a fresh lock */
+#endif
     if (mtu)
         printf("lock over GATT, MTU %u: %ld frames in, %ld out, %d new failures\n",
                (unsigned)mtu, frames_in, frames_out, failures - before);

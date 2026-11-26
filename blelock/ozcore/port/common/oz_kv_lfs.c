@@ -213,8 +213,8 @@ static int set(const char *key, const uint8_t *buf, size_t len)
         return rc;
     if (!fs)
         return OZ_E_HW;
-    if (len > 0x7fffffff)
-        return OZ_E_ARG;
+    if (len > OZ_KV_VALUE_MAX)
+        return OZ_E_ARG;              /* KV-OVERSIZE-1: the same cap as every port */
 
     int e = open_file(&k, temp, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
     if (e < 0) {
