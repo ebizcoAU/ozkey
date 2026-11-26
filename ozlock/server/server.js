@@ -306,6 +306,9 @@ const CONFIG = {
   // exercise a real failover in seconds; unset = 2 min grace / 30 s sweep.
   FAILOVER_GRACE_MS: Number(process.env.OZLOCK_FAILOVER_GRACE_MS) || 2 * 60 * 1000,
   FAILOVER_SWEEP_MS: Number(process.env.OZLOCK_FAILOVER_SWEEP_MS) || 30_000,
+  // OZLOCK-PEER-DOWN-1: a peer's peer_down is ignored while the bridge's own
+  // online presence is younger than this (2 × the 30 s resync + 15 s).
+  PEER_DOWN_FRESH_MS: Number(process.env.OZLOCK_PEER_DOWN_FRESH_MS) || 75_000,
   // S3 + ozkey-29 cutovers: drop grants.raw_value/user_name/date_from/date_to
   // on boot. Irreversible, so it is the profile's explicit choice, never a
   // core default — the hosted relay holds nothing beyond the pairing.

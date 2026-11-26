@@ -876,6 +876,28 @@ async function handlePeerStatus(reportingBridgeId, payloadStr) {
     return;
   }
   if (obj.event !== 'peer_down' || !obj.peer) return;
+  // OZLOCK-PEER-DOWN-1 (phase B, 2026-11-19): a peer's report alone must not
+  // mark a bridge offline while that bridge's OWN presence says online and is
+  // fresh. peer_down is a Thread-roster opinion (no roster for 50 s); the
+  // relay needs the bridge's MQTT session and BLE link, which its own
+  // presence (and its LWT) speaks for. A 'online' row can only have been
+  // written by the bridge's own report, since peer_down writes 'offline'. The
+  // periodic presence resync re-delivers that retained report, so the row
+  // stays fresh exactly while the broker still holds the bridge's session.
+  const freshMs = Number(CONFIG.PEER_DOWN_FRESH_MS) || 75_000;
+  const [[own]] = await pool.query(
+    `SELECT presence, TIMESTAMPDIFF(SECOND, presence_at, NOW()) AS age_s
+       FROM bridges_presence WHERE bridge_id = ?`,
+    [obj.peer]
+  );
+  if (own && own.presence === 'online' && own.age_s !== null && own.age_s * 1000 <= freshMs) {
+    logEvent(
+      'warn',
+      `XF-144 peer_down: bridge ${reportingBridgeId} reports peer ${obj.peer} down — ignored, ` +
+        `${obj.peer}'s own presence is online (${own.age_s}s old, fresh window ${freshMs / 1000}s)`
+    );
+    return;
+  }
   logEvent(
     'key',
     `XF-144 peer_down: bridge ${reportingBridgeId} reports peer ${obj.peer} down — fast-tracking bridges_presence`
