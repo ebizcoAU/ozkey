@@ -13,7 +13,7 @@ const sent = []; // { topic, buf }
 let brokerUp = true;
 const audits = [];
 Object.assign(ctx, {
-  CONFIG: { SITE_ID: 'lab', OZKIE_WAIT_MS: 300, OZKIE_EDHOC_LEASE_MS: 1000, OZKIE_M3_WAIT_MS: 150 },
+  CONFIG: { SITE_ID: 'lab', OZKIE_WAIT_MS: 300, OZKIE_EDHOC_LEASE_MS: 1000, OZKIE_M3_WAIT_MS: 150, OZKIE_EDHOC_SETTLE_MS: 200 },
   logEvent: () => {},
 });
 require('../transport').mqttPublishRaw = (topic, buf) => {
@@ -114,7 +114,7 @@ test('broker down: 503 mqtt_down, nothing pending afterwards', async () => {
   assert.equal((await p).status, 200);
 });
 
-test('EDHOC: m1 → m2, m3 + silence = done (one audit row), lease released', async () => {
+test('EDHOC: m1 → m2, m3 + silence = delivered, unconfirmed (no audit row, OZKIE-RELAY-TIMING-1 S2), lease released', async () => {
   audits.length = 0;
   const m1 = Buffer.from([0, 0x03, 0x02, 0x58]);
   const p1 = relay(m1);
@@ -130,8 +130,8 @@ test('EDHOC: m1 → m2, m3 + silence = done (one audit row), lease released', as
   const r3 = await relay(Buffer.from([0, 0x52, 0xe5, 0x62]));
   assert.equal(r3.status, 200);
   assert.equal(r3.body.frame_b64, null);
-  assert.equal(audits.length, 1);
-  assert.equal(audits[0][2], 'ozkie_edhoc');
+  assert.equal(r3.body.confirmed, false);
+  assert.equal(audits.length, 0);
   // released: another sender can start now
   const pB = relay(m1, { appId: 'app-b' });
   await nextTick();
@@ -161,9 +161,11 @@ test('EDHOC: m3 refused by the lock comes back, no audit row; m3 without a lease
   assert.equal(oz.ozkieCounters().uplink_no_lease, before + 1);
 });
 
-test('EDHOC: no message_2 is 504 and frees the lease', async () => {
+test('EDHOC: no message_2 is 504 and frees the lease (after the settle, OZKIE-RELAY-TIMING-1 S1)', async () => {
   const r = await relay(Buffer.from([0, 0x03]));
   assert.equal(r.status, 504);
+  assert.equal((await relay(Buffer.from([0, 0x03]), { appId: 'app-b' })).body.code, 'edhoc_settling');
+  await new Promise((res) => setTimeout(res, 250));
   const p = relay(Buffer.from([0, 0x03]), { appId: 'app-b' });
   await nextTick();
   oz.handleOzkieUplink(L, B, Buffer.from([0, 0x58]));

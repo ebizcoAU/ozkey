@@ -324,7 +324,10 @@ const CONFIG = {
   // lease 35 s (outlasts the lock's 30 s), message_3 refusal window 2 s.
   OZKIE_WAIT_MS: Number(process.env.OZLOCK_OZKIE_WAIT_MS) || 10_000,
   OZKIE_EDHOC_LEASE_MS: Number(process.env.OZLOCK_OZKIE_EDHOC_LEASE_MS) || 35_000,
-  OZKIE_M3_WAIT_MS: Number(process.env.OZLOCK_OZKIE_M3_WAIT_MS) || 2_000,
+  // OZKIE-RELAY-TIMING-1: message_3 window 5 s (S3); settle 10 s after a
+  // message_1 timeout (S1).
+  OZKIE_M3_WAIT_MS: Number(process.env.OZLOCK_OZKIE_M3_WAIT_MS) || 5_000,
+  OZKIE_EDHOC_SETTLE_MS: Number(process.env.OZLOCK_OZKIE_EDHOC_SETTLE_MS) || 10_000,
   PROVISION_WIFI_SSID: SECRETS.PROVISION_WIFI_SSID,
   PROVISION_WIFI_PASSWORD: SECRETS.PROVISION_WIFI_PASSWORD,
   // S1e-2 (ozkey-50 §8.2): lock broker_secret stored hashed, as in ozpms.

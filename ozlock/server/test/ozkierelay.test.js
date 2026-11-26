@@ -176,10 +176,10 @@ test('owner app: door pairing, then EDHOC, read and Echo unlock through ozlock',
   assert.match(hostOut, /\[DOOR\] UNLOCKED/, 'the host lock actuated');
   const lock = await getLock(L);
   assert.equal(lock.ozkie_version, 2);
-  // exactly one content-free audit row for the relay handshake
+  // OZKIE-RELAY-TIMING-1 S2: message_3 + silence is not a confirmation, so
+  // the relay handshake leaves no audit row (it did before).
   const rows = await fx.query("SELECT app_id, detail FROM audit_log WHERE action = 'ozkie_edhoc' AND device_id = ?", [L]);
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].app_id, lines.find((x) => x.app_id).app_id);
+  assert.equal(rows.length, 0);
 });
 
 /* ===========================================================================
@@ -283,7 +283,7 @@ test('transit-only: no relay call wrote pending_queue or grants; audit = pairing
   const extra = await fx.query('SELECT action, COUNT(*) AS n FROM audit_log WHERE id > ? GROUP BY action', [counts0.audit_max_id]);
   const byAction = Object.fromEntries(extra.map((r) => [r.action, Number(r.n)]));
   // pair: L (the app's /pairings) + L2, L3, L4; bridge_reconcile: the XF-144
-  // move the failover test makes; ozkie_edhoc: the one relay handshake.
-  // Nothing else: no relayed request leaves a row.
-  assert.deepEqual(byAction, { pair: 4, bridge_reconcile: 1, ozkie_edhoc: 1 });
+  // move the failover test makes. Nothing else: no relayed request and no
+  // relay handshake leaves a row (OZKIE-RELAY-TIMING-1 S2).
+  assert.deepEqual(byAction, { pair: 4, bridge_reconcile: 1 });
 });
