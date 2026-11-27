@@ -953,6 +953,12 @@ static int after_msg3(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, s
     int rc = oz_edhoc_oscore(&k->edhoc, secret, salt, &sid, &rid);
     if (!rc) rc = oz_oscore_derive(c, secret, 16, salt, 8, sid.b, sid.len, rid.b, rid.len, NULL, 0);
     oz_wipe(secret, sizeof secret);
+    /* F1 (OZKIE-RELAY-TIMING-1): the relay link's message_4, sent below only
+     * once the context is saved. It tells ozlock the context really exists. */
+    uint8_t m4[OZ_EDHOC_MSG4_LEN];
+    size_t m4_len = 0;
+    if (!rc && k->relay)
+        rc = cap < sizeof m4 ? OZ_E_NO_SPACE : oz_edhoc_r_msg4(&k->edhoc, m4, sizeof m4, &m4_len);
     oz_edhoc_wipe(&k->edhoc);
     k->edhoc_active = 0;
     if (k->relay) {
@@ -977,6 +983,10 @@ static int after_msg3(oz_lock *L, oz_link *k, uint8_t *out_type, uint8_t *out, s
         /* A new context: a registration bound to the old one can't continue. */
         memset(&L->relay_obs[slot], 0, sizeof L->relay_obs[slot]);
         c->ssn_limit = c->ssn + RELAY_SSN_BLOCK;
+        memcpy(out, m4, m4_len);
+        *out_type = OZ_FRAME_EDHOC;
+        *out_len = m4_len;
+        return OZ_OK;
     }
     if (rc)
         return rc;

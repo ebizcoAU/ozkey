@@ -164,7 +164,14 @@ class Edhoc:
         th4 = sha256(cbor(self.th3) + pt + self.cred)
         prk_out = self.kdf(prk4e3m, 7, th4, 32)
         self.prk_exporter = self.kdf(prk_out, 10, b'', 32)
+        # message_4 the responder must send (RFC 9528 §5.5): empty PLAINTEXT_4.
+        k4, iv4 = self.kdf(prk4e3m, 8, th4, 16), self.kdf(prk4e3m, 9, th4, 13)
+        self.m4_expected = cbor(ccm_seal(k4, iv4, cbor(['Encrypt0', b'', th4]), b''))
         return m3
+
+    def msg4(self, m4):
+        """True when m4 is the responder's message_4 for this handshake."""
+        return hmac.compare_digest(m4, self.m4_expected)
 
     def exporter(self, label, n, ctx=b''):
         return self.kdf(self.prk_exporter, label, ctx, n)
@@ -324,7 +331,12 @@ class OzApp:
             return err[1] if len(err) == 2 and isinstance(err[1], str) else 'refused at message_2'
         link.send(0, self.e.msg3(ead3))
         t, p = link.recv(timeout=0.3)
-        if t == 0:
+        self.got_m4 = False
+        if t == 0 and p[:1] == b'\x48':           # message_4 (relay link, ozkey-48 §3)
+            if not self.e.msg4(p):
+                return 'message_4 bad'
+            self.got_m4 = True
+        elif t == 0:
             err = uncbor_seq(p)
             return err[1] if len(err) > 1 else 'refused'
         self.osc = Oscore(*self.e.oscore())
@@ -391,6 +403,7 @@ def rfc_check():
     e.msg2(h('582b419701d7f00a26c2dc587a36dd752549f33763c893422c8ea0f955a13a4ff5d59862a1eef9e0e7e1886fcd'),
            lambda idc: (cred_r, T['g_r']))
     chk('message_3', e.msg3(), h('52e562097bc417dd5919485ac7891ffd90a9fc'))
+    chk('message_4 (RFC 9529 §3.6)', e.m4_expected, h('4828c966b7ca304f83'))
     sec, salt, sid, rid = e.oscore()
     chk('OSCORE master secret', sec, h('f9868f6a3aca78a05d1485b35030b162'))
     chk('OSCORE master salt', salt, h('ada24c7dbfc85eeb'))
@@ -432,6 +445,7 @@ def interop(exe):
         # First pairing (§3.4): the app computes the code, the "owner" types it.
         k = LockLink(ble)
         chk('pairing handshake', owner.connect(k, lock_pub) is None)
+        chk('no message_4 on the BLE session link', not owner.got_m4)
         owner.mid += 1
         req, x = owner.osc.protect(0x02, 'pair', mid=owner.mid)
         k.send(1, req)
@@ -476,6 +490,7 @@ def interop(exe):
         # Relay: owner unlock needs Echo; service can't actuate.
         r = LockLink(rel)
         chk('owner relay context', owner.connect(r, lock_pub) is None)
+        chk('…confirmed by message_4', owner.got_m4)
         code, opts, _ = owner.request(0x02, 'lock/unlock')
         chk('relay unlock → 4.01 + Echo', code == 0x81 and 252 in opts)
         code, _, res = owner.request(0x02, 'lock/unlock', echo=opts[252])
@@ -483,6 +498,7 @@ def interop(exe):
         r.close()
         r = LockLink(rel)
         chk('service relay context', svc.connect(r, lock_pub) is None)
+        chk('…confirmed by message_4', svc.got_m4)
         rc, res = svc.call(0x02, 'lock/unlock')
         chk('service cannot unlock', res and res[0] == R['FORBIDDEN'])
         r.close()

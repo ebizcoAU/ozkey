@@ -162,6 +162,8 @@ static void app_new(void)
     app_kccs_len = w.len;
 }
 
+static int got_m4;   /* the last handshake was answered with message_4 (F1) */
+
 static int handshake(void)
 {
     uint8_t m1[128], m2[256], m3[512], lo[256];
@@ -183,8 +185,15 @@ static int handshake(void)
     if (!m2l || oz_edhoc_i_msg2(&e, m2, m2l, lo, sizeof lo, &lol))
         return -1;
     oz_edhoc_i_msg3(&e, NULL, 0, m3, sizeof m3, &m3l);
-    if (exchange(OZ_FRAME_EDHOC, m3, m3l, lo, sizeof lo))
+    got_m4 = 0;
+    lol = exchange(OZ_FRAME_EDHOC, m3, m3l, lo, sizeof lo);
+    if (lol && lo[0] == 0x48) {         /* message_4: relay link only (ozkey-48 rev 15) */
+        if (oz_edhoc_i_msg4(&e, lo, lol))
+            return -1;
+        got_m4 = 1;
+    } else if (lol) {
         return -1;                      /* an EDHOC error */
+    }
     uint8_t sec[16], salt[8];
     oz_edhoc_cid sid, rid;
     oz_edhoc_oscore(&e, sec, salt, &sid, &rid);
@@ -1505,10 +1514,12 @@ static void relay_link(void)
     cur_rec = REC_OZKIE;
     cur_idx = 0;
     expect_int("owner session on ozkie", handshake(), 0);
+    expect_int("…no message_4 on the session link", got_m4, 0);
     capture_start();
     cur_rec = REC_RELAY;
     cur_idx = 1;
     expect_int("EDHOC on the relay link, answered on notify index 1", handshake(), 0);
+    expect_int("…confirmed by message_4 (F1)", got_m4, 1);
     size_t n = request(OZ_COAP_POST, "lock/unlock", req, sizeof req, &x);
     size_t ol = exchange(OZ_FRAME_OSCORE, req, n, out, sizeof out);
     /* The relay link's first request: 4.01 + Echo, and nothing done (B.1.2). */

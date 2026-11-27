@@ -3,7 +3,8 @@
  * Supported: method 3 (static DH both sides), cipher suite 0
  * (AES-CCM-16-64-128, SHA-256, MAC 8, X25519). Suite 2 differs only in the
  * curve, so tests can run the RFC 9529 static-DH trace by injecting its DH
- * outputs through `dh`. message_4 is not used (ozkey-48 §3).
+ * outputs through `dh`. message_4 is built for the relay link only
+ * (ozkey-48 §3, F1); the session link's key confirmation is its first OSCORE reply.
  *
  * No malloc: a session is one struct the caller owns (~2 KB). Wipe it with
  * oz_edhoc_wipe() when done.
@@ -99,6 +100,7 @@ typedef struct {
     uint8_t        prk_3e2m[32];
     uint8_t        prk_4e3m[32];
     uint8_t        prk_exporter[32];
+    uint8_t        m4[8];          /* CIPHERTEXT_4, set on completion (not secret) */
     uint8_t        a[OZ_EDHOC_BUF];   /* scratch: contexts, plaintexts */
     uint8_t        b[OZ_EDHOC_BUF];   /* scratch: KDF info, transcript inputs */
     uint8_t        pt[OZ_EDHOC_BUF];  /* decrypted plaintext kept for peer/ead views */
@@ -138,6 +140,15 @@ int oz_edhoc_oscore(oz_edhoc *s, uint8_t secret[16], uint8_t salt[8],
                     oz_edhoc_cid *sender_id, oz_edhoc_cid *recipient_id);
 /* The 6-digit first-pairing code (ozkey-48 §3.4), 0..999999. */
 int oz_edhoc_pair_code(oz_edhoc *s, uint32_t *code);
+
+/* message_4 (RFC 9528 §5.5; ozkey-48 §3, OZKIE-RELAY-TIMING-1 F1): an empty
+ * PLAINTEXT_4 sealed under K_4 / IV_4 with A_4 = ["Encrypt0", h'', TH_4].
+ * R: writes it once message_3 is verified (OZ_EDHOC_MSG4_LEN bytes).
+ * I: checks the responder's message_4 once message_3 is built; OZ_E_AUTH if
+ * it doesn't match. Both: OZ_E_ARG before completion. */
+#define OZ_EDHOC_MSG4_LEN 9
+int oz_edhoc_r_msg4(oz_edhoc *s, uint8_t *out, size_t cap, size_t *out_len);
+int oz_edhoc_i_msg4(oz_edhoc *s, const uint8_t *in, size_t in_len);
 
 /* Helpers */
 /* X25519 key out of a CCS {8: {1: {1: 1, -1: 4, -2: x}}} (OKP, X25519). */

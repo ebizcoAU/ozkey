@@ -257,11 +257,30 @@ static int k3_iv3(oz_edhoc *s, uint8_t k[KEY_LEN], uint8_t iv[IV_LEN], uint8_t a
     return rc;
 }
 
-/* TH_4 is in s->th: derive PRK_exporter (§4.1.3) and drop the handshake keys. */
+/* CIPHERTEXT_4 (§5.5): an empty PLAINTEXT_4 under K_4 / IV_4 with
+ * A_4 = ["Encrypt0", h'', TH_4]; TH_4 is in s->th. Only the tag remains. */
+static int msg4_tag(oz_edhoc *s)
+{
+    uint8_t k[KEY_LEN], iv[IV_LEN], aad[45];
+    static const uint8_t hdr[13] = { 0x83, 0x68, 'E', 'n', 'c', 'r', 'y', 'p', 't', '0',
+                                     0x40, 0x58, 0x20 };
+    int rc = kdf(s, s->prk_4e3m, 8, s->th, 32, k, KEY_LEN);
+    if (!rc) rc = kdf(s, s->prk_4e3m, 9, s->th, 32, iv, IV_LEN);
+    memcpy(aad, hdr, sizeof hdr);
+    memcpy(aad + 13, s->th, 32);
+    if (!rc) rc = oz_aes128_ccm_seal(k, iv, IV_LEN, aad, sizeof aad, s->a, 0,
+                                     MAC_LEN, s->m4, sizeof s->m4);
+    oz_wipe(k, sizeof k);
+    oz_wipe(iv, sizeof iv);
+    return rc;
+}
+
+/* TH_4 is in s->th: message_4, PRK_exporter (§4.1.3), then drop the handshake keys. */
 static int finish(oz_edhoc *s)
 {
     uint8_t prk_out[32];
-    int rc = kdf(s, s->prk_4e3m, 7, s->th, 32, prk_out, 32);
+    int rc = msg4_tag(s);
+    if (!rc) rc = kdf(s, s->prk_4e3m, 7, s->th, 32, prk_out, 32);
     if (!rc) rc = kdf(s, prk_out, 10, NULL, 0, s->prk_exporter, 32);
     oz_wipe(prk_out, sizeof prk_out);
     oz_wipe(s->prk_2e, sizeof s->prk_2e);
@@ -644,6 +663,30 @@ int oz_edhoc_r_msg3(oz_edhoc *s, const uint8_t *in, size_t in_len,
 }
 
 /* ── public: after completion ───────────────────────────────────────────── */
+
+/* message_4 = bstr CIPHERTEXT_4 (§5.5), built at completion by finish(). */
+int oz_edhoc_r_msg4(oz_edhoc *s, uint8_t *out, size_t cap, size_t *out_len)
+{
+    *out_len = 0;
+    if (s->state != ST_DONE || s->initiator)
+        return OZ_E_ARG;
+    if (cap < OZ_EDHOC_MSG4_LEN)
+        return OZ_E_NO_SPACE;
+    out[0] = 0x40 | MAC_LEN;
+    memcpy(out + 1, s->m4, MAC_LEN);
+    *out_len = OZ_EDHOC_MSG4_LEN;
+    return OZ_OK;
+}
+
+int oz_edhoc_i_msg4(oz_edhoc *s, const uint8_t *in, size_t in_len)
+{
+    if (s->state != ST_DONE || !s->initiator)
+        return OZ_E_ARG;
+    if (in_len != OZ_EDHOC_MSG4_LEN || in[0] != (0x40 | MAC_LEN) ||
+        oz_ct_equal(in + 1, s->m4, MAC_LEN))
+        return OZ_E_AUTH;
+    return OZ_OK;
+}
 
 int oz_edhoc_exporter(oz_edhoc *s, uint32_t label, const uint8_t *ctx, size_t ctx_len,
                       uint8_t *out, size_t len)

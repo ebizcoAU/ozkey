@@ -78,6 +78,8 @@ typedef struct {
     oz_coap_msg resp;
     uint8_t echo[8];
     int has_echo;
+    int got_m4;                /* the lock answered message_3 with message_4 (F1) */
+    uint8_t m4[OZ_EDHOC_MSG4_LEN];
 } app_t;
 
 static app_t owner, member, stranger, issuer, guest, service;
@@ -228,8 +230,17 @@ static int hs_end(app_t *a, oz_link *k, const uint8_t *ead3, size_t ead3_len, ch
     size_t m3l, lol;
     uint8_t lt;
     oz_edhoc_i_msg3(&a->e, ead3, ead3_len, m3, sizeof m3, &m3l);
+    a->got_m4 = 0;
     lock_rx(k, OZ_FRAME_EDHOC, m3, m3l, &lt, lo, sizeof lo, &lol);
-    if (lol) {
+    if (lol && lo[0] == 0x48) {
+        /* message_4 (F1): a bstr; an EDHOC error starts with an int. */
+        a->got_m4 = 1;
+        memcpy(a->m4, lo, lol < sizeof a->m4 ? lol : sizeof a->m4);
+        if (lt != OZ_FRAME_EDHOC || oz_edhoc_i_msg4(&a->e, lo, lol)) {
+            if (why) strcpy(why, "message_4 bad");
+            return 1;
+        }
+    } else if (lol) {
         /* EDHOC error: (1, "TEXT") */
         oz_cbor_r r;
         oz_cbor_r_init(&r, lo, lol);
@@ -2591,6 +2602,43 @@ static void kv_faults2(void)
     oz_host_kv_reset();
     boot_lock();
 }
+
+/* F1, OZKIE-RELAY-TIMING-1 (ozkey-48 §3): on the relay link the lock answers
+ * message_3 with message_4, and only once the relay context is saved. */
+static void relay_m4(void)
+{
+    oz_host_kv_reset();
+    boot_lock();
+    app_new(&owner);
+    claim(&owner);
+    expect_int("M4: BLE session link: no message_4", owner.got_m4, 0);
+
+    oz_link_open(&relay, 1);
+    oz_host_kv_fail("r0", 1);
+    char why[32] = "";
+    expect_int("M4: relay save failing → refused", handshake(&owner, &relay, NULL, 0, why) != 0, 1);
+    expect_int("M4: …as STORAGE_FAILED, not a message_4",
+               !strcmp(why, "STORAGE_FAILED") && !owner.got_m4, 1);
+    oz_host_kv_fail(NULL, 0);
+
+    oz_link_open(&relay, 1);
+    expect_int("M4: relay handshake OK", handshake(&owner, &relay, NULL, 0, NULL), 0);
+    expect_int("M4: …answered with a valid message_4", owner.got_m4, 1);
+    expect_int("M4: …the context it confirms is saved", kv_has("r0") && L.relay_used[0], 1);
+    expect_int("M4: …and works", call(&owner, &relay, OZ_COAP_GET, "dev/info", NULL, 0), OZ_R_OK);
+    boot_lock();
+    oz_link_open(&relay, 1);
+    expect_int("M4: …after a reboot too", call(&owner, &relay, OZ_COAP_GET, "dev/info", NULL, 0), OZ_R_OK);
+
+    /* The MQTT payload ozlock receives (ozkey-48 §2.4.1: type 0 ‖ message_4).
+     * Not secret: an AEAD tag over an empty plaintext. */
+    printf("relay message_4 frame:   00");
+    for (size_t i = 0; i < sizeof owner.m4; i++)
+        printf(" %02x", owner.m4[i]);
+    printf("\n");
+    oz_host_kv_reset();
+    boot_lock();
+}
 #endif
 
 static void run_suite(size_t mtu)
@@ -2634,6 +2682,7 @@ static void run_suite(size_t mtu)
 #ifndef OZ_SELFTEST_TARGET
     kv_faults();        /* boots a fresh lock */
     kv_faults2();       /* boots a fresh lock */
+    relay_m4();         /* boots a fresh lock */
 #endif
     if (mtu)
         printf("lock over GATT, MTU %u: %ld frames in, %ld out, %d new failures\n",
