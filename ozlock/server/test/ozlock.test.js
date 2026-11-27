@@ -402,7 +402,10 @@ test('uplink: plaintext failure code marks the last sent grant failed', async ()
   assert.equal(grants[0].sync_status, 'failed');
 });
 
-test('uplink: sealed envelope is audited, not read; overheard chatter is not', async () => {
+// ozkey-57 R3 (operator ruling 2026-11-18): ozlock is transit-only, so a
+// sealed uplink is a per-use event and is NOT audited any more (was: one
+// 'uplink' row). It is still relayed and never read.
+test('uplink: sealed envelope is relayed, not read, and NOT audited (ozkey-57 R3); overheard chatter neither', async () => {
   const sealed = { from: L2, to: APP_A.hex, envelope_hex: 'abcdef' };
   await step('uplink-L2-sealed', async () => {
     await fx.pub(T('uplink', L2), sealed);
@@ -410,8 +413,7 @@ test('uplink: sealed envelope is audited, not read; overheard chatter is not', a
   });
   const { res } = await step('apps-A-activity-uplink', () => call('GET', `/apps/${APP_A.hex}/activity?limit=50`));
   const uplinks = res.body.activity.filter((a) => a.action === 'uplink');
-  assert.equal(uplinks.length, 1);
-  assert.equal(uplinks[0].detail, `size=${Buffer.byteLength(JSON.stringify(sealed))}B`);
+  assert.equal(uplinks.length, 0);
 });
 
 test('uplink: caps report from a bonded lock is stored as device caps', async () => {

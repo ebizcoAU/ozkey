@@ -17,8 +17,15 @@ const logEvent = (...args) => ctx.logEvent(...args);
  * Record a control-plane action in the app-attributed audit trail. If appId is
  * omitted it's resolved from the device's current pairing. Best-effort — never
  * throws into the caller (an audit failure must not fail the real action).
+ *
+ * ozkey-57 R3: `kind` is 'security' or 'use'. A profile that sets
+ * CONFIG.AUDIT_KEEP_KINDS writes only those kinds (ozlock: ['security'], the
+ * transit-only rule); an untagged call counts as 'use' there, so a new per-use
+ * row cannot leak by default. Without the key every row is written (ozpms).
  */
-async function recordAudit(appId, deviceId, action, detail) {
+async function recordAudit(appId, deviceId, action, detail, kind) {
+  const keep = CONFIG.AUDIT_KEEP_KINDS;
+  if (Array.isArray(keep) && !keep.includes(kind || 'use')) return;
   try {
     let aid = appId;
     if (!aid && deviceId) {
@@ -45,6 +52,16 @@ async function recordAudit(appId, deviceId, action, detail) {
 // inventory, so only it gets a purge.
 async function purgeOldAuditLog() {
   try {
+    // ozkey-57 R3, transit-only profiles: rows written before the kinds
+    // existed. The per-use shapes are exactly the five 'use' call sites:
+    // uplink, caps_update and every unlock row that is not a refusal.
+    if (Array.isArray(CONFIG.AUDIT_KEEP_KINDS) && !CONFIG.AUDIT_KEEP_KINDS.includes('use')) {
+      const [r] = await pool.query(
+        `DELETE FROM audit_log WHERE action IN ('uplink', 'caps_update')
+           OR (action = 'unlock' AND detail NOT LIKE 'remote unlock: refused%')`
+      );
+      if (r.affectedRows > 0) logEvent('info', `ozkey-57 R3: removed ${r.affectedRows} per-use audit_log row(s)`);
+    }
     const [result] = await pool.query(
       'DELETE FROM audit_log WHERE created_at < (NOW() - INTERVAL ? SECOND)',
       [CONFIG.AUDIT_LOG_RETENTION_MS / 1000]

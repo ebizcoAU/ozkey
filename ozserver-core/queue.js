@@ -149,7 +149,7 @@ async function flushQueueForDeviceImpl(siteId, deviceId, onSent) {
           null,
           deviceId,
           'revoke_failed',
-          `revoke-key grant #${job.grant_id}: queue #${job.id} expired unsent`
+          `revoke-key grant #${job.grant_id}: queue #${job.id} expired unsent`, 'security'
         );
       }
       continue;

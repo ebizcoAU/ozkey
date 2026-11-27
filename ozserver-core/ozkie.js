@@ -233,6 +233,11 @@ async function relayFrame({ siteId, lockId, bridgeId, appId, frame }) {
       logEvent('info', result.body.confirmed
         ? `OZKIE relay: message_3 confirmed by message_4 ${via}`
         : `OZKIE relay: message_3 refused by the lock after message_3 ${via}`);
+      // ozkey-57 slice 1b: a refusal is a failed access → one security row
+      // (kept on ozlock). A confirmed handshake writes none (PM 11-27).
+      if (!result.body.confirmed) {
+        await require('./audit').recordAudit(appId, lockId, 'ozkie_edhoc', 'relay handshake refused by the lock after message_3', 'security');
+      }
     } else if (result.body.code === 'no_message_4') {
       logEvent('info', `OZKIE relay: no message_4 after message_3 ${via}; outcome unknown`);
     }

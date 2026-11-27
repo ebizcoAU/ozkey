@@ -295,7 +295,7 @@ async function handleLockPresence(deviceId, payload) {
           null,
           deviceId,
           'bridge_reconcile_rejected',
-          `claim from ${obj.via} rejected — ${oldBridgeId} still healthy; release_lock sent to ${obj.via}`
+          `claim from ${obj.via} rejected — ${oldBridgeId} still healthy; release_lock sent to ${obj.via}`, 'security'
         );
       } else {
         await pool.query(
@@ -322,7 +322,7 @@ async function handleLockPresence(deviceId, payload) {
           null,
           deviceId,
           'bridge_reconcile',
-          `bridge_id corrected to ${obj.via} via reconciliation-on-connect (was ${oldBridgeId || '(none)'})`
+          `bridge_id corrected to ${obj.via} via reconciliation-on-connect (was ${oldBridgeId || '(none)'})`, 'security'
         );
         effectiveBridgeId = obj.via;
       }
@@ -555,7 +555,8 @@ async function runBridgeFailoverSweep() {
       lock.id,
       'bridge_failover',
       `auto-failover from ${oldBridgeId} to ${next.bridge_id} after sustained bridge_offline (pair_lock dispatched` +
-        `${viaScanConfirm ? ', candidate found via scan-confirm — no prior lock_bridges history)' : ')'}`
+        `${viaScanConfirm ? ', candidate found via scan-confirm — no prior lock_bridges history)' : ')'}`,
+      'security'
     );
   }
 }
@@ -760,7 +761,7 @@ async function pinBridgePub(bridgeId, pub) {
     `Bridge ${bridgeId} presents a DIFFERENT OZKIE key (${pub.slice(0, 12)}…, pinned ${row.ozkie_pub.slice(0, 12)}…): ` +
       'conflict, served null until an admin re-key'
   );
-  await recordAudit(null, null, 'bridge_key_conflict', `bridge ${bridgeId}: presented ${pub.slice(0, 16)}…, pinned ${row.ozkie_pub.slice(0, 16)}…`);
+  await recordAudit(null, null, 'bridge_key_conflict', `bridge ${bridgeId}: presented ${pub.slice(0, 16)}…, pinned ${row.ozkie_pub.slice(0, 16)}…`, 'security');
 }
 
 async function handleBridgePresenceImpl(bridgeId, payload) {

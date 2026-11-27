@@ -1402,21 +1402,12 @@
         "body": {
           "activity": [
             {
-              "action": "uplink",
-              "app_id": "015acabd3be4dc7903b21d6300c3e8213785df1352785ccea9caf42661db7351",
-              "created_at": "<masked>",
-              "detail": "size=120B",
-              "device_id": "s0-bridged-02",
-              "id": 9,
-              "site_id": "lab"
-            },
-            {
               "action": "grant_failed",
               "app_id": "015acabd3be4dc7903b21d6300c3e8213785df1352785ccea9caf42661db7351",
               "created_at": "<masked>",
               "detail": "grant-key grant #1: MCU_TIMEOUT",
               "device_id": "s0-bridged-02",
-              "id": 8,
+              "id": 7,
               "site_id": "lab"
             },
             {
@@ -1424,15 +1415,6 @@
               "app_id": "015acabd3be4dc7903b21d6300c3e8213785df1352785ccea9caf42661db7351",
               "created_at": "<masked>",
               "detail": "grant PIN slot 3",
-              "device_id": "s0-bridged-02",
-              "id": 7,
-              "site_id": "lab"
-            },
-            {
-              "action": "unlock",
-              "app_id": "015acabd3be4dc7903b21d6300c3e8213785df1352785ccea9caf42661db7351",
-              "created_at": "<masked>",
-              "detail": "remote unlock: sent_unconfirmed",
               "device_id": "s0-bridged-02",
               "id": 6,
               "site_id": "lab"
@@ -1469,7 +1451,7 @@
           "limit": 50,
           "offset": 0,
           "ok": true,
-          "total": 7
+          "total": 5
         },
         "status": 200
       }

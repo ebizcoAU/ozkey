@@ -104,7 +104,7 @@ async function handleUplinkReset(deviceId, payloadStr) {
     lock.app_id,
     deviceId,
     'reset',
-    'device-reported factory reset via relay channel — ownership cleared'
+    'device-reported factory reset via relay channel — ownership cleared', 'security'
   );
   return true;
 }
@@ -165,7 +165,7 @@ async function handleUplinkCaps(deviceId, payloadStr) {
     deviceId,
   ]);
   logEvent('info', `Lock ${deviceId} capability report via relay channel: caps=${ident.caps}`);
-  await recordAudit(lock.app_id, deviceId, 'caps_update', `device-reported caps=${ident.caps}`);
+  await recordAudit(lock.app_id, deviceId, 'caps_update', `device-reported caps=${ident.caps}`, 'use');
   return true;
 }
 
@@ -216,7 +216,7 @@ async function logUplinkMetadata(fromDeviceId, payloadBuf, payloadStr) {
     `Uplink from ${fromDeviceId} to ${to || '(unresolved)'}: ${size}B (content sealed, not read)` +
       (isRealUplink ? '' : ' — no envelope_hex, treating as overheard chatter, not persisting')
   );
-  if (isRealUplink) await recordAudit(to, fromDeviceId, 'uplink', `size=${size}B`);
+  if (isRealUplink) await recordAudit(to, fromDeviceId, 'uplink', `size=${size}B`, 'use');
 }
 
 /** ozkey-31 §2. The uplink wrapper's `code` field is plaintext by design
@@ -275,7 +275,7 @@ async function handleUplinkOutcome(fromDeviceId, payloadStr) {
     null,
     fromDeviceId,
     isRevoke ? 'revoke_failed' : 'grant_failed',
-    `${pending.actionType} grant #${pending.grantId}: ${obj.code}`
+    `${pending.actionType} grant #${pending.grantId}: ${obj.code}`, 'security'
   );
 }
 

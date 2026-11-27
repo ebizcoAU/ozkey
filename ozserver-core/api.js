@@ -138,7 +138,7 @@ async function registerPairing(appId, deviceId, label, bridgeId, ozkieVersion) {
         ? ` via bridge ${bridgeId} (bridged — no self-enroll, see ozkey-11 §3)`
         : ' — awaiting doorlock contact')
   );
-  await recordAudit(appId, deviceId, 'pair', 'registered pairing');
+  await recordAudit(appId, deviceId, 'pair', 'registered pairing', 'security');
 }
 
 /* -- Pairing registration (trust-model v2, XF-42 §13.2) ---------------------- */
@@ -400,7 +400,7 @@ api.put('/locks/:lock_id/bridges/:bridge_id/bond', async (req, res) => {
       'UPDATE lock_bridges SET bond_pub_fp = ?, bond_slot = ?, bonded_at = NOW() WHERE lock_id = ? AND bridge_id = ?',
       [bond_pub_fp, slot, lock.id, bridgeId]
     );
-    await recordAudit(lock.app_id, lock.id, 'bridge_bond', `bridge ${bridgeId} slot ${slot} (advisory)`);
+    await recordAudit(lock.app_id, lock.id, 'bridge_bond', `bridge ${bridgeId} slot ${slot} (advisory)`, 'security');
     const [[b]] = await pool.query('SELECT ozkie_pub FROM bridges WHERE id = ?', [bridgeId]);
     if (b && b.ozkie_pub && bondFp(b.ozkie_pub) !== bond_pub_fp) {
       logEvent('warn', `Bridge bond on ${lock.id}: app's fingerprint for ${bridgeId} doesn't match the pinned key`);
@@ -430,7 +430,7 @@ api.delete('/locks/:lock_id/bridges/:bridge_id/bond', async (req, res) => {
         WHERE lock_id = ? AND bridge_id = ? AND bonded_at IS NOT NULL`,
       [lock.id, bridgeId]
     );
-    if (r.affectedRows) await recordAudit(lock.app_id, lock.id, 'bridge_unbond', `bridge ${bridgeId} (advisory)`);
+    if (r.affectedRows) await recordAudit(lock.app_id, lock.id, 'bridge_unbond', `bridge ${bridgeId} (advisory)`, 'security');
     res.json({ ok: true, cleared: r.affectedRows > 0 }); // idempotent
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -690,7 +690,7 @@ api.patch('/locks/:id', async (req, res) => {
         null,
         req.params.id,
         newBridgeId ? 'pair' : 'unpair',
-        newBridgeId ? `bridge_id set to ${newBridgeId}` : 'bridge_id cleared'
+        newBridgeId ? `bridge_id set to ${newBridgeId}` : 'bridge_id cleared', 'security'
       );
       // XF-144 (2026-09-01): keep `lock_bridges` in sync with every real
       // pair/re-pair, not just at migration time — otherwise the candidate
@@ -1075,7 +1075,7 @@ api.post('/locks/:id/grants', async (req, res) => {
       `Granted ${type.toUpperCase()} slot ${slot_number} on ${deviceId} ` +
         `(grant #${grantId}, queue #${queueResult.insertId}, sealed) — awaiting wake`
     );
-    await recordAudit(lock.app_id, deviceId, 'grant', `grant ${type.toUpperCase()} slot ${slot_number}`);
+    await recordAudit(lock.app_id, deviceId, 'grant', `grant ${type.toUpperCase()} slot ${slot_number}`, 'security');
 
     flushQueueForDevice(lock.site_id, deviceId).catch(() => {});
 
@@ -1375,7 +1375,7 @@ api.post('/locks/:id/unlock', async (req, res) => {
         const pub = await publishUnlockNow(lock.site_id, deviceId, envelope_hex);
         if (!pub.ok) {
           logEvent('warn', `Remote UNLOCK for "${lock.label}" NOT sent — MQTT publish refused (never queued)`);
-          await recordAudit(lock.app_id, deviceId, 'unlock', 'remote unlock: not sent (transport down)');
+          await recordAudit(lock.app_id, deviceId, 'unlock', 'remote unlock: not sent (transport down)', 'use');
           return res.status(503).json({
             ok: false,
             code: 'transport_unavailable',
@@ -1400,7 +1400,7 @@ api.post('/locks/:id/unlock', async (req, res) => {
           new Promise((resolve) => (timer = setTimeout(() => resolve(null), CONFIG.UNLOCK_REFUSAL_WATCH_MS))),
         ]);
         if (code) {
-          await recordAudit(lock.app_id, deviceId, 'unlock', `remote unlock: refused ${code}`);
+          await recordAudit(lock.app_id, deviceId, 'unlock', `remote unlock: refused ${code}`, 'security');
           return res.status(502).json({
             ok: false,
             code: 'lock_refused',
@@ -1411,7 +1411,7 @@ api.post('/locks/:id/unlock', async (req, res) => {
             msg_id: pub.msgId,
           });
         }
-        await recordAudit(lock.app_id, deviceId, 'unlock', 'remote unlock: sent_unconfirmed');
+        await recordAudit(lock.app_id, deviceId, 'unlock', 'remote unlock: sent_unconfirmed', 'use');
         return res.json({
           ok: true,
           device_id: deviceId,
@@ -1455,7 +1455,7 @@ api.post('/locks/:id/unlock', async (req, res) => {
       `ASSISTED UNLOCK queued for "${lock.label}" ` +
         `(queue #${queueResult.insertId}, expires ${windowMs / 1000}s, needs a keypad touch, sealed)`
     );
-    await recordAudit(lock.app_id, deviceId, 'unlock', 'assisted unlock: queued');
+    await recordAudit(lock.app_id, deviceId, 'unlock', 'assisted unlock: queued', 'use');
     const sent = await flushQueueForDevice(lock.site_id, deviceId);
 
     res.json({
@@ -1550,7 +1550,7 @@ async function handleBondVerb(req, res, actionType, label) {
       'key',
       `${label} queued for "${lock.label}" (queue #${queueResult.insertId}, expires 7d)`
     );
-    await recordAudit(lock.app_id, deviceId, actionType, label);
+    await recordAudit(lock.app_id, deviceId, actionType, label, 'security');
     const sent = await flushQueueForDevice(lock.site_id, deviceId);
 
     res.json({
@@ -1621,7 +1621,7 @@ api.post('/bridges/:id/reset', async (req, res) => {
       op: 'factory_reset',
       app_id,
     });
-    await recordAudit(app_id, bridgeId, 'bridge-reset', 'factory reset requested');
+    await recordAudit(app_id, bridgeId, 'bridge-reset', 'factory reset requested', 'security');
 
     if (!transportOk) {
       // Never reached the broker — genuinely nothing happened, not "unknown
@@ -1747,7 +1747,7 @@ api.delete('/locks/:id/grants/:gid', async (req, res) => {
       'revoke',
       grant
         ? `revoke ${grant.type.toUpperCase()} slot ${grant.slot_number}`
-        : `revoke grant #${grantId} (no server record)`
+        : `revoke grant #${grantId} (no server record)`, 'security'
     );
 
     flushQueueForDevice(siteId, deviceId).catch(() => {});

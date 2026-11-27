@@ -125,3 +125,24 @@ test('M4-7: a late message_4 after the 504 is dropped (no lease), not handed to 
   oz.handleOzkieUplink(L, B, M4_RFC);
   assert.equal(oz.ozkieCounters().uplink_no_lease, before + 1);
 });
+
+/* ozkey-57 slice 1b (PM ruled 11-19; "completed" row dropped by the PM 11-27):
+ * a lock that refuses after message_3 is a failed access → ONE security row.
+ * A confirmed handshake and every 504 leave no row. */
+test('1b-1: a refusal after message_3 → exactly one audit row, kind security', async () => {
+  audits.length = 0;
+  const err = Buffer.concat([Buffer.from([0, 0x01, 0x6e]), Buffer.from('STORAGE_FAILED')]);
+  await m3Answer('ozk-1b-refuse', err);
+  assert.equal(audits.length, 1, JSON.stringify(audits));
+  const [appId, lockId, action, detail, kind] = audits[0];
+  assert.deepEqual([appId, lockId, action, kind], ['app-a', 'ozk-1b-refuse', 'ozkie_edhoc', 'security']);
+  assert.match(detail, /refused by the lock after message_3/);
+});
+
+test('1b-2: a confirmed handshake, a 504 after message_3 and a 504 after message_1 leave no audit row', async () => {
+  audits.length = 0;
+  await m3Answer('ozk-1b-ok', M4_RFC);
+  await m3Answer('ozk-1b-silent', null);
+  assert.equal((await relay('ozk-1b-m1', M1)).status, 504);
+  assert.equal(audits.length, 0, JSON.stringify(audits));
+});

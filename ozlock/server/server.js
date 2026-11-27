@@ -178,7 +178,13 @@ const CONFIG = {
   // documented (2026-07-31) as retained per the Sovereign Edge whitepaper's
   // 90-day target — but nothing ever enforced it; grepped clean, no cron, no
   // age-based DELETE anywhere. This is that enforcement, finally wired up.
-  AUDIT_LOG_RETENTION_MS: 90 * 24 * 3600 * 1000,
+  // ozkey-57 R3 (operator ruling 2026-11-18): ozlock is transit-only. It
+  // keeps security events only (pairing, revokes, bridge events, failed or
+  // tampered access; console actions with actor are written separately), for
+  // 30 days, not the whitepaper's 90. Per-use rows (unlock sent, uplink,
+  // caps) are never written. ozpms keeps its own 90 d and every kind.
+  AUDIT_LOG_RETENTION_MS: 30 * 24 * 3600 * 1000,
+  AUDIT_KEEP_KINDS: ['security'],
   AUDIT_LOG_PURGE_INTERVAL_MS: 24 * 3600 * 1000,
   // nexus-14 ask #3: DELETE /locks/:id tells Nexus's lock_registry to
   // tombstone the MAC, so a decommissioned lock's stored pubkey doesn't

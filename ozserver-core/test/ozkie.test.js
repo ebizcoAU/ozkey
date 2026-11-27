@@ -140,7 +140,7 @@ test('EDHOC: m1 → m2, m3 + silence = 504 unknown (no audit row; F1 message_4),
   assert.equal((await relay(Buffer.from([0, 0x52]), { appId: 'app-b' })).status, 504); // silence: unknown, lease released
 });
 
-test('EDHOC: m3 refused by the lock comes back, no audit row; m3 without a lease refused', async () => {
+test('EDHOC: m3 refused by the lock comes back with ONE security row (ozkey-57 1b); m3 without a lease refused', async () => {
   audits.length = 0;
   const p1 = relay(Buffer.from([0, 0x03]));
   await nextTick();
@@ -152,7 +152,9 @@ test('EDHOC: m3 refused by the lock comes back, no audit row; m3 without a lease
   oz.handleOzkieUplink(L, B, err);
   const r3 = await p3;
   assert.ok(Buffer.from(r3.body.frame_b64, 'base64').equals(err));
-  assert.equal(audits.length, 0);
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0][2], 'ozkie_edhoc');
+  assert.equal(audits[0][4], 'security');
   const orphan = await relay(Buffer.from([0, 0x52, 0x00]));
   assert.equal(orphan.status, 409);
   assert.equal(orphan.body.code, 'edhoc_no_lease');
