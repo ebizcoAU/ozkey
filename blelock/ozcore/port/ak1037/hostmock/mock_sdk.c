@@ -531,6 +531,7 @@ int mock_ble_inits, mock_ble_init_fail, mock_gatt_fail;
 const T_BT_ATTREC *mock_gatt_table;
 uint32_t mock_gatt_len;
 uint16_t mock_mtu_requested;
+T_pVOID mock_mtu_handle;
 uint8_t mock_dev_addr[6] = { 0xb8, 0xca, 0x3a, 0xe6, 0xbe, 0xac };
 int mock_no_dev_addr;
 int mock_ble_up, mock_dev_addr_stays_zero;
@@ -629,9 +630,14 @@ T_eBLE_RESULT com_ble_set_adv_data(T_BT_ADV_DATA *adv, T_BT_ADV_DATA *rsp)
 
 uint8_t com_ble_set_mtu_size(T_pVOID handle, uint16_t mtu)
 {
-    (void)handle;
+    mock_mtu_handle = handle;
     mock_mtu_requested = mtu;
     return 0;
+}
+
+T_pVOID com_ble_get_conn_handle(T_U8 id)
+{
+    return (T_pVOID)((uintptr_t)MOCK_LINK0 + 0x100u * id);
 }
 
 /* As on the chip (2026-11-18): all zeros until com_ble_init has run, because

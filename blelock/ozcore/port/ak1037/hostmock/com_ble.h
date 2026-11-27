@@ -88,5 +88,6 @@ T_eBLE_RESULT com_ble_set_adv_interval(uint8_t adv_type, uint16_t interval_min, 
                                        uint8_t peer_addr_type, T_BLE_ADDR peer_addr);
 T_eBLE_RESULT com_ble_set_adv_data(T_BT_ADV_DATA *p_adv_data, T_BT_ADV_DATA *p_scan_rsp_data);
 uint8_t       com_ble_set_mtu_size(T_pVOID handle, uint16_t mtu);
+T_pVOID       com_ble_get_conn_handle(T_U8 id);   /* both SDKs; V2.00 sets MTU through it */
 uint8_t      *com_ble_get_dev_addr(void);
 #endif
