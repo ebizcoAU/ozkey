@@ -1,6 +1,9 @@
 ### SDK V2.00 (AK-SDK-2-1). Same partition table as config_ozkie.txt (OZKV offset unchanged).
-### No romfs.bin: only voice images read ROMFS (PM nexus-1b 2026-11-27). V2.00 LP/lfs/fpdat from bin\1037.
-### No ozkv_blank.bin: OZKV is kept (identity, bonds). The self-test uses its own "zt" namespace;
+### No SDK romfs.bin: only voice images read ROMFS (PM nexus-1b 2026-11-27). V2.00 LP/lfs/fpdat from bin\1037.
+### The tool refuses a partition with no file ("Partition name and BIN file name are different"), so ROMFS and OZKV
+### are written back with their OWN current contents, cut from a read-back by burn/keepparts.py (romfs_keep.bin,
+### ozkv_keep.bin). ozkv_keep.bin holds the lock's identity and bonds: never commit or share it.
+### No ozkv_blank.bin: OZKV is kept (identity, bonds) via ozkv_keep.bin. The self-test uses its own "zt" namespace;
 ### littlefs is the same on both SDKs (disk version 2.0). Add the line back only to wipe a lock on purpose.
 ###Project Name
 project name = AnyMicro1037
@@ -58,12 +61,14 @@ partition count = 7
 	partition6 = OZKV, 1, 0, 0, 64
 	partition7 = FPDAT, 1, 0, 0, 628
 
-download_to_nand count = 5
+download_to_nand count = 7
 download_to_nand1 = 1, ..\..\app_ota\bin\app_ota.bin, 0x0, OTA, 0, 0
 download_to_nand2 = 1, ..\..\app_mcu\bin\ozkie_app.bin, 0x0, PROG, 0, 0
 download_to_nand3 = 1, ..\..\app_mcu\bin\1037\lowpower.bin, 0x0, LP, 0, 0
-download_to_nand4 = 1, ..\..\app_mcu\bin\1037\lfs.bin, 0x0, UDATA, 0, 0
-download_to_nand5 = 1, ..\..\app_mcu\bin\1037\fpdat.bin, 0x0, FPDAT, 0, 0
+download_to_nand4 = 1, ..\..\app_mcu\bin\romfs_keep.bin, 0x0, ROMFS, 0, 0
+download_to_nand5 = 1, ..\..\app_mcu\bin\1037\lfs.bin, 0x0, UDATA, 0, 0
+download_to_nand6 = 1, ..\..\app_mcu\bin\ozkv_keep.bin, 0x0, OZKV, 0, 0
+download_to_nand7 = 1, ..\..\app_mcu\bin\1037\fpdat.bin, 0x0, FPDAT, 0, 0
 
 download_to_spi_img count = 0
 
