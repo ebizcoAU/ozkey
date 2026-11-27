@@ -632,7 +632,7 @@ uint8_t com_ble_set_mtu_size(T_pVOID handle, uint16_t mtu)
 {
     mock_mtu_handle = handle;
     mock_mtu_requested = mtu;
-    return 0;
+    return 1;                           /* com_ble.h: 1 = success */
 }
 
 T_pVOID com_ble_get_conn_handle(T_U8 id)
