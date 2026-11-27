@@ -41,12 +41,13 @@ def post(path, body):
 class HttpLink:
     """ozapp's link shape (send/recv), over ozlock's relay endpoint."""
     def __init__(self, app_id):
-        self.app_id, self.last, self.statuses = app_id, None, []
+        self.app_id, self.last, self.statuses, self.confirmed = app_id, None, [], None
 
     def send(self, typ, p):
         st, body = post(f'/locks/{LOCK}/ozkie',
                         {'app_id': self.app_id, 'frame_b64': base64.b64encode(bytes([typ]) + p).decode()})
         self.statuses.append((st, body.get('code')))
+        self.confirmed = body.get('confirmed')  # F1: true only for message_4 after message_3
         fb = body.get('frame_b64') if st == 200 else None
         self.last = (None, None) if not fb else (base64.b64decode(fb)[0], base64.b64decode(fb)[1:])
 
@@ -102,7 +103,14 @@ check('relay: EDHOC through ozlock', refused is None, refused=refused, statuses=
 if refused is not None:
     print(json.dumps({'app_id': APP_ID, 'fails': fails}), flush=True)
     sys.exit(1)
-check('relay: m1 and m3 both 200', [s for s, _ in link.statuses] == [200, 200], statuses=link.statuses)
+# F1 (ozkey-48 rev 15): an F1 lock answers message_3 with message_4 → 200 confirmed:true,
+# and the app has verified its tag (got_m4). A pre-F1 lock is silent → 504 no_message_4,
+# outcome unknown, and the app goes on to try the new context. Never one without the other.
+got_m4 = getattr(owner, 'got_m4', False)
+m3_ok = (link.statuses[1:] == [(200, None)] and link.confirmed is True and got_m4) or \
+        (link.statuses[1:] == [(504, 'no_message_4')] and not got_m4)
+check('relay: m1 200; m3 confirmed by a verified message_4, or 504 unknown with none',
+      link.statuses[:1] == [(200, None)] and m3_ok, statuses=link.statuses, confirmed=link.confirmed, got_m4=got_m4)
 
 rc, _, res = owner.request(0x01, 'lock/state')
 check('relay: lock/state read', rc == 0x45 and res and res[0] == R['OK'], rc=rc)

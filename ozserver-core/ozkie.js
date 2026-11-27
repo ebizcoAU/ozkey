@@ -11,8 +11,9 @@
  * for at most one wait and touch no table. Nothing is queued, retried or
  * re-sent (§2.4.4: a v2 unlock is never held). Nothing is stored: the
  * "completed relay EDHOC" audit row (ozkey-56 §2, F1) is gone, because
- * message_3 + silence is not a confirmation (OZKIE-RELAY-TIMING-1 S2). When
- * the lock sends message_4 (fw F1), a confirmed handshake can be recorded again.
+ * message_3 + silence is not a confirmation (OZKIE-RELAY-TIMING-1 S2). Since
+ * fw F1 the lock answers message_3 with message_4 (confirmed:true) or an EDHOC
+ * error; silence is 504 unknown. Still nothing stored (transit only).
  *
  * What we read of a frame:
  *   - the type byte (closed set, §2.4.1);
@@ -120,6 +121,10 @@ function publishAndWait(topic, frame, ms, register, onTimeout) {
   });
 }
 
+/** message_4 on the relay (ozkey-48 rev 15 §3): type 0, then a CBOR bstr of
+ *  8 bytes (0x48 + tag), 10 bytes in all. Shape only; the app verifies. */
+const isMessage4 = (frm) => frm.length === 10 && frm[0] === 0x00 && frm[1] === 0x48;
+
 const answer = (frame, bridgeId) => ({
   status: 200,
   body: { ok: true, frame_b64: frame ? frame.toString('base64') : null, bridge_id: bridgeId },
@@ -206,21 +211,30 @@ async function relayFrame({ siteId, lockId, bridgeId, appId, frame }) {
         settling.set(lockId, Date.now() + settleMs());
         return refuse(504, 'no_ack', 'No message_2 from the lock.', { outcome: 'unknown' });
       }
-      // S2: message_3 + silence is NOT a confirmation. The lock sends no
-      // message_4 yet (F1 adds one), may have refused with STORAGE_FAILED
-      // after our window, or never got message_3. The app's first OSCORE
-      // answer on the new context is the confirmation (ozkey-48 §3).
-      return answer(null, bridgeId);
+      // F1: message_3 + silence is never success. The lock may have
+      // refused after our window, never got message_3, or runs pre-F1
+      // firmware (no message_4). Outcome unknown: the app tries the new
+      // context or starts again.
+      return refuse(504, 'no_message_4', 'No message_4 from the lock: the handshake may or may not have completed.', {
+        outcome: 'unknown',
+      });
     }
   );
   l.waiter = null;
   if (!isMsg1) {
     releaseLease(lockId);
+    const via = `for ${lockId} by app ${appId} via ${bridgeId}`;
     if (result.status === 200) {
-      result.body.confirmed = false;
-      if (result.body.frame_b64 === null) {
-        logEvent('info', `OZKIE relay: message_3 delivered, unconfirmed, for ${lockId} by app ${appId} via ${bridgeId}`);
-      }
+      // ozkey-48 rev 15 §3: message_4 = 00 48 <8-byte tag>. ozlock can't
+      // check the tag (no EDHOC keys); the app MUST. Anything else is the
+      // lock's EDHOC error (first byte 0x01), passed on unconfirmed.
+      const frm = Buffer.from(result.body.frame_b64, 'base64');
+      result.body.confirmed = isMessage4(frm);
+      logEvent('info', result.body.confirmed
+        ? `OZKIE relay: message_3 confirmed by message_4 ${via}`
+        : `OZKIE relay: message_3 refused by the lock after message_3 ${via}`);
+    } else if (result.body.code === 'no_message_4') {
+      logEvent('info', `OZKIE relay: no message_4 after message_3 ${via}; outcome unknown`);
     }
   }
   return result;

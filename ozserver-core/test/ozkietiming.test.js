@@ -6,8 +6,8 @@
  *       OZKIE_EDHOC_SETTLE_MS: a new message_1 from anyone is 409
  *       edhoc_settling (retry_after_ms), and every type 0 uplink in that time
  *       is stale: dropped and counted, never handed to anyone.
- *   S2  message_3 + silence is NOT success: 200 {frame_b64: null,
- *       confirmed: false}, logged "delivered, unconfirmed", no audit row. The
+ *   S2  message_3 + silence is NOT success (since F1: 504 outcome unknown,
+ *       see ozkiem4.test.js), no audit row. The
  *       app's first OSCORE answer is the confirmation (ozkey-48 §3); the lock
  *       may have refused with STORAGE_FAILED or never got message_3.
  *   S3  the message_3 window default is 5 s (was 2 s).
@@ -75,7 +75,7 @@ test('S1: the settle is per lock; another lock is not affected', async () => {
   await relay('ozk-t-b', M3);
 });
 
-test('S2: message_3 + silence is "delivered, unconfirmed": confirmed:false, no audit row, no "completed" log', async () => {
+test('S2 (+F1): message_3 + silence is never success: 504 unknown, no audit row, no "completed" log', async () => {
   const L = 'ozk-t-m3';
   audits.length = 0;
   logs.length = 0;
@@ -84,12 +84,12 @@ test('S2: message_3 + silence is "delivered, unconfirmed": confirmed:false, no a
   oz.handleOzkieUplink(L, B, M2);
   assert.equal((await p).status, 200);
   const r3 = await relay(L, M3);
-  assert.equal(r3.status, 200);
-  assert.equal(r3.body.frame_b64, null);
-  assert.equal(r3.body.confirmed, false);
+  assert.equal(r3.status, 504);
+  assert.equal(r3.body.outcome, 'unknown');
+  assert.notEqual(r3.body.confirmed, true);
   assert.equal(audits.length, 0, 'no completion is audited at message_3');
   assert.ok(!logs.some((l) => /handshake completed/.test(l)), 'no "completed" claim');
-  assert.ok(logs.some((l) => /message_3 delivered, unconfirmed/.test(l)));
+  assert.ok(logs.some((l) => /no message_4 after message_3/.test(l)));
   // the lease is released: the same app can start again at once
   const p2 = relay(L, M1);
   await nextTick();
