@@ -22,6 +22,7 @@ const makeSecret = (...args) => require('./util').makeSecret(...args);
 const hashBrokerSecret = (...args) => require('./util').hashBrokerSecret(...args);
 const recordAudit = (...args) => require('./audit').recordAudit(...args);
 const mqttPublish = (...args) => require('./transport').mqttPublish(...args);
+const presenceChanged = (...args) => require('./presencelog').changed(...args);
 
 /** ozkey-23 §10.2a: mint-once, same shape as the lock's `handleEnroll()`
  *  (`brokerUsername = id`, `brokerSecret = makeSecret(16, 'ozl_')`). Returns
@@ -382,11 +383,9 @@ async function handleLockPresence(deviceId, payload) {
       deviceId,
     ]);
     const result = await recomputeAndStorePresence(deviceId);
-    if (result)
-      logEvent(
-        'info',
-        `Presence: lock ${deviceId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}, verdict=${result.reason}`
-      );
+    const line = result && `Presence: lock ${deviceId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}, verdict=${result.reason}`;
+    // OZLOCK-LOG-NOISE-1: logged on change only (the XF-152 resync repeats it).
+    if (line && presenceChanged('lock', deviceId, line)) logEvent('info', line);
   }
 
   // ozkey-41 §5.2: `no_bond` means the sender's request couldn't even be
@@ -778,7 +777,11 @@ async function handleBridgePresenceImpl(bridgeId, payload) {
      ON DUPLICATE KEY UPDATE presence = VALUES(presence), presence_at = VALUES(presence_at)`,
     [bridgeId, state]
   );
-  logEvent('info', `Presence: bridge ${bridgeId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}`);
+  // OZLOCK-LOG-NOISE-1: the bridge line and its re-verdict line are logged on
+  // change only; the DB write and the re-verdict below still run every time.
+  const bridgeLine = `Presence: bridge ${bridgeId} -> ${state}${obj.reason ? ` (${obj.reason})` : ''}`;
+  const bridgeChanged = presenceChanged('bridge', bridgeId, bridgeLine);
+  if (bridgeChanged) logEvent('info', bridgeLine);
   // ozkey-56 §5: pin the bridge's OZKIE key on first sight (TOFU).
   if (typeof obj.ozkie_pub === 'string' && /^[0-9a-fA-F]{64}$/.test(obj.ozkie_pub)) {
     await pinBridgePub(bridgeId, obj.ozkie_pub.toLowerCase());
@@ -842,7 +845,7 @@ async function handleBridgePresenceImpl(bridgeId, payload) {
   // verdicts, not N separate discoveries on each lock's own next report.
   const [locks] = await pool.query('SELECT id FROM locks WHERE bridge_id = ?', [bridgeId]);
   for (const { id } of locks) await recomputeAndStorePresence(id);
-  if (locks.length)
+  if (locks.length && bridgeChanged)
     logEvent('info', `Presence: re-verdicted ${locks.length} lock(s) behind bridge ${bridgeId}`);
 }
 
