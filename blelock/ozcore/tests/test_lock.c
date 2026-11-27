@@ -2285,6 +2285,314 @@ static void kv_faults(void)
 }
 #endif
 
+/* ── KV-OVERSIZE-1 part 2 (PM nexus-1b 2026-11-27): every answer the lock gives
+ * is still true after a reboot, whatever the flash did. Host only. ──────── */
+#ifndef OZ_SELFTEST_TARGET
+static void tkey(char *buf, char c, int i) { snprintf(buf, 4, "%c%d", c, i); }
+
+static int kv_has(const char *key)
+{
+    uint8_t b[OZ_KV_VALUE_MAX];
+    size_t n;
+    return oz_port_kv_get(key, b, sizeof b, &n) == OZ_OK;
+}
+
+static void reboot_owner(void)
+{
+    boot_lock();
+    oz_link_open(&ble, 0);
+    handshake(&owner, &ble, NULL, 0, NULL);
+}
+
+static int first_free_slot(void)
+{
+    for (int i = 0; i < OZ_LOCK_MAX_BONDS; i++)
+        if (!L.bonds[i].used)
+            return i;
+    return -1;
+}
+
+static int64_t info_key(uint64_t key)
+{
+    if (call(&owner, &ble, OZ_COAP_GET, "dev/info", NULL, 0) != OZ_R_OK)
+        return -2;
+    return resp_int(&owner, key);
+}
+
+static size_t body_sync1(uint8_t *b, size_t cap, const char *pin)
+{
+    oz_cbor_w w;
+    size_t sl = body_epoch(b, cap, 1);
+    oz_cbor_w_init(&w, b + sl, cap - sl);
+    oz_cbor_put_uint(&w, 1);
+    oz_cbor_put_array(&w, 1);
+    oz_cbor_put_array(&w, 5); oz_cbor_put_uint(&w, OZ_CRED_PIN);
+    oz_cbor_put_bstr(&w, (const uint8_t *)pin, strlen(pin));
+    oz_cbor_put_int(&w, 0); oz_cbor_put_int(&w, 0); oz_cbor_put_int(&w, -1);
+    return sl + w.len;
+}
+
+static void kv_faults2(void)
+{
+    static const uint8_t CARD[4] = { 0x51, 0x52, 0x53, 0x54 };
+    char k[4], why[32];
+    uint8_t b[128];
+    size_t bl;
+    int s;
+
+    oz_host_kv_reset();
+    boot_lock();
+    app_new(&owner); app_new(&guest); app_new(&stranger); app_new(&bridge1); app_new(&issuer);
+    claim(&owner);
+    expect_int("P2: owner sets time", set_time(&owner, 1790000000), OZ_R_TIME_OK);
+    bl = body_pin(b, sizeof b, "135790");
+    expect_int("P2: add permanent PIN", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    bl = body_card(b, sizeof b, CARD, sizeof CARD, 0);
+    expect_int("P2: add permanent card", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+
+    /* A: a revoke the flash refuses is refused, and stays refused. */
+    expect_int("A: guest redeems", redeem(&guest, &owner, 2, 0, 0x90, NULL), 0);
+    s = slot_of(&guest);
+    oz_link_open(&ble, 0); handshake(&owner, &ble, NULL, 0, NULL);
+    tkey(k, 'b', s);
+    oz_host_kv_fail(k, 1);
+    expect_int("A: revoke with the bond erase failing → STORAGE_FAILED", revoke_as(&owner, &ble, s),
+               OZ_R_STORAGE_FAILED);
+    expect_int("A: …the guest is still bonded", slot_of(&guest), s);
+    reboot_owner();
+    expect_int("A: …and still after a reboot", slot_of(&guest), s);
+    expect_int("A: retry → REVOKE_OK", revoke_as(&owner, &ble, s), OZ_R_REVOKE_OK);
+    reboot_owner();
+    expect_int("A: …gone after a reboot", slot_of(&guest), -1);
+
+    /* B: the relay record goes before the bond. */
+    expect_int("B: enrol issuer", enrol_issuer(&issuer), OZ_R_BOND_OK);
+    s = slot_of(&issuer);
+    oz_link_open(&relay, 1);
+    oz_link_open(&ble, 0); handshake(&owner, &ble, NULL, 0, NULL);
+    expect_int("B: issuer relay handshake", handshake(&issuer, &relay, NULL, 0, NULL), 0);
+    tkey(k, 'r', s);
+    oz_host_kv_fail(k, 1);
+    expect_int("B: revoke with the relay erase failing → STORAGE_FAILED", revoke_as(&owner, &ble, s),
+               OZ_R_STORAGE_FAILED);
+    expect_int("B: …bond and relay context still in use now", slot_of(&issuer) == s && L.relay_used[s], 1);
+    reboot_owner();
+    expect_int("B: after a reboot: bond and relay context both still there",
+               slot_of(&issuer) == s && L.relay_used[s], 1);
+    expect_int("B: retry → REVOKE_OK", revoke_as(&owner, &ble, s), OZ_R_REVOKE_OK);
+    reboot_owner();
+    expect_int("B: after a reboot: neither", slot_of(&issuer) == -1 && !L.relay_used[s], 1);
+
+    /* C: enrol. A bond that can't be saved spends the invite; a nonce that
+     * can't be saved leaves the invite usable and makes no bond. */
+    s = first_free_slot();
+    tkey(k, 'b', s);
+    oz_host_kv_fail(k, 1);
+    expect_int("C: redeem with the bond save failing → refused", redeem(&guest, &owner, 2, 0, 0x91, why), 1);
+    expect_int("C: …as STORAGE_FAILED", strcmp(why, "STORAGE_FAILED"), 0);
+    expect_int("C: …no bond", slot_of(&guest), -1);
+    reboot_owner();
+    expect_int("C: …none after a reboot either", slot_of(&guest), -1);
+    expect_int("C: the invite is spent (fail closed)", redeem(&guest, &owner, 2, 0, 0x91, why), 1);
+    expect_int("C: …MEMBER_REPLAY", strcmp(why, "MEMBER_REPLAY"), 0);
+    oz_host_kv_fail("nc", 1);
+    expect_int("C: redeem with the nonce save failing → refused", redeem(&guest, &owner, 2, 0, 0x92, why), 1);
+    expect_int("C: …as STORAGE_FAILED", strcmp(why, "STORAGE_FAILED"), 0);
+    expect_int("C: …no bond", slot_of(&guest), -1);
+    expect_int("C: the same invite then works", redeem(&guest, &owner, 2, 0, 0x92, NULL), 0);
+    reboot_owner();
+    expect_int("C: …and its bond survives a reboot", slot_of(&guest) >= 0, 1);
+
+    /* D: bond add. */
+    s = first_free_slot();
+    tkey(k, 'b', s);
+    oz_host_kv_fail(k, 1);
+    expect_int("D: bond add with its save failing → STORAGE_FAILED", enrol_bridge(&bridge1, "br"),
+               OZ_R_STORAGE_FAILED);
+    reboot_owner();
+    expect_int("D: …no bond after a reboot", slot_of(&bridge1), -1);
+
+    /* F: credentials. */
+    oz_host_kv_fail("cr", 1);
+    bl = body_pin(b, sizeof b, "246802");
+    expect_int("F: add PIN with its save failing → STORAGE_FAILED", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl),
+               OZ_R_STORAGE_FAILED);
+    expect_int("F: …it doesn't open", oz_lock_keypad_pin(&L, "246802"), OZ_PIN_WRONG);
+    reboot_owner();
+    expect_int("F: …nor after a reboot", oz_lock_keypad_pin(&L, "246802"), OZ_PIN_WRONG);
+    bl = body_pin(b, sizeof b, "246804");
+    expect_int("F: add PIN 246804", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    int64_t id = resp_int(&owner, 1);
+    char cp[16];
+    snprintf(cp, sizeof cp, "cred/%d", (int)id);
+    oz_host_kv_fail("cr", 1);
+    bl = body_epoch(b, sizeof b, 0);
+    expect_int("F: delete with its save failing → STORAGE_FAILED", call(&owner, &ble, OZ_COAP_DELETE, cp, b, bl),
+               OZ_R_STORAGE_FAILED);
+    expect_int("F: …the PIN still opens", oz_lock_keypad_pin(&L, "246804"), OZ_PIN_OPEN);
+    reboot_owner();
+    expect_int("F: …and still after a reboot", oz_lock_keypad_pin(&L, "246804"), OZ_PIN_OPEN);
+    bl = body_epoch(b, sizeof b, 0);
+    expect_int("F: retry delete → OK", call(&owner, &ble, OZ_COAP_DELETE, cp, b, bl), OZ_R_CRED_OK);
+    reboot_owner();
+    expect_int("F: …refused after a reboot", oz_lock_keypad_pin(&L, "246804"), OZ_PIN_WRONG);
+    oz_host_kv_fail("cr", 1);
+    bl = body_sync1(b, sizeof b, "975310");
+    expect_int("F: sync with its save failing → STORAGE_FAILED", call(&owner, &ble, OZ_COAP_PUT, "cred/sync", b, bl),
+               OZ_R_STORAGE_FAILED);
+    expect_int("F: …the old set still opens", oz_lock_keypad_pin(&L, "135790"), OZ_PIN_OPEN);
+    expect_int("F: …the new one doesn't", oz_lock_keypad_pin(&L, "975310"), OZ_PIN_WRONG);
+
+    /* G: the epoch is saved before the change. */
+    uint32_t ep = L.epoch;
+    oz_host_kv_fail("ep", 1);
+    bl = body_pin(b, sizeof b, "246806");
+    expect_int("G: add PIN with the epoch save failing → STORAGE_FAILED",
+               call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_STORAGE_FAILED);
+    expect_int("G: …epoch unchanged", (long long)L.epoch, (long long)ep);
+    expect_int("G: …PIN not added", oz_lock_keypad_pin(&L, "246806"), OZ_PIN_WRONG);
+
+    /* H: an invite cancel the flash refuses is not reported as done. */
+    oz_host_kv_fail("cx", 1);
+    expect_int("H: cancel with its save failing → STORAGE_FAILED", cancel_invite(0x93, 1790000000 + 86400),
+               OZ_R_STORAGE_FAILED);
+
+    /* L (class 5): a limit that can't be saved is counted in dev/info. */
+    int64_t f0 = info_key(5);
+    oz_host_kv_fail("pl", 1);
+    expect_int("L: wrong PIN with the keypad limit save failing", oz_lock_keypad_pin(&L, "000001"), OZ_PIN_WRONG);
+    expect_int("L: …dev/info kv_faults counts it", info_key(5), f0 + 1);
+
+    /* I: factory reset. b0 is the commit point. */
+    oz_host_kv_fail("b0", 1);
+    bl = body_epoch(b, sizeof b, 0);
+    expect_int("I: dev/reset with the owner erase failing → STORAGE_FAILED",
+               call(&owner, &ble, OZ_COAP_POST, "dev/reset", NULL, 0), OZ_R_STORAGE_FAILED);
+    expect_int("I: …still claimed", oz_lock_claimed(&L), 1);
+    reboot_owner();
+    expect_int("I: …still claimed after a reboot", oz_lock_claimed(&L), 1);
+    expect_int("I: …the PIN still opens", oz_lock_keypad_pin(&L, "135790"), OZ_PIN_OPEN);
+
+    /* I: a reset whose later erases fail is still a reset. */
+    uint8_t pub_before[32];
+    memcpy(pub_before, L.pub, 32);
+    bl = body_pin(b, sizeof b, "864200");      /* its own PIN: no help from earlier rows */
+    expect_int("I: add PIN 864200", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    expect_int("I: …it opens", oz_lock_keypad_pin(&L, "864200"), OZ_PIN_OPEN);
+    oz_host_kv_fail("cr", -1);
+    expect_int("I: dev/reset with the credential erase failing → OK (committed)",
+               call(&owner, &ble, OZ_COAP_POST, "dev/reset", NULL, 0), OZ_R_OK);
+    expect_int("I: …unclaimed", oz_lock_claimed(&L), 0);
+    expect_int("I: …the old PIN doesn't open", oz_lock_keypad_pin(&L, "864200"), OZ_PIN_WRONG);
+    boot_lock();
+    expect_int("I: …nor after a reboot with the erase still failing", oz_lock_keypad_pin(&L, "864200"),
+               OZ_PIN_WRONG);
+    oz_host_kv_fail(NULL, 0);
+    boot_lock();
+    expect_int("I: once the flash recovers, the boot erases the leftovers", kv_has("cr"), 0);
+
+    /* I: a power cut right after the commit (only b0 gone). */
+    app_new(&owner);
+    claim(&owner);
+    expect_int("I: re-claim", oz_lock_claimed(&L), 1);
+    oz_link_open(&ble, 0); handshake(&owner, &ble, NULL, 0, NULL);
+    bl = body_pin(b, sizeof b, "135790");
+    expect_int("I: add PIN again", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    expect_int("I: guest again", redeem(&guest, &owner, 2, 0, 0x94, NULL), 0);
+    memcpy(pub_before, L.pub, 32);
+    oz_port_kv_erase("b0");                         /* power cut after the commit */
+    boot_lock();
+    expect_int("I(cut): unclaimed", oz_lock_claimed(&L), 0);
+    expect_int("I(cut): the old PIN doesn't open", oz_lock_keypad_pin(&L, "135790"), OZ_PIN_WRONG);
+    expect_int("I(cut): no guest bond", slot_of(&guest), -1);
+    expect_int("I(cut): credentials, members, nonces erased",
+               kv_has("cr") || kv_has("b1") || kv_has("nc"), 0);
+    expect_int("I(cut): identity kept", memcmp(L.pub, pub_before, 32), 0);
+
+    /* J: owner record fault. */
+    app_new(&owner);
+    claim(&owner);
+    oz_link_open(&ble, 0); handshake(&owner, &ble, NULL, 0, NULL);
+    bl = body_pin(b, sizeof b, "135790");
+    expect_int("J: add permanent PIN", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    bl = body_card(b, sizeof b, CARD, sizeof CARD, 0);
+    expect_int("J: add permanent card", call(&owner, &ble, OZ_COAP_POST, "cred", b, bl), OZ_R_CRED_OK);
+    expect_int("J: guest", redeem(&guest, &owner, 2, 0, 0x95, NULL), 0);
+    uint8_t keep_b0[96];
+    size_t n0;
+    oz_port_kv_get("b0", keep_b0, sizeof keep_b0, &n0);
+    static const uint8_t JUNK[5] = { 0x85, 0x01, 0x02, 0xff, 0x00 };
+    oz_port_kv_set("b0", JUNK, sizeof JUNK);        /* corrupt owner record */
+    boot_lock();
+    oz_link_open(&ble, 0);
+    expect_int("J: corrupt b0: a stranger can't start a claim", handshake(&stranger, &ble, NULL, 0, NULL) != 0 &&
+               !ble.pairing, 1);
+    expect_int("J: …the permanent PIN still opens", oz_lock_keypad_pin(&L, "135790"), OZ_PIN_OPEN);
+    expect_int("J: …the permanent card still opens", oz_lock_card(&L, CARD, sizeof CARD), OZ_CARD_OPEN);
+    expect_int("J: …nothing erased", kv_has("cr") && slot_of(&guest) >= 0, 1);
+    oz_port_kv_set("b0", keep_b0, n0);
+    oz_host_kv_fail("b0", -1);
+    oz_host_kv_fail_reads(1);                        /* b0 can't be read at all */
+    boot_lock();
+    oz_link_open(&ble, 0);
+    expect_int("J: b0 read error: a stranger can't start a claim", handshake(&stranger, &ble, NULL, 0, NULL) != 0 &&
+               !ble.pairing, 1);
+    expect_int("J: …the permanent PIN still opens", oz_lock_keypad_pin(&L, "135790"), OZ_PIN_OPEN);
+    oz_host_kv_fail(NULL, 0);
+    oz_host_kv_fail_reads(0);
+    reboot_owner();
+    expect_int("J: flash back: claimed by the same owner, nothing lost",
+               oz_lock_claimed(&L) && kv_has("cr") && slot_of(&guest) >= 0, 1);
+
+    /* K: an identity read error never mints a new identity. */
+    memcpy(pub_before, L.pub, 32);
+    oz_host_kv_fail("lk", 1);
+    oz_host_kv_fail_reads(1);
+    expect_int("K: lk read error → the lock doesn't start",
+               oz_lock_init(&L, "ozk-test0001", "ozcore-p2", &HOOKS) != OZ_OK, 1);
+    oz_host_kv_fail_reads(0);
+    boot_lock();
+    expect_int("K: …next boot: same identity", memcmp(L.pub, pub_before, 32), 0);
+
+    /* Guard 1 (PM): a claimed lock with a readable b0 never wipes, over 100
+     * boots with random flash faults on other keys. */
+    static const char *const OTHER[] = { "b1", "b2", "r0", "cr", "nc", "cx", "ep", "pl", "rl", "es" };
+    uint32_t seed = 0x6b7a2027u;
+    int wiped = 0, unclaimed = 0;
+    oz_host_kv_fail_reads(1);
+    for (int i = 0; i < 100; i++) {
+        seed = seed * 1103515245u + 12345u;
+        oz_host_kv_fail(OTHER[(seed >> 16) % (sizeof OTHER / sizeof OTHER[0])], (int)((seed >> 8) % 4));
+        boot_lock();
+        unclaimed += !oz_lock_claimed(&L);
+        oz_host_kv_fail(NULL, 0);
+        wiped += !kv_has("b0") || !kv_has("cr") || !kv_has("lk");
+    }
+    oz_host_kv_fail_reads(0);
+    expect_int("Guard1: 100 faulty boots: never unclaimed", unclaimed, 0);
+    expect_int("Guard1: …never wiped", wiped, 0);
+    reboot_owner();
+    expect_int("Guard1: then a clean boot: PIN, card and guest all intact",
+               oz_lock_keypad_pin(&L, "135790") == OZ_PIN_OPEN && oz_lock_card(&L, CARD, sizeof CARD) == OZ_CARD_OPEN &&
+               slot_of(&guest) >= 0, 1);
+
+    /* Guard 2 (PM): a fresh, never-claimed lock boots and keeps what it needs. */
+    oz_host_kv_reset();
+    expect_int("Guard2: fresh lock boots", oz_lock_init(&L, "ozk-test0001", "ozcore-p2", &HOOKS), OZ_OK);
+    memcpy(pub_before, L.pub, 32);
+    for (int i = 0; i < 5; i++)
+        oz_lock_keypad_pin(&L, "000000");
+    int locked = oz_lock_keypad_pin(&L, "000000") == OZ_PIN_LOCKED_OUT;
+    expect_int("Guard2: keypad locked out", locked, 1);
+    expect_int("Guard2: reboot OK", oz_lock_init(&L, "ozk-test0001", "ozcore-p2", &HOOKS), OZ_OK);
+    expect_int("Guard2: …same identity", memcmp(L.pub, pub_before, 32), 0);
+    expect_int("Guard2: …still locked out", oz_lock_keypad_pin(&L, "000000"), OZ_PIN_LOCKED_OUT);
+    expect_int("Guard2: …limiter and identity records kept", kv_has("pl") && kv_has("lk"), 1);
+    oz_host_kv_reset();
+    boot_lock();
+}
+#endif
+
 static void run_suite(size_t mtu)
 {
     framed_mtu = mtu;
@@ -2325,6 +2633,7 @@ static void run_suite(size_t mtu)
     nonce_held();       /* boots a fresh lock */
 #ifndef OZ_SELFTEST_TARGET
     kv_faults();        /* boots a fresh lock */
+    kv_faults2();       /* boots a fresh lock */
 #endif
     if (mtu)
         printf("lock over GATT, MTU %u: %ld frames in, %ld out, %d new failures\n",

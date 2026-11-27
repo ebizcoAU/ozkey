@@ -37,6 +37,9 @@
 > and no invite may be open more than 7 days (App. A "Redeemed invites").
 > Rev 13 (2026-11-27, PM nexus-1b, KV-OVERSIZE-1 part 1): failed flash writes, App. A "Storage
 > failures". New result 37 `STORAGE_FAILED`. Found defect: the AK1037 kv took values of any length.
+> Rev 14 (2026-11-27, PM nexus-1b, KV-OVERSIZE-1 part 2): every other flash write fails closed, the
+> factory reset has one commit point (b0), an unreadable owner record is a fault and not "unclaimed",
+> `dev/info` keys 4 and 5. Three security defects found and fixed (App. A "Storage failures").
 
 ## 0. What changes from v1, in one table
 
@@ -508,7 +511,7 @@ operation source, alarm code and similar are taken from Matter so we don't inven
 | `bond/invite/<nonce>` | DELETE | `bond.invite.cancel` | admin | optional `{1: redeem_by}` (App. A, rev 9) |
 | `bond/member` | DELETE | (new, rev 11) | issuer | `{0: epoch, 1: guest key (32 B)}`: revoke its own guest by key (App. A, G1c) |
 | `time` | PUT / GET | `time.set` / `time.get` | bridge, admin | `{1: utc_s}`, monotonic-forward rule unchanged |
-| `dev/info` | GET | `device.info` | member+ | → `{1: fw, 2: profile, 3: caps}` |
+| `dev/info` | GET | `device.info` | member+ | → `{1: fw, 2: profile, 3: caps, 4: owner_fault (0/1), 5: kv_faults}` (4, 5: rev 14, App. A) |
 | `dev/reset` | POST | `device.reset` | admin | — (Echo on relay) |
 | `events` | GET + Observe | `event.*` | admin, member (own), service | access, alarm, duress, battery, doorbell, bolt (§5.1) |
 
@@ -844,8 +847,45 @@ take effect in RAM only, since a reboot would undo it.
   lock's fault, not a guess). Before: the door opened, and after a reboot the use came back.
 - **Never a lockout.** A flash fault never stops a permanent credential (`uses` = −1), the app
   unlock, the exit button or the mechanical key from opening the door (PM ruling 2026-11-27).
-- Part 2 (not built yet): bond enrol and revoke, nonce and cancel records, the epoch, the keypad and
-  card limits, and factory reset.
+
+**Storage failures, part 2 (rev 14, KV-OVERSIZE-1 part 2).**
+- **Erases.** Only "not found" counts as gone. Any other erase error is a failed write.
+- **The epoch is saved first.** Every change guarded by the epoch (§4.3) saves the new epoch before
+  the change. If the epoch can't be saved, nothing changes (`STORAGE_FAILED`). An epoch saved for a
+  change that then fails costs one `STALE_EPOCH` and a re-read, never a wrong roster.
+- **Answers are true.** Revoke (relay record first, then the bond), member enrol, bond add, claim,
+  `cred` POST / DELETE / `cred/sync`, and invite cancel answer `STORAGE_FAILED` when their write
+  fails. RAM goes back to what flash holds, so a reboot changes nothing. A revoke or delete is never
+  reported done while the record would come back at the next boot.
+- **Enrol order: epoch, nonce, bond.** If the bond can't be saved after the nonce, the invite is spent
+  (the guest needs a new invite). A bond whose invite could be redeemed a second time is never left.
+- **Keypad and card limits.** A limit that can't be saved keeps its lockout in RAM, is retried at the
+  next flush, and is counted. The keypad is not refused for it (residents would be locked out).
+- **`dev/info` key 5 `kv_faults`**: flash writes that failed since boot (RAM only). Key 4
+  `owner_fault`: 1 when the owner record is there but unreadable (below).
+- **Factory reset commit point.** `dev/reset` (and `oz_lock_factory_reset()`, below) first erases the
+  owner bond `b0`. If that fails: `STORAGE_FAILED`, nothing changed. Once `b0` is gone the reset is
+  committed: the rest (credentials, bonds 1+, relay contexts, invite records, epoch) is erased, then
+  the device records (limits, event seq, identity). A boot that finds no `b0` erases whatever an owner
+  set up and loads none of it, even if those erases fail again. A boot never erases the device
+  records: a fresh lock keeps its identity and keypad lockout across reboots.
+- **Owner record fault.** `b0` present but unreadable or corrupt: the lock is NOT unclaimed. Nothing
+  is erased, the rest loads, permanent PINs and cards still open, and nobody can claim the lock at the
+  door (the claim is refused with `STORAGE_FAILED`). `dev/info` key 4 = 1. When flash reads again,
+  the same owner is back with nothing lost.
+  - 🟡 Known effect: while it lasts, `oz_lock_claimed()` is false, so every message_3 takes the claim
+    path: members and the service bond can't open a session either (BLE `STORAGE_FAILED`, relay
+    `BOND_DENIED`), so `dev/info` key 4 can't be read over the air. The INFO characteristic shows
+    `claimed` = 0. The app must not offer a claim when it gets `STORAGE_FAILED`; the cure is service.
+- **Identity.** A new identity is minted only when `lk` is not found. A read error stops the lock from
+  starting: minting then would have replaced the lock's key under every bond.
+- **Found defects (security, ship gate: merge before any lock leaves the bench).**
+  1. A power cut or flash fault in the middle of a factory reset could leave a guest's PIN working on
+     an unclaimed lock.
+  2. An unreadable or corrupt `b0` read as "unclaimed", so anyone at the door could claim the lock.
+  3. Any `lk` read error minted a new identity, which broke every bond.
+- **Not wired yet.** `oz_lock_factory_reset()` is the hands-on reset. No reset button calls it yet:
+  board work (BOARD-PROFILE-1).
 
 `PIN_TOO_SHORT` (2026-11-05, PM ruling): a `cred` POST or a `cred/sync` entry of type PIN with fewer
 than `OZ_LOCK_PIN_MIN` = 6 digits. A sync with one such entry is refused whole and changes nothing.
