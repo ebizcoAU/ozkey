@@ -40,6 +40,9 @@
 > Rev 14 (2026-11-27, PM nexus-1b, KV-OVERSIZE-1 part 2): every other flash write fails closed, the
 > factory reset has one commit point (b0), an unreadable owner record is a fault and not "unclaimed",
 > `dev/info` keys 4 and 5. Three security defects found and fixed (App. A "Storage failures").
+> Rev 15 (2026-11-27, PM nexus-1b GO, OZKIE-RELAY-TIMING-1 F1): on the **relay link** the lock answers
+> a good message_3 with EDHOC **message_4**, and only after the new relay context is saved (§3, §2.4.3).
+> ozlock reads message_4 as "confirmed"; an error or silence is not. The session link is unchanged.
 
 ## 0. What changes from v1, in one table
 
@@ -226,7 +229,9 @@ holds **one** responder handshake.
   - drops a handshake waiting for message_3 after **30 s** (`OZ_LOCK_EDHOC_TIMEOUT_MS`);
   - treats a message_1 that arrives mid-handshake as **abort and restart**: message_1 opens with
     a CBOR integer (< 0x40), message_3 is a byte string;
-  - resets on a failed message_3 and sends EDHOC error 1.
+  - resets on a failed message_3 and sends EDHOC error 1;
+  - answers a good message_3 with message_4 once the relay context is saved, or with EDHOC error 1
+    `STORAGE_FAILED` if it can't be (rev 15, §3).
 - **The server (ozlock)** holds one EDHOC **lease per lock across all senders, 35 s**. A second
   sender's message_1 is refused as busy and never queued. Every type 0 uplink belongs to the
   lease holder. A type 0 uplink with no lease open is dropped and logged.
@@ -238,6 +243,7 @@ holds **one** responder handshake.
 |---|---|---|---|
 | message_3 wait | 30 s | lock | half-done handshake dropped (§2.4.3) |
 | relay EDHOC lease | 35 s | server | must outlast the lock's 30 s |
+| message_4 wait | server's choice (proposed 5 s) | server | after message_3: message_4 = confirmed, EDHOC error = refused, silence = unknown (never "success") |
 | Echo validity | 10 s, one use | lock | the repeat after `4.01 + Echo` goes at once, inside 10 s |
 | request timeout | 10 s | each sender | no response in 10 s = lost |
 | pairing window | §3.4 | lock | session link only (no pairing on the relay) |
@@ -308,7 +314,17 @@ sends a maximum-size message in each direction, **with a 50-character site and 6
   - message_1: app → lock.
   - message_2: lock → app.
   - message_3: app → lock.
-  - message_4 is not used. The first OSCORE response gives the app key confirmation (RFC 9528 §5.5).
+  - message_4 (rev 15, F1): **relay link only.** The lock sends it, as a type 0 frame, once the new
+    relay context is **saved to flash**. It is RFC 9528 §5.5 with an empty EAD_4: 9 bytes,
+    `0x48` ‖ CIPHERTEXT_4 (the AEAD tag of an empty PLAINTEXT_4 under K_4 / IV_4,
+    A_4 = ["Encrypt0", h'', TH_4]). Test vector: RFC 9529 §3.6, `48 28 c9 66 b7 ca 30 4f 83`.
+    - It is the lock's "context saved" answer. If the save fails the lock sends EDHOC error 1
+      `STORAGE_FAILED` instead, and the bond's previous relay context stays in use (App. A).
+    - The app MUST verify it (a wrong message_4 = handshake failed) and MUST keep its previous relay
+      context until it has a verified message_4 or a first OSCORE answer on the new one.
+    - A message_4 is a CBOR byte string (first byte `0x48`); an EDHOC error starts with an integer.
+  - On the **session link** (BLE) there is no message_4: the first OSCORE response gives the app key
+    confirmation (RFC 9528 §5.5), and a BLE context is never saved.
 - **Connection identifiers:** C_I and C_R are 1-byte values. They become the OSCORE Sender and
   Recipient IDs.
 - **Credentials:** a CWT Claims Set (CCS, RFC 8392) holding an X25519 COSE_Key.

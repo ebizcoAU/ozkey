@@ -3,7 +3,8 @@
  * Supported: method 3 (static DH both sides), cipher suite 0
  * (AES-CCM-16-64-128, SHA-256, MAC 8, X25519). Suite 2 differs only in the
  * curve, so tests can run the RFC 9529 static-DH trace by injecting its DH
- * outputs through `dh`. message_4 is not used (ozkey-48 §3).
+ * outputs through `dh`. message_4 is built for the relay link only
+ * (ozkey-48 §3, F1); the session link's key confirmation is its first OSCORE reply.
  *
  * No malloc: a session is one struct the caller owns (~2 KB). Wipe it with
  * oz_edhoc_wipe() when done.
