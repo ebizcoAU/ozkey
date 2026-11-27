@@ -19,7 +19,10 @@ NAMES = ("OTA", "PROG", "LP", "ROMFS", "UDATA", "OZKV", "FPDAT")
 
 def table(img):
     """Partition table written by the tool: 32-byte entries, name[6] kb:u16 pad:u16 off:u32 len:u32 ..."""
+    # "OTA\0\0\0" also occurs before the table; take the match followed by PROG one entry later.
     t = img.find(b"OTA\0\0\0", 0, 0x4000)
+    while t >= 0 and img[t + 32: t + 38] != b"PROG\0\0":
+        t = img.find(b"OTA\0\0\0", t + 1, 0x4000)
     if t < 0:
         sys.exit("no partition table in the first 16 KB")
     parts = {}
