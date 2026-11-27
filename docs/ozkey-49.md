@@ -439,6 +439,26 @@ invites and the lock engine.
    Drop download line 6 to keep them across a re-burn. Production updates go through OTA, not the
    burner.
 
+**Burn checklist (SDK V2.00, GUI tool V1.0.68 on Mac2 Windows; PM nexus-1b 2026-11-28).** Learned on the
+first V2.00 burn (ozkey_notes/ctest/2026-11-28_ak1037_v2_selftest_onchip/).
+1. **Read back first**: Tool → Read Back SPI NOR Flash Image. The title must say "Mirror Upload" (screenshot
+   before every BOOT press: with Auto Burn ticked, BOOT in normal mode BURNS). Auto Burn must be ticked or the
+   tool never opens COM3. About 7 min; saves `Downloads\UploadBin\spiflash.bin` (4 MiB). Keep it, mode 0600.
+2. **Every partition needs a file**, or the tool stops with "Partition name and BIN file name are
+   different" (before writing anything). To keep ROMFS/OZKV, cut them from the read-back with
+   `burn/keepparts.py` and prove each equals its slice (`cmp`) before burning. `ozkv_keep.bin` holds the
+   lock's keys: it never leaves the two Macs and is gitignored.
+3. **Edit a config only with the tool closed.** The tool saves configs as UTF-16LE on close, overwriting
+   any edit made while it runs; patch the tool's own saved copy and read it back.
+4. Restart the tool to leave Mirror Upload. Screenshot: the right config ticked alone, Auto Burn on,
+   Secure Boot off, title without "Mirror Upload". Then BOOT+reset.
+5. Close the tool before capturing COM3 (it holds the port). First boot: tap SW13 alone.
+   `oz.selftest` takes about 45 min on V2.00 (the lock suite on flash), so capture until "OZ SELFTEST".
+6. 🔴 **Identity check = file level**: read back again and run `burn/ozkvcmp pre.bin post.bin` (full
+   read-backs or 64 KiB OZKV images). Exit 0 = every `oz.*` file present in both and identical. OZKV is
+   NOT byte-identical after a self-test run (its "zt" namespace shares the littlefs), so a byte compare
+   is the wrong check.
+
 **Images packaged 2026-10-29** (the `.bin` sha256 varies with the SDK objects' build stamp):
 
 | Image | `ozkie_app.bin` | PROG 798,720 B free |
