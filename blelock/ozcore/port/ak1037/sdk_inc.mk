@@ -1,6 +1,9 @@
 # SDK include paths, from app_mcu's eide config (Makefile.cli INCS), rebased on $(SDK).
+# SDK V2.00 keeps the closed libraries' headers per chip (library/ak1037/include);
+# V1.02 has them in library/include (AK-SDK-2-1).
+SDKLIB := $(firstword $(wildcard $(SDK)/library/ak1037) $(SDK)/library)
 SDKINC = \
-    -I$(SDK)/library/include \
+    -I$(SDKLIB)/include \
     -I$(SDK)/platform \
     -I$(SDK)/platform/component/audio/decode \
     -I$(SDK)/platform/component/audio/voice \

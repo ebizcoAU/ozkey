@@ -967,6 +967,12 @@ int oz_gatt_ak1037_radio_up(void)
         oz_port_log("gatt: service registration failed");
         return OZ_E_HW;
     }
+    /* AK-SDK-2-1: SDK V2.00 takes the local MTU after init and before any
+     * connection, per link (its samples: link 0, right here). V1.02 asks for
+     * "after the service", which this also is. The connect-time request below
+     * stays until a V2.00 burn shows whether it is still needed. */
+    if (com_ble_set_mtu_size(com_ble_get_conn_handle(0), 247) != 1)
+        oz_port_log("gatt: MTU 247 not set before connect");
     up = 1;
     return OZ_OK;
 }

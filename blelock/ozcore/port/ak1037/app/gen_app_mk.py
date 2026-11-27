@@ -29,7 +29,11 @@ sdk, ozrel, out = args
 fp, voice = '--fp' in flags, '--voice' in flags
 pdir = os.path.join(sdk, 'app_mcu')
 eide = json.load(open(os.path.join(pdir, '.eide', 'eide.json')))
-opts = json.load(open(os.path.join(pdir, '.eide', 'debug.riscv.gcc.options.json')))
+# SDK V1.02: one options file; V2.00: one per chip (AK-SDK-2-1).
+optf = os.path.join(pdir, '.eide', 'debug.riscv.gcc.options.json')
+if not os.path.exists(optf):
+    optf = os.path.join(pdir, '.eide', 'ak1037.riscv.gcc.options.json')
+opts = json.load(open(optf))
 
 norm = lambda p: os.path.normpath(p).replace('\\', '/')
 sdk_excl = [norm(e) for e in eide['excludeList'] if not e.startswith('<virtual_root>')]
@@ -78,6 +82,8 @@ defs = dep['defineList']
 g, cc, ld = opts['global'], opts['c/cpp-compiler'], opts['linker']
 arch = f"-march={g['arch']} -mabi={g['abi']} -mcmodel={g['code-model']}"
 cflags = f"{arch} -std={cc['language-c']} -Os -g -Wall {cc['C_FLAGS']}"
+if g.get('misc-control'):                   # V2.00: -DCHIP_AK1037=1
+    cflags += ' ' + g['misc-control']
 
 objname = lambda s: 'build/' + s.replace('../', 'up_').replace('/', '__').rsplit('.', 1)[0] + '.o'
 objs = [objname(s) for s in srcs]

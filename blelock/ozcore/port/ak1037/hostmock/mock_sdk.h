@@ -69,6 +69,10 @@ extern int mock_ble_inits, mock_ble_init_fail, mock_gatt_fail;
 extern const T_BT_ATTREC *mock_gatt_table;
 extern uint32_t mock_gatt_len;
 extern uint16_t mock_mtu_requested;
+extern T_pVOID mock_mtu_handle;         /* the handle the last MTU request named */
+/* com_ble_get_conn_handle(id): link id's handle, a fixed value per id
+ * (link 0 = MOCK_LINK0, the handle the tests connect on). */
+#define MOCK_LINK0 ((T_pVOID)0x1234)
 extern uint8_t mock_dev_addr[6];
 extern int mock_no_dev_addr;
 extern int mock_ble_up;                /* com_ble_init has succeeded */

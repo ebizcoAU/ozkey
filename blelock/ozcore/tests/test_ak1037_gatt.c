@@ -36,7 +36,7 @@
 #include "oz_wdt.h"
 #include "oz_wdt_ak1037.h"
 
-#define LINK ((void *)0x1234)
+#define LINK MOCK_LINK0                 /* link 0 (hostmock) */
 
 /* gatt_table rows (oz_gatt_ak1037.c) */
 #define REC_INFO  (&mock_gatt_table[2])
@@ -303,6 +303,11 @@ static void boot(void)
     expect_int("touch pads registered once", mock_tk_registered, 1);
     expect_int("all 15 pads enabled", (long long)mock_tk_keymark, 0x7fff);
     expect_int("pad sensitivity as the SDK's EVB V103", mock_tk_sen0 == 60 && mock_tk_sen_wk == 50, 1);
+    /* AK-SDK-2-1: SDK V2.00 takes the local MTU before any connection, on the
+     * link's handle (com_ble.h V2.00: "must be called after init and before
+     * connection"; its samples do it right after the GATT service). */
+    expect_int("MTU 247 set before any connection", mock_mtu_requested, 247);
+    expect_int("…on link 0's handle", mock_mtu_handle == MOCK_LINK0, 1);
     expect("service UUID", mock_gatt_table[0].p_data, 16, "010000000000" "4b434f4c" "01" "00324b5a4f");
     expect("ozkie UUID", mock_gatt_table[3].p_data, 16, "010000000000" "4b434f4c" "03" "00324b5a4f");
     mock_wait_parked();
