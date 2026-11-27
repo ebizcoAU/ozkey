@@ -173,6 +173,13 @@ test('owner app: door pairing, then EDHOC, read and Echo unlock through ozlock',
   for (const c of lines.filter((x) => x.check)) assert.ok(c.ok, `${c.check}: ${JSON.stringify(c)}`);
   assert.equal(r.status, 0, `ozkierelay_app.py failed:\n${r.stdout}\n${r.stderr}`);
   assert.ok(lines.filter((x) => x.check).length >= 8, 'every check ran');
+  // F1 (ozkey-48 rev 15): this checkout's host lock sends message_4 after
+  // message_3, so the relay path is "confirmed", never the 504 fallback.
+  const m3 = lines.find((x) => x.check && x.check.startsWith('relay: m1 200; m3'));
+  assert.ok(m3, 'the message_3 check ran');
+  assert.equal(m3.confirmed, true, JSON.stringify(m3));
+  assert.equal(m3.got_m4, true, JSON.stringify(m3));
+  assert.deepEqual(m3.statuses, [[200, null], [200, null]]);
   assert.match(hostOut, /\[DOOR\] UNLOCKED/, 'the host lock actuated');
   const lock = await getLock(L);
   assert.equal(lock.ozkie_version, 2);

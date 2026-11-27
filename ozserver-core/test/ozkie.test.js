@@ -114,7 +114,7 @@ test('broker down: 503 mqtt_down, nothing pending afterwards', async () => {
   assert.equal((await p).status, 200);
 });
 
-test('EDHOC: m1 → m2, m3 + silence = delivered, unconfirmed (no audit row, OZKIE-RELAY-TIMING-1 S2), lease released', async () => {
+test('EDHOC: m1 → m2, m3 + silence = 504 unknown (no audit row; F1 message_4), lease released', async () => {
   audits.length = 0;
   const m1 = Buffer.from([0, 0x03, 0x02, 0x58]);
   const p1 = relay(m1);
@@ -128,16 +128,16 @@ test('EDHOC: m1 → m2, m3 + silence = delivered, unconfirmed (no audit row, OZK
   assert.equal(r1.status, 200);
   assert.ok(Buffer.from(r1.body.frame_b64, 'base64').equals(m2));
   const r3 = await relay(Buffer.from([0, 0x52, 0xe5, 0x62]));
-  assert.equal(r3.status, 200);
-  assert.equal(r3.body.frame_b64, null);
-  assert.equal(r3.body.confirmed, false);
+  assert.equal(r3.status, 504);
+  assert.equal(r3.body.code, 'no_message_4');
+  assert.equal(r3.body.outcome, 'unknown');
   assert.equal(audits.length, 0);
   // released: another sender can start now
   const pB = relay(m1, { appId: 'app-b' });
   await nextTick();
   oz.handleOzkieUplink(L, B, m2);
   assert.equal((await pB).status, 200);
-  assert.equal((await relay(Buffer.from([0, 0x52]), { appId: 'app-b' })).status, 200); // done, lease released
+  assert.equal((await relay(Buffer.from([0, 0x52]), { appId: 'app-b' })).status, 504); // silence: unknown, lease released
 });
 
 test('EDHOC: m3 refused by the lock comes back, no audit row; m3 without a lease refused', async () => {
