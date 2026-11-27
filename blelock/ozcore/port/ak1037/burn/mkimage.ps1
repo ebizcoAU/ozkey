@@ -6,19 +6,21 @@
 #    (the SDK's own layout, same as the reference app_mcu.bin), and checks it fits PROG.
 # 2. app_mcu\bin\ozkv_blank.bin: the OZKV partition, all 0xFF, so the first boot formats it.
 #    Burning it wipes the lock's identity and bonds; drop that download line to keep them.
-# 3. tools\burntool\config_ozkie.txt: config_ozkie.txt from the repo, in the UTF-16LE + BOM
+# 3. tools\burntool\<Config>: the repo's burn config (-Config, default config_ozkie.txt;
+#    config_ozkie_v2.txt for SDK V2.00), in the UTF-16LE + BOM
 #    and CRLF the tool reads.
 # Then, from tools\burntool: Anyka_BurnCli_Tool.exe -b 2000000 -f config_ozkie.txt
 param(
     [Parameter(Mandatory = $true)][string]$Name,
     [string]$Sdk = 'C:\Users\sshuser\ak1037\AnyMicro1037_SDK_V1.02',
-    [string]$Tc  = 'C:\Users\sshuser\ak1037\SysGCC\risc-v\bin\riscv64-unknown-elf-'
+    [string]$Tc  = 'C:\Users\sshuser\ak1037\SysGCC\risc-v\bin\riscv64-unknown-elf-',
+    [string]$Config = 'config_ozkie.txt'
 )
 $ErrorActionPreference = 'Stop'
 $build = "$Sdk\app_mcu\build"
 $bin   = "$Sdk\app_mcu\bin"
 $elf   = "$build\$Name.elf"
-$cfgIn = "$PSScriptRoot\config_ozkie.txt"
+$cfgIn = "$PSScriptRoot\$Config"
 if (-not (Test-Path $elf)) { throw "no $elf (link it with link_app_mcu.ps1 -Name $Name)" }
 
 & "${Tc}objcopy" -O binary -j .bootcode -j .data $elf "$build\$Name.ram.bin"
@@ -45,6 +47,6 @@ for ($i = 0; $i -lt $kv.Length; $i++) { $kv[$i] = 0xFF }
 "ozkv_blank.bin {0:N0} B" -f $kv.Length
 
 # The tool reads UTF-16LE with a BOM and CRLF line ends, like the SDK's own configs.
-[IO.File]::WriteAllText("$Sdk\tools\burntool\config_ozkie.txt", (($cfg -join "`r`n") + "`r`n"),
+[IO.File]::WriteAllText("$Sdk\tools\burntool\$Config", (($cfg -join "`r`n") + "`r`n"),
                         (New-Object Text.UnicodeEncoding($false, $true)))
-"config_ozkie.txt written to $Sdk\tools\burntool"
+"$Config written to $Sdk\tools\burntool"
