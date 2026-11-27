@@ -205,6 +205,8 @@ function initMqtt() {
     // for an actually-dead bridge, which defeats the point. 30s is frequent
     // enough to fail over promptly once the grace period genuinely elapses
     // without being a meaningful DB load.
+    // OZLOCK-LOG-NOISE-1: one presence summary line per period (idempotent).
+    require('./presencelog').startPresenceSummary();
     if (bridgeFailoverTimer) clearInterval(bridgeFailoverTimer);
     bridgeFailoverTimer = setInterval(() => {
       runBridgeFailoverSweep().catch((err) =>
