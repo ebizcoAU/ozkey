@@ -1,2 +1,3 @@
 # cut from a read-back by keepparts.py; ozkv_keep.bin holds identity + bonds
 *_keep.bin
+ozkvcmp
