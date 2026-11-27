@@ -645,6 +645,20 @@ int oz_edhoc_r_msg3(oz_edhoc *s, const uint8_t *in, size_t in_len,
 
 /* ── public: after completion ───────────────────────────────────────────── */
 
+/* F1 red: not built yet. */
+int oz_edhoc_r_msg4(oz_edhoc *s, uint8_t *out, size_t cap, size_t *out_len)
+{
+    (void)s; (void)out; (void)cap;
+    *out_len = 0;
+    return OZ_E_ARG;
+}
+
+int oz_edhoc_i_msg4(oz_edhoc *s, const uint8_t *in, size_t in_len)
+{
+    (void)s; (void)in; (void)in_len;
+    return OZ_E_ARG;
+}
+
 int oz_edhoc_exporter(oz_edhoc *s, uint32_t label, const uint8_t *ctx, size_t ctx_len,
                       uint8_t *out, size_t len)
 {

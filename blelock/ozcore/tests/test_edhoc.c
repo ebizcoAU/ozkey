@@ -150,6 +150,13 @@ static void test_rfc9529_trace(void)
     expect("trace: PRK_exporter (R)", R.prk_exporter, 32,
            "e14d06699cee248c5a04bf9227bbcd4ce394de7dcb56db43555474171e6446db");
 
+    /* message_4, RFC 9529 §3.6 (F1, OZKIE-RELAY-TIMING-1). */
+    uint8_t m4[16];
+    size_t m4l = 0;
+    expect_int("trace: R writes message_4", oz_edhoc_r_msg4(&R, m4, sizeof m4, &m4l), 0);
+    expect("trace: message_4", m4, m4l, "4828c966b7ca304f83");
+    expect_int("trace: I accepts message_4", oz_edhoc_i_msg4(&I, m4, m4l), 0);
+
     uint8_t sec[16], salt[8];
     oz_edhoc_cid sid, rid;
     oz_edhoc_oscore(&I, sec, salt, &sid, &rid);
@@ -252,6 +259,20 @@ static void test_x25519_roundtrip(void)
     expect_int("x25519: I accepts", oz_edhoc_i_msg2(&I, m2, m2l, er, sizeof er, &erl), 0);
     expect_int("x25519: msg3", oz_edhoc_i_msg3(&I, ead3, ead3_len, m3, sizeof m3, &m3l), 0);
     expect_int("x25519: R accepts", oz_edhoc_r_msg3(&R, m3, m3l, er, sizeof er, &erl), 0);
+    {
+        uint8_t m4[16];
+        size_t m4l = 0;
+        expect_int("x25519: R writes message_4", oz_edhoc_r_msg4(&R, m4, sizeof m4, &m4l), 0);
+        expect_int("x25519: …9 bytes", (long long)m4l, OZ_EDHOC_MSG4_LEN);
+        expect_int("x25519: …too small a buffer refused", oz_edhoc_r_msg4(&R, m4, 8, &m4l), OZ_E_NO_SPACE);
+        oz_edhoc_r_msg4(&R, m4, sizeof m4, &m4l);
+        m4[m4l - 1] ^= 0x01;
+        expect_int("x25519: tampered message_4 refused", oz_edhoc_i_msg4(&I, m4, m4l), OZ_E_AUTH);
+        m4[m4l - 1] ^= 0x01;
+        expect_int("x25519: short message_4 refused", oz_edhoc_i_msg4(&I, m4, m4l - 1), OZ_E_AUTH);
+        expect_int("x25519: I accepts message_4", oz_edhoc_i_msg4(&I, m4, m4l), 0);
+        expect_int("x25519: R can't check a message_4", oz_edhoc_i_msg4(&R, m4, m4l), OZ_E_ARG);
+    }
     printf("x25519 handshake sizes: msg1 %u, msg2 %u, msg3 %u (kccs + %u-byte EAD_3)\n",
            (unsigned)m1l, (unsigned)m2l, (unsigned)m3l, (unsigned)ead3_len);
 
@@ -297,6 +318,8 @@ static void test_failures(void)
                OZ_EDHOC_SEND_ERROR);
     uint8_t k[16];
     expect_int("no export after failure", oz_edhoc_exporter(&R, 0, NULL, 0, k, 16), OZ_E_ARG);
+    size_t kl;
+    expect_int("no message_4 after failure", oz_edhoc_r_msg4(&R, k, sizeof k, &kl), OZ_E_ARG);
 
     /* A different lock answering under the expected kid: MAC_2 fails. */
     setup_pair();
