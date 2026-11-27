@@ -9,9 +9,10 @@
  *
  * TRANSIT-ONLY (PM nexus-46, 2026-11-17): frames live in this process's memory
  * for at most one wait and touch no table. Nothing is queued, retried or
- * re-sent (§2.4.4: a v2 unlock is never held). The only stored trace is one
- * content-free audit row per completed relay EDHOC (ozkey-56 §2, F1), behind
- * AUDIT_RELAY_BOND so it is a one-line removal if the operator rules so.
+ * re-sent (§2.4.4: a v2 unlock is never held). Nothing is stored: the
+ * "completed relay EDHOC" audit row (ozkey-56 §2, F1) is gone, because
+ * message_3 + silence is not a confirmation (OZKIE-RELAY-TIMING-1 S2). When
+ * the lock sends message_4 (fw F1), a confirmed handshake can be recorded again.
  *
  * What we read of a frame:
  *   - the type byte (closed set, §2.4.1);
@@ -23,10 +24,7 @@
 
 const { ctx } = require('./ctx');
 const logEvent = (...args) => ctx.logEvent(...args);
-const recordAudit = (...args) => require('./audit').recordAudit(...args);
 const mqttPublishRaw = (...args) => require('./transport').mqttPublishRaw(...args);
-
-const AUDIT_RELAY_BOND = true; // F1 toggle (ozkey-56 §2)
 
 const T_EDHOC = 0x00;
 const T_OSCORE = 0x01;
@@ -37,7 +35,10 @@ const MAX_TOPIC = 200; // §2.4.6
 const cfg = (k, dflt) => (ctx.CONFIG && ctx.CONFIG[k] !== undefined ? ctx.CONFIG[k] : dflt);
 const waitMs = () => cfg('OZKIE_WAIT_MS', 10_000);
 const leaseMs = () => cfg('OZKIE_EDHOC_LEASE_MS', 35_000);
-const m3WaitMs = () => cfg('OZKIE_M3_WAIT_MS', 2_000);
+// OZKIE-RELAY-TIMING-1 S3: 5 s (was 2 s), ~10× the measured relay round trip.
+const m3WaitMs = () => cfg('OZKIE_M3_WAIT_MS', 5_000);
+// S1: after a message_1 timeout the lock's relay EDHOC settles this long.
+const settleMs = () => cfg('OZKIE_EDHOC_SETTLE_MS', 10_000);
 
 // In-memory counters by reason; C0b metrics read them. Never persisted.
 const counters = Object.create(null);
@@ -49,6 +50,18 @@ function count(reason) {
 const pending = new Map();
 // lockId -> { holder, bridgeId, timer, waiter: { finish } | null }
 const leases = new Map();
+// OZKIE-RELAY-TIMING-1 S1: lockId -> settle-until (ms). A message_2 carries
+// nothing that ties it to its message_1, so after a message_1 timed out a late
+// message_2 could reach a retry's wait. While settling, a new message_1 is
+// refused and every type 0 uplink is stale.
+const settling = new Map();
+const settleLeft = (lockId) => {
+  const until = settling.get(lockId);
+  if (!until) return 0;
+  const left = until - Date.now();
+  if (left <= 0) settling.delete(lockId);
+  return Math.max(0, left);
+};
 
 const key = (lockId, token) => `${lockId}|${token.toString('hex')}`;
 
@@ -151,6 +164,12 @@ async function relayFrame({ siteId, lockId, bridgeId, appId, frame }) {
 
   // EDHOC (type 0): one lease per lock across all senders (§2.4.3).
   const isMsg1 = f.msg[0] < 0x40;
+  const left = isMsg1 ? settleLeft(lockId) : 0;
+  if (left) {
+    return refuse(409, 'edhoc_settling', 'The lock\'s last handshake timed out; a late answer may still arrive. Try again shortly.', {
+      retry_after_ms: left,
+    });
+  }
   const lease = leases.get(lockId);
   if (lease && lease.holder !== appId) {
     return refuse(409, 'edhoc_busy', 'Another sender holds this lock\'s relay handshake. Try again shortly.');
@@ -184,18 +203,24 @@ async function relayFrame({ siteId, lockId, bridgeId, appId, frame }) {
     () => {
       if (isMsg1) {
         releaseLease(lockId);
+        settling.set(lockId, Date.now() + settleMs());
         return refuse(504, 'no_ack', 'No message_2 from the lock.', { outcome: 'unknown' });
       }
-      // message_3 + silence = accepted: the lock sends no message_4 (§3).
+      // S2: message_3 + silence is NOT a confirmation. The lock sends no
+      // message_4 yet (F1 adds one), may have refused with STORAGE_FAILED
+      // after our window, or never got message_3. The app's first OSCORE
+      // answer on the new context is the confirmation (ozkey-48 §3).
       return answer(null, bridgeId);
     }
   );
   l.waiter = null;
   if (!isMsg1) {
     releaseLease(lockId);
-    if (result.status === 200 && result.body.frame_b64 === null) {
-      logEvent('key', `OZKIE relay: handshake completed for ${lockId} by app ${appId} via ${bridgeId}`);
-      if (AUDIT_RELAY_BOND) await recordAudit(appId, lockId, 'ozkie_edhoc', 'relay handshake completed (no content)');
+    if (result.status === 200) {
+      result.body.confirmed = false;
+      if (result.body.frame_b64 === null) {
+        logEvent('info', `OZKIE relay: message_3 delivered, unconfirmed, for ${lockId} by app ${appId} via ${bridgeId}`);
+      }
     }
   }
   return result;
@@ -229,6 +254,11 @@ function handleOzkieUplink(lockId, bridgeId, buf) {
     return;
   }
   // type 0 (or 2): belongs to the lease holder's open wait.
+  if (settleLeft(lockId)) {
+    count('uplink_settling');
+    logEvent('info', `OZKIE relay: stale EDHOC uplink from ${lockId} via ${bridgeId} while settling; dropped`);
+    return;
+  }
   const l = leases.get(lockId);
   if (!l || !l.waiter) {
     count('uplink_no_lease');
@@ -274,4 +304,9 @@ function ozkieCounters() {
   return { ...counters };
 }
 
-module.exports = { relayFrame, refuseFrame, handleOzkieUplink, abortPinned, ozkieCounters, coapToken, parseFrame };
+/** The relay's timers as configured (ms). */
+function ozkieTimings() {
+  return { waitMs: waitMs(), leaseMs: leaseMs(), m3WaitMs: m3WaitMs(), settleMs: settleMs() };
+}
+
+module.exports = { relayFrame, refuseFrame, handleOzkieUplink, abortPinned, ozkieCounters, ozkieTimings, coapToken, parseFrame };
